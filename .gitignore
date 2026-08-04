@@ -1,0 +1,5 @@
+db/*
+!db/.gitignore
+__pycache__/
+*.py[cod]
+.DS_Store

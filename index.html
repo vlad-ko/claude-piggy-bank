@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Claude Code Usage Report</title>
+<script src="/vendor/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2430; --muted:#67707c; --line:#e3e6ea; --accent:#2563eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  .wrap { max-width:1200px; margin:0 auto; padding:20px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin-bottom:16px; }
+  .banner { background:#fef3c7; border:1px solid #f59e0b; color:#78350f; padding:10px 14px; border-radius:8px; margin-bottom:14px; display:none; }
+  .cost-basis-note { background:#eef2ff; border:1px solid #c7d2fe; color:#3730a3; padding:8px 14px; border-radius:8px; margin-bottom:14px; font-size:12px; cursor:help; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .card .label { color:var(--muted); font-size:12px; }
+  .card .value { font-size:20px; font-weight:600; margin-top:2px; }
+  .card .note { color:var(--muted); font-size:11px; margin-top:2px; }
+  .filters { display:flex; gap:8px; align-items:center; margin-bottom:16px; flex-wrap:wrap; }
+  .filters button { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer; }
+  .filters button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .filters input { border:1px solid var(--line); border-radius:8px; padding:6px 8px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:16px; }
+  .panel h2 { font-size:15px; margin:0 0 10px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:right; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  td.preview { text-align:left; white-space:normal; max-width:420px; color:var(--muted); }
+  tbody tr.clickable { cursor:pointer; }
+  tbody tr.clickable:hover { background:#eef2ff; }
+  .toggle { float:right; font-size:12px; }
+  .chartbox { position:relative; height:340px; }
+  #detail { display:none; }
+  #detail .close { float:right; cursor:pointer; color:var(--muted); background:none; border:none; font:inherit; padding:0; }
+  .mono { font-family:ui-monospace, monospace; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Claude Code Usage Report</h1>
+  <div class="sub">Token usage from local session transcripts. Dates are America/New_York.</div>
+  <div class="banner" id="banner"></div>
+  <div class="cost-basis-note" id="scope-note">Loading scope&hellip;</div>
+  <div class="cost-basis-note" id="cost-basis-note" title="Cost figures are list-rate arithmetic over measured tokens, computed from a local, hand-maintained rate table. They do not reflect subscription accounting, discounts, or overage behavior and will differ from your actual bill.">Loading cost basis&hellip;</div>
+
+  <div class="filters" id="filters">
+    <button data-range="1">24h</button>
+    <button data-range="7" class="active">7d</button>
+    <button data-range="30">30d</button>
+    <button data-range="all">All</button>
+    <span>Custom:</span>
+    <input type="date" id="from"> <input type="date" id="to">
+    <button id="apply">Apply</button>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="panel">
+    <h2>Daily token usage
+      <span class="toggle">
+        <label><input type="radio" name="by" value="class" checked> by token class</label>
+        <label><input type="radio" name="by" value="turntype"> by turn type</label>
+        <label><input type="radio" name="by" value="scope"> by scope (main vs subagent)</label>
+      </span>
+    </h2>
+    <div class="chartbox"><canvas id="chart"></canvas></div>
+  </div>
+
+  <div class="panel">
+    <h2>Spend by model
+      <span class="toggle" style="font-weight:normal;color:var(--muted);font-size:12px;">
+        the same model is a separate row per scope -- main-thread and subagent are never merged
+      </span>
+    </h2>
+    <div style="overflow-x:auto"><table id="models"><thead><tr>
+      <th>Model</th><th>Scope</th><th>Calls</th>
+      <th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th>
+      <th title="List-rate ESTIMATE from a local rate table -- not a bill.">Cost estimate</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="panel" id="detail">
+    <button type="button" class="close" id="detail-close" aria-label="Close session details">✕ close</button>
+    <h2 id="detail-title">Session</h2>
+    <div id="detail-body"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Sessions</h2>
+    <div style="overflow-x:auto"><table id="sessions"><thead><tr>
+      <th>Session</th><th>Last activity</th><th>API calls</th>
+      <th title="Of the API calls, how many came from subagent (sidechain) transcripts.">Subagent calls</th>
+      <th>Input</th><th>Cache read</th>
+      <th>Cache write</th><th>Output</th><th>Avg ctx/call</th>
+      <th title="List-rate ESTIMATE from a local rate table -- not a bill.">Cost estimate</th>
+      <th title="Task-tool dispatches within the selected from/to period.">Dispatches</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="panel">
+    <h2>Top subagent dispatches (by spend)
+      <span class="toggle" style="font-weight:normal;color:var(--muted);font-size:12px;">
+        "unavailable" = transcript reaped from /private/tmp -- spend unknown, never $0
+      </span>
+    </h2>
+    <div style="overflow-x:auto"><table id="agents"><thead><tr>
+      <th>Agent</th><th>Type</th><th>Description</th><th>Session</th>
+      <th>Model</th><th>Calls</th><th>Cache read</th>
+      <th title="List-rate ESTIMATE from a local rate table -- not a bill.">Cost estimate</th>
+      <th>Status</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="panel">
+    <h2>Outlier API calls (by cache-read, period-wide)</h2>
+    <div style="overflow-x:auto"><table id="outliers"><thead><tr>
+      <th>When</th><th>Session</th><th>Model</th><th>Turn type</th><th>Cache read</th>
+      <th>Context</th><th>Turn preview</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+let state = { from: null, to: null, by: "class", chart: null };
+
+function fmtTok(n) {
+  if (n === null || n === undefined) return "—";
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(n);
+}
+function fmtCost(c) {
+  if (c === null || c === undefined) return "—";
+  if (c > 0 && c < 0.01) return "<$0.01"; // a real nonzero cost must never render as fabricated "$0.00"
+  return "$" + c.toFixed(2);
+}
+function fmtTs(ts) {
+  if (ts === null || ts === undefined) return "—";
+  return new Date(ts * 1000).toLocaleString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+function esc(s) {
+  // textContent/innerHTML only escapes &, <, > -- not quotes, and this value
+  // is interpolated into a double-quoted data-id attribute (line below).
+  return String(s ?? "").replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+function isoLocal(d) {
+  return d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(url + " -> " + r.status);
+  return r.json();
+}
+function rangeQS() {
+  const p = new URLSearchParams();
+  if (state.from) p.set("from", state.from);
+  if (state.to) p.set("to", state.to);
+  return p.toString();
+}
+
+function card(label, value, note) {
+  return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div>${note ? `<div class="note">${note}</div>` : ""}</div>`;
+}
+
+// #4966: every figure on this page names the SCOPE it ranges over. Subagent
+// API calls live in separate `<session>/subagents/agent-*.jsonl` transcripts;
+// when none were ingested the numbers are main-thread-only and this note says
+// so, because "no subagent transcripts on disk" and "subagents spent nothing"
+// are different facts (rule #12) and must not render identically.
+function renderScopeNote(scope) {
+  const el = document.getElementById("scope-note");
+  const cov = scope.coverage;
+  // Every count here is scoped to the SELECTED WINDOW, exactly like the
+  // buckets it describes -- except `runs_undated_unavailable`, which is
+  // corpus-wide because those runs carry no timestamp to window by, and which
+  // is labelled as such below rather than blended in.
+  const undated = cov.runs_undated_unavailable
+    ? ` <strong>${cov.runs_undated_unavailable} reaped dispatch(es)</strong> carry ` +
+      `no readable timestamp, so they belong to no date window and are counted ` +
+      `here instead (corpus-wide, not window-scoped).`
+    : "";
+  if (!cov.sessions_with_subagent_transcripts) {
+    el.innerHTML =
+      `<strong>Scope: MAIN-THREAD ONLY.</strong> No <code>subagents/</code> ` +
+      `transcripts were found for any of the ${cov.sessions} session(s) in ` +
+      `this period, so subagent spend is <strong>unmeasured, not zero</strong> ` +
+      `&mdash; every figure below is a main-thread figure, not a session total.` +
+      undated;
+    return;
+  }
+  el.innerHTML =
+    `<strong>Scope: main-thread + subagent.</strong> ` +
+    `${cov.subagent_files.toLocaleString()} subagent transcript(s) across ` +
+    `${cov.sessions_with_subagent_transcripts} of ${cov.sessions} session(s) ` +
+    `in this period are included. Subagent calls have no main-thread turn, so ` +
+    `they appear under the "subagent" bucket in the by-turn-type chart.` +
+    undated;
+}
+
+function renderSummary(s) {
+  const noData = !s.calls;
+  const cards = [
+    card("Input tokens", noData ? "—" : fmtTok(s.input)),
+    card("Cache-read tokens", noData ? "—" : fmtTok(s.cache_read)),
+    card("Cache-write tokens", noData ? "—" : fmtTok(s.cache_write)),
+    card("Output tokens", noData ? "—" : fmtTok(s.output)),
+    card(
+      "Cost estimate",
+      noData ? "—" : fmtCost(s.cost_estimate_usd),
+      `List-rate estimate, not a bill (rates as of ${esc(s.cost_basis.rates_as_of)})`
+    ),
+    card("Sessions", s.sessions),
+    card(
+      "API calls",
+      s.calls.toLocaleString(),
+      `${s.scope.main_thread.calls.toLocaleString()} main-thread + ` +
+      `${s.scope.subagent.calls.toLocaleString()} subagent`
+    ),
+    card("Avg context/call", noData ? "—" : fmtTok(Math.round(s.avg_context))),
+  ];
+  document.getElementById("cards").innerHTML = cards.join("");
+
+  renderScopeNote(s.scope);
+  renderModels(s.models);
+
+  document.getElementById("cost-basis-note").innerHTML =
+    `<strong>Cost figures are an ESTIMATE, not a bill.</strong> They are list-rate ` +
+    `arithmetic (<code>pricing.py</code>) over the measured token counts above -- ` +
+    `they do not reflect subscription accounting, discounts, or overage behavior, ` +
+    `and will differ from your actual bill. Rate table last checked ` +
+    `${esc(s.cost_basis.rates_as_of)} (${esc(s.cost_basis.source)}).`;
+
+  const banner = document.getElementById("banner");
+  const msgs = [];
+  if (s.ingest.files === 0) msgs.push("No files ingested yet — run ingest.py.");
+  if (s.ingest.unparsed_records > 0) msgs.push(`INCONCLUSIVE: ${s.ingest.unparsed_records} unparsed record(s) across ingested files — totals may undercount.`);
+  if (s.unpriced_calls > 0) msgs.push(`${s.unpriced_calls} call(s) on unpriced model(s) [${s.unpriced_models.join(", ")}] are EXCLUDED from cost (never priced at $0).`);
+  banner.style.display = msgs.length ? "block" : "none";
+  banner.textContent = msgs.join(" ");
+}
+
+const CLASS_COLORS = { input: "#2563eb", cache_read: "#059669", cache_write: "#d97706", output: "#dc2626" };
+const TT_COLORS = ["#2563eb", "#059669", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#be185d", "#64748b"];
+
+function renderChart(ts) {
+  const keys = Object.keys(ts.series);
+  const datasets = keys.map((k, i) => ({
+    label: k,
+    data: ts.series[k],
+    backgroundColor: CLASS_COLORS[k] || TT_COLORS[i % TT_COLORS.length],
+    stack: "tokens",
+    yAxisID: "y",
+  }));
+  datasets.push({
+    type: "line",
+    label: "avg context/call",
+    data: ts.avg_context,
+    borderColor: "#111827",
+    backgroundColor: "#111827",
+    yAxisID: "y2",
+    tension: 0.2,
+    pointRadius: 2,
+  });
+  if (state.chart) state.chart.destroy();
+  state.chart = new Chart(document.getElementById("chart"), {
+    type: "bar",
+    data: { labels: ts.days, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { stacked: true },
+        y: { stacked: true, ticks: { callback: v => fmtTok(v) }, title: { display: true, text: "tokens/day" } },
+        y2: { position: "right", grid: { drawOnChartArea: false }, ticks: { callback: v => fmtTok(v) }, title: { display: true, text: "avg context/call" } },
+      },
+      plugins: { tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmtTok(c.raw)}` } } },
+    },
+  });
+}
+
+// The subagent-call COUNT alone is a rule-#12 trap: a plain "0" reads as
+// "this session dispatched nothing" when it can equally mean "its transcripts
+// were reaped" or "nothing was ever scanned". `subagent_status` is the API's
+// answer to that and was computed but never rendered (#4651 shape) -- so the
+// count now always carries its own provenance.
+const SUBAGENT_STATUS = {
+  "measured": ["", "Subagent transcripts were read for this session."],
+  "unavailable": [" !", "INCOMPLETE: a dispatch dated into this period had its transcript reaped, so this count is a LOWER BOUND -- not zero."],
+  "unavailable-undated": [" ?", "A reaped dispatch exists for this session but carries no timestamp, so whether it falls in this period is unknown. Treat the count as unverified."],
+  "none": [" 0", "The task index was scanned and lists no dispatch -- a real zero."],
+  "unknown": [" ?", "The task index was never scanned for this session, so subagent spend is UNMEASURED, not zero."],
+};
+
+function subagentCell(r) {
+  const [mark, why] = SUBAGENT_STATUS[r.subagent_status] || [" ?", "Unrecognized subagent status."];
+  const n = r.subagent_calls.toLocaleString();
+  return mark
+    ? `<span title="${esc(why)}">${n}<strong>${esc(mark)}</strong></span>`
+    : `<span title="${esc(why)}">${n}</span>`;
+}
+
+function renderSessions(rows) {
+  const tb = document.querySelector("#sessions tbody");
+  tb.innerHTML = rows.map(r => `
+    <tr class="clickable" data-id="${esc(r.id)}">
+      <td class="mono">${esc(r.id.slice(0, 8))}</td>
+      <td>${fmtTs(r.last_ts)}</td>
+      <td>${r.calls.toLocaleString()}</td>
+      <td>${subagentCell(r)}</td>
+      <td>${fmtTok(r.input)}</td><td>${fmtTok(r.cache_read)}</td>
+      <td>${fmtTok(r.cache_write)}</td><td>${fmtTok(r.output)}</td>
+      <td>${fmtTok(Math.round(r.avg_context))}</td>
+      <td>${fmtCost(r.cost_estimate_usd)}${r.unpriced_calls ? " *" : ""}</td>
+      <td>${r.dispatches}</td>
+    </tr>`).join("") || `<tr><td colspan="11">No sessions in this period.</td></tr>`;
+  tb.querySelectorAll("tr.clickable").forEach(tr => {
+    tr.tabIndex = 0;
+    tr.setAttribute("role", "button");
+    tr.addEventListener("click", () => showDetail(tr.dataset.id));
+    tr.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); showDetail(tr.dataset.id); }
+    });
+  });
+}
+
+function renderAgents(rows) {
+  // #4966: this is "which agent cost me that" in one look -- the exact gap
+  // the issue's live evidence found (the most expensive agent appeared
+  // nowhere in the tool's output). An `unavailable` run's figures are NULL
+  // from the API and fmtTok/fmtCost already render null as "--", never "0".
+  document.querySelector("#agents tbody").innerHTML = rows.map(r => `
+    <tr${r.status === "unavailable" ? ' style="color:var(--muted)"' : ""}>
+      <td class="mono">${esc((r.agent_id || "").slice(0, 10))}</td>
+      <td>${esc(r.agent_type ?? "(unknown)")}</td>
+      <td class="preview">${esc(r.description ?? "")}</td>
+      <td class="mono">${esc((r.session_id || "").slice(0, 8))}</td>
+      <td>${esc(r.model ?? "—")}</td>
+      <td>${r.calls === null ? "—" : r.calls.toLocaleString()}</td>
+      <td>${fmtTok(r.cache_read)}</td>
+      <td>${fmtCost(r.cost_estimate_usd)}</td>
+      <td>${r.status === "unavailable" ? "unavailable (transcript reaped)" : "ingested"}</td>
+    </tr>`).join("") || `<tr><td colspan="9">No subagent dispatches in this period.</td></tr>`;
+}
+
+function renderOutliers(rows) {
+  document.querySelector("#outliers tbody").innerHTML = rows.map(r => `
+    <tr>
+      <td>${fmtTs(r.ts)}</td>
+      <td class="mono">${esc(r.session_id.slice(0, 8))}</td>
+      <td>${esc(r.model)}${r.is_sidechain ? " (side)" : ""}</td>
+      <td>${esc(r.turn_type ?? "(no turn)")}</td>
+      <td>${fmtTok(r.cache_read)}</td>
+      <td>${fmtTok(r.context_size)}</td>
+      <td class="preview">${esc(r.preview ?? "")}</td>
+    </tr>`).join("") || `<tr><td colspan="7">No calls in this period.</td></tr>`;
+}
+
+function tokenCols(r) {
+  return `<td>${fmtTok(r.input)}</td><td>${fmtTok(r.cache_read)}</td><td>${fmtTok(r.cache_write)}</td><td>${fmtTok(r.output)}</td><td>${fmtCost(r.cost_estimate_usd)}</td>`;
+}
+
+// Window-level spend by model. `models()` splits every model by scope on
+// purpose, so the same model appears once per scope and the two are never
+// summed into a figure that hides which side spent it.
+//
+// An empty list renders an explicit "no calls in this period" row rather than
+// an empty table: a blank table body is indistinguishable from a failed fetch,
+// and the tool's posture is that absence must never render as a value.
+function renderModels(models) {
+  const body = document.querySelector("#models tbody");
+  if (!models || models.length === 0) {
+    body.innerHTML = `<tr><td colspan="8">No API calls in this period.</td></tr>`;
+    return;
+  }
+  body.innerHTML = models.map(r =>
+    `<tr><td>${esc(r.model)}</td><td>${esc(r.scope)}</td>` +
+    `<td>${r.calls.toLocaleString()}</td>${tokenCols(r)}</tr>`
+  ).join("");
+}
+
+async function showDetail(id) {
+  let d;
+  try {
+    d = await getJSON("/api/session?id=" + encodeURIComponent(id));
+  } catch (e) {
+    reportLoadFailure(e);
+    return;
+  }
+  document.getElementById("detail-title").textContent = "Session " + id;
+  const tt = d.turn_types.map(r => `<tr><td>${esc(r.turn_type)}</td><td>${r.turns}</td><td>${r.calls}</td>${tokenCols(r)}</tr>`).join("");
+  const mm = d.models.map(r => `<tr><td>${esc(r.model)}</td><td></td><td>${r.calls}</td>${tokenCols(r)}</tr>`).join("");
+  const at = d.agent_types.map(r => `<tr><td>${esc(r.agent_type)}</td><td>${r.dispatches}</td><td>${r.subagent_tokens === null ? "—" : fmtTok(r.subagent_tokens)}${r.untotaled_dispatches ? ` (+${r.untotaled_dispatches} untotaled)` : ""}</td></tr>`).join("") || `<tr><td colspan="3">No agent dispatches recorded.</td></tr>`;
+  const ot = d.outlier_turns.map(r => `<tr><td>${fmtTs(r.ts)}</td><td>${esc(r.turn_type)}</td><td>${r.calls}</td><td>${fmtTok(r.cache_read)}</td><td class="preview">${esc(r.preview)}</td></tr>`).join("");
+  const sc = d.scopes.map(r => `<tr><td>${esc(r.scope)}</td><td>${r.calls}</td>${tokenCols(r)}</tr>`).join("")
+    || `<tr><td colspan="7">No API calls recorded for this session.</td></tr>`;
+  document.getElementById("detail-body").innerHTML = `
+    <h3>By scope (main-thread vs subagent)</h3>
+    <table><thead><tr><th>Scope</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th title="List-rate ESTIMATE -- not a bill.">Cost estimate</th></tr></thead><tbody>${sc}</tbody></table>
+    <h3>By turn type</h3>
+    <table><thead><tr><th>Turn type</th><th>Turns</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th title="List-rate ESTIMATE -- not a bill.">Cost estimate</th></tr></thead><tbody>${tt}</tbody></table>
+    <h3>By model</h3>
+    <table><thead><tr><th>Model</th><th></th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th title="List-rate ESTIMATE -- not a bill.">Cost estimate</th></tr></thead><tbody>${mm}</tbody></table>
+    <h3>Agent dispatch spend (subagent-reported tokens)</h3>
+    <table><thead><tr><th>Agent type</th><th>Dispatches</th><th>Subagent tokens</th></tr></thead><tbody>${at}</tbody></table>
+    <h3>Top turns by cache-read</h3>
+    <table><thead><tr><th>When</th><th>Type</th><th>Calls</th><th>Cache read</th><th>Preview</th></tr></thead><tbody>${ot}</tbody></table>`;
+  const panel = document.getElementById("detail");
+  panel.style.display = "block";
+  panel.scrollIntoView({ behavior: "smooth" });
+}
+function hideDetail() { document.getElementById("detail").style.display = "none"; }
+document.getElementById("detail-close").addEventListener("click", hideDetail);
+
+function reportLoadFailure(e) {
+  // A failed refresh must say so, not leave the previous numbers on screen
+  // looking current (CodeRabbit finding -- stale data read as current).
+  const banner = document.getElementById("banner");
+  banner.textContent = "Load failed: " + e.message + " -- displayed figures may be stale.";
+  banner.style.display = "block";
+}
+
+async function loadAll() {
+  const qs = rangeQS();
+  let summary, ts, sessions, agents, outliers;
+  try {
+    [summary, ts, sessions, agents, outliers] = await Promise.all([
+      getJSON("/api/summary?" + qs),
+      getJSON("/api/timeseries?" + qs + "&by=" + state.by),
+      getJSON("/api/sessions?" + qs),
+      getJSON("/api/agents?" + qs + "&limit=15"),
+      getJSON("/api/outliers?" + qs + "&limit=20"),
+    ]);
+  } catch (e) {
+    reportLoadFailure(e);
+    return;
+  }
+  renderSummary(summary);
+  renderChart(ts);
+  renderSessions(sessions);
+  renderAgents(agents);
+  renderOutliers(outliers);
+}
+
+function setRange(days) {
+  if (days === "all") { state.from = null; state.to = null; }
+  else {
+    const now = new Date();
+    state.to = isoLocal(now);
+    state.from = isoLocal(new Date(now.getTime() - (days - 1) * 86400e3));
+  }
+  document.getElementById("from").value = state.from ?? "";
+  document.getElementById("to").value = state.to ?? "";
+  loadAll();
+}
+
+document.querySelectorAll("#filters button[data-range]").forEach(b =>
+  b.addEventListener("click", () => {
+    document.querySelectorAll("#filters button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+    setRange(b.dataset.range === "all" ? "all" : Number(b.dataset.range));
+  }));
+document.getElementById("apply").addEventListener("click", () => {
+  document.querySelectorAll("#filters button").forEach(x => x.classList.remove("active"));
+  state.from = document.getElementById("from").value || null;
+  state.to = document.getElementById("to").value || null;
+  loadAll();
+});
+document.querySelectorAll('input[name="by"]').forEach(r =>
+  r.addEventListener("change", () => { state.by = r.value; loadAll(); }));
+
+setRange(7);
+</script>
+</body>
+</html>
