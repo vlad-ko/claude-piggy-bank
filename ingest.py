@@ -93,7 +93,7 @@ DERIVED_TABLES = (
 # of the transcripts (regenerable in full by re-running this script), so an
 # older shape is rebuilt from scratch rather than migrated in place -- see
 # `_prepare_schema`.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -126,7 +126,10 @@ CREATE TABLE IF NOT EXISTS api_calls (
     output_tokens INTEGER NOT NULL,
     context_size INTEGER NOT NULL,
     is_sidechain INTEGER NOT NULL DEFAULT 0,
-    cost_usd REAL
+    cost_usd REAL,
+    -- The API's own id for this response. NULL is legitimate and is NOT a
+    -- shared key: two NULL-id records are two calls, never one.
+    message_id TEXT
 );
 CREATE TABLE IF NOT EXISTS agent_dispatches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,6 +193,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_dispatches_turn_id ON agent_dispatches (tur
 -- #4966: the per-file delete scope and the main-vs-subagent split are both
 -- hot paths now (one subagent transcript changing must not scan every row).
 CREATE INDEX IF NOT EXISTS idx_api_calls_source_path ON api_calls (source_path);
+CREATE INDEX IF NOT EXISTS idx_api_calls_message_id ON api_calls (message_id);
 CREATE INDEX IF NOT EXISTS idx_api_calls_source_kind ON api_calls (source_kind);
 CREATE INDEX IF NOT EXISTS idx_turns_source_path ON turns (source_path);
 CREATE INDEX IF NOT EXISTS idx_agent_dispatches_source_path
@@ -284,6 +288,7 @@ class ApiCall:
     cache_write: int
     output_tokens: int
     is_sidechain: bool
+    message_id: Optional[str] = None
 
     @property
     def context_size(self) -> int:
@@ -339,6 +344,14 @@ class ParseResult:
     # Per-failure diagnostics ("<file>:<line>: <reason>"), one per unparsed
     # record -- the INCONCLUSIVE count is otherwise unactionable (Qodo finding).
     unparsed_details: list[str] = field(default_factory=list)
+    # Records whose `message.id` was absent, so dedupe had no key. They are
+    # KEPT as individual calls; the count is surfaced so a corpus where this
+    # is common cannot be mistaken for a clean one.
+    calls_without_message_id: int = 0
+    # Ids whose records disagreed on something other than the accumulating
+    # `output_tokens` -- the genuinely ambiguous case, ~1 in 19,000 on the
+    # corpus this was measured against.
+    divergent_message_ids: int = 0
 
 
 def parse_ts(record: dict) -> Optional[float]:
@@ -654,7 +667,69 @@ def parse_file(path: Path, collect_turns: bool = True) -> ParseResult:
                 result.unparsed_details.append(
                     f"{path.name}:{line_no}: {rtype or '(no type)'}: {exc}"
                 )
+    result.calls = _dedupe_calls(result)
     return result
+
+
+# The four token classes an API response reports. `output_tokens` is excluded
+# from the agreement check on purpose -- it is the one that legitimately grows.
+_STATIC_USAGE = ("input_tokens", "cache_read", "cache_write")
+
+
+def _dedupe_calls(result: ParseResult) -> list[ApiCall]:
+    """One row per API call, keyed on `message.id`.
+
+    Claude Code writes one transcript record per streamed content block, and
+    every record repeats the SAME `message.usage` object. Treating each as a
+    call inflated every aggregate by 1.9-2.4x. That is worse than a scale
+    error: the factor differs between main-thread and subagent transcripts, so
+    comparisons between them were distorted in SHAPE, not merely in magnitude.
+
+    **Last wins, and the rule is measured rather than assumed.** Across the
+    corpus this was derived from, `output_tokens` is non-decreasing over the
+    records of a single id in 4,928 of 4,928 cases, and only the final record
+    carries the finished total -- 942 where every earlier record said 2. So
+    summing over-counts, and first-wins would have UNDER-counted output by
+    roughly 99%.
+
+    **A whole record survives, never a synthesis of fields.** Where records of
+    one id disagree beyond `output_tokens`, taking a per-field maximum would
+    report a call that both wrote and did not write cache -- a combination
+    that occurred in no real API response. One real record is kept and the
+    ambiguity is COUNTED, so a corpus where it is common cannot pass as clean
+    (rule #12).
+
+    **A missing id is not a shared key.** Records without `message.id` each
+    stay their own call. Dropping them would silently delete real spend, and
+    grouping them together would merge unrelated calls; both are worse than
+    keeping them and saying how many there were.
+    """
+    keyed: dict[str, list[ApiCall]] = {}
+    unkeyed: list[ApiCall] = []
+    for call in result.calls:
+        if call.message_id is None:
+            unkeyed.append(call)
+        else:
+            keyed.setdefault(call.message_id, []).append(call)
+
+    result.calls_without_message_id = len(unkeyed)
+
+    deduped: list[ApiCall] = list(unkeyed)
+    for group in keyed.values():
+        if len(group) > 1 and len(
+            {tuple(getattr(c, f) for f in _STATIC_USAGE) for c in group}
+        ) > 1:
+            result.divergent_message_ids += 1
+        # max() is stable and returns the FIRST maximum, so iterate reversed
+        # to make the LAST record win a tie -- ties are the common case, since
+        # every record before the final one repeats the same usage.
+        deduped.append(max(reversed(group), key=lambda c: c.output_tokens))
+
+    # Restore transcript order; the caller pairs calls with turns positionally
+    # in places, and a reordered list would silently mis-associate them.
+    order = {id(c): i for i, c in enumerate(result.calls)}
+    deduped.sort(key=lambda c: order[id(c)])
+    return deduped
 
 
 def _parse_assistant(
@@ -698,6 +773,10 @@ def _parse_assistant(
             cache_write=tok("cache_creation_input_tokens"),
             output_tokens=tok("output_tokens"),
             is_sidechain=bool(record.get("isSidechain")),
+            message_id=(
+                message["id"] if isinstance(message.get("id"), str) and message["id"]
+                else None
+            ),
         )
     )
 
@@ -964,8 +1043,8 @@ def store_source(conn: sqlite3.Connection, source: Source, parsed: ParseResult) 
         conn.execute(
             "INSERT INTO api_calls (session_id, source_path, source_kind, agent_id,"
             " turn_id, ts, model, input_tokens, cache_read, cache_write,"
-            " output_tokens, context_size, is_sidechain, cost_usd)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " output_tokens, context_size, is_sidechain, cost_usd, message_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 source.session_id,
                 source_path,
@@ -982,6 +1061,7 @@ def store_source(conn: sqlite3.Connection, source: Source, parsed: ParseResult) 
                 1 if call.is_sidechain else 0,
                 cost_usd(call.model, call.input_tokens, call.cache_read,
                          call.cache_write, call.output_tokens),
+                call.message_id,
             ),
         )
 
@@ -1270,6 +1350,11 @@ def ingest(
             "schema_rebuilt": schema_rebuilt,
             "records_parsed": 0,
             "unparsed_records": 0,
+            # Dedupe diagnostics (#2). Both are counts of records the keying
+            # rule could not treat as ordinary, surfaced rather than hidden so
+            # a corpus where either is common cannot read as a clean one.
+            "calls_without_message_id": 0,
+            "divergent_message_ids": 0,
             "unparsed_details": [],
         }
         index = discover_task_index(
@@ -1302,6 +1387,8 @@ def ingest(
                 summary["subagent_files_ingested"] += 1
             summary["records_parsed"] += parsed.records_parsed
             summary["unparsed_records"] += parsed.unparsed_records
+            summary["calls_without_message_id"] += parsed.calls_without_message_id
+            summary["divergent_message_ids"] += parsed.divergent_message_ids
             summary["unparsed_details"].extend(parsed.unparsed_details)
 
         # Reconcile: a transcript deleted/renamed on disk must not leave its
@@ -1509,6 +1596,19 @@ def main() -> None:
         f" | records parsed: {summary['records_parsed']}"
         f" | unparsed_records: {summary['unparsed_records']}"
     )
+    if summary["divergent_message_ids"] or summary["calls_without_message_id"]:
+        # Both are dedupe outcomes the keying rule could not treat as ordinary.
+        # A divergent id is genuinely ambiguous -- one real record was kept,
+        # but which one is a judgement -- and a missing id means dedupe had no
+        # key at all. Neither is an error, and neither should be invisible.
+        print(
+            "NOTE: dedupe --"
+            f" ids whose records disagreed beyond output_tokens:"
+            f" {summary['divergent_message_ids']} (one whole record kept, never"
+            " a per-field synthesis);"
+            f" records with no message.id: {summary['calls_without_message_id']}"
+            " (kept as individual calls, never merged and never dropped)."
+        )
     if summary["candidates_scan_truncated"] or summary["candidates_unreadable"]:
         # Loud, and separate from every other count: these candidates were
         # EXCLUDED without a verdict, so any spend they carry is unmeasured

@@ -29,7 +29,8 @@ from ingest import (  # noqa: E402
 )
 from pricing import RATES_AS_OF, cost_usd, rates_for_model  # noqa: E402
 
-FIXTURE = Path(__file__).resolve().parent / "fixtures" / "session-fixture.jsonl"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+FIXTURE = FIXTURES / "session-fixture.jsonl"
 SUBAGENT_FIXTURE = (
     Path(__file__).resolve().parent / "fixtures" / "subagent-transcript.jsonl"
 )
@@ -1309,6 +1310,159 @@ class SchemaRebuildSafetyTest(unittest.TestCase):
         conn.close()
         summary = ingest(self.projects, self.db)
         self.assertTrue(summary["schema_rebuilt"])
+
+class StreamedRecordDedupeTest(unittest.TestCase):
+    """One API call is ONE row, keyed on `message.id` (#2).
+
+    Claude Code writes one transcript record per streamed content block, and
+    every one repeats the SAME `message.usage`. Counting each as a call
+    inflated every aggregate 1.9-2.4x. Worse than a scale error: the factor
+    differs by scope, so main-vs-subagent comparisons were distorted in SHAPE.
+
+    The resolution rule is not a guess. Across the real corpus `output_tokens`
+    is non-decreasing over the records of one id in 4,928 of 4,928 cases, and
+    only the last record carries the finished total -- so LAST WINS, and
+    first-wins would have undercounted output by ~99%.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-dedupe-test-"))
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir(parents=True)
+        shutil.copy(FIXTURES / "streamed-message.jsonl", self.projects / "s.jsonl")
+        self.db = self.tmp / "usage.db"
+        ingest(self.tmp / "projects", self.db)
+        self.conn = sqlite3.connect(self.db)
+        self.conn.row_factory = sqlite3.Row
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        shutil.rmtree(self.tmp)
+
+    def test_three_records_of_one_message_are_ONE_call(self) -> None:
+        n = self.conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        self.assertEqual(n, 2, "one row per message.id: msg_stream + msg_second")
+
+    def test_the_surviving_row_carries_the_FINAL_output_count(self) -> None:
+        # 450, not 2 (the first record) and not 454 (the sum). Fixture pins
+        # these three deliberately unequal so no two can be confused.
+        row = self.conn.execute(
+            "SELECT output_tokens FROM api_calls WHERE message_id = 'msg_stream'"
+        ).fetchone()
+        self.assertEqual(row["output_tokens"], 450)
+
+    def test_input_and_cache_are_not_multiplied(self) -> None:
+        row = self.conn.execute(
+            "SELECT input_tokens, cache_read, cache_write FROM api_calls"
+            " WHERE message_id = 'msg_stream'"
+        ).fetchone()
+        self.assertEqual(
+            (row["input_tokens"], row["cache_read"], row["cache_write"]),
+            (11, 9000, 700),
+            "repeated identical usage must be counted once, not summed",
+        )
+
+    def test_a_genuinely_separate_call_survives_as_its_own_row(self) -> None:
+        # Dedupe must not collapse distinct calls; the guard against an
+        # over-eager fix is a second id in the same file.
+        row = self.conn.execute(
+            "SELECT output_tokens FROM api_calls WHERE message_id = 'msg_second'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["output_tokens"], 33)
+
+    def test_totals_reflect_calls_not_records(self) -> None:
+        total = self.conn.execute(
+            "SELECT SUM(output_tokens) FROM api_calls"
+        ).fetchone()[0]
+        self.assertEqual(total, 483)  # 450 + 33, never 2+2+450+33
+
+
+class DivergentUsageTest(unittest.TestCase):
+    """When records of one id disagree beyond output, pick a WHOLE record.
+
+    Field-wise maxima would fabricate a combination that occurred in no real
+    API response -- on the real corpus, the id that diverges has cw=5857 on
+    its early records and cw=0 on the last, so a per-field max reports a call
+    that both wrote and did not write cache. One real row, and the ambiguity
+    COUNTED and surfaced rather than hidden (rule #12).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-divergent-test-"))
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir(parents=True)
+        shutil.copy(FIXTURES / "divergent-usage.jsonl", self.projects / "d.jsonl")
+        self.db = self.tmp / "usage.db"
+        self.summary = ingest(self.tmp / "projects", self.db)
+        self.conn = sqlite3.connect(self.db)
+        self.conn.row_factory = sqlite3.Row
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        shutil.rmtree(self.tmp)
+
+    def test_the_row_is_one_real_record_not_a_synthesis(self) -> None:
+        row = self.conn.execute(
+            "SELECT input_tokens, cache_read, cache_write, output_tokens"
+            " FROM api_calls WHERE message_id = 'msg_diverge'"
+        ).fetchone()
+        self.assertEqual(
+            (row["input_tokens"], row["cache_write"], row["cache_read"], row["output_tokens"]),
+            (26, 0, 238759, 263),
+            "must be the last record verbatim, never a per-field maximum",
+        )
+
+    def test_the_ambiguity_is_counted_and_surfaced(self) -> None:
+        self.assertEqual(self.summary["divergent_message_ids"], 1)
+
+    def test_an_agreeing_duplicate_is_NOT_counted_as_divergent(self) -> None:
+        # Otherwise the diagnostic fires on every ordinary streamed message
+        # and becomes noise nobody reads.
+        other = Path(tempfile.mkdtemp(prefix="cpb-agree-test-"))
+        proj = other / "projects"
+        proj.mkdir(parents=True)
+        shutil.copy(FIXTURES / "streamed-message.jsonl", proj / "s.jsonl")
+        try:
+            summary = ingest(other / "projects", other / "usage.db")
+            self.assertEqual(summary["divergent_message_ids"], 0)
+        finally:
+            shutil.rmtree(other)
+
+
+class MissingMessageIdTest(unittest.TestCase):
+    """A record with no `message.id` is kept and COUNTED, never dropped.
+
+    Dedupe keys on the id, so the tempting shortcut is to skip records that
+    lack one -- which would silently delete real spend. Every such record
+    stays its own call, and the count is surfaced so a corpus where this is
+    common cannot look like a clean one.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-noid-test-"))
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir(parents=True)
+        shutil.copy(FIXTURES / "no-message-id.jsonl", self.projects / "n.jsonl")
+        self.db = self.tmp / "usage.db"
+        self.summary = ingest(self.tmp / "projects", self.db)
+        self.conn = sqlite3.connect(self.db)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        shutil.rmtree(self.tmp)
+
+    def test_records_without_an_id_are_still_ingested(self) -> None:
+        n = self.conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        self.assertEqual(n, 2)
+
+    def test_they_are_not_collapsed_into_each_other(self) -> None:
+        total = self.conn.execute("SELECT SUM(output_tokens) FROM api_calls").fetchone()[0]
+        self.assertEqual(total, 25, "12 + 13 -- a NULL id is not a shared key")
+
+    def test_the_count_is_surfaced(self) -> None:
+        self.assertEqual(self.summary["calls_without_message_id"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
