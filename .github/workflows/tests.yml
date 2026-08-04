@@ -1,0 +1,129 @@
+name: Tests
+
+# The repo's branch protection requires a PR but, until this workflow existed,
+# required no check — so a PR could merge with the suite failing or never run.
+# Protection without a check guarantees the shape of a change, not its
+# correctness.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Every version reports. A green 3.13 beside a red 3.11 is the useful
+      # signal -- fail-fast would hide which versions are actually supported.
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Show interpreter
+        run: python -VV
+
+      - name: Run the suite
+        # No pip install, deliberately: see stdlib-only below.
+        run: python -m unittest discover -s tests -v
+
+  stdlib-only:
+    # "Python 3 standard library only. No pip installs, no Node, no build step"
+    # is the project's first stated design rule (README, CONTRIBUTING) and
+    # nothing enforced it. A single `import requests` would break the promise
+    # that this runs anywhere with a Python 3, and would be caught only by a
+    # reader who happened to know the rule.
+    name: stdlib-only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Every import must resolve against a bare interpreter
+        # Checks the modules the project actually ships. A third-party import
+        # fails here with ModuleNotFoundError on an interpreter that has had
+        # nothing installed into it -- which is precisely the claim under test.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast, pathlib, sys, sysconfig
+
+          # Modules this project defines itself; everything else must be stdlib.
+          local = {p.stem for p in pathlib.Path(".").glob("*.py")}
+          local |= {p.stem for p in pathlib.Path("tests").glob("*.py")}
+
+          stdlib = set(sys.stdlib_module_names)
+          offenders = []
+          for path in sorted(pathlib.Path(".").rglob("*.py")):
+              if ".git" in path.parts:
+                  continue
+              tree = ast.parse(path.read_text(), filename=str(path))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      names = [a.name.split(".")[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom):
+                      # A relative import (level > 0) is by definition local.
+                      if node.level:
+                          continue
+                      names = [(node.module or "").split(".")[0]]
+                  else:
+                      continue
+                  for name in names:
+                      if name and name not in stdlib and name not in local:
+                          offenders.append(f"{path}: {name}")
+
+          if offenders:
+              print("Non-stdlib imports found -- the README promises none:")
+              for line in offenders:
+                  print(f"  {line}")
+              sys.exit(1)
+          print(f"All imports resolve to the standard library or to this repo "
+                f"({len(local)} local modules).")
+          PY
+
+      - name: No dependency manifests
+        # The rule is about the whole build, not only imports: a requirements
+        # file or a package.json means someone intends an install step.
+        run: |
+          set -euo pipefail
+          found=$(ls requirements*.txt pyproject.toml setup.py package.json Pipfile 2>/dev/null || true)
+          if [ -n "$found" ]; then
+            echo "Dependency manifest(s) present, contradicting stdlib-only:"
+            echo "$found"
+            exit 1
+          fi
+          echo "No dependency manifests."
+
+  # Fan-in. Branch protection requires THIS one check, so the matrix can grow
+  # or shrink without anyone editing the protection settings -- and a matrix
+  # leg that never ran cannot be mistaken for one that passed, because a
+  # skipped or cancelled dependency is not `success`.
+  suite:
+    name: suite
+    if: always()
+    needs: [test, stdlib-only]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every dependency to have succeeded
+        run: |
+          set -euo pipefail
+          echo "test        = ${{ needs.test.result }}"
+          echo "stdlib-only = ${{ needs.stdlib-only.result }}"
+          if [ "${{ needs.test.result }}" != "success" ] \
+          || [ "${{ needs.stdlib-only.result }}" != "success" ]; then
+            echo "A required job did not succeed."
+            exit 1
+          fi
+          echo "All required jobs succeeded."
