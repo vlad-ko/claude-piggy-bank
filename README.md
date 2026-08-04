@@ -23,21 +23,44 @@ be a poor one if using it cost anything.
 
 ## Status: early, and honest about it
 
-CPB is pre-1.0 and **some of its headline numbers are known to be wrong.**
+CPB is pre-1.0. The defect that made its headline numbers wrong is **fixed**;
+what follows is the record, because a tool about measurement should show its
+own corrections rather than quietly restate them.
 
-`api_calls` currently counts transcript *records*, and Claude Code writes one
-record per streamed content block, each repeating the same `message.usage`
-object. Measured on one real corpus: **84,986 records against 35,842 distinct
-`message.id`** on the main thread. Call counts and the token totals derived
-from them are therefore inflated roughly **2–2.8×** — with a *different* factor
-for subagents than for the main thread, which distorts comparisons in shape and
-not only in magnitude.
+`api_calls` used to count transcript *records*. Claude Code writes one record
+per streamed content block, and each repeats the same `message.usage` object,
+so a single API response was counted many times. On one real corpus:
 
-This is tracked and being fixed. Until it lands, treat totals as upper bounds.
+| | counted before | actual | inflation |
+|---|---|---|---|
+| main-thread calls | 85,324 | 36,167 | 2.36x |
+| subagent calls | 242,242 | 126,757 | 1.91x |
+| estimated cost | $144,697 | $65,776 | 2.20x |
 
-Publishing a tool whose own README says its numbers are under review is a
-choice. The alternative was to fix it privately first, and the point of this
-project is that measurement should be inspectable — including when it is wrong.
+The factor differed by scope, so comparisons were distorted in **shape**, not
+merely in magnitude. The clearest casualty: main-thread spend appeared to
+dominate subagent spend, $83k against $61k. Deduplicated, it is **$33,073
+against $32,703** — a dead heat. A conclusion, not just a scale, was wrong.
+
+Ingest now emits one row per distinct `message.id`. The resolution rule is
+measured rather than assumed: across that corpus `output_tokens` is
+non-decreasing over the records of one id in **4,928 of 4,928** cases and only
+the final record carries the finished total, so the last record wins. Taking
+the first would have under-counted output by roughly 99%.
+
+Two residual cases are counted and printed rather than hidden. **109 ids**
+whose records disagreed on something other than `output_tokens` keep one whole
+real record, never a per-field maximum -- that would report a call which both
+wrote and did not write cache, a combination present in no real response.
+Records with **no** `message.id` each stay their own call; on this corpus there
+were none, but dropping them would delete real spend and grouping them would
+merge unrelated calls.
+
+Cost figures remain list-rate estimates, not a bill -- see below.
+
+Publishing a tool whose README documented its own broken numbers was a choice.
+The alternative was to fix it privately first, and the point of this project is
+that measurement should be inspectable, including when it is wrong.
 
 ## Install
 
