@@ -1040,5 +1040,102 @@ class AvailableProjectsTest(unittest.TestCase):
         self.assertEqual(available_projects(home=Path("/nonexistent-xyz")), [])
 
 
+class ContentBlockTest(unittest.TestCase):
+    """What the context is MADE OF -- #4967's composition detectors.
+
+    `api_calls` records how many tokens a call cost but nothing about what
+    those tokens were. Every composition figure this epic produced (prose
+    20-56%, Bash input 12-33%, Bash output 11-17%) was counted by hand off the
+    transcripts; this is the pass that makes them queryable.
+
+    ## Why CHARACTERS, and why that is not a token count
+
+    The tool is stdlib-only, so there is no tokenizer, and there is no
+    per-block token figure in the transcript -- `usage` is per-CALL only. Chars
+    are therefore the honest measured unit. They are NOT tokens and must never
+    be presented as tokens: chars-per-token varies by content (minified JSON
+    tool output tokenizes very differently from English prose), so a
+    composition stated in chars overstates the dense contributors' share of the
+    real context. Any token-denominated composition is an APPORTIONMENT of the
+    measured per-call total under a uniform-density assumption, and must be
+    labelled as such (the tool already keeps measured tokens and estimated
+    dollars visually and semantically distinct; this is the same split).
+
+    ## The fixture pins each contributor to a DIFFERENT length
+
+    ...and gives the two tools OPPOSITE input/output relationships -- Bash
+    100 in / 30 out, Read 42 in / 200 out. A detector that assumed one
+    direction globally (the hand-measured finding was "Bash input exceeds Bash
+    output") would pass on a single-tool fixture and be wrong; here it cannot.
+    """
+
+    CONTENT_FIXTURE = (
+        Path(__file__).resolve().parent / "fixtures" / "content-blocks.jsonl"
+    )
+    STRIPPED_FIXTURE = (
+        Path(__file__).resolve().parent / "fixtures" / "thinking-stripped.jsonl"
+    )
+
+    def setUp(self) -> None:
+        self.parsed = parse_file(self.CONTENT_FIXTURE)
+        self.by = {}
+        for b in self.parsed.content_blocks:
+            self.by[(b.block_type, b.tool_name)] = b.chars
+
+    def test_assistant_prose_and_thinking_are_separate_contributors(self) -> None:
+        # Collapsing thinking into prose would hide the single largest
+        # assistant-side contributor behind the one people already watch.
+        self.assertEqual(self.by[("thinking", None)], 70)
+        self.assertEqual(self.by[("text", None)], 40)
+
+    def test_a_STRIPPED_thinking_block_is_unmeasurable_NOT_zero(self) -> None:
+        """Measured on the real corpus: 0 of 14,918 thinking blocks keep their
+        text. Claude Code persists `type` + an empty `thinking` + a
+        `signature`, so thinking CONTENT is structurally absent from every
+        transcript -- while thinking TOKENS are still billed inside
+        `output_tokens`.
+
+        Recording that as `chars=0` would make a composition table report
+        "thinking: 0.0%", i.e. thinking costs nothing. It is the exact defect
+        this tool exists to catch (rule #12), so a stripped block carries
+        `chars=None` -- unmeasurable, and countable as such -- while a block
+        that really does carry text is measured normally.
+        """
+        stripped = parse_file(self.STRIPPED_FIXTURE).content_blocks
+        thinking = [b for b in stripped if b.block_type == "thinking"]
+        self.assertEqual(len(thinking), 1, "the block must still be COUNTED")
+        self.assertIsNone(
+            thinking[0].chars,
+            "a stripped thinking block must be unmeasurable, never a real 0",
+        )
+
+    def test_tool_input_is_attributed_to_the_TOOL_that_carried_it(self) -> None:
+        self.assertEqual(self.by[("tool_use", "Bash")], 115)
+        self.assertEqual(self.by[("tool_use", "Read")], 42)
+
+    def test_tool_RESULT_is_attributed_to_its_tool_via_tool_use_id(self) -> None:
+        # A tool_result names only a tool_use_id; the tool NAME has to be
+        # carried forward from the tool_use block that opened it. Without that
+        # join every result lands in one anonymous bucket and per-tool output
+        # attribution is impossible.
+        self.assertEqual(self.by[("tool_result", "Bash")], 30)
+        self.assertEqual(self.by[("tool_result", "Read")], 200)
+
+    def test_the_two_tools_run_in_OPPOSITE_directions(self) -> None:
+        # The property the fixture exists to protect: input>output for one
+        # tool and output>input for the other, so no global assumption passes.
+        self.assertGreater(self.by[("tool_use", "Bash")], self.by[("tool_result", "Bash")])
+        self.assertLess(self.by[("tool_use", "Read")], self.by[("tool_result", "Read")])
+
+    def test_the_human_prompt_is_its_own_contributor(self) -> None:
+        self.assertEqual(self.by[("user_text", None)], 55)
+
+    def test_every_block_in_the_fixture_is_accounted_for(self) -> None:
+        # Rule #12 at the aggregate: a silently dropped block would make every
+        # share sum to less than the whole while still looking like a total.
+        self.assertEqual(len(self.parsed.content_blocks), 7)
+        self.assertEqual(sum(b.chars for b in self.parsed.content_blocks), 552)
+
+
 if __name__ == "__main__":
     unittest.main()

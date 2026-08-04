@@ -295,9 +295,39 @@ class Dispatch:
 
 
 @dataclass
+class ContentBlock:
+    """One contributor to the context, measured in CHARACTERS.
+
+    Chars, not tokens, and the distinction is load-bearing: `usage` carries a
+    per-CALL token count and nothing per-block, and the tool is stdlib-only so
+    there is no tokenizer. Chars are what can be measured honestly. Because
+    chars-per-token varies sharply by content -- minified JSON tool output
+    against English prose -- a composition stated in chars is NOT a
+    composition of the context window, and presenting it as one would overstate
+    the dense contributors. Any token-denominated view is an apportionment of
+    the measured per-call total and must be labelled as an estimate.
+
+    `tool_name` is set for `tool_use` and `tool_result` alike; a `tool_result`
+    names only a `tool_use_id`, so the name is carried forward from the
+    `tool_use` that opened it.
+    """
+
+    record_type: str
+    block_type: str
+    tool_name: Optional[str]
+    # None = the block exists but its content is NOT PERSISTED in the
+    # transcript (thinking blocks), so its size is unknown rather than
+    # zero. Every aggregate must treat it as no-sample, never as 0.
+    chars: Optional[int]
+    turn_index: Optional[int] = None
+    ts: Optional[float] = None
+
+
+@dataclass
 class ParseResult:
     turns: list[Turn] = field(default_factory=list)
     calls: list[ApiCall] = field(default_factory=list)
+    content_blocks: list[ContentBlock] = field(default_factory=list)
     dispatches: dict[str, Dispatch] = field(default_factory=dict)
     unparsed_records: int = 0
     records_parsed: int = 0
@@ -580,6 +610,8 @@ def parse_file(path: Path, collect_turns: bool = True) -> ParseResult:
     result = ParseResult()
     current_turn: Optional[int] = None
     tool_use_meta: dict[str, tuple[Optional[str], Optional[str]]] = {}
+    # tool_use_id -> tool name, so a later tool_result can name its tool.
+    tool_names: dict[str, str] = {}
 
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line_no, line in enumerate(fh, start=1):
@@ -599,11 +631,13 @@ def parse_file(path: Path, collect_turns: bool = True) -> ParseResult:
             rtype = record.get("type")
             try:
                 if rtype == "assistant":
-                    _parse_assistant(record, result, current_turn, tool_use_meta)
+                    _parse_assistant(
+                        record, result, current_turn, tool_use_meta, tool_names
+                    )
                     result.records_parsed += 1
                 elif rtype == "user":
                     new_turn = _parse_user(
-                        record, result, tool_use_meta, collect_turns
+                        record, result, tool_use_meta, tool_names, collect_turns
                     )
                     if new_turn is not None:
                         current_turn = new_turn
@@ -623,6 +657,7 @@ def _parse_assistant(
     result: ParseResult,
     current_turn: Optional[int],
     tool_use_meta: dict[str, tuple[Optional[str], Optional[str]]],
+    tool_names: dict[str, str],
 ) -> None:
     message = record.get("message")
     if not isinstance(message, dict):
@@ -666,6 +701,7 @@ def _parse_assistant(
     # BOTH stored as parsed AND counted as unparsed (CodeRabbit finding) --
     # over-warning is tolerable, double-counting is not. Skip defensively.
     content = message.get("content")
+    _collect_assistant_blocks(record, message, result, current_turn, tool_names)
     if isinstance(content, list):
         for block in content:
             if (
@@ -683,16 +719,165 @@ def _parse_assistant(
                 )
 
 
+def _collect_assistant_blocks(
+    record: dict,
+    message: dict,
+    result: ParseResult,
+    current_turn: Optional[int],
+    tool_names: dict[str, str],
+) -> None:
+    """Attribute an assistant message's content blocks (#4967).
+
+    Defensive throughout, for the same reason the Agent scan below is: this
+    runs after the ApiCall has been recorded, so raising here would count one
+    record as parsed AND unparsed. A block whose shape defeats expectations is
+    skipped, never guessed at.
+
+    `tool_names` accumulates `tool_use_id -> tool name` so the matching
+    `tool_result` in a LATER user record can be attributed to the tool that
+    produced it -- the result block itself carries only the id.
+    """
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    ts = parse_ts(record)
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            chars = len(str(block.get("text", "")))
+        elif btype == "thinking":
+            # Measured on the real corpus: 0 of 14,918 thinking blocks retain
+            # their text. Claude Code persists `type` + an EMPTY `thinking` +
+            # a `signature`, so thinking CONTENT is structurally absent from
+            # every transcript -- while thinking TOKENS are still billed in
+            # `output_tokens`.
+            #
+            # `chars = 0` here would make a composition table report
+            # "thinking: 0.0%", i.e. that thinking costs nothing. That is
+            # absence rendering as a value (rule #12) in the tool built to
+            # catch it. `None` keeps the block COUNTED and its size UNKNOWN,
+            # which are different facts and must stay different.
+            raw = str(block.get("thinking", ""))
+            chars = len(raw) if raw else None
+        elif btype == "tool_use":
+            tool_input = block.get("input")
+            if tool_input is None:
+                continue
+            # The SERIALISED input is what occupies context, not the value of
+            # any one argument -- keys and JSON punctuation are paid for too.
+            try:
+                chars = len(json.dumps(tool_input, sort_keys=True))
+            except (TypeError, ValueError):
+                continue
+            name = block.get("name")
+            if isinstance(block.get("id"), str) and isinstance(name, str):
+                tool_names[block["id"]] = name
+            result.content_blocks.append(
+                ContentBlock(
+                    record_type="assistant",
+                    block_type="tool_use",
+                    tool_name=name if isinstance(name, str) else None,
+                    chars=chars,
+                    turn_index=current_turn,
+                    ts=ts,
+                )
+            )
+            continue
+        else:
+            continue
+        result.content_blocks.append(
+            ContentBlock(
+                record_type="assistant",
+                block_type=btype,
+                tool_name=None,
+                chars=chars,
+                turn_index=current_turn,
+                ts=ts,
+            )
+        )
+
+
+def _collect_user_blocks(
+    record: dict,
+    message: dict,
+    result: ParseResult,
+    turn_index: Optional[int],
+    tool_names: dict[str, str],
+) -> None:
+    """Attribute a user record's content: tool results, and the human's own text.
+
+    A tool RESULT is the largest single contributor in most sessions and is not
+    the user talking, so it is never folded into the human-prompt bucket. The
+    tool name comes from `tool_names`, populated when the `tool_use` was seen;
+    an id with no recorded name yields `tool_name=None` -- honestly
+    unattributed rather than attributed to a guess.
+    """
+    content = message.get("content")
+    ts = parse_ts(record)
+    if isinstance(content, str):
+        result.content_blocks.append(
+            ContentBlock("user", "user_text", None, len(content), turn_index, ts)
+        )
+        return
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "tool_result":
+            payload = block.get("content")
+            if isinstance(payload, str):
+                chars = len(payload)
+            else:
+                try:
+                    chars = len(json.dumps(payload, sort_keys=True))
+                except (TypeError, ValueError):
+                    continue
+            tool_use_id = block.get("tool_use_id")
+            result.content_blocks.append(
+                ContentBlock(
+                    record_type="user",
+                    block_type="tool_result",
+                    tool_name=tool_names.get(tool_use_id)
+                    if isinstance(tool_use_id, str)
+                    else None,
+                    chars=chars,
+                    turn_index=turn_index,
+                    ts=ts,
+                )
+            )
+        elif btype == "text":
+            result.content_blocks.append(
+                ContentBlock(
+                    "user", "user_text", None,
+                    len(str(block.get("text", ""))), turn_index, ts,
+                )
+            )
+
+
 def _parse_user(
     record: dict,
     result: ParseResult,
     tool_use_meta: dict[str, tuple[Optional[str], Optional[str]]],
+    tool_names: dict[str, str],
     collect_turns: bool = True,
 ) -> Optional[int]:
     """Handle a user record; return the new turn index if one starts."""
     message = record.get("message")
     if not isinstance(message, dict):
         raise ValueError("user record without message object")
+    # BEFORE the early returns below, deliberately. A tool round-trip is not a
+    # turn, but its tool_result is content and is typically the largest single
+    # contributor in the session -- returning first would drop it from every
+    # composition figure while the totals still read as complete. Same for a
+    # subagent transcript: it has no turns but it does have content.
+    _collect_user_blocks(
+        record, message, result, len(result.turns) - 1 if result.turns else None,
+        tool_names,
+    )
     text = user_text(message.get("content"))
     if text is None:  # tool round-trip, not a new turn
         return None
