@@ -222,12 +222,20 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(parsed.unparsed_records, 0)
         self.assertEqual(parsed.records_parsed, 1)
 
-    def test_deleted_transcript_is_pruned_from_db(self) -> None:
-        # Qodo finding: a deleted/renamed transcript must not leave stale
-        # rows that keep appearing in the UI after the source file is gone.
+    def test_deleted_transcript_is_pruned_only_when_pruning_is_ASKED_FOR(self) -> None:
+        # Originally this asserted that a vanished transcript is pruned on the
+        # NEXT ingest, unconditionally -- the Qodo finding that stale rows must
+        # not linger in the UI. That premise was right and its default was
+        # wrong: it could not tell a deliberate delete from Claude Code reaping
+        # the file on its 30-day schedule, so every run destroyed measurements
+        # whose source no longer existed to re-read.
+        #
+        # The intent is preserved and moved behind the explicit flag: pruning
+        # still removes every row for that source, per-file, exactly as before.
+        # What changed is that you have to ask.
         path = self.projects_dir / "session-fixture.jsonl"
         path.unlink()
-        summary2 = ingest(self.projects_dir, self.db_path)
+        summary2 = ingest(self.projects_dir, self.db_path, prune_missing=True)
         self.assertEqual(summary2["files_pruned"], 1)
         self.assertEqual(self.q1("SELECT COUNT(*) n FROM sessions")["n"], 0)
         self.assertEqual(self.q1("SELECT COUNT(*) n FROM api_calls")["n"], 0)
@@ -428,8 +436,12 @@ class SubagentTranscriptIngestTest(unittest.TestCase):
         self.assertEqual(self.q1("SELECT COUNT(*) n FROM turns")["n"], 3)
 
     def test_deleted_subagent_file_prunes_only_its_own_rows(self) -> None:
+        # The per-FILE scoping this protects is unchanged and still matters:
+        # a session has one main transcript plus N subagent transcripts sharing
+        # a session_id, so the delete must never widen to the session. Only the
+        # trigger moved behind the explicit flag (see the sibling test above).
         self.subagent_path.unlink()
-        summary2 = ingest(self.projects_dir, self.db_path)
+        summary2 = ingest(self.projects_dir, self.db_path, prune_missing=True)
         self.assertEqual(summary2["files_pruned"], 1)
         self.assertEqual(
             self.q1("SELECT COUNT(*) n FROM api_calls")["n"], self.MAIN["n"]
@@ -1136,6 +1148,167 @@ class ContentBlockTest(unittest.TestCase):
         self.assertEqual(len(self.parsed.content_blocks), 7)
         self.assertEqual(sum(b.chars for b in self.parsed.content_blocks), 552)
 
+
+class ReapedTranscriptRetentionTest(unittest.TestCase):
+    """A transcript the OS reaped must not take its measurements with it.
+
+    Two mechanisms combined into silent, unrecoverable loss:
+
+      1. Claude Code deletes transcripts after `cleanupPeriodDays`, default 30.
+      2. `ingest()` deleted every row whose source file was no longer on disk.
+
+    So each run destroyed the measurements for every session reaped since the
+    last one -- and the DB is the ONLY durable copy, because the source is gone.
+    Verified on a real corpus: an ingest measured sessions from 2026-06-06 while
+    the oldest surviving transcript was 2026-06-30.
+
+    The prune existed for a real reason (a renamed or deleted transcript should
+    not linger in the UI). The defect is that it could not tell two very
+    different causes apart:
+
+      user deleted it       -> prune; the data is unwanted
+      the OS reaped it      -> RETAIN; the data is irreplaceable
+
+    Collapsing them treats scheduled expiry as a delete request.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-retention-test-"))
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def calls(self) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_measurements_survive_the_transcript_being_reaped(self) -> None:
+        before = self.calls()
+        self.assertGreater(before, 0, "fixture must produce rows to begin with")
+        self.transcript.unlink()          # the OS reaping it, 30 days on
+        ingest(self.projects, self.db)    # the run that used to destroy them
+        self.assertEqual(
+            self.calls(), before,
+            "a reaped transcript must not delete its measurements -- the DB is "
+            "the only durable copy once the source is gone",
+        )
+
+    def test_the_source_is_marked_archived_rather_than_forgotten(self) -> None:
+        self.transcript.unlink()
+        ingest(self.projects, self.db)
+        conn = sqlite3.connect(self.db)
+        try:
+            row = conn.execute(
+                "SELECT archived_at FROM ingest_state WHERE path = ?",
+                (str(self.transcript),),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, "the source row itself must be retained")
+        self.assertIsNotNone(
+            row[0], "a source whose file is gone must be MARKED, so an aggregate "
+                    "over it can say the corpus is truncated",
+        )
+
+    def test_a_returning_transcript_is_un_archived(self) -> None:
+        # A file can come back -- a worktree remounted, a restore. The mark
+        # describes the CURRENT state, not a one-way latch.
+        shutil.copy(FIXTURE, self.projects / "other.jsonl")
+        ingest(self.projects, self.db)
+        self.transcript.unlink()
+        ingest(self.projects, self.db)
+        shutil.copy(FIXTURE, self.transcript)
+        ingest(self.projects, self.db)
+        conn = sqlite3.connect(self.db)
+        try:
+            archived = conn.execute(
+                "SELECT archived_at FROM ingest_state WHERE path = ?",
+                (str(self.transcript),),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertIsNone(archived)
+
+    def test_explicit_prune_is_the_only_way_to_delete(self) -> None:
+        before = self.calls()
+        self.transcript.unlink()
+        ingest(self.projects, self.db, prune_missing=True)
+        self.assertLess(
+            self.calls(), before,
+            "the destructive behaviour must still be REACHABLE -- it is opt-in, "
+            "not removed",
+        )
+
+    def test_summary_reports_archived_separately_from_pruned(self) -> None:
+        self.transcript.unlink()
+        summary = ingest(self.projects, self.db)
+        self.assertEqual(summary["files_archived"], 1)
+        self.assertEqual(
+            summary["files_pruned"], 0,
+            "retaining is not pruning; the two counts must stay distinguishable",
+        )
+
+
+class SchemaRebuildSafetyTest(unittest.TestCase):
+    """A schema rebuild must not destroy what a re-ingest cannot reproduce.
+
+    `_prepare_schema` drops and rebuilds on a version change, justified by:
+    "The DB holds no original data -- it is a derived rendering of the
+    transcripts and a full re-ingest reproduces it exactly."
+
+    That premise is FALSE once any transcript has been reaped, and it is the
+    same false premise as the prune above: it treats an ephemeral source as a
+    durable one. The trap is self-inflicted -- bumping SCHEMA_VERSION to ADD
+    the archive column would itself destroy the data the column exists to save.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-rebuild-test-"))
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_rebuild_refuses_when_a_source_can_no_longer_be_re_read(self) -> None:
+        self.transcript.unlink()
+        ingest(self.projects, self.db)  # archives it; rows retained
+
+        conn = sqlite3.connect(self.db)
+        conn.execute("PRAGMA user_version = 1")  # simulate an older shape
+        conn.commit()
+        conn.close()
+
+        with self.assertRaises(SystemExit) as caught:
+            ingest(self.projects, self.db)
+        message = str(caught.exception)
+        self.assertIn("REFUSING", message)
+        # The refusal must NAME the source it is protecting -- an operator who
+        # cannot see which file is at risk cannot decide whether to back up.
+        self.assertIn(str(self.transcript), message)
+
+    def test_rebuild_still_proceeds_when_every_source_is_re_readable(self) -> None:
+        # The original justification holds while nothing has been reaped, so
+        # the safety check must not block the ordinary upgrade path.
+        conn = sqlite3.connect(self.db)
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+        conn.close()
+        summary = ingest(self.projects, self.db)
+        self.assertTrue(summary["schema_rebuilt"])
 
 if __name__ == "__main__":
     unittest.main()

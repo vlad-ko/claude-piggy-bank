@@ -241,6 +241,10 @@ function renderSummary(s) {
   if (s.ingest.files === 0) msgs.push("No files ingested yet — run ingest.py.");
   if (s.ingest.unparsed_records > 0) msgs.push(`INCONCLUSIVE: ${s.ingest.unparsed_records} unparsed record(s) across ingested files — totals may undercount.`);
   if (s.unpriced_calls > 0) msgs.push(`${s.unpriced_calls} call(s) on unpriced model(s) [${s.unpriced_models.join(", ")}] are EXCLUDED from cost (never priced at $0).`);
+  // Totals here are COMPLETE — the archived calls are counted. What they are
+  // not is reproducible: those transcripts are gone, so this database is the
+  // only copy and re-ingesting will not bring them back. Back it up.
+  if (!s.durability.reproducible) msgs.push(`${s.durability.archived_calls} call(s) in this window come from ${s.durability.archived_sources} transcript(s) no longer on disk — counted in the totals, but NOT reproducible by re-ingesting. This database is their only copy.`);
   banner.style.display = msgs.length ? "block" : "none";
   banner.textContent = msgs.join(" ");
 }

@@ -86,6 +86,29 @@ transcript has been reaped.
 Every `assistant` record carrying a `message.usage` block is one API call, with
 its four token classes: input, cache-read, cache-write, and output.
 
+### Transcripts expire — back up the database
+
+Claude Code deletes transcripts after `cleanupPeriodDays`, which **defaults to
+30** and is usually left unset. That bound is on the *source*, so it bounds what
+CPB can ever measure going forward: a session older than the window cannot be
+ingested for the first time, because there is nothing left to read.
+
+What CPB does not do is compound the loss. Once a source is gone its
+measurements are **kept** and marked archived; they are excluded from
+"what is currently on disk" coverage counts but stay in every historical total.
+Pruning them is available as an explicit `--prune-missing`, never a default, and
+a schema upgrade that would destroy them **refuses to run** rather than
+rebuilding over them.
+
+The practical consequence: past the retention window, **`db/usage.db` is the
+only copy of your history**. It is not derived data you can drop and regenerate.
+Back it up, and raise `cleanupPeriodDays` in `~/.claude/settings.json` if you
+want a longer window — though the tool is designed to be correct at the default,
+not only when configured.
+
+Any window containing archived sources says so in the report banner: the totals
+are complete, but they are no longer reproducible by re-ingesting.
+
 ## Two design rules worth knowing
 
 These explain decisions in the code that otherwise look odd.
