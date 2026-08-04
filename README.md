@@ -9,7 +9,10 @@ CPB answers a question Claude Code does not: **where does your context and
 token spend actually go?** It ingests the session transcripts Claude Code
 already writes locally into SQLite and serves a single-page report over them.
 
-- **Python 3 standard library only.** No pip installs, no Node, no build step.
+- **Python 3.10+, standard library only.** No pip installs, no Node, no build
+  step. The floor is tested, not assumed: CI runs the suite on 3.10, 3.11, 3.12
+  and 3.13, and a separate job fails the build if any import in any shipped
+  module resolves outside the standard library.
 - **Nothing leaves your machine.** No network calls, no telemetry, no CDN — the
   chart library is vendored so the page renders fully offline.
 - **No model in the loop.** Every number is arithmetic, SQL, or JSON parsing.

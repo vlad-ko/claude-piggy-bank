@@ -7,9 +7,15 @@ is good.
 
 ## The four constraints
 
-**1. Standard library only.** Python 3, no pip installs, no Node, no build
+**1. Standard library only.** Python 3.10+, no pip installs, no Node, no build
 step. A tool for understanding cost should not itself require a toolchain to
 run. If you need a dependency, open an issue and make the case first.
+
+This one is enforced rather than trusted: the `stdlib-only` CI job parses every
+shipped module and fails if any import resolves outside `sys.stdlib_module_names`
+or this repo, and rejects dependency manifests outright. Before it existed, a
+single `import requests` would have been caught only by a reviewer who happened
+to know the rule.
 
 **2. Nothing leaves the machine.** No network calls, no telemetry, no CDN
 references. This page renders your own prompts, file paths and source code —
