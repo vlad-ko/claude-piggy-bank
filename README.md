@@ -45,7 +45,7 @@ that ships the numbers themselves — ingest, the server, the page — has no mo
 in it at all. This is a rule CPB imposes on itself, not one Claude Code imposes
 on plugins.
 
-CPB is **<!--cpb:version-->1.2.0<!--/cpb:version-->** and follows [Semantic
+CPB is **<!--cpb:version-->1.3.0<!--/cpb:version-->** and follows [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html). What that promises you is
 written down rather than left to be guessed at: the command line, the HTTP API,
 and **what each figure measures** are the interface, so a number that changes
@@ -470,6 +470,18 @@ transcript has been reaped.
 
 Every `assistant` record carrying a `message.usage` block is one API call, with
 its four token classes: input, cache-read, cache-write, and output.
+
+The cache-write class is **stored three ways**, because one number cannot answer
+"did this write pay for itself?". The flat total is kept exactly as the API
+reports it, and beside it the per-TTL split from `usage.cache_creation` — a
+5-minute write costs 1.25x base input tokens and is repaid by its *first* read,
+a 1-hour write costs 2x and needs its *second*
+([TA-8](docs/claude-api-token-accounting.md#ta-8)). Both columns are **nullable
+and mean unmeasured**: a call recorded before CPB read that field, or one whose
+record carried only one of the two TTLs, has no split, and the report's
+repayment figure ranges over the calls that do — taking its reads from those
+same calls, so the two sides of the ratio cover one set. Until you re-ingest,
+that figure reads *not measured* rather than reading zero.
 
 ### The format CPB reads is internal, and Anthropic says so
 

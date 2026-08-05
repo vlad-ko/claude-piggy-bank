@@ -207,6 +207,51 @@ USAGE_TOKEN_KEYS = (
     "output_tokens",
 )
 
+# THE PER-TTL CACHE-WRITE SPLIT (#84). `cache_creation_input_tokens` above is a
+# FLAT TOTAL over two writes that are priced differently, and TA-8 in
+# `docs/claude-api-token-accounting.md` (Documented, checked 2026-08-04) works
+# out why collapsing them is wrong rather than merely coarse:
+#
+#   5-minute write  1.25x base input -- repaid by the FIRST read (1.35 against
+#                   2.00 at n=2), so one read per write already pays for it;
+#   1-hour write    2x base input -- needs the SECOND (2.10 against 2.00 at
+#                   n=2 is still a LOSS; 2.20 against 3.00 at n=3 is the win).
+#
+# So "did this cache write repay?" has two different answers and the flat total
+# cannot say which one applies. TA-8's own words: "Stating either as 'repays on
+# the second hit' understates 5-minute caching by a hit; keep the arithmetic,
+# not the slogan."
+#
+# The split sits INSIDE `usage`, under `cache_creation`, and CPB threw it away
+# until this change.
+#
+# MEASURED HERE, 2026-08-05, over one developer machine's local transcripts --
+# 3,021 files, 342,850 assistant records carrying `message.usage`, 170,079 of
+# them after dedupe by `message.id`. One operator's usage, live and growing
+# between scans (two runs an hour apart differed by 21 calls), so every figure
+# is a dated SAMPLE. Re-measure before quoting.
+#
+#   * `cache_creation` was a dict on 342,850 of 342,850 records -- 100%, with
+#     no record carrying the flat total and no split, and none on which it was
+#     anything but an object;
+#   * it carried EXACTLY these two keys on all 342,850, both `int`, and no
+#     third key occurred anywhere;
+#   * the mix is NOT marginal: 630,337,571 tokens of 5-minute write against
+#     231,497,808 of 1-hour, so 1-hour is 26.86% of split cache-write tokens.
+#     A quarter of the corpus is answered with the wrong break-even by any
+#     figure that assumes one TTL. It is also CONCENTRATED rather than spread:
+#     only 41 of the 3,021 files contain a 1-hour write at all.
+#
+# None of that makes the shape a contract. Anthropic documents the transcript
+# format as internal to Claude Code, so an absent split reads as UNMEASURED
+# (NULL) and never as 0 -- and a third key is censused by name rather than
+# dropped. See `_cache_write_split()` and `_census_cache_creation()`.
+CACHE_CREATION_KEY = "cache_creation"
+CACHE_WRITE_5M_KEY = "ephemeral_5m_input_tokens"
+CACHE_WRITE_1H_KEY = "ephemeral_1h_input_tokens"
+# In column order, so the census, the reader and the tests range over one list.
+CACHE_WRITE_TTL_KEYS = (CACHE_WRITE_5M_KEY, CACHE_WRITE_1H_KEY)
+
 # CACHE-MISS DIAGNOSTICS (#5). Claude Code sends the `cache-diagnosis-2026-04-07`
 # beta header and PERSISTS Anthropic's own answer on the response record, so CPB
 # READS the classification and never re-derives it. Re-derivation was not merely
@@ -308,11 +353,11 @@ DERIVED_TABLES = (
 # older shape is rebuilt from scratch rather than migrated in place -- see
 # `_prepare_schema`, and `IN_PLACE_UPGRADE_FROM` below for the narrow case
 # where rebuilding would cost rows to arrive at the identical database.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Versions whose difference from the current shape can be applied WITHOUT
 # losing a measurement, so they upgrade in place instead of being dropped and
-# rebuilt. Five such hops exist, and a v6 database makes all five at once:
+# rebuilt. Six such hops exist, and a v6 database makes all six at once:
 #
 #   v6 -> v7  ADDS `ingest_runs`, supplied by `CREATE TABLE IF NOT EXISTS`.
 #   v7 -> v8  DROPS `api_calls.cost_usd` (#30), applied by `ALTER TABLE ...
@@ -328,6 +373,10 @@ SCHEMA_VERSION = 11
 #             diagnostics (#5), applied by `ALTER TABLE ... ADD COLUMN` -- see
 #             IN_PLACE_ADDABLE_COLUMNS for why NULL is a TRUE statement about
 #             every row already there.
+#   v11 -> v12 ADDS two nullable `api_calls` columns for the per-TTL
+#             cache-write split (#84), by the same statement and clearing the
+#             same bar -- and only because the flat `cache_write` STAYS. This
+#             hop adds a measurement, it does not redefine one.
 #
 # RE-DECIDED at this bump, not extended by habit -- the comment below has said
 # since v8 that this does not accumulate, so each member was re-checked against
@@ -336,13 +385,15 @@ SCHEMA_VERSION = 11
 #   * 6: needs `ingest_runs` created (empty is true of it), `cost_usd` dropped
 #     in place, `source_shape` created (empty is true of it -- see
 #     IN_PLACE_CREATABLE_TABLES), duplicate dispatch rows resolved, the three
-#     diagnostics columns added.
+#     diagnostics columns added, the two TTL columns added.
 #   * 7: `cost_usd` dropped in place, `source_shape` created, duplicates
-#     resolved, diagnostics columns added.
-#   * 8: `source_shape` created, duplicates resolved, diagnostics columns added.
-#   * 9: duplicates resolved, diagnostics columns added.
-#   * 10: diagnostics columns added, and NOTHING else -- the v10 shape is the
-#     current one minus those three columns.
+#     resolved, diagnostics columns added, TTL columns added.
+#   * 8: `source_shape` created, duplicates resolved, diagnostics columns
+#     added, TTL columns added.
+#   * 9: duplicates resolved, diagnostics columns added, TTL columns added.
+#   * 10: diagnostics columns added, TTL columns added.
+#   * 11: the two TTL columns added, and NOTHING else -- the v11 shape is the
+#     current one minus `cache_write_5m` and `cache_write_1h`.
 #
 # THE BAR MOVED AT THE v10 BUMP, and saying so is the point of re-deciding
 # rather than extending. It was "the delta preserves every ROW"; v9 -> v10
@@ -362,11 +413,21 @@ SCHEMA_VERSION = 11
 #
 # Whoever bumps SCHEMA_VERSION next has to re-decide this AGAIN, and against
 # the bar as it now stands: a delta that loses a MEASUREMENT belongs nowhere
-# near this set, whatever it does to row counts. v10 was admitted at this bump
-# under that bar and not under the older one: its delta deletes no row AND
+# near this set, whatever it does to row counts. v10 was admitted at the v11
+# bump under that bar and not under the older one: its delta deletes no row AND
 # loses no measurement, because the columns it gains had no value on any
 # existing row to lose.
-IN_PLACE_UPGRADE_FROM = frozenset({6, 7, 8, 9, 10})
+#
+# v11 is admitted at THIS bump under the same bar, and the load-bearing half is
+# what the hop does NOT do. It would have been easy to "improve" `cache_write`
+# into one of the two new columns, or to derive it from them; either would lose
+# a measurement in the direction the bar is written to catch, because
+# `cache_write` is what every existing figure reads and its definition would
+# have changed under a stable name (breaking under `docs/versioning.md`). The
+# hop adds two columns beside it and touches nothing else, so the delta loses
+# no row and no measurement, and the only value it writes to an existing row is
+# NULL -- which is the true one (see IN_PLACE_ADDABLE_COLUMNS).
+IN_PLACE_UPGRADE_FROM = frozenset({6, 7, 8, 9, 10, 11})
 
 # The two permissions an in-place upgrade needs, named and bounded, because
 # `CREATE TABLE IF NOT EXISTS` silently grants the first to EVERY table and
@@ -410,11 +471,35 @@ IN_PLACE_CREATABLE_TABLES = frozenset({INGEST_RUNS_TABLE, SHAPE_TABLE})
 # would manufacture an observation nobody made, over a whole corpus at once.
 # They are re-read when their source file next changes -- the same resolution
 # `source_shape` takes for an uncensused source (#15), and for the same reason.
+#
+# The two per-TTL cache-write columns (#84) clear it for the third time, and
+# the argument has to be made about THEM rather than inherited from the shape
+# of the change. NULL in `cache_write_5m` means "this row was written before
+# CPB read `usage.cache_creation`" -- unmeasured -- which is true of every row
+# any pre-v12 build wrote, by construction, since no such build ever looked
+# inside that object. What makes the argument load-bearing here is that the two
+# plausible back-fills are both FALSE, and falsely precise:
+#
+#   * 0 would state that this call wrote no 5-minute cache. On the corpus
+#     measured above that is wrong for 131,662 of 170,079 calls.
+#   * `cache_write_5m = cache_write` -- "assume it was all 5-minute" -- is the
+#     exact collapse TA-8 warns against, applied to a whole corpus at once and
+#     unmarked. It would be wrong for the 26.86% of cache-write tokens that
+#     were 1-hour, and wrong in the direction that makes a 2x write look like a
+#     1.25x one, i.e. it would report writes as repaid that were not.
+#
+# A NULL here is also SAFE in a way those are not: `recommendations.py` already
+# refuses to call the 1.0-2.0 reads-per-write band without knowing the TTL, so
+# an unmeasured split keeps the honest refusal, while a back-filled one would
+# resolve the band with a value nobody measured. Those rows are re-read when
+# their source file next changes.
 IN_PLACE_ADDABLE_COLUMNS: dict[tuple[str, str], str] = {
     ("ingest_state", "archived_at"): "REAL",
     ("api_calls", "cache_miss_outcome"): "TEXT",
     ("api_calls", "cache_miss_reason"): "TEXT",
     ("api_calls", "cache_missed_input_tokens"): "INTEGER",
+    ("api_calls", "cache_write_5m"): "INTEGER",
+    ("api_calls", "cache_write_1h"): "INTEGER",
 }
 
 # What one `agent_dispatches` row knows about a dispatch BEYOND its identity
@@ -541,6 +626,32 @@ CREATE TABLE IF NOT EXISTS turns (
 -- reject every one of them. NULL means no magnitude was read -- the API
 -- supplies none for the two no-comparison types -- and never 0, which would
 -- say the miss cost nothing.
+--
+-- THE CACHE WRITE IS THREE COLUMNS, AND THE FLAT ONE IS NOT THE SUM (#84).
+-- `cache_write` is `usage.cache_creation_input_tokens` verbatim and is
+-- unchanged: it is what every existing figure reads, and redefining it under a
+-- stable name would be breaking (`docs/versioning.md`). `cache_write_5m` and
+-- `cache_write_1h` are `usage.cache_creation`'s two members, stored beside it
+-- because the two TTLs are priced 1.25x and 2x and repay after a DIFFERENT
+-- number of reads (TA-8) -- one number cannot answer "did this write repay?".
+--
+-- Both are NULLABLE, and NULL is the point rather than a convenience: it means
+-- the split was NOT MEASURED for this call. Never 0, which would state that
+-- this call wrote no cache of that TTL, and never a share of `cache_write`,
+-- which would be an apportionment nobody observed. A row from a pre-v12 build
+-- reads NULL for the same reason.
+--
+-- THE THREE DO NOT ALWAYS RECONCILE, and that is a MEASUREMENT, not a bug to
+-- normalise away. Measured 2026-08-05 over the corpus named beside
+-- CACHE_WRITE_TTL_KEYS: `cache_write_5m + cache_write_1h` equalled
+-- `cache_write` on 170,071 of 170,079 deduped calls. On the other 8 -- 49,838
+-- tokens, spread over 6 transcripts and 4 Claude Code versions -- the flat
+-- total was 0 while the split was not, so the flat total UNDERSTATED. The
+-- reverse never occurred (0 calls). Nothing here reconciles them: both are
+-- stored exactly as read, so `cache_write != cache_write_5m + cache_write_1h`
+-- is a question a reader can ask of any row, and the count is said out loud at
+-- ingest (`print_cache_write_split_note`). Making them agree would delete the
+-- only evidence that they do not.
 CREATE TABLE IF NOT EXISTS api_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -559,7 +670,9 @@ CREATE TABLE IF NOT EXISTS api_calls (
     message_id TEXT,
     cache_miss_outcome TEXT,
     cache_miss_reason TEXT,
-    cache_missed_input_tokens INTEGER
+    cache_missed_input_tokens INTEGER,
+    cache_write_5m INTEGER,
+    cache_write_1h INTEGER
 );
 -- `task_id` IS the agent, so at most one row may carry each one (#36) -- see
 -- the UNIQUE INDEX at the foot of this schema, and `_resolve_dispatch()` for
@@ -914,10 +1027,47 @@ class ApiCall:
     # sample". Counted per call after dedupe and said out loud, so a release
     # that changed the shape cannot pass as a corpus that never missed.
     diagnostics_unreadable: bool = False
+    # The per-TTL split of `cache_write`, read off `usage.cache_creation` (#84).
+    # `Optional` because the two are priced differently and an unmeasured one
+    # must not read as "this call wrote no cache at that TTL" -- see
+    # `_cache_write_split()` and the schema comment above `api_calls`.
+    cache_write_5m: Optional[int] = None
+    cache_write_1h: Optional[int] = None
+    # NOT stored, and the same kind of fact as `diagnostics_unreadable`: some
+    # part of a PRESENT `cache_creation` defeated the reader, which the NULL
+    # columns cannot distinguish from "Claude Code wrote no split".
+    split_unreadable: bool = False
 
     @property
     def context_size(self) -> int:
         return self.input_tokens + self.cache_write + self.cache_read
+
+    @property
+    def cache_write_split_total(self) -> Optional[int]:
+        """The two TTLs summed, or None when the sum would not be a measurement.
+
+        A PARTIAL split cannot be totalled: with one TTL measured and the other
+        unmeasured, the sum of what is known is not the sum of what happened,
+        and returning it would understate the write while looking like an
+        answer. So it refuses, and the reconciliation check below never ranges
+        over a call whose total is unknown -- reporting a call as disagreeing
+        with the flat total when half its split was never read would invent a
+        finding, in the field added to stop exactly that.
+        """
+        if self.cache_write_5m is None or self.cache_write_1h is None:
+            return None
+        return self.cache_write_5m + self.cache_write_1h
+
+    @property
+    def cache_write_unreconciled(self) -> bool:
+        """Both TTLs measured, and they do not sum to the flat total.
+
+        Measured on 8 of 170,079 deduped calls (2026-08-05). Recorded rather
+        than corrected: the two are separate readings of one API response and
+        CPB stores what each said.
+        """
+        total = self.cache_write_split_total
+        return total is not None and total != self.cache_write
 
 
 @dataclass
@@ -997,6 +1147,20 @@ class ParseResult:
     # common would otherwise read as a corpus that stopped missing the cache.
     calls_without_diagnostics: int = 0
     calls_with_unreadable_diagnostics: int = 0
+    # Per-TTL cache-write split coverage and reconciliation (#84), per CALL
+    # (post-dedupe). Three counts, because they answer three questions and a
+    # single "problems" number would name none of them:
+    #
+    #   * no split measured at all -- the columns are NULL, so a reader must
+    #     not total them as if the TTLs were known;
+    #   * a PRESENT `cache_creation` this reader could not use -- a different
+    #     absence from "Claude Code wrote none", and the one that would appear
+    #     first if a release changed the shape;
+    #   * both TTLs measured and NOT summing to `cache_creation_input_tokens` --
+    #     the finding, kept rather than normalised away.
+    calls_without_cache_write_split: int = 0
+    calls_with_unreadable_cache_write_split: int = 0
+    calls_with_unreconciled_cache_write: int = 0
     # The transcript-SHAPE census for this file (#15): `(fact, name) -> records`,
     # written to `source_shape` verbatim. See `new_shape_census()` for why it
     # starts non-empty.
@@ -1471,6 +1635,7 @@ def parse_file(path: Path, collect_turns: bool = True) -> ParseResult:
                 )
     result.calls = _dedupe_calls(result)
     _count_cache_diagnostics(result)
+    _count_cache_write_split(result)
     return result
 
 
@@ -1486,6 +1651,34 @@ def _count_cache_diagnostics(result: ParseResult) -> None:
     )
     result.calls_with_unreadable_diagnostics = sum(
         1 for call in result.calls if call.diagnostics_unreadable
+    )
+
+
+def _count_cache_write_split(result: ParseResult) -> None:
+    """Count what the per-TTL split could and could not say (#84).
+
+    AFTER dedupe, for the same reason `_count_cache_diagnostics` is: the split
+    is a property of the API CALL and every streamed record of one call repeats
+    it, so counting records would multiply all three figures by however many
+    content blocks Claude Code happened to write.
+
+    "Without a split" is BOTH TTLs unmeasured, not either. A partial split --
+    one key present, the other not -- is a call that measured something, and
+    folding it in here would report a measurement as an absence; what it is
+    instead is a `missing-usage-key` census row naming exactly which key went
+    (`_census_cache_creation`), which is the mechanism that already exists for
+    a key CPB reads disappearing from `usage`.
+    """
+    result.calls_without_cache_write_split = sum(
+        1
+        for call in result.calls
+        if call.cache_write_5m is None and call.cache_write_1h is None
+    )
+    result.calls_with_unreadable_cache_write_split = sum(
+        1 for call in result.calls if call.split_unreadable
+    )
+    result.calls_with_unreconciled_cache_write = sum(
+        1 for call in result.calls if call.cache_write_unreconciled
     )
 
 
@@ -1543,17 +1736,81 @@ def _census_usage(usage: dict, result: ParseResult) -> None:
     Never raises. It is a census, not a validation: a record with a surprising
     shape is still parsed exactly as before, and the surprise is recorded
     beside the measurement rather than instead of it.
+
+    It descends ONE level, into `cache_creation`, and only there. That object is
+    the only nested one CPB derives a number from, and being a KNOWN top-level
+    key it would otherwise hide every change to its contents: a third TTL, or a
+    renamed one, would pass this function silently while `_cache_write_split()`
+    quietly stopped measuring (#84).
     """
     for key in sorted(set(usage) - KNOWN_USAGE_KEYS):
         result.note_shape(SHAPE_UNKNOWN_USAGE_KEY, key)
     for key in USAGE_TOKEN_KEYS:
         if key not in usage:
             result.note_shape(SHAPE_MISSING_USAGE_KEY, key)
+    _census_cache_creation(usage.get(CACHE_CREATION_KEY), result)
 
 
-# The four token classes an API response reports. `output_tokens` is excluded
-# from the agreement check on purpose -- it is the one that legitimately grows.
-_STATIC_USAGE = ("input_tokens", "cache_read", "cache_write")
+def _census_cache_creation(cache_creation: Any, result: ParseResult) -> None:
+    """Census the per-TTL split's own keys, under the SAME two facts (#84).
+
+    Reusing `unknown-usage-key` and `missing-usage-key` rather than inventing a
+    third fact, because the question is identical one level down and the answer
+    already has a reader, a roll-up and a printed note. Names are QUALIFIED --
+    `cache_creation.ephemeral_1h_input_tokens` -- so a nested key can never be
+    confused with a top-level one of the same spelling, and so an operator
+    reading the census knows where to look.
+
+    The two directions differ in urgency here, and the comment says which is
+    which because the reasons are not the same as at the top level:
+
+      * an UNKNOWN key is the loud one. A third TTL is a token class CPB would
+        otherwise drop on the floor: it is inside neither stored column, and
+        `cache_creation_input_tokens` may or may not include it. Storing the
+        name is what makes it findable. 0 of 342,850 records carried one
+        (2026-08-05), so its arrival means a release changed the accounting.
+      * a MISSING one is SAFE where the top-level equivalent is dangerous.
+        `tok()` reads an absent `output_tokens` as a real 0, which is why that
+        absence is counted; an absent TTL key reads as NULL -- unmeasured --
+        and nothing is silently zeroed. It is counted anyway, because a release
+        that stopped writing one of them is still a format move, and a column
+        that quietly went all-NULL is not a thing anyone notices in a chart.
+
+    An absence is only counted against a `cache_creation` that is THERE and is
+    an object. Where it is absent or unusable there is no dict to be missing a
+    key FROM, and counting two keys as missing would report one absence twice
+    under a name that suggests they went individually; that case is a per-call
+    count instead (`_count_cache_write_split`).
+    """
+    if not isinstance(cache_creation, dict):
+        return
+    for key in sorted(set(cache_creation) - set(CACHE_WRITE_TTL_KEYS)):
+        result.note_shape(SHAPE_UNKNOWN_USAGE_KEY, f"{CACHE_CREATION_KEY}.{key}")
+    for key in CACHE_WRITE_TTL_KEYS:
+        if key not in cache_creation:
+            result.note_shape(
+                SHAPE_MISSING_USAGE_KEY, f"{CACHE_CREATION_KEY}.{key}"
+            )
+
+
+# The token classes an API response reports that do NOT accumulate across the
+# records of one `message.id`. `output_tokens` is excluded on purpose -- it is
+# the one that legitimately grows.
+#
+# The two TTL fields joined this tuple with #84, and the measurement says they
+# add nothing TODAY: of 123,367 multi-record ids on the 2026-08-05 corpus, 109
+# disagreed on the three original fields and 0 disagreed on the split alone.
+# They are here so that stays a MEASURED fact rather than an unexamined one --
+# `divergent_message_ids` names the ids whose records disagree beyond
+# `output_tokens`, and a field CPB stores but does not compare is one the count
+# silently does not range over.
+_STATIC_USAGE = (
+    "input_tokens",
+    "cache_read",
+    "cache_write",
+    "cache_write_5m",
+    "cache_write_1h",
+)
 
 
 def _dedupe_calls(result: ParseResult) -> list[ApiCall]:
@@ -1669,6 +1926,66 @@ def _missed_input_tokens(reason: dict) -> tuple[Optional[int], bool]:
     return value, False
 
 
+def _cache_write_split(usage: dict) -> tuple[Optional[int], Optional[int], bool]:
+    """The per-TTL cache-write split (#84). Returns (5m, 1h, unreadable).
+
+    A READ of `usage.cache_creation`, never a derivation. The one thing this
+    function must never do is produce a number from the flat total: splitting
+    `cache_creation_input_tokens` by any rule -- all 5-minute, a corpus-wide
+    ratio, last call's mix -- would invent the answer to the exact question the
+    columns exist to answer, and it would look like a measurement.
+
+    Every branch that cannot read a value yields `None`, which is UNMEASURED:
+
+      * `cache_creation` absent, or not an object -> both None. Absent is
+        ordinary (a release that never wrote it); a non-object is a shape
+        change, so the second sets `unreadable`.
+      * a key absent -> that TTL None, the other still read. A partial split is
+        a real half-measurement and is kept as one; the absent half is censused
+        by name (`_census_cache_creation`).
+      * a key present with a value this reader cannot use -> that TTL None and
+        `unreadable`. No number is invented, and the fact that one was offered
+        and refused is counted -- the same shape `_missed_input_tokens()` takes.
+
+    NEVER RAISES, and that is deliberate rather than lax: `tok()` raises on a
+    present non-numeric value so the record is counted unparsed, which is right
+    for a field every figure is made of. Doing that here would cost a call its
+    `input_tokens`, `cache_read`, `cache_write` and `output_tokens` -- four
+    measured classes -- over a fifth, supplementary one. Same judgment as
+    `_read_cache_diagnostics`: refusing to classify must not throw away a
+    measurement that was fine.
+
+    Strict about types for the same reason `_missed_input_tokens` is: `bool` is
+    an `int` in Python and `True` would store as a plausible 1, and a float is a
+    shape change in a field that was an `int` on 685,700 of 685,700 values
+    (2026-08-05) -- truncating one would apply that change silently.
+    """
+    if CACHE_CREATION_KEY not in usage:
+        return None, None, False
+    cache_creation = usage[CACHE_CREATION_KEY]
+    # An explicit `null` lands here rather than on the branch above, and is
+    # counted as unreadable rather than as an ordinary absence. It is a PRESENT
+    # key with no documented meaning -- unlike `diagnostics: null`, which
+    # Anthropic defines as "no divergence" -- so the honest reading is "this
+    # reader was offered something and could not use it". Both columns are NULL
+    # either way; what differs is whether anyone is told.
+    if not isinstance(cache_creation, dict):
+        return None, None, True
+    values: list[Optional[int]] = []
+    unreadable = False
+    for key in CACHE_WRITE_TTL_KEYS:
+        if key not in cache_creation:
+            values.append(None)
+            continue
+        value = cache_creation[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            values.append(None)
+            unreadable = True
+            continue
+        values.append(value)
+    return values[0], values[1], unreadable
+
+
 def _read_cache_diagnostics(
     message: dict,
 ) -> tuple[str, Optional[str], Optional[int], bool]:
@@ -1760,6 +2077,8 @@ def _parse_assistant(
         return int(value)
 
     outcome, miss_reason, missed_tokens, unreadable = _read_cache_diagnostics(message)
+    # Read, never derived from `cache_creation_input_tokens` below (#84).
+    write_5m, write_1h, split_unreadable = _cache_write_split(usage)
     result.calls.append(
         ApiCall(
             turn_index=current_turn,
@@ -1778,6 +2097,9 @@ def _parse_assistant(
             cache_miss_reason=miss_reason,
             cache_missed_input_tokens=missed_tokens,
             diagnostics_unreadable=unreadable,
+            cache_write_5m=write_5m,
+            cache_write_1h=write_1h,
+            split_unreadable=split_unreadable,
         )
     )
 
@@ -2187,8 +2509,9 @@ def store_source(
             "INSERT INTO api_calls (session_id, source_path, source_kind, agent_id,"
             " turn_id, ts, model, input_tokens, cache_read, cache_write,"
             " output_tokens, context_size, is_sidechain, message_id,"
-            " cache_miss_outcome, cache_miss_reason, cache_missed_input_tokens)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " cache_miss_outcome, cache_miss_reason, cache_missed_input_tokens,"
+            " cache_write_5m, cache_write_1h)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 source.session_id,
                 source_path,
@@ -2207,6 +2530,8 @@ def store_source(
                 call.cache_miss_outcome,
                 call.cache_miss_reason,
                 call.cache_missed_input_tokens,
+                call.cache_write_5m,
+                call.cache_write_1h,
             ),
         )
 
@@ -2996,6 +3321,13 @@ def ingest(
             # that did not miss the cache.
             "calls_without_diagnostics": 0,
             "calls_with_unreadable_diagnostics": 0,
+            # Per-TTL cache-write split (#84). Counted apart from each other
+            # and from every token total: an unmeasured split is not a call
+            # that wrote no cache, and a split that disagrees with the flat
+            # total is neither of those again.
+            "calls_without_cache_write_split": 0,
+            "calls_with_unreadable_cache_write_split": 0,
+            "calls_with_unreconciled_cache_write": 0,
             # Dispatch dedupe (#36), counted the same way and for the same
             # reason. A RUN event, not a standing fact about the corpus: it
             # counts collisions THIS run resolved, so a run that skipped every
@@ -3053,6 +3385,15 @@ def ingest(
             summary["calls_without_diagnostics"] += parsed.calls_without_diagnostics
             summary["calls_with_unreadable_diagnostics"] += (
                 parsed.calls_with_unreadable_diagnostics
+            )
+            summary["calls_without_cache_write_split"] += (
+                parsed.calls_without_cache_write_split
+            )
+            summary["calls_with_unreadable_cache_write_split"] += (
+                parsed.calls_with_unreadable_cache_write_split
+            )
+            summary["calls_with_unreconciled_cache_write"] += (
+                parsed.calls_with_unreconciled_cache_write
             )
             summary["unparsed_details"].extend(parsed.unparsed_details)
 
@@ -3207,6 +3548,9 @@ def ingest_transcript(
             "divergent_message_ids": 0,
             "calls_without_diagnostics": 0,
             "calls_with_unreadable_diagnostics": 0,
+            "calls_without_cache_write_split": 0,
+            "calls_with_unreadable_cache_write_split": 0,
+            "calls_with_unreconciled_cache_write": 0,
             "duplicate_dispatches_resolved": 0,
             "divergent_dispatch_task_ids": 0,
             "unparsed_details": [],
@@ -3249,6 +3593,15 @@ def ingest_transcript(
             summary["calls_without_diagnostics"] = parsed.calls_without_diagnostics
             summary["calls_with_unreadable_diagnostics"] = (
                 parsed.calls_with_unreadable_diagnostics
+            )
+            summary["calls_without_cache_write_split"] = (
+                parsed.calls_without_cache_write_split
+            )
+            summary["calls_with_unreadable_cache_write_split"] = (
+                parsed.calls_with_unreadable_cache_write_split
+            )
+            summary["calls_with_unreconciled_cache_write"] = (
+                parsed.calls_with_unreconciled_cache_write
             )
             summary["unparsed_details"] = list(parsed.unparsed_details)
             # THIS FILE's shape census, and only this file's (#15). Directory
@@ -3478,6 +3831,45 @@ def print_cache_diagnostics_note(summary: dict[str, Any]) -> None:
     )
 
 
+def print_cache_write_split_note(summary: dict[str, Any]) -> None:
+    """What the per-TTL cache-write split could not say, said out loud (#84).
+
+    Three counts, printed as three, because they are three different facts and
+    a reader who cannot tell them apart cannot act on any of them. Printed only
+    when there is something to say, so its appearance MEANS something.
+
+    The reconciliation count is the one to read twice. It is NOT an error and
+    nothing was corrected: both readings are stored exactly as the transcript
+    gave them, so a reader can go and look. On the reference corpus every
+    disagreement ran one way -- the flat total was 0 while the split was not --
+    which would make a figure built on `cache_write` alone UNDERSTATE those
+    calls. Saying so is the whole of what CPB can honestly do about it.
+
+    All three range over the calls INGESTED THIS RUN, like the diagnostics note
+    above: an all-skipped incremental run read no record and so observed
+    nothing. The standing facts are the stored columns.
+    """
+    absent = summary.get("calls_without_cache_write_split") or 0
+    unreadable = summary.get("calls_with_unreadable_cache_write_split") or 0
+    unreconciled = summary.get("calls_with_unreconciled_cache_write") or 0
+    if not absent and not unreadable and not unreconciled:
+        return
+    print(
+        "NOTE: per-TTL cache-write split --"
+        f" calls with no `usage.cache_creation` split: {absent};"
+        f" calls whose split this tool found unreadable: {unreadable}."
+        " Both are UNMEASURED, never 0 and never 'assume all 5-minute': the"
+        " two TTLs cost 1.25x and 2x and repay after a different number of"
+        " reads (TA-8), so a guessed split answers the question with the wrong"
+        " constant."
+        f"\n      calls whose split does NOT sum to"
+        f" `cache_creation_input_tokens`: {unreconciled}. Both readings are"
+        " stored verbatim and NEITHER was adjusted -- they are two figures the"
+        " transcript reported, and making them agree would delete the only"
+        " evidence that they did not."
+    )
+
+
 def _named_counts(census: dict[Optional[str], int]) -> str:
     """`name=count` pairs for a census, with the absence bucket named as one.
 
@@ -3588,6 +3980,7 @@ def run_transcript_mode(transcript: Path, db_path: Path) -> None:
     )
     print_dedupe_note(summary)
     print_cache_diagnostics_note(summary)
+    print_cache_write_split_note(summary)
     print_shape_note(summary)
     print_inconclusive_note(summary)
 
@@ -3699,6 +4092,7 @@ def main() -> None:
             f" {summary['sessions_with_subagent_transcripts']}"
         )
     print_cache_diagnostics_note(summary)
+    print_cache_write_split_note(summary)
     print_shape_note(summary)
     print_inconclusive_note(summary)
 

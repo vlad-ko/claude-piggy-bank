@@ -24,13 +24,15 @@ that redlining them is a diff to this file and nothing else. What is being
 agreed by shipping this is the STRUCTURE; the numbers are expected to move.
 
 **Provenance is per BOUNDARY, not per table.** This is the reason the module
-exists rather than a dict literal. Of the thirteen boundaries here, exactly two
+exists rather than a dict literal. Of the sixteen boundaries here, exactly three
 are documented facts with a citation -- `1.0` and `2.0` reads per write, where
-TA-8's arithmetic puts the two cache-write break-evens. Four are domain floors,
-which arithmetic fixes and nobody decided. The remaining seven are product-
-owner judgments with no source anywhere. Anthropic publishes the cache
-multipliers; it publishes nothing about what share of a window is wasteful and
-nothing at all about what a user should do next.
+TA-8's arithmetic puts the two cache-write break-evens, and `1.0` on the
+TTL-aware ratio below, where those same two break-evens land once each write is
+weighted by the TTL it asked for. Five are domain floors, which arithmetic fixes
+and nobody decided. The remaining eight are product-owner judgments with no
+source anywhere. Anthropic publishes the cache multipliers; it publishes nothing
+about what share of a window is wasteful and nothing at all about what a user
+should do next.
 
 If those sat under one table-level provenance, the judged `0.25` would inherit
 the credibility of the cited `1.0` and the page would have no way to tell them
@@ -40,29 +42,52 @@ to refuse (#31), reappearing one level down -- so each boundary carries its own
 it covers, and a judgment structurally CANNOT carry a source (see
 `Provenance.__post_init__`).
 
-**Why cache reads-per-write has TWO cited boundaries and a band between them.**
-The first draft of this table had one, at `1.0`, citing TA-8 for "a single read
-repays the write markup". TA-8 does not say that of every write: it says it of
-the **5-minute** write (1.25x, break-even at the first read) and explicitly not
-of the **1-hour** write (2x, still a loss at one read, a win at two). It warns
-in as many words against compressing either into a slogan.
+**Why cache reads-per-write is TWO metrics, and how the band between the two
+cited boundaries was resolved.** The first draft of this table had one boundary,
+at `1.0`, citing TA-8 for "a single read repays the write markup". TA-8 does not
+say that of every write: it says it of the **5-minute** write (1.25x, break-even
+at the first read) and explicitly not of the **1-hour** write (2x, still a loss
+at one read, a win at two). It warns in as many words against compressing either
+into a slogan.
 
-CPB cannot tell the two apart. `ingest.py` reads `cache_write` from the flat
-`cache_creation_input_tokens`; the per-TTL split Claude Code persists beside it
-(`usage.cache_creation.ephemeral_5m_input_tokens` /
-`ephemeral_1h_input_tokens`) is observed but not ingested, so no column and no
-query can separate them today. And the split is not a rounding error: over 400
-of this machine's 3,017 transcripts on 2026-08-05, 1-hour writes were
-57,887,581 of 221,276,407 cache-write tokens, **26%** -- a raw-record scan, NOT
-deduped by `message.id`, so treat it as a share and not as a total.
+So the flat ratio carries the two claims that hold **whichever TTL was used** --
+below `1.0` no write of either kind is repaid, at or above `2.0` a write of
+either kind is -- and between them sat a band declared unresolvable, because
+`ingest.py` read only the flat `cache_creation_input_tokens` and no column could
+say which TTL a write asked for. That hedge was correct and is now retired:
+**#84 ingests `usage.cache_creation`'s per-TTL split**, so which break-even
+applies is measured per call.
 
-A single `1.0` cited to TA-8 would therefore be a judged number wearing a cited
-one's clothes for a quarter of the corpus. So the two boundaries this table
-carries are the two claims that hold **whichever TTL was used**: below `1.0` no
-write of either kind is repaid, at or above `2.0` a write of either kind is.
-Between them sits the band the data cannot resolve, and it says so in its own
-entry rather than picking a side. Ingesting the per-TTL split would let that
-band be resolved and is worth filing; until it is, this is the honest shape.
+The band resolves into a SECOND metric rather than into a narrower band, for
+three reasons.
+
+  * A read carries no TTL of its own. The split resolves the WRITE side only,
+    so "reads per 5-minute write" is not a quantity anything observes; what can
+    be computed is how the period's reads compare to what its own mix of writes
+    requires. That is a different number from the flat ratio, so it gets a
+    different key rather than a redefinition under a stable name
+    (`docs/versioning.md`).
+  * The flat ratio still has to exist. Every call ingested before #84 reads
+    NULL for the split, and a transcript past `cleanupPeriodDays` can never be
+    re-ingested to fix that -- so on most databases the flat ratio is the only
+    one of the two that can be computed at all, and its band is still the
+    honest answer for a number that ranges over both TTLs at once. What changed
+    in its entry is the REASON: not "CPB cannot see which TTL", which is no
+    longer true, but "one flat total cannot say which, and the reading beside
+    it can".
+  * The mix is not a constant that could be baked into one boundary. Measured
+    2026-08-05, deduped by `message.id` over 170,079 calls, 1-hour writes are
+    26.86% of the cache-write tokens the split accounts for -- but they occur
+    in only 41 of 3,021 files
+    and one session was entirely 1-hour. A corpus-wide average applied as a
+    boundary would be exactly wrong for the sessions that sit at either
+    extreme, which are the sessions the advice is for.
+
+`REPAID_AT_ITS_OWN_TTL` is therefore a boundary that is CITED where it was
+previously a hedge, and its statement says so: neither break-even moved, and
+what changed is that CPB can tell which one applies wherever the split was
+measured. `cache_write_repayment()` holds the weighting, so the arithmetic the
+citation names cannot drift away from the boundary it justifies.
 
 **What the structure guarantees, so a test does not have to catch it later.**
 
@@ -255,7 +280,26 @@ _CACHE_COVERS = (
     f"{CACHE_ARITHMETIC_ENTRY}: the 5-minute write at 1.25x base input tokens, "
     "the 1-hour write at 2x, the read at 0.1x. The multipliers are uniform "
     "across the published model table. It does NOT cover which TTL any "
-    "particular write asked for -- CPB does not record that."
+    "particular write asked for: that is measured rather than documented -- "
+    "CPB reads it per call from `usage.cache_creation` (#84) -- and it is "
+    "unmeasured for every call ingested before it, which this flat ratio "
+    "ranges over regardless."
+)
+
+# The third citation, and the one that resolved the band. Same record, same
+# check date, same two break-evens; what is new is that each write token can be
+# weighted by the TTL it asked for instead of the two being averaged blind.
+_REPAYMENT_COVERS = (
+    f"the two break-evens {TOKEN_ACCOUNTING_RECORD} {CACHE_ARITHMETIC_ENTRY} "
+    "works out, applied one per TTL: the 5-minute write at 1.25x base input "
+    "tokens is repaid by its FIRST read, the 1-hour write at 2x by its SECOND, "
+    "the read being 0.1x in both cases. What is documented is those two "
+    "break-evens; weighting each measured write token by its own is arithmetic "
+    "over token counts CPB reads per call. It does NOT cover which read repaid "
+    "which write -- a read carries no TTL of its own, so this holds over a "
+    "period on average and never per prefix -- and it does not cover calls "
+    "whose split was never measured, which are excluded from both sides rather "
+    "than assumed to be of either TTL."
 )
 
 UNREPAID_UNDER_EVERY_TTL = cited(
@@ -273,21 +317,67 @@ REPAID_UNDER_EVERY_TTL = cited(
     "the 1-hour write (2x) turns a profit at its second read -- 2.20 against "
     "3.00 at n = 3 -- and the 5-minute write (1.25x) turned one at its first. "
     "Between one read and two, which side of break-even a write sits on "
-    "depends on a TTL CPB does not record.",
+    "depends on a TTL one flat total cannot name.",
     checked="2026-08-04",
     source=_CACHE_SOURCE,
     covers=_CACHE_COVERS,
 )
 
-# Measured 2026-08-05 over 400 of this machine's 3,017 transcripts, counting
-# `usage.cache_creation` sub-keys on raw records with NO dedupe by
-# `message.id`: 57,887,581 of 221,276,407 cache-write tokens asked for the
-# 1-hour TTL. A share, not a total -- the streamed-record duplication
-# `_dedupe_calls()` exists to remove is still in both numbers. It is recorded
-# because it is the evidence that the unresolvable band below is worth having
-# rather than a hypothetical: a quarter of this corpus sits on the side of the
-# arithmetic a flat 1.0 boundary would get wrong.
-ONE_HOUR_WRITE_SHARE_AS_MEASURED = 0.26
+# How many read tokens one write token has to earn back before it has repaid
+# its own markup, one figure per TTL. TA-8's two break-evens in the units this
+# module's second cache metric divides in, and DELIBERATELY UNEQUAL: they are
+# the whole difference between the two TTLs, and a build that collapsed them
+# into one constant would be the slogan TA-8 warns against, in code.
+READ_TOKENS_TO_REPAY_A_5M_WRITE_TOKEN = 1.0
+READ_TOKENS_TO_REPAY_A_1H_WRITE_TOKEN = 2.0
+
+REPAID_AT_ITS_OWN_TTL = cited(
+    "at 1.0 a period's cache reads cover exactly what its writes require at "
+    "the break-even of the TTL each one asked for -- one read token per "
+    "5-minute write token, two per 1-hour write token. Below it those writes "
+    "are not repaid; at or above it they are, and no averaging over the two "
+    "TTLs is involved. This boundary was a HEDGE until 2026-08-05: with only "
+    "the flat cache-write total ingested, every reading between one read per "
+    "write and two turned on a TTL CPB had not read, and the table carried an "
+    "unresolvable band there instead of a verdict. Ingesting "
+    "`usage.cache_creation` (#84) resolved it. Neither break-even moved; which "
+    "one applies stopped being unknown.",
+    checked="2026-08-04",
+    source=_CACHE_SOURCE,
+    covers=_REPAYMENT_COVERS,
+)
+
+# Measured 2026-08-05 over 3,021 of this machine's transcripts, counting
+# `usage.cache_creation`'s two members on records DEDUPED by `message.id` with
+# ingest's own rule -- 342,850 assistant usage records, 170,079 calls:
+# 231,497,808 of 861,835,379 split cache-write tokens asked for the 1-hour TTL.
+# It supersedes an earlier raw-record scan that put the share at 26% over a
+# smaller file set; both are dated samples of a corpus that grows between
+# scans, so re-measure before quoting either.
+#
+# Recorded because it is the evidence for TWO decisions rather than one. That
+# the share is a quarter is why a single 1.0 boundary cited to TA-8 would have
+# been wrong for a quarter of the corpus. That it is CONCENTRATED -- 1-hour
+# writes occur in only 41 of the 3,021 files, and one session was entirely
+# 1-hour -- is why the resolution weights each corpus's own measured mix
+# instead of baking this number into a boundary: the sessions this advice is
+# for are exactly the ones the average describes worst.
+ONE_HOUR_WRITE_SHARE_AS_MEASURED = 0.2686
+
+# Why the TTL-aware metric divides by the SPLIT and never by the flat total.
+# Measured in the same scan: `cache_write_5m + cache_write_1h` equalled
+# `cache_creation_input_tokens` on 170,071 of 170,079 deduped calls. On the
+# other 8 -- 49,838 tokens -- the flat total read 0 while the split did not, so
+# the flat total UNDERSTATED the write; the reverse occurred 0 times. Ingest
+# stores both verbatim and counts the disagreement rather than reconciling it.
+#
+# The direction is what matters here: an understated denominator makes the flat
+# reads-per-write ratio read HIGHER, i.e. healthier, than the writes justify.
+# At 49,838 tokens against 861,835,379 that bias is far too small to move any
+# boundary in this table today, and it is recorded anyway, because the metric
+# that avoids it entirely is worth having for a corpus where it is not.
+FLAT_WRITE_UNDERSTATED_CALLS_AS_MEASURED = 8
+DEDUPED_CALLS_AS_MEASURED = 170_079
 
 _FLOOR_OF_A_SHARE = structural(
     "domain floor: a share is one count divided by a set containing it, so it "
@@ -588,6 +678,7 @@ class Metric:
 
 METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW = "main_thread_share_over_half_window"
 METRIC_CACHE_READS_PER_WRITE = "cache_reads_per_write"
+METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL = "cache_write_repayment_at_own_ttl"
 METRIC_CACHE_WRITE_ONLY_SHARE = "cache_write_only_share"
 METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY = "main_vs_subagent_tokens_per_reply"
 
@@ -618,6 +709,21 @@ _READS_PER_WRITE_HEALTHY_EDGE = Boundary(
         "order of magnitude above the later of the two documented break-evens "
         "rather than derived from anything. A corpus measuring 55.0 sits well "
         "clear of it, which is the only evidence behind the number."
+    ),
+)
+_REPAYMENT_BREAK_EVEN_EDGE = Boundary(1.0, REPAID_AT_ITS_OWN_TTL)
+_REPAYMENT_HEALTHY_EDGE = Boundary(
+    10.0,
+    judged(
+        "ten times what a period's writes require is 'the prefix is doing its "
+        "job', an order of magnitude above the break-even and mirroring the "
+        "flat ratio's own judged edge. Deliberately NOT the same demand in "
+        "reads: a corpus whose writes all asked for the one-hour TTL needs "
+        "twenty reads per write to reach it against ten on an all-five-minute "
+        "one, because the one-hour write starts twice as deep. Nobody "
+        "publishes this number, and unlike the flat ratio's ten it has no "
+        "corpus behind it yet -- the readings this table was drafted against "
+        "predate the split and are unmeasured here."
     ),
 )
 _WRITE_ONLY_WATCH_EDGE = Boundary(
@@ -743,9 +849,14 @@ METRICS: dict[str, Metric] = {
                         "Between the two break-evens: these writes are repaid "
                         "if they asked for the five-minute TTL and are still a "
                         "loss if they asked for the one-hour one (TA-8), and "
-                        "CPB does not record which was requested -- so this "
-                        "reading cannot be called either way. One more read "
-                        "per write settles it in your favour whichever it was."
+                        "one flat total over both TTLs cannot say which. The "
+                        "reading beside it, "
+                        f"{METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL}, weighs "
+                        "each write by the TTL it actually asked for and does "
+                        "call it; where that one reads as unmeasured, this "
+                        "period was ingested before the split was read and "
+                        "cannot be called either way. One more read per write "
+                        "settles it in your favour whichever it was."
                     ),
                 ),
             ),
@@ -775,6 +886,79 @@ METRICS: dict[str, Metric] = {
                         "Reuse is working: each stored prefix is read back many "
                         "times before it expires, which is the whole point of "
                         "storing it. Do not change this."
+                    ),
+                ),
+            ),
+        ),
+    ),
+    METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL: Metric(
+        key=METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+        measurement=(
+            "cache-read tokens on the calls whose per-TTL cache-write split "
+            "was measured, divided by the read tokens those calls' writes "
+            "require to break even -- one read token per five-minute write "
+            "token and two per one-hour write token, TA-8's two break-evens "
+            "applied one per TTL rather than averaged. 1.0 is break-even. A "
+            "period-level aggregate over many prefixes, not per-prefix "
+            "arithmetic: a read carries no TTL of its own, so which write it "
+            "repaid is not observed. A call with no split, or with only one of "
+            "the two TTLs read, is excluded from BOTH sides -- never counted "
+            "as five-minute and never as a zero at either TTL. Undefined, and "
+            "so unmeasured, when no such call wrote cache, which is true of "
+            "every call ingested before the split was read (#84) and so of "
+            "most of any database that predates it"
+        ),
+        worse_when=WORSE_WHEN_LOWER,
+        ranges=(
+            Range(
+                lower=Boundary(0.0, _FLOOR_OF_A_RATIO),
+                upper=_REPAYMENT_BREAK_EVEN_EDGE,
+                recommendation=Recommendation(
+                    severity=SEVERITY_ACT,
+                    lever=lever(ACTION_INCREASE, "prompt_prefix_stability"),
+                    detail=(
+                        "These writes are not repaid at the break-even of the "
+                        "TTL they asked for: a five-minute write is 1.25x base "
+                        "input tokens and needs one read token back per write "
+                        "token, a one-hour write is 2x and needs two, and this "
+                        "period's reads fall short of what its own mix "
+                        "requires (TA-8). Keep the prompt prefix "
+                        "byte-identical between calls: a system prompt, tool "
+                        "list or early file read that changes invalidates "
+                        "everything stored after it."
+                    ),
+                ),
+            ),
+            Range(
+                lower=_REPAYMENT_BREAK_EVEN_EDGE,
+                upper=_REPAYMENT_HEALTHY_EDGE,
+                recommendation=Recommendation(
+                    severity=SEVERITY_WATCH,
+                    lever=lever(ACTION_INCREASE, "prompt_prefix_stability"),
+                    detail=(
+                        "Every write here is repaid at the break-even of the "
+                        "TTL it asked for, with the one-hour writes held to "
+                        "the two reads they need rather than the one a flat "
+                        "ratio would have accepted. The prefix is still being "
+                        "rebuilt more often than a long session should need: "
+                        "look for something early in the prompt that changes "
+                        "between calls -- a timestamp, a shuffled tool list, a "
+                        "file read that lands before the stable part."
+                    ),
+                ),
+            ),
+            Range(
+                lower=_REPAYMENT_HEALTHY_EDGE,
+                upper=None,
+                recommendation=Recommendation(
+                    severity=SEVERITY_OK,
+                    lever=None,
+                    detail=(
+                        "Reuse is an order of magnitude past what these writes "
+                        "require at the TTL each one asked for, so even a "
+                        "one-hour write -- twice the base input tokens of an "
+                        "uncached send -- is earned back many times over. Do "
+                        "not change this."
                     ),
                 ),
             ),
@@ -889,6 +1073,66 @@ METRICS: dict[str, Metric] = {
         ),
     ),
 }
+
+
+# --------------------------------------------------------------------------
+# The one metric whose value this module computes
+# --------------------------------------------------------------------------
+
+
+def cache_write_repayment(
+    read_tokens: Optional[int],
+    write_5m_tokens: Optional[int],
+    write_1h_tokens: Optional[int],
+) -> Optional[float]:
+    """`METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL`'s value, or `None` if unmeasured.
+
+    Every other metric's value is the caller's arithmetic; this one is not, and
+    the exception is deliberate. WHICH NUMBER MULTIPLIES WHICH TTL IS THE CITED
+    BOUNDARY. If `serve.py` wrote `2 *` into a query, the weighting and the
+    citation that justifies it would be free to drift apart -- the defect
+    `serve.RANKED_BY` was introduced to stop one level up, where a heading and
+    an `ORDER BY` disagreed for a whole release. So the weights, the boundary
+    and this function are one thing in one file, and a caller can only get it
+    right.
+
+    Totals, not per-call values: sum each column over the period's calls whose
+    split was measured, and pass the reads from THOSE SAME CALLS, so the two
+    sides of the ratio range over one set. `ingest.Call.cache_write_split_total`
+    is where the same "a partial split is not a total" rule lives on the write
+    path.
+
+    `None` -- never a number -- in three cases, three different absences with
+    one honest answer:
+
+      * either write total unmeasured. A call with no split is not a call that
+        wrote nothing at that TTL: reading an absent 1-hour total as `0` would
+        report writes that cost 2x base input tokens as though they cost 1.25x,
+        and say they were repaid at a read they were not.
+      * reads unmeasured.
+      * nothing required -- no measured write token in the period. A zero
+        denominator is an unmeasured metric, and returning `inf` (or `0.0`)
+        would be exactly the absence-as-a-value `assess()` then refuses.
+
+    A negative input raises: token counts are counts, and a negative one means
+    the caller is passing something other than what this signature says.
+    """
+    if read_tokens is None or write_5m_tokens is None or write_1h_tokens is None:
+        return None
+    for name, count in (
+        ("read_tokens", read_tokens),
+        ("write_5m_tokens", write_5m_tokens),
+        ("write_1h_tokens", write_1h_tokens),
+    ):
+        if count < 0:
+            raise ValueError(f"{name} cannot be negative: got {count!r}")
+    required = (
+        READ_TOKENS_TO_REPAY_A_5M_WRITE_TOKEN * write_5m_tokens
+        + READ_TOKENS_TO_REPAY_A_1H_WRITE_TOKEN * write_1h_tokens
+    )
+    if required == 0:
+        return None
+    return read_tokens / required
 
 
 # --------------------------------------------------------------------------

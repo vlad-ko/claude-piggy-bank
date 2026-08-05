@@ -24,11 +24,15 @@ from collections.abc import Sequence
 from datetime import date
 from http.server import HTTPServer
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cpb  # noqa: E402
 from ingest import (  # noqa: E402
+    CACHE_CREATION_KEY,
+    CACHE_WRITE_1H_KEY,
+    CACHE_WRITE_5M_KEY,
     INGEST_RUNS_TABLE,
     SOURCE_MAIN,
     SOURCE_SUBAGENT,
@@ -58,6 +62,7 @@ from recommendations import (  # noqa: E402
     LEVER_TARGETS,
     METRIC_CACHE_READS_PER_WRITE,
     METRIC_CACHE_WRITE_ONLY_SHARE,
+    METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
     METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,
     METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
     METRICS,
@@ -66,6 +71,8 @@ from recommendations import (  # noqa: E402
     PROVENANCE_KINDS,
     PROVENANCE_STRUCTURAL,
     RANKING_PROVENANCE,
+    READ_TOKENS_TO_REPAY_A_1H_WRITE_TOKEN,
+    READ_TOKENS_TO_REPAY_A_5M_WRITE_TOKEN,
     RECOMMENDATION_PROVENANCE,
     RECOMMENDATIONS_AS_OF,
     SEVERITY_OK,
@@ -79,6 +86,7 @@ from serve import (  # noqa: E402
     OVER_HALF_WINDOW_BANDS,
     PERCENTILES,
     RANKED_BY,
+    RECOMMENDED_METRICS,
     SCOPE_INCLUDES_BOTH,
     SCOPE_MAIN,
     SCOPE_ORDER,
@@ -92,6 +100,7 @@ from serve import (  # noqa: E402
     UTIL_NO_SAMPLE_NO_CONTEXT_MEASUREMENT,
     UTIL_NO_SAMPLE_NO_DOCUMENTED_WINDOW,
     Api,
+    _refuse_unwired_metrics,
     clamp_limit,
     day_bounds,
     eastern_day,
@@ -5985,23 +5994,40 @@ class ClientSideAgeRecomputeTest(unittest.TestCase):
 # right, and every token class of every call deliberately unequal so a swapped
 # column mapping cannot reproduce a figure.
 #
-#   * REC_FULL_DAY runs both scopes and pins all four metrics at once. Its
-#     values are chosen to land in FOUR DIFFERENT places in the table -- an
-#     `act` above an open-ended range, a `watch` inside a range whose lower
-#     edge is CITED and whose upper edge is JUDGED, and so on -- so one fixture
+#   * REC_FULL_DAY runs both scopes and pins all five metrics at once. Its
+#     values are chosen to land in DIFFERENT places in the table -- an `act`
+#     above an open-ended range, a `watch` inside a range whose lower edge is
+#     CITED and whose upper edge is JUDGED, and so on -- so one fixture
 #     exercises every provenance kind the payload can carry.
 #   * REC_SOLO_DAY dispatches no subagent. `main_vs_subagent_tokens_per_reply`
 #     is then UNMEASURED, which is the zero-denominator case this whole block
 #     turns on: no subagent reply is not a ratio of zero.
-#   * REC_NO_CACHE_DAY runs calls that wrote no cache at all, so BOTH cache
+#   * REC_NO_CACHE_DAY runs calls that wrote no cache at all, so BOTH flat cache
 #     metrics lose their denominators -- one a token sum, one a call count,
 #     which vanish together here and are checked separately in the code.
 #   * REC_UNWINDOWED_DAY runs the main thread on a model with no documented
 #     window, so `main_thread_share_over_half_window` has no denominator while
-#     the other three still do.
-#   * REC_EMPTY_DAY holds nothing, so all four are unmeasured and `ranked` is
+#     the others still do.
+#   * REC_EMPTY_DAY holds nothing, so all five are unmeasured and `ranked` is
 #     empty -- the state in which a page that rendered absence as health would
 #     tell the reader everything is fine.
+#
+# THE PER-TTL SPLIT IS THE EIGHTH FIELD (#84), and it is the transcript's own
+# `usage.cache_creation` object rather than a pair of numbers, because the three
+# states that matter are states of the RECORD and not of the arithmetic:
+#
+#   * `None` -- no `cache_creation` key at all, which is what every Claude Code
+#     record CPB ingested before #84 looks like. Both columns land NULL.
+#   * both TTL keys -- a measured split. Only these calls are in either side of
+#     `cache_write_repayment_at_own_ttl`.
+#   * ONE TTL key -- a half-measurement. It is excluded from BOTH sides, and the
+#     fixture carries one on purpose: reading the absent half as 0 is the
+#     mistake that would report a 1-hour write repaid at its first read.
+#
+# The splits below RECONCILE with the flat `cache_write` beside them (they are
+# the same write, counted twice), and the two TTLs are deliberately unequal on
+# every call that has both, so a denominator that swapped the 1x and 2x weights
+# cannot reproduce the expected figure.
 REC_SESSION = "recommendation-fixture"
 REC_AGENT = "agent-rec78a"
 REC_FULL_DAY = "2026-07-01"
@@ -6014,37 +6040,99 @@ REC_OPUS_1M = "claude-opus-5-20260101"          # 1,000,000-token window
 REC_HAIKU_200K = "claude-haiku-4-5-20251001"    # 200,000-token window
 REC_UNKNOWN_MODEL = "claude-nosuchtier-9-20260101"
 
-# (day, kind, model, input, cache_write, cache_read, output). `context_size` is
-# input + cache_write + cache_read, which is how `ingest.py` derives it, so the
-# main-thread contexts below are engineered to sit in known bands against a
-# 1M window: 600k (50-90), 950k (>=90), 300k, 100k, 38k.
-REC_CALLS: list[tuple[str, str, str, int, int, int, int]] = [
+# The `usage.cache_creation` object a record carries, spelled with ingest's own
+# key names so a renamed key fails here too.
+def _split(five_m: Optional[int] = None, one_h: Optional[int] = None) -> dict:
+    out: dict[str, int] = {}
+    if five_m is not None:
+        out[CACHE_WRITE_5M_KEY] = five_m
+    if one_h is not None:
+        out[CACHE_WRITE_1H_KEY] = one_h
+    return out
+
+
+# (day, kind, model, input, cache_write, cache_read, output, cache_creation).
+# `context_size` is input + cache_write + cache_read, which is how `ingest.py`
+# derives it, so the main-thread contexts below are engineered to sit in known
+# bands against a 1M window: 600k (50-90), 950k (>=90), 300k, 100k, 38k.
+REC_CALLS: list[tuple[str, str, str, int, int, int, int, Optional[dict]]] = [
     # --- the full day, main thread: two of five calls over half the window ---
-    (REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 10_000, 120_000, 470_000, 2_000),
-    (REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 11_000, 121_000, 818_000, 2_200),
-    (REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 12_000, 122_000, 166_000, 2_400),
-    (REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 13_000, 23_000, 64_000, 2_600),
+    # SPLIT MEASURED, both TTLs, unequal: 100,000 + 20,000 = the flat 120,000.
+    (
+        REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 10_000, 120_000, 470_000, 2_000,
+        _split(100_000, 20_000),
+    ),
+    # NO SPLIT, and the two largest read totals of the day are here on purpose:
+    # 984,000 read tokens whose writes cannot enter the denominator. A numerator
+    # taken over the whole window rather than over the split-measured calls
+    # inflates the metric by exactly these.
+    (
+        REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 11_000, 121_000, 818_000, 2_200,
+        None,
+    ),
+    (
+        REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 12_000, 122_000, 166_000, 2_400,
+        None,
+    ),
+    # SPLIT MEASURED, and mostly 1-hour: 3,000 + 20,000 = the flat 23,000. The
+    # 1-hour tokens outweigh the 5-minute ones across the day's measured set, so
+    # swapping the two weights moves the figure.
+    (
+        REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 13_000, 23_000, 64_000, 2_600,
+        _split(3_000, 20_000),
+    ),
     # Wrote cache and read NOTHING back -- one half of `cache_write_only_share`.
-    (REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 14_000, 24_000, 0, 2_800),
+    (
+        REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 14_000, 24_000, 0, 2_800,
+        None,
+    ),
     # --- the full day, subagents ---
-    (REC_FULL_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 5_000, 6_000, 7_000, 8_000),
+    # SPLIT MEASURED, all five-minute. Both scopes are in the metric, as they
+    # are in the flat ratio beside it.
+    (
+        REC_FULL_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 5_000, 6_000, 7_000, 8_000,
+        _split(6_000, 0),
+    ),
     # The second write-only call, in the OTHER scope: the share ranges over
     # both, so a query that filtered to one would come out 1/5 or 1/2 here
-    # rather than 2/7.
-    (REC_FULL_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 5_100, 6_100, 0, 8_100),
+    # rather than 2/7. HALF A SPLIT -- the 1-hour key is absent, not zero -- so
+    # its 6,100 write tokens belong in no denominator at all.
+    (
+        REC_FULL_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 5_100, 6_100, 0, 8_100,
+        _split(6_100),
+    ),
     # Wrote no cache at all, so it is in NEITHER the numerator nor the
     # denominator of the write-only share -- a call that never stored a prefix
     # cannot have failed to read one back.
-    (REC_FULL_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 5_200, 0, 0, 8_200),
-    # --- a day the main thread ran alone ---
-    (REC_SOLO_DAY, SOURCE_MAIN, REC_OPUS_1M, 1_000, 2_000, 3_000, 4_000),
-    (REC_SOLO_DAY, SOURCE_MAIN, REC_OPUS_1M, 1_100, 2_100, 3_100, 4_100),
-    # --- a day nothing wrote cache ---
-    (REC_NO_CACHE_DAY, SOURCE_MAIN, REC_OPUS_1M, 5_000, 0, 0, 6_000),
-    (REC_NO_CACHE_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 7_000, 0, 0, 8_000),
+    (
+        REC_FULL_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 5_200, 0, 0, 8_200,
+        None,
+    ),
+    # --- a day the main thread ran alone, and NOTHING carries a split: the
+    # shape of every database not re-ingested since #84, where the flat ratio is
+    # measured and the per-TTL one is not ---
+    (REC_SOLO_DAY, SOURCE_MAIN, REC_OPUS_1M, 1_000, 2_000, 3_000, 4_000, None),
+    (REC_SOLO_DAY, SOURCE_MAIN, REC_OPUS_1M, 1_100, 2_100, 3_100, 4_100, None),
+    # --- a day nothing wrote cache. The split IS measured here and is 0 at both
+    # TTLs, which is a real reading and still not a ratio: nothing was required,
+    # so there is nothing to have repaid ---
+    (
+        REC_NO_CACHE_DAY, SOURCE_MAIN, REC_OPUS_1M, 5_000, 0, 0, 6_000,
+        _split(0, 0),
+    ),
+    (
+        REC_NO_CACHE_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 7_000, 0, 0, 8_000,
+        _split(0, 0),
+    ),
     # --- a day the main thread ran on a model with no documented window ---
-    (REC_UNWINDOWED_DAY, SOURCE_MAIN, REC_UNKNOWN_MODEL, 1_000, 2_000, 3_000, 4_000),
-    (REC_UNWINDOWED_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 1_100, 2_100, 3_100, 4_100),
+    (
+        REC_UNWINDOWED_DAY, SOURCE_MAIN, REC_UNKNOWN_MODEL,
+        1_000, 2_000, 3_000, 4_000, None,
+    ),
+    (
+        REC_UNWINDOWED_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K,
+        1_100, 2_100, 3_100, 4_100, None,
+    ),
 ]
 
 # Hand-written from the table above, then checked against it by
@@ -6060,6 +6148,27 @@ REC_FULL_CACHE_READS = 1_525_000
 REC_FULL_CACHE_WRITES = 422_100
 REC_FULL_WRITING_CALLS = 7
 REC_FULL_WRITE_ONLY_CALLS = 2
+# The per-TTL metric's set (#84): the three full-day calls carrying BOTH TTL
+# keys, and the reads from those same three. Every figure here is hand-written
+# from the table above and checked against it below.
+REC_FULL_SPLIT_CALLS = 3
+REC_FULL_SPLIT_READS = 541_000        # 470,000 + 64,000 + 7,000
+REC_FULL_SPLIT_5M = 109_000           # 100,000 + 3,000 + 6,000
+REC_FULL_SPLIT_1H = 40_000            # 20,000 + 20,000 + 0
+# HAND-WRITTEN, not derived from the module's weights: 1 x 109,000 + 2 x 40,000.
+# An expectation computed from `READ_TOKENS_TO_REPAY_A_*` would move with them,
+# so a release that swapped the two multipliers would pass every assertion below
+# -- the "fixture that makes the defect undetectable" failure, arriving through
+# a constant instead of through a value. The weights are checked AGAINST this
+# literal in `test_the_fixtures_split_holds_what_the_expectations_claim`.
+REC_FULL_REQUIRED = 189_000
+# 541,000 / 189,000 = 2.8624...
+# Deliberately unlike its four neighbours, none of which may reproduce it:
+#   whole-window reads over the same denominator  1,525,000/189,000 = 8.069
+#   the weights swapped                             541,000/258,000 = 2.097
+#   the half-split call counted as 5-minute only    541,000/195,100 = 2.773
+#   the flat reads-per-write ratio                1,525,000/422,100 = 3.613
+REC_FULL_REPAYMENT = REC_FULL_SPLIT_READS / REC_FULL_REQUIRED
 
 
 def build_recommendation_corpus(root: Path) -> Path:
@@ -6070,7 +6179,18 @@ def build_recommendation_corpus(root: Path) -> Path:
     subagents.mkdir(parents=True)
 
     def record(n: int, call: tuple) -> str:
-        day, kind, model, inp, write, read, out = call
+        day, kind, model, inp, write, read, out, split = call
+        usage: dict[str, object] = {
+            "input_tokens": inp,
+            "cache_creation_input_tokens": write,
+            "cache_read_input_tokens": read,
+            "output_tokens": out,
+        }
+        # ABSENT, not `{}`: a record from before #84 has no such key, and an
+        # empty object is a different observation (offered and empty) that
+        # `_cache_write_split()` reads differently.
+        if split is not None:
+            usage[CACHE_CREATION_KEY] = split
         payload: dict[str, object] = {
             "type": "assistant",
             "sessionId": REC_SESSION,
@@ -6082,12 +6202,7 @@ def build_recommendation_corpus(root: Path) -> Path:
                 # denominator below.
                 "id": f"msg-rec78-{n}",
                 "model": model,
-                "usage": {
-                    "input_tokens": inp,
-                    "cache_creation_input_tokens": write,
-                    "cache_read_input_tokens": read,
-                    "output_tokens": out,
-                },
+                "usage": usage,
                 "content": [{"type": "text", "text": f"rec78 call {n}"}],
             },
         }
@@ -6110,8 +6225,9 @@ class RecommendationApiTest(unittest.TestCase):
 
     Asserted through the real ingest path, so every figure is measured over
     rows written the way production writes them -- including `source_kind`,
-    which two of the four metrics divide by and which the ingester derives from
-    the source's own path.
+    which two of the five metrics divide by and which the ingester derives from
+    the source's own path, and the per-TTL cache-write columns, which only the
+    ingester can decide are NULL rather than 0.
     """
 
     @classmethod
@@ -6150,14 +6266,75 @@ class RecommendationApiTest(unittest.TestCase):
         sub = [c for c in full if c[1] == SOURCE_SUBAGENT]
         self.assertEqual(len(main), REC_FULL_MAIN_CALLS)
         self.assertEqual(len(sub), REC_FULL_SUB_CALLS)
-        self.assertEqual(sum(sum(c[3:]) for c in main), REC_FULL_MAIN_TOTAL)
-        self.assertEqual(sum(sum(c[3:]) for c in sub), REC_FULL_SUB_TOTAL)
+        self.assertEqual(sum(sum(c[3:7]) for c in main), REC_FULL_MAIN_TOTAL)
+        self.assertEqual(sum(sum(c[3:7]) for c in sub), REC_FULL_SUB_TOTAL)
         self.assertEqual(sum(c[5] for c in full), REC_FULL_CACHE_READS)
         self.assertEqual(sum(c[4] for c in full), REC_FULL_CACHE_WRITES)
         self.assertEqual(len([c for c in full if c[4] > 0]), REC_FULL_WRITING_CALLS)
         self.assertEqual(
             len([c for c in full if c[4] > 0 and c[5] == 0]),
             REC_FULL_WRITE_ONLY_CALLS,
+        )
+
+    def test_the_fixtures_split_holds_what_the_expectations_claim(self) -> None:
+        # #84's half of the check above. A call is in the per-TTL metric's set
+        # only if its record carried BOTH TTL keys, so the membership test is
+        # spelled out here rather than taken from the code under test -- and
+        # the flat totals are asserted to DIFFER from the split ones, because a
+        # fixture where they agreed could not tell the two sets apart.
+        full = [c for c in REC_CALLS if c[0] == REC_FULL_DAY]
+        measured = [
+            c
+            for c in full
+            if c[7] is not None
+            and CACHE_WRITE_5M_KEY in c[7]
+            and CACHE_WRITE_1H_KEY in c[7]
+        ]
+        self.assertEqual(len(measured), REC_FULL_SPLIT_CALLS)
+        self.assertEqual(sum(c[5] for c in measured), REC_FULL_SPLIT_READS)
+        self.assertEqual(
+            sum(c[7][CACHE_WRITE_5M_KEY] for c in measured), REC_FULL_SPLIT_5M
+        )
+        self.assertEqual(
+            sum(c[7][CACHE_WRITE_1H_KEY] for c in measured), REC_FULL_SPLIT_1H
+        )
+        # Each measured split reconciles with the flat write beside it: they are
+        # one write counted twice, and a fixture where they disagreed would let
+        # a query that read `cache_write` pass as one that read the split.
+        for call in measured:
+            with self.subTest(call=call[3]):
+                self.assertEqual(
+                    call[7][CACHE_WRITE_5M_KEY] + call[7][CACHE_WRITE_1H_KEY], call[4]
+                )
+        # The two sets are different sets, in both quantities.
+        self.assertNotEqual(REC_FULL_SPLIT_READS, REC_FULL_CACHE_READS)
+        self.assertNotEqual(
+            REC_FULL_SPLIT_5M + REC_FULL_SPLIT_1H, REC_FULL_CACHE_WRITES
+        )
+        # Where the hand-written denominator meets the module's weights. This is
+        # the ONE place they are compared, and it is an equality against a
+        # literal: swapping the two multipliers reads 258,000 here and fails,
+        # where an expectation derived from them would have moved with them.
+        self.assertEqual(
+            READ_TOKENS_TO_REPAY_A_5M_WRITE_TOKEN * REC_FULL_SPLIT_5M
+            + READ_TOKENS_TO_REPAY_A_1H_WRITE_TOKEN * REC_FULL_SPLIT_1H,
+            REC_FULL_REQUIRED,
+            "the read tokens this fixture's writes require is not what the "
+            "module's per-TTL break-evens say it is",
+        )
+        # Exactly one half-measured call, and it is not in the set above.
+        half = [
+            c
+            for c in full
+            if c[7] is not None
+            and (CACHE_WRITE_5M_KEY in c[7]) != (CACHE_WRITE_1H_KEY in c[7])
+        ]
+        self.assertEqual(len(half), 1)
+        self.assertGreater(
+            half[0][4],
+            0,
+            "a half-split call that wrote nothing could not show the "
+            "exclusion it exists to show",
         )
 
     def test_the_fixture_reaches_every_provenance_kind(self) -> None:
@@ -6194,6 +6371,12 @@ class RecommendationApiTest(unittest.TestCase):
                 unmeasured = set(block["unmeasured"])
                 self.assertEqual(ranked | unmeasured, set(METRICS))
                 self.assertEqual(ranked & unmeasured, set())
+                # And against what `serve` DECLARES it computes (#84). The
+                # import-time guard compares that declaration with the table;
+                # this compares it with what a served payload actually holds,
+                # so a declaration that had drifted from the mapping below it
+                # cannot pass by agreeing with the table alone.
+                self.assertEqual(ranked | unmeasured, set(RECOMMENDED_METRICS))
 
     def test_cache_reads_per_write_divides_the_tokens_its_measurement_names(
         self,
@@ -6224,6 +6407,109 @@ class RecommendationApiTest(unittest.TestCase):
         full = [c for c in REC_CALLS if c[0] == REC_FULL_DAY]
         self.assertNotAlmostEqual(value, REC_FULL_WRITE_ONLY_CALLS / len(full))
         self.assertNotAlmostEqual(value, (REC_FULL_WRITE_ONLY_CALLS + 1) / len(full))
+
+    # --- #84: the per-TTL repayment, over the calls whose split was measured ---
+
+    def test_the_per_ttl_repayment_weights_each_ttl_at_its_own_break_even(
+        self,
+    ) -> None:
+        # The metric's whole reason for existing: 1 read token per 5-minute
+        # write token, 2 per 1-hour write token, one per TTL rather than
+        # averaged. The fixture's measured set is mostly 1-hour by weight, so
+        # the two multipliers swapped is a DIFFERENT number (2.097 against
+        # 2.862) and cannot pass -- which a fixture whose writes were all one
+        # TTL would not have caught.
+        self.assertAlmostEqual(
+            self.reading(REC_FULL_DAY, METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL)[
+                "value"
+            ],
+            REC_FULL_REPAYMENT,
+        )
+        # 2 x 109,000 + 1 x 40,000 = 258,000, the denominator a swap produces.
+        self.assertNotAlmostEqual(
+            REC_FULL_REPAYMENT, REC_FULL_SPLIT_READS / 258_000
+        )
+
+    def test_the_reads_come_from_the_same_calls_as_the_writes(self) -> None:
+        # THE defect this metric is most likely to ship with, and it inflates:
+        # the day's split-measured calls read 541,000 tokens while the window
+        # reads 1,525,000, so a numerator taken over the whole window against a
+        # denominator taken over the measured set reports 8.07 -- a project
+        # comfortably repaying its writes -- where the measured set reports
+        # 2.86. Both are plausible readings in the same band's neighbourhood,
+        # which is why only the number can tell them apart.
+        value = self.reading(REC_FULL_DAY, METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL)[
+            "value"
+        ]
+        # Asserted as the PROPERTY, not against one wrong figure: recover the
+        # numerator the served value implies and check WHICH SET it came from.
+        # A `assertNotAlmostEqual` against a single hand-computed alternative
+        # passes for every other way of widening the numerator, and the first
+        # mutation tried -- dropping the `WHERE` from the whole query, so both
+        # sides widen but by different amounts -- was exactly that.
+        implied_reads = value * REC_FULL_REQUIRED
+        self.assertAlmostEqual(implied_reads, REC_FULL_SPLIT_READS, places=6)
+        self.assertNotAlmostEqual(implied_reads, REC_FULL_CACHE_READS, places=6)
+        # And the direction, stated rather than left to be inferred: reads that
+        # do not belong to the measured set can only INFLATE the ratio, so the
+        # honest reading is the smaller one.
+        self.assertLess(value, REC_FULL_CACHE_READS / REC_FULL_REQUIRED)
+
+    def test_a_call_with_only_one_ttl_read_is_in_neither_side(self) -> None:
+        # A partial split is a half-measurement, not a 5-minute write. The
+        # fixture's half-split call wrote 6,100 tokens and read none back, so
+        # admitting it to the denominator alone reads 2.773 against 2.862 --
+        # close enough to look like rounding and wrong for a reason that would
+        # never be found from the number.
+        self.assertNotAlmostEqual(
+            self.reading(REC_FULL_DAY, METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL)[
+                "value"
+            ],
+            REC_FULL_SPLIT_READS / (REC_FULL_REQUIRED + 6_100),
+        )
+
+    def test_the_per_ttl_metric_is_not_the_flat_ratio_under_another_name(
+        self,
+    ) -> None:
+        # Two metrics, two sets, two numbers -- and both are ranked on this
+        # day, so a wiring that computed the flat ratio twice would show a
+        # reader one figure claiming to answer two questions.
+        flat = self.reading(REC_FULL_DAY, METRIC_CACHE_READS_PER_WRITE)["value"]
+        per_ttl = self.reading(REC_FULL_DAY, METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL)[
+            "value"
+        ]
+        self.assertNotAlmostEqual(flat, per_ttl)
+        self.assertAlmostEqual(flat, REC_FULL_CACHE_READS / REC_FULL_CACHE_WRITES)
+
+    def test_a_window_whose_calls_predate_the_split_has_no_repayment(self) -> None:
+        # THE state of every database today: #84 reads the split going forward
+        # and no past call can be re-ingested to acquire one, so on a corpus
+        # that has not been re-ingested the metric is UNMEASURED. Not 0, which
+        # would band as the worst reading in the table and tell the reader
+        # their cache writes are never repaid -- over calls nobody measured.
+        block = self.block(REC_SOLO_DAY)
+        self.assertIn(METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, block["unmeasured"])
+        self.assertNotIn(
+            METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+            [a["metric"] for a in block["ranked"]],
+        )
+        # The flat ratio IS measured on that same day, which is the point of
+        # keeping both: a blanket "this day has no cache figure" would pass the
+        # assertion above while saying something false.
+        self.assertIn(
+            METRIC_CACHE_READS_PER_WRITE, [a["metric"] for a in block["ranked"]]
+        )
+
+    def test_a_measured_split_of_zero_requires_nothing_and_is_unmeasured(self) -> None:
+        # The other absence, and a different one: the split here WAS read and
+        # both TTLs are 0, so the denominator is a measured zero. Nothing was
+        # required, so nothing can have repaid it -- `inf` is what the
+        # arithmetic offers and `assess()` refuses it, so the module returns
+        # None one step earlier.
+        self.assertIn(
+            METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+            self.block(REC_NO_CACHE_DAY)["unmeasured"],
+        )
 
     def test_the_reply_ratio_is_per_api_call_as_its_measurement_says(self) -> None:
         # The metric's KEY says "per reply"; its `measurement` says "per API
@@ -6310,13 +6596,13 @@ class RecommendationApiTest(unittest.TestCase):
     def test_an_unwindowed_main_thread_has_no_saturation_share(self) -> None:
         # A share of an empty set is not 0%. Every main-thread call this day ran
         # on a model with no documented window, so nothing was banded and there
-        # is no denominator -- while the other three metrics still have one,
-        # which is what stops a blanket "this day is unmeasured" from passing.
+        # is no denominator -- while other metrics still have one, which is
+        # what stops a blanket "this day is unmeasured" from passing.
         block = self.block(REC_UNWINDOWED_DAY)
         self.assertIn(METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW, block["unmeasured"])
         self.assertNotEqual(block["ranked"], [])
 
-    def test_an_empty_window_is_four_unmeasured_metrics_and_no_advice(self) -> None:
+    def test_an_empty_window_is_every_metric_unmeasured_and_no_advice(self) -> None:
         # The state a page that rendered absence as health would describe as a
         # clean bill: nothing measured, so nothing to advise -- said out loud
         # rather than by an empty block.
@@ -6632,11 +6918,14 @@ class RecommendationRenderTest(unittest.TestCase):
 
     def test_the_unmeasured_mapping_is_consumed_whole(self) -> None:
         # The wiring guard CANNOT check this one, and the gap is worth stating.
-        # Its fixture measures all four metrics, so `unmeasured` is `{}` there;
-        # an empty mapping has no members for the walk to adjudicate, so naming
-        # the path is enough to satisfy it (mutation-checked: replacing the
-        # `Object.entries` consumer with a bare `summary.recommendations
-        # .unmeasured.rows` leaves the guard GREEN).
+        # Its fixture measured all four metrics when this was written, so
+        # `unmeasured` was `{}` there; an empty mapping has no members for the
+        # walk to adjudicate, so naming the path was enough to satisfy it
+        # (mutation-checked: replacing the `Object.entries` consumer with a
+        # bare `summary.recommendations.unmeasured.rows` leaves the guard
+        # GREEN). #84 made that fixture's mapping non-empty by adding a metric
+        # it cannot measure, which is luck rather than coverage -- the next
+        # fixture may measure everything again.
         #
         # What makes every member reachable is therefore not the fixture but
         # the shape: the keys are metric names the SERVER decides, so the page
@@ -6653,8 +6942,9 @@ class RecommendationRenderTest(unittest.TestCase):
             iteration_aliases(self.html, {"summary.recommendations.unmeasured"}),
             frozenset(),
             "nothing iterates the unmeasured mapping, so the metrics it names "
-            "reach no reader -- and the wiring guard cannot say so, because "
-            "its fixture measures all four and leaves this mapping empty",
+            "reach no reader -- and the wiring guard cannot be relied on to "
+            "say so, because a fixture that measures every metric leaves this "
+            "mapping empty",
         )
         self.assertTrue(
             is_read_whole(self.html, {"summary.recommendations.unmeasured"}),
@@ -6672,6 +6962,85 @@ class RecommendationRenderTest(unittest.TestCase):
         self.assertNotIn("<table", self.band)
 
 
+class RecommendationWiringIsCompleteTest(unittest.TestCase):
+    """#84: the two enumerations of the metric set cannot drift apart.
+
+    THE FAILURE THIS EXISTS FOR, because it happened. `recommendations.METRICS`
+    declares the metrics; `serve._recommendations()` computes a value for each;
+    nothing connected the two. A branch added a fifth metric to the table, ran
+    the whole suite green, and broke on merge -- `assess_all()` refusing a
+    four-key mapping against a five-metric table, on every Python version, in
+    every test that served a summary.
+
+    The refusal was right and is not relaxed. What was missing is that it can
+    only fire when a request builds a mapping: at the commit that branch forked
+    from, `serve.py` did not mention `assess_all` at all, so a suite that never
+    served a summary from that tree had nothing to notice. The coupling was
+    predicted in the module's own docstring and left untied.
+
+    So the tie is `serve.RECOMMENDED_METRICS`, checked at IMPORT -- which is
+    what makes the failure arrive on the branch that causes it rather than on
+    the merge that reveals it. These tests pin the tie itself, and the payload
+    test above pins that the declaration still describes what is computed.
+    """
+
+    def test_serve_declares_exactly_the_metrics_the_table_declares(self) -> None:
+        # Set equality, not containment, and the message names both directions:
+        # a metric declared and not computed 500s the whole payload, and one
+        # computed but not declared is a query paid for and never read.
+        self.assertEqual(
+            set(RECOMMENDED_METRICS),
+            set(METRICS),
+            "serve and recommendations enumerate different metric sets",
+        )
+
+    def test_a_metric_the_table_declares_and_serve_does_not_is_refused(self) -> None:
+        # The #84 shape exactly: the table grows by one, the caller does not.
+        with self.assertRaises(RuntimeError) as caught:
+            _refuse_unwired_metrics(
+                frozenset(METRICS), frozenset(METRICS) | {"a_sixth_metric"}
+            )
+        self.assertIn("a_sixth_metric", str(caught.exception))
+
+    def test_a_metric_serve_computes_and_no_table_declares_is_refused(self) -> None:
+        # The quieter direction, and the reason this is not a restatement of
+        # `assess_all()`'s own refusal: that one raises on a MISSING key and
+        # says nothing about a surplus one, which `assess_all` would report as
+        # an unknown metric only once a request reached it.
+        with self.assertRaises(RuntimeError) as caught:
+            _refuse_unwired_metrics(
+                frozenset(METRICS) | {"a_metric_nobody_assesses"}, frozenset(METRICS)
+            )
+        self.assertIn("a_metric_nobody_assesses", str(caught.exception))
+
+    def test_agreeing_sets_pass_whatever_they_contain(self) -> None:
+        # Teeth on the two above: a guard that raised unconditionally would
+        # pass both of them and refuse every import.
+        self.assertIsNone(_refuse_unwired_metrics(frozenset(), frozenset()))
+        self.assertIsNone(_refuse_unwired_metrics(frozenset({"x"}), frozenset({"x"})))
+
+    def test_the_guard_runs_at_import_not_only_when_a_summary_is_served(
+        self,
+    ) -> None:
+        # WHERE the check sits is the whole fix, so it is asserted rather than
+        # left to the reader: the call is at module scope in serve.py, outside
+        # every class and function, so `import serve` performs it. A check
+        # moved inside `_recommendations()` would be green on a branch that
+        # serves no summary -- which is the state #84 shipped in.
+        source = (Path(__file__).resolve().parent.parent / "serve.py").read_text()
+        calls = [
+            line
+            for line in source.splitlines()
+            if line.startswith("_refuse_unwired_metrics(")
+        ]
+        self.assertEqual(
+            len(calls),
+            1,
+            "the completeness check is not called at module scope in serve.py, "
+            "so importing the module no longer performs it",
+        )
+
+
 class RecommendationVersionTest(unittest.TestCase):
     """A new payload field is a MINOR release, and the manifest carries it.
 
@@ -6685,6 +7054,12 @@ class RecommendationVersionTest(unittest.TestCase):
     """
 
     RECOMMENDATIONS_MINOR = (1, 2, 0)
+    # #84: a FIFTH metric is a new member of `recommendations.unmeasured` and a
+    # new possible member of `ranked` -- payload fields both, so minor again.
+    # The floor is per change rather than one constant re-pointed, because what
+    # each release owed is a fact about that release: overwriting this would
+    # make the previous claim unverifiable.
+    PER_TTL_REPAYMENT_MINOR = (1, 3, 0)
 
     def test_serving_the_recommendation_block_owes_a_minor_bump(self) -> None:
         self.assertIn("recommendations", Api.summary.__doc__ or "")
@@ -6696,6 +7071,21 @@ class RecommendationVersionTest(unittest.TestCase):
             "payload field and so a MINOR release (docs/versioning.md). The "
             "plugin manifest is Claude Code's update cache key: left unbumped, "
             "installed users receive nothing.",
+        )
+
+    def test_serving_the_per_ttl_repayment_owes_a_further_minor_bump(self) -> None:
+        # The metric has to be IN the payload for the floor to be owed, so both
+        # are asserted here: a version bumped without the field, or a field
+        # shipped without the bump, each fails.
+        self.assertIn(METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, RECOMMENDED_METRICS)
+        parsed = tuple(int(p) for p in cpb.VERSION.split("."))
+        self.assertGreaterEqual(
+            parsed,
+            self.PER_TTL_REPAYMENT_MINOR,
+            "`cache_write_repayment_at_own_ttl` is a new member of the "
+            "`recommendations` payload, which docs/versioning.md makes a MINOR "
+            "release. Bump cpb.VERSION and .claude-plugin/plugin.json together "
+            "-- the manifest is the plugin loader's update cache key.",
         )
 
 

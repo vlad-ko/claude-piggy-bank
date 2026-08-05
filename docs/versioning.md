@@ -1,7 +1,7 @@
 # Versioning
 
 CPB follows [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html),
-and is at **<!--cpb:version-->1.2.0<!--/cpb:version-->** (checked against `cpb.VERSION` on 2026-08-05; that constant
+and is at **<!--cpb:version-->1.3.0<!--/cpb:version-->** (checked against `cpb.VERSION` on 2026-08-05; that constant
 is the authority and this line has lagged a release before).
 
 `cpb.VERSION` is the source of truth; `.claude-plugin/plugin.json` repeats it
