@@ -315,11 +315,17 @@ HEALTH_ORDER = (HEALTH_FAILED, HEALTH_UNCHECKED, HEALTH_OK)
 # these rather than composing its own, for the reason `sample_is` exists: the
 # words that say what was and was not established belong with the code that
 # established it.
+#
+# EACH LEADS WITH ITS ANSWER (#88). The card's heading is the question "is
+# anything blowing up?", and a first line that opens with the evidence has made
+# the reader derive the answer from it. `ok` said "No." from the start; the
+# failed one led with the evidence until #88, which matters more now that
+# `failed` is the ONE verdict that expands its own detail.
 HEALTH_STATEMENTS = {
     HEALTH_FAILED: (
-        "At least one check FAILED. That is not softened by the checks that "
-        "passed -- read the failing line first, and treat every figure it "
-        "qualifies as suspect until it is fixed."
+        "Yes. At least one check FAILED, and that is not softened by the "
+        "checks that passed -- read the failing line first, and treat every "
+        "figure it qualifies as suspect until it is fixed."
     ),
     HEALTH_UNCHECKED: (
         "Nothing is proven broken, and at least one check COULD NOT BE MADE. "
@@ -367,6 +373,91 @@ SATURATION_RANKED_BY = (
     "share of a scope's banded calls at or above half the model's documented "
     "context window"
 )
+
+# #88: THE ANSWER TO "AM I WASTING CONTEXT?", and it is a measurement.
+#
+# The card shipped answering with a LOCATION -- "Most of it, of the scopes
+# measured, is in your main-thread" -- which names where the context is and
+# never says whether any of it is a problem. A reader wanting yes or no got
+# neither, and "most of it" had no antecedent on the resting page, because the
+# meters that would give "it" a referent are one expansion down.
+#
+# The previous wording was a correction of a worse one: "the pressure is in
+# your X" asserts that there IS pressure, which is false of a healthy corpus
+# and would be the page inventing a finding. That instinct was right. The fix
+# is not to soften further but to make the sentence CONDITIONAL ON THE
+# MEASUREMENT -- so it is decided here, beside the tallies it is decided from,
+# and the page renders the verdict and its sentence exactly as it renders the
+# health verdict's.
+#
+# FIVE STATES, BECAUSE THE QUESTION HAS FIVE TRUE ANSWERS over this data, and
+# collapsing any pair of them would be the milder-of-two-true-statements defect
+# `HEALTH_UNCHECKED` exists to prevent one card up:
+#
+#   * `yes`         -- calls sit at or above the judged boundary. Proven, and
+#                      the scope doing most of it is named beside the verdict.
+#   * `no`          -- a complete sample, banded, none of it at the boundary. A
+#                      POSITIVE finding, stated as one, exactly as an `ok`
+#                      health verdict is.
+#   * `inconclusive`-- nothing reached the boundary, but part of the period
+#                      could not be read against a window at all. Not a clean
+#                      no; the counts that say how much sit with the verdict.
+#   * `unknown`     -- calls were measured and NONE of them could be banded, so
+#                      there is nothing to compare against a window.
+#   * `no sample`   -- no call in the period carried a measured context size.
+#
+# AN UNKNOWN MAY WEAKEN A `no` AND NEVER A `yes`: a proven saturation is not
+# softened by the calls that could not be measured beside it. Same direction as
+# every other fallback in this repository.
+CONTEXT_ANSWER_YES = "yes"
+CONTEXT_ANSWER_NO = "no"
+CONTEXT_ANSWER_INCONCLUSIVE = "inconclusive"
+CONTEXT_ANSWER_UNKNOWN = "unknown"
+CONTEXT_ANSWER_NO_SAMPLE = "no sample"
+# Enumerated, in the order "worst known" to "least established", so "every
+# state is handled" is a checkable statement rather than a habit.
+CONTEXT_ANSWER_STATES = (
+    CONTEXT_ANSWER_YES,
+    CONTEXT_ANSWER_NO,
+    CONTEXT_ANSWER_INCONCLUSIVE,
+    CONTEXT_ANSWER_UNKNOWN,
+    CONTEXT_ANSWER_NO_SAMPLE,
+)
+# One sentence per state, spelled ONCE and here rather than in the page, for
+# the reason `HEALTH_STATEMENTS` and `shape_statement` are: this branch shipped
+# a heading ("And it only ever grows.") that the same database contradicted
+# three hours later, because nothing guards prose written in a template. Each
+# of these LEADS WITH THE ANSWER WORD -- the question is a yes/no question, and
+# a first line that opens with a caveat has not answered it.
+CONTEXT_ANSWER_STATEMENTS = {
+    CONTEXT_ANSWER_YES: (
+        "Yes. Calls are running at or above half the context window their "
+        "model documents -- the judged boundary dated below -- and the scope "
+        "doing most of it is named beside this line."
+    ),
+    CONTEXT_ANSWER_NO: (
+        "No. Every scope's banded calls sat below half the context window "
+        "their models document, and every call in this period was measured, "
+        "banded and inside its window. That is a measured no over a complete "
+        "sample, not an absence of evidence."
+    ),
+    CONTEXT_ANSWER_INCONCLUSIVE: (
+        "Not established. No scope reached half its models' documented "
+        "window, but part of this period could not be read against one, so "
+        "this is not a clean no. The counts beside this line say how much, "
+        "and each of them is UNKNOWN rather than low."
+    ),
+    CONTEXT_ANSWER_UNKNOWN: (
+        "Unknown. Contexts were measured in this period and not one of them "
+        "could be compared with a documented window, so there is no "
+        "utilisation to answer with -- unknown, not none."
+    ),
+    CONTEXT_ANSWER_NO_SAMPLE: (
+        "No sample. No call in this period carried a measured context size, "
+        "so there is no median and no utilisation to report. None of that is "
+        "a zero."
+    ),
+}
 
 # #65: the growth curve. THE finding that makes the context figures actionable
 # -- typical main-session context across the four quarters of its own life,
@@ -1663,6 +1754,13 @@ class Api:
         # which is the exact failure this block exists to prevent.
         kinds = list(SCOPE_ORDER) + sorted(k for k in scopes if k not in SCOPE_ORDER)
         by_scope = [self._scoped_utilisation(k, scopes.get(k)) for k in kinds]
+        pooled_scoped = self._scoped_utilisation(None, pooled)
+        # ONE row wins the ranking, and the winner's own figures travel with
+        # its name: `worst_scope` alone names a scope without saying what makes
+        # it the worst, and the reader would have to open the meters to find
+        # out. Read off the winning row rather than re-derived, so the answer
+        # and the meter behind it cannot disagree.
+        worst = self._worst_saturated_scope(by_scope)
         sizes.sort()
         growth = self._growth_curve(growth_points)
         percentiles = {f"p{p}": nearest_rank(sizes, p) for p in PERCENTILES}
@@ -1703,7 +1801,7 @@ class Api:
                 # share of a set the reader cannot see, and the reader's own
                 # scope is diluted in it 6:1.
                 "includes": SCOPE_INCLUDES_BOTH,
-                **self._scoped_utilisation(None, pooled),
+                **pooled_scoped,
                 # The SCOPED tallies -- one entry per scope, always both known
                 # kinds, in `SCOPE_ORDER`.
                 "by_scope": by_scope,
@@ -1713,8 +1811,21 @@ class Api:
                 # (`RANKED_BY`'s rule), so the phrase below is the one
                 # `_worst_saturated_scope()` maximises and the one the page
                 # puts in the sentence.
-                "worst_scope": self._worst_saturated_scope(by_scope),
+                "worst_scope": worst["scope"] if worst else None,
                 "worst_scope_ranked_by": SATURATION_RANKED_BY,
+                # #88: the VALUE of the key the ranking ordered by, published
+                # beside the winner it produced. Null when no scope ranked --
+                # never 0, which would report the scope that measured nothing
+                # as the most frugal one.
+                "worst_scope_over_half_window_calls": (
+                    worst["over_half_window_calls"] if worst else None
+                ),
+                "worst_scope_over_half_window_share": (
+                    worst["over_half_window_share"] if worst else None
+                ),
+                # #88: and whether any of that is a problem, which is the
+                # question the card's heading asks and the one nothing answered.
+                "answer": self._context_answer(worst, pooled_scoped, len(sizes)),
             },
             # #65: the mechanism behind the bands. Its own block rather than a
             # field on `utilisation`, because it ranges over ONE scope and over
@@ -1724,8 +1835,10 @@ class Api:
         }
 
     @staticmethod
-    def _worst_saturated_scope(by_scope: list[dict[str, Any]]) -> Optional[str]:
-        """The scope with the largest `over_half_window_share`, or None (#65).
+    def _worst_saturated_scope(
+        by_scope: list[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """The scope ROW with the largest `over_half_window_share` (#65).
 
         None when NO scope has a share at all -- every one of them has an empty
         banded sample, so there is no ranking rather than a ranking whose
@@ -1737,11 +1850,61 @@ class Api:
         Ties go to the FIRST scope in `SCOPE_ORDER`, which `max()` gives
         without a tiebreaker because it returns the first maximal element. That
         is the main thread, which is the scope a reader can act on.
+
+        **The whole ROW, not the name** (#88). The card states the share and
+        the count that make this scope the winner, and taking them off the row
+        the ranking returned is what stops the answer and the meter below it
+        from being two derivations of one figure.
         """
         ranked = [s for s in by_scope if s["over_half_window_share"] is not None]
         if not ranked:
             return None
-        return max(ranked, key=lambda s: s["over_half_window_share"])["scope"]
+        return max(ranked, key=lambda s: s["over_half_window_share"])
+
+    @staticmethod
+    def _context_answer(
+        worst: Optional[dict[str, Any]],
+        pooled: dict[str, Any],
+        sample_calls: int,
+    ) -> dict[str, Any]:
+        """Whether this period is wasting context, as one of five states (#88).
+
+        The card's heading is a question, so its first line must answer that
+        question -- and the answer has to be DERIVED, because a sentence
+        written into the template is a claim nothing can check. This branch
+        already shipped one of those ("And it only ever grows.") and the same
+        database contradicted it three hours later.
+
+        **The order of the branches is the judgment.** A proven reading is
+        reported before an absent one: `yes` is decided from the POOLED count
+        at or above the judged boundary, so it holds however the unmeasured,
+        unwindowed and over-window calls fall around it. Only where nothing
+        reached the boundary can an unknown weaken the answer -- and there it
+        must, because "no scope reached it, and a third of the period could not
+        be looked at" is not the same claim as "no scope reached it".
+
+        `no` is therefore the ONE state that asserts a complete clean sample,
+        which is what makes it safe to say plainly. Every other state names
+        what it could not establish.
+        """
+        if not sample_calls:
+            verdict = CONTEXT_ANSWER_NO_SAMPLE
+        elif worst is None:
+            verdict = CONTEXT_ANSWER_UNKNOWN
+        elif pooled["over_half_window_calls"]:
+            verdict = CONTEXT_ANSWER_YES
+        elif (
+            pooled["unmeasured_calls"]
+            or pooled["unknown_model_calls"]
+            or pooled["over_window_calls"]
+        ):
+            verdict = CONTEXT_ANSWER_INCONCLUSIVE
+        else:
+            verdict = CONTEXT_ANSWER_NO
+        return {
+            "verdict": verdict,
+            "statement": CONTEXT_ANSWER_STATEMENTS[verdict],
+        }
 
     @classmethod
     def _growth_curve(

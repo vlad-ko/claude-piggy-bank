@@ -114,6 +114,15 @@
   .answer { font-size:15px; font-weight:600; letter-spacing:-.01em; line-height:1.4; }
   .answer .tag { display:inline-block; border-radius:5px; padding:1px 7px; margin-right:6px;
                  font-size:11px; font-weight:700; letter-spacing:.03em; background:#eef2ff; color:#3730a3; }
+  /* The three KINDS of claim an answer can be, as named classes rather than a
+     colour spelled at the binding: a measured problem, a measured all-clear,
+     and something not established. The health band colours its tag from the
+     card's own edge class; a question card has no edge, so the tone rides on
+     the tag -- and the state's own word is rendered inside it either way, so
+     the colour is never the only thing carrying the verdict. */
+  .answer .tag-alarm { background:#fee2e2; color:var(--red); }
+  .answer .tag-clear { background:#ecfdf5; color:var(--ok); }
+  .answer .tag-incomplete { background:#fef3c7; color:var(--amber); }
   /* The KEY a ranking is ordered by, and the DATE a lookup table was decided:
      small, but never hidden. A ranking whose key is one click away has not
      named its key (serve.RANKED_BY's rule), and a judged table whose date is
@@ -392,9 +401,14 @@
 
        SIX LINES OF `OK -- check-name: full sentence` WAS THE DENSITY PROBLEM IN
        MINIATURE, so the checks moved one expansion down and the verdict did
-       not. `healthOpen` decides the DEFAULT only: a clean corpus collapses to
-       two lines, and anything that is not clean opens itself, because a problem
-       must never sit behind a click the reader has to know to make. -->
+       not. `healthOpen` decides the DEFAULT only, and only a FAILED verdict
+       opens itself: a problem must never sit behind a click the reader has to
+       know to make, and an `unchecked` one is not that problem. Measured on
+       this project's own database, `unchecked` is the PERMANENT state -- 58 of
+       59 sources were ingested before the census existed and are censused only
+       when they next change -- so a card that opened on it was a card open for
+       ever. The verdict line still says UNCHECKED, in its own tone, and says
+       the bill of health is incomplete. See `HEALTH_OPEN`. -->
   <section class="q" id="health-note" x-cloak x-show="summary" :class="healthTone">
     <h2><span class="num">1</span>Is anything blowing up?</h2>
     <template x-if="summary && banner.loadFailure"><div>
@@ -457,10 +471,23 @@
        stops; its evidence -- meters, quarter medians, ranked rows, counts,
        provenance -- sits in exactly one `<details>` below it. The `:open`
        binding decides only the DEFAULT, and it decides it from the payload: a
-       reading the API calls healthy collapses to a line, and anything that is
-       not healthy opens ITSELF, because a problem must never be hidden behind
-       a click the reader has to know to make. A healthy corpus is therefore a
-       short quiet page, which is itself the finding.
+       card opens ITSELF when the API has PROVEN something to act on -- a
+       failed check, a scope at or above the judged boundary, a lever -- because
+       a problem must never be hidden behind a click the reader has to know to
+       make. Everything else collapses, and that INCLUDES the states that
+       merely could not be established.
+
+       WHY AN UNKNOWN COLLAPSES RATHER THAN OPENS, which is the correction #88
+       needed twice. The states that say "could not be checked" are the
+       PERMANENT ones: a corpus censused only when its files next change, a
+       metric with no sample because this project dispatches no subagents, a
+       model this build has no window for. Opened by those, a card is open on
+       every load for ever, by a condition the reader cannot clear and need not
+       act on -- and a density rule that never collapses anything is not one.
+       So each of those states states ITSELF at rest, in the API's own words
+       and with its own counts, and puts only the EVIDENCE one click down. A
+       healthy corpus is therefore a short quiet page, which is itself the
+       finding.
 
        WHAT COLLAPSING MAY NOT COST. Collapsed is still rendered -- no field
        lost a reader and `NOT_RENDERED` did not grow by one. A real 0 and a
@@ -491,15 +518,30 @@
   <!-- =====================================================================
        QUESTION 2: AM I WASTING CONTEXT? (#31, #61, #65, #88)
 
-       THE ANSWER IS THE SCOPE, and it is stated before a single number. Which
-       scope is the problem is a RANKING, so it is computed once, server-side,
-       beside the phrase it orders by -- `RANKED_BY`'s discipline. The page
-       states the winner and the key; it ranks nothing itself.
+       THE FIRST LINE ANSWERS THE HEADING, and until #88's second pass it did
+       not. The card read "Most of it, of the scopes measured, is in your
+       main-thread", which is a LOCATION: a reader wanting yes or no got
+       neither, and "most of it" had no antecedent on the resting page, because
+       the meters that would give "it" a referent are one expansion down.
+
+       THE ANSWER IS CONDITIONAL ON THE MEASUREMENT, and it is the API that
+       decides it. A scope at or above the judged boundary answers YES and
+       names the scope with the share and the count that make it so; nothing
+       above the boundary answers NO, as a finding, exactly as an `ok` health
+       verdict is a positive statement rather than an absence. Where part of
+       the period could not be read against a window at all the answer says
+       that instead, because "no scope reached it" and "no scope reached it,
+       and a third of the calls could not be looked at" are different claims.
+       Five states, five sentences, all five in `serve.CONTEXT_ANSWER_*` --
+       none of them written here. A sentence typed into this template is a
+       claim nothing can check, which is how this branch once shipped the
+       heading "And it only ever grows." over a database that had sawtoothed.
 
        THE KEY STAYS ON THE CARD. A ranking whose ordering key is one click
        away has not named its key, so `worst_scope_ranked_by` sits with the
-       answer even though it is the longest string here. The evidence it is a
-       ranking OVER -- the per-scope meters -- is what moved down.
+       answer even though it is the longest string here -- and since #88 the
+       VALUE of that key sits there too. The evidence it is a ranking OVER --
+       the per-scope meters -- is what moved down.
 
        TWO PROVENANCES, NEVER MERGED, and neither is deleted by the collapse.
        The denominator is Anthropic's DOCUMENTED context window. Where the band
@@ -508,34 +550,40 @@
        it is and the judged one visually marked, because presenting the second
        in the first's voice would borrow an authority this project has not
        earned -- which is the whole reason the API carries them as two fields
-       with two dates.
+       with two dates. The judged one also PRODUCES the verdict above it, so it
+       stays on the resting card with the claim it produced.
        ===================================================================== -->
   <section class="q" id="context-note">
     <h2><span class="num">2</span>Am I wasting context?</h2>
     <template x-if="!summary"><div class="answer">Loading&hellip;</div></template>
+    <!-- A window with no measured context at all keeps its own branch, because
+         what follows it is a screen of meters over a sample that does not
+         exist -- but the SENTENCE is the API's, like every other state's. -->
     <template x-if="summary && !summary.context.sample_calls"><div>
-      <div class="answer"><span class="tag">NO SAMPLE</span>
-        No call in this period carried a measured context size, so there is no
-        median and no utilisation to report.</div>
+      <div class="answer"><span class="tag" :class="contextTone"
+             x-text="summary.context.utilisation.answer.verdict.toUpperCase()"></span>
+        <span x-text="summary.context.utilisation.answer.statement"></span></div>
       <div class="answer-key"><span x-text="fmtCount(summary.context.unmeasured_calls)"></span>
         call(s) carry no context accounting at all &mdash; UNMEASURED, not zero.</div>
     </div></template>
     <template x-if="summary && summary.context.sample_calls"><div>
-      <div class="answer">
-        <template x-if="summary.context.utilisation.worst_scope === null"><span>
-          <span class="tag">UNKNOWN</span> No scope in this period has a banded
-          sample, so there is no scope to name &mdash; unknown, not none.
-        </span></template>
-        <!-- A SUPERLATIVE OVER A RANKING, not a verdict this page reached.
-             "The pressure is in your X" asserts that there IS pressure, which
-             is false of a healthy corpus and would be the page inventing a
-             finding; "most of it is in X" is true whatever the level, and the
-             LEVEL is what the meters below state. Whether the reading is quiet
-             enough to leave collapsed is `contextIsQuiet`, which counts rather
-             than judges. -->
+      <div class="answer"><span class="tag" :class="contextTone"
+             x-text="summary.context.utilisation.answer.verdict.toUpperCase()"></span>
+        <span x-text="summary.context.utilisation.answer.statement"></span>
+        <!-- WHAT MAKES IT SO, and it is the ranking's own winner with the
+             VALUE of the key it was ranked by. A yes that named no scope would
+             leave the reader nowhere to go, and a no with no figure beside it
+             would be a claim with no evidence on a card whose evidence is
+             collapsed. Both figures come off the winning row server-side, so
+             this line and the meter below it cannot be two derivations of one
+             number. Absent when no scope ranked -- there is no winner to name,
+             and the verdict above already says so. -->
         <template x-if="summary.context.utilisation.worst_scope !== null"><span>
-          Most of it, of the scopes measured, is in your
-          <strong x-text="summary.context.utilisation.worst_scope"></strong>.
+          Highest scope:
+          <strong x-text="summary.context.utilisation.worst_scope"></strong>,
+          <strong x-text="fmtPct(summary.context.utilisation.worst_scope_over_half_window_share)"></strong>
+          (<span x-text="fmtCount(summary.context.utilisation.worst_scope_over_half_window_calls)"></span>)
+          of its banded calls at or above half the window.
         </span></template>
       </div>
       <div class="answer-key">Ranked by
@@ -545,14 +593,36 @@
         boundaries this project judges
         (<span x-text="summary.context.utilisation.bands_as_of"></span>).</div>
 
-      <!-- THE EVIDENCE. One disclosure, opened by `contextIsQuiet`: a scope
-           that ran nothing at or above the judged half-window line, with no
-           unmeasured, unwindowed or over-window call among them, collapses;
-           anything else opens. Every branch of "not clean" is in that getter
-           on purpose -- an INCONCLUSIVE reading is not a healthy one, and
-           hiding it would be the milder-of-two-true-statements defect this
-           repository keeps finding. -->
-      <details class="disclosure" id="context-detail" :open="!contextIsQuiet">
+      <!-- WHAT THE ANSWER COULD NOT RANGE OVER, at rest and only when there is
+           some: the verdict above collapses its evidence unless it is a proven
+           yes, so a period that could not be fully read must say so on the
+           resting card rather than one click down. Counted three ways because
+           they are three different absences with three different remedies --
+           and each is a health check of its own one card up, which is where a
+           call measuring past its own window is reported as the FAILURE it is.
+           Silent on a clean corpus: a notice that never varies is one nobody
+           reads. -->
+      <template x-if="summary.context.utilisation.unmeasured_calls
+                      || summary.context.utilisation.unknown_model_calls
+                      || summary.context.utilisation.over_window_calls"><div class="answer-key">
+        Not fully banded:
+        <span x-text="fmtCount(summary.context.utilisation.unmeasured_calls)"></span>
+        call(s) with no context accounting,
+        <span x-text="fmtCount(summary.context.utilisation.unknown_model_calls)"></span>
+        on a model with no documented window,
+        <span x-text="fmtCount(summary.context.utilisation.over_window_calls)"></span>
+        measuring above 100% of theirs. The first two are UNKNOWN rather than
+        low; the third is impossible, so treat the bands as suspect rather than
+        those calls as extraordinary.</div></template>
+
+      <!-- THE EVIDENCE. One disclosure, and `contextOpen` decides only its
+           DEFAULT: a proven YES opens the meters, because a problem must never
+           sit behind a click the reader has to know to make, and every other
+           state collapses because it has already stated itself above -- with
+           its counts -- and none of them is a thing to act on. An absence that
+           forced this open would hold it open for ever on any corpus that
+           carries one, which is the defect `HEALTH_OPEN` records. -->
+      <details class="disclosure" id="context-detail" :open="contextOpen">
         <summary>The meters, the growth curve, and how all of it is computed</summary>
 
         <!-- #61: SCOPED FIRST, POOLED SECOND.
@@ -972,12 +1042,19 @@
       </div></template>
       <div class="answer-key">Each reading is looked up in a dated table of
         ranges (decided <span x-text="summary.recommendations.as_of"></span>).
+        <!-- THE UNMEASURED COUNT IS THE PRICE OF COLLAPSING ON IT. This card
+             no longer opens itself for a metric with no sample -- a project
+             that dispatches no subagent has no main-to-subagent ratio and
+             never will, and a card held open by that is a card never collapsed
+             at all -- so the count stays at rest, beside the answer, saying in
+             the same breath that unmeasured is not healthy. WHICH metrics they
+             are is evidence, and evidence is what the disclosure holds. -->
         <template x-if="Object.keys(summary.recommendations.unmeasured).length"><span>
           <span x-text="Object.keys(summary.recommendations.unmeasured).length"></span>
           of them could not be measured in this period, which is not the same as
           healthy.</span></template></div>
 
-      <details class="disclosure" id="optimize-detail" :open="!opportunitiesAreQuiet">
+      <details class="disclosure" id="optimize-detail" :open="opportunitiesOpen">
         <summary>Every reading, worst first &mdash; and where each range comes from</summary>
         <span class="context-line context-judged">Table:
           <span x-text="summary.recommendations.provenance"></span></span>
@@ -1117,9 +1194,17 @@
         First: <strong x-text="topOpportunity.lever.directive"></strong>.
       </div></template>
       <div class="answer-key">In the order the dated table ranks them, each move
-        named by the figure that justifies it.</div>
+        named by the figure that justifies it.
+        <!-- The same count as question 3's, for the same reason and on the
+             same card-by-card rule: a metric with no sample might have been
+             the first move, so a list that collapses on "no lever" must state
+             at rest how many readings never got one. -->
+        <template x-if="Object.keys(summary.recommendations.unmeasured).length"><span>
+          <span x-text="Object.keys(summary.recommendations.unmeasured).length"></span>
+          reading(s) could not be measured in this period, so no move is offered
+          for them &mdash; unmeasured, not healthy.</span></template></div>
 
-      <details class="disclosure" id="next-detail" :open="!opportunitiesAreQuiet">
+      <details class="disclosure" id="next-detail" :open="opportunitiesOpen">
         <summary>Every move, in order</summary>
         <ol class="next">
           <template x-for="a in summary.recommendations.ranked" :key="a.metric">
@@ -1799,19 +1884,77 @@ const HEALTH_TONE_UNRECOGNISED = HEALTH_TONE.failed;
 // #88: whether the verdict's evidence is OPEN when the page lands, one entry
 // per state, and a table for exactly the reason `HEALTH_TONE` is one.
 //
-// THE ASYMMETRY IS THE POINT and it runs the same direction as every other
-// fallback on this page. A clean corpus collapses to two lines, because a
-// healthy report should be short and quiet -- that brevity IS the finding. A
-// corpus that is not clean opens ITSELF, because a problem hidden behind a
-// click the reader has to know to make is a problem this page failed to
-// report. A state added server-side that this build has never seen therefore
-// falls to OPEN, never to collapsed.
+// ONLY A PROVEN PROBLEM EXPANDS ITSELF. A problem must never sit behind a
+// click the reader has to know to make, so `failed` opens its own six lines.
+// Everything else collapses, INCLUDING `unchecked` -- and that correction is
+// the whole of this rule.
+//
+// WHY `unchecked` COLLAPSES, measured 2026-08-05 on this project's own
+// database: the corpus was clean, every check passed but one, and the card
+// still opened all six lines. The `transcript-format-census` check read 58 of
+// 59 sources uncensused -- they were ingested before the census existed and
+// are unchanged, so they are censused only when they next change, which for
+// most of them is never. That verdict is PERMANENT AND BENIGN, so the card was
+// permanently open: the one page state nobody can design for is the one every
+// reader sees every time, and a density rule that never collapses anything is
+// not a density rule.
+//
+// NOTHING IS HIDDEN BY IT. The verdict line still renders UNCHECKED, in its
+// own tone, saying the bill of health is incomplete -- the reader is told and
+// can open the detail. What they must not get is six dense lines forced open
+// for ever by a condition they cannot clear and need not act on.
+//
+// A state added server-side that this build has never seen falls to OPEN,
+// never to collapsed: an unrecognised verdict might be a new FAILURE, and the
+// fallback runs the same direction as `HEALTH_TONE_UNRECOGNISED`.
 const HEALTH_OPEN = {
   ok: false,
-  unchecked: true,
+  unchecked: false,
   failed: true,
 };
 const HEALTH_OPEN_UNRECOGNISED = true;
+
+// #88: the same rule on question 2, over the API's own five answers.
+//
+// `yes` is the only PROVEN one -- calls measured at or above the judged
+// boundary -- so it is the only one that opens the meters. `no` is a clean
+// finding and collapses; `inconclusive`, `unknown` and `no sample` are
+// absences, and an absence forced permanently open is the `unchecked` defect
+// again: a corpus that always carries a few calls with no context accounting,
+// or one model this build has no window for, would open this card for ever.
+//
+// COLLAPSED IS NOT SILENT. Each of those states states ITSELF at rest, in the
+// API's own sentence, with the counts that qualify it beside the verdict --
+// which is what makes collapsing the evidence a density decision rather than a
+// suppression. Where a call cannot be banded at all, the health card one level
+// up reports it as a check of its own and, if it is a failure rather than an
+// unknown, opens itself there.
+const CONTEXT_OPEN = {
+  "yes": true,
+  "no": false,
+  "inconclusive": false,
+  "unknown": false,
+  "no sample": false,
+};
+const CONTEXT_OPEN_UNRECOGNISED = true;
+
+// The tone the ANSWER's tag wears, one entry per state, on the tag rather than
+// on the card: the question cards are the overview's own idiom and only the
+// health band carries a coloured edge. Three tones for five states, because
+// the three KINDS of claim are what a reader tells apart at a glance -- a
+// measured problem, a measured all-clear, and something not established -- and
+// the state's own word is rendered beside it for which of them it is.
+//
+// An unrecognised state takes the loudest tone, never the reassuring one, for
+// the reason `HEALTH_TONE_UNRECOGNISED` does.
+const CONTEXT_TONE = {
+  "yes": "tag-alarm",
+  "no": "tag-clear",
+  "inconclusive": "tag-incomplete",
+  "unknown": "tag-incomplete",
+  "no sample": "tag-incomplete",
+};
+const CONTEXT_TONE_UNRECOGNISED = "tag-alarm";
 
 // #88: one tone per SEGMENT of a utilisation meter, keyed on the band's
 // POSITION in the API's own high-to-low order rather than on its name --
@@ -2233,27 +2376,33 @@ function report() {
       return HEALTH_OPEN[this.summary.health.verdict] ?? HEALTH_OPEN_UNRECOGNISED;
     },
 
-    // --- what each question card is quiet enough to collapse (#88) --------
+    // --- which question card expands its own evidence (#88) ---------------
     //
-    // "Quiet" is NOT "good". It means every reading in the block is a clean
-    // measured one that the API itself places inside a healthy range, so
-    // nothing is being hidden by collapsing it. INCONCLUSIVE is not quiet: an
-    // unmeasured, unwindowed or over-window call is an unknown, and an unknown
-    // is exactly the thing this repository refuses to let a page soften.
+    // ONE RULE ACROSS ALL FOUR: a card expands itself when, and only when, the
+    // API has PROVEN something to act on. A clean finding collapses because a
+    // healthy report should be short and that brevity is itself the finding;
+    // an absence collapses because an absence is not a problem and the states
+    // that produce one are effectively permanent -- a corpus uncensused before
+    // the census existed, a metric with no sample because this project
+    // dispatches no subagents. A card held open by a condition the reader
+    // cannot clear is a card that is never collapsed at all.
     //
-    // NEITHER GETTER RANKS OR THRESHOLDS ANYTHING. `over_half_window_calls` is
-    // a count the API computed against a boundary the API judged and dates;
-    // asking whether that count is non-zero adds no judgment of this page's
-    // own. The alternative -- a cut point spelled here -- would be a second
-    // undated threshold, which is `band_provenance`'s whole failure mode.
-    get contextIsQuiet() {
-      const u = this.summary.context.utilisation;
-      if (u.no_sample_reason !== null) return false;
-      if (u.over_half_window_calls) return false;
-      if (u.unmeasured_calls) return false;
-      if (u.unknown_model_calls) return false;
-      if (u.over_window_calls) return false;
-      return true;
+    // WHAT COLLAPSING MAY NOT COST: every one of those states says ITSELF at
+    // rest, in the API's own words, with the count that qualifies it. The
+    // evidence moves; the claim does not.
+    //
+    // NO GETTER HERE RANKS OR THRESHOLDS ANYTHING. Both read a state the API
+    // decided against a boundary the API dates; a cut point spelled here would
+    // be a second undated threshold, which is `band_provenance`'s failure mode
+    // in the layout layer.
+    get contextOpen() {
+      const verdict = this.summary.context.utilisation.answer.verdict;
+      return CONTEXT_OPEN[verdict] ?? CONTEXT_OPEN_UNRECOGNISED;
+    },
+
+    get contextTone() {
+      const verdict = this.summary.context.utilisation.answer.verdict;
+      return CONTEXT_TONE[verdict] ?? CONTEXT_TONE_UNRECOGNISED;
     },
 
     // The FIRST ranked reading that carries a lever, or null when none does.
@@ -2268,13 +2417,17 @@ function report() {
       return this.summary.recommendations.ranked.find(a => a.lever) ?? null;
     },
 
-    // An unmeasured metric is NOT a healthy one, so it opens the card just as
-    // a lever does. Collapsing it would make "no sample" and "nothing to
-    // change" render identically, which is the defect the table's explicit
-    // healthy entry exists to prevent.
-    get opportunitiesAreQuiet() {
-      if (Object.keys(this.summary.recommendations.unmeasured).length) return false;
-      return this.topOpportunity === null;
+    // A LEVER IS THE PROVEN THING HERE, so a lever is what opens these two
+    // cards. An unmeasured metric used to open them as well, and that was the
+    // `unchecked` defect one card over: a project that dispatches no subagent
+    // has no ratio of main to subagent tokens and never will, so both cards
+    // stood permanently open over a reading nobody can act on. It is not
+    // hidden -- each card states HOW MANY readings could not be measured at
+    // rest, beside the answer, and says in the same breath that unmeasured is
+    // not healthy. Which ones they are is the evidence, and evidence is what
+    // the disclosure holds.
+    get opportunitiesOpen() {
+      return this.topOpportunity !== null;
     },
 
     // --- summary ---------------------------------------------------------

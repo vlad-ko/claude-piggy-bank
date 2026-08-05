@@ -87,6 +87,13 @@ from serve import (  # noqa: E402
     CHECK_MODEL_WINDOW_KNOWN,
     CHECK_RECORDS_PARSED,
     CHECK_WITHIN_WINDOW,
+    CONTEXT_ANSWER_INCONCLUSIVE,
+    CONTEXT_ANSWER_NO,
+    CONTEXT_ANSWER_NO_SAMPLE,
+    CONTEXT_ANSWER_STATEMENTS,
+    CONTEXT_ANSWER_STATES,
+    CONTEXT_ANSWER_UNKNOWN,
+    CONTEXT_ANSWER_YES,
     CONTEXT_SAMPLE,
     GROWTH_MATERIAL_CHANGE,
     GROWTH_MIN_CALLS,
@@ -7997,6 +8004,21 @@ class HealthVerdictTest(HealthGrowthCorpusTest):
         self.assertIsNone(census["of"])
         self.assertEqual(health["verdict"], HEALTH_UNCHECKED)
 
+    def test_the_two_decided_verdicts_lead_with_their_answer(self) -> None:
+        # #88: the card's heading is the question "is anything blowing up?",
+        # and a first line that opens with the evidence has made the reader
+        # derive the answer from it. `ok` has said "No." since #64; the failed
+        # one led with the evidence, which matters more now that `failed` is
+        # the ONE verdict that expands its own six lines. `unchecked` is not
+        # here because its answer is neither: it leads by saying so.
+        self.assertTrue(HEALTH_STATEMENTS[HEALTH_OK].startswith("No."))
+        self.assertTrue(HEALTH_STATEMENTS[HEALTH_FAILED].startswith("Yes."))
+        self.assertNotIn(
+            HEALTH_STATEMENTS[HEALTH_UNCHECKED].split()[0],
+            ("Yes.", "No."),
+            "the unchecked verdict answers a question it cannot answer",
+        )
+
     def test_the_three_verdict_statements_are_three_different_claims(self) -> None:
         # Rendered identically, the states would be a distinction the payload
         # made and the reader could not see.
@@ -8267,6 +8289,240 @@ class SaturationRankingTest(HealthGrowthCorpusTest):
             found[0]["value"],
             self.scope(HG_CLEAN_DAY, SCOPE_MAIN)["over_half_window_share"],
         )
+
+
+class ContextAnswerTest(HealthGrowthCorpusTest):
+    """#88: question 2 answers its own heading, and the answer is a measurement.
+
+    The card asked "am I wasting context?" and replied "Most of it, of the
+    scopes measured, is in your main-thread" -- a LOCATION. A reader wanting
+    yes or no got neither, and "most of it" had no antecedent on the resting
+    page, because the meters that would give "it" a referent are one expansion
+    down.
+
+    The wording before that one ("the pressure is in your X") was worse: it
+    asserts that there IS pressure, which is false of a healthy corpus and
+    would be the page inventing a finding. The fix for both is the same -- the
+    sentence is CONDITIONAL ON THE MEASUREMENT, and it is decided here, beside
+    the tallies it is decided from, never written into a template. This branch
+    already shipped one authored heading ("And it only ever grows.") that the
+    same database contradicted three hours later.
+    """
+
+    def answer(self, day: str | None = None, to: str | None = None) -> dict:
+        return self.summary(day, to)["context"]["utilisation"]["answer"]
+
+    def util(self, day: str | None = None) -> dict:
+        return self.summary(day)["context"]["utilisation"]
+
+    # --- the two answers the question actually has ---
+
+    def test_a_saturated_period_answers_yes(self) -> None:
+        # 8 of 16 main-thread calls at or above half a 1M window. "Yes" is the
+        # answer; the scope is where to go and look.
+        answer = self.answer(HG_CLEAN_DAY)
+        self.assertEqual(answer["verdict"], CONTEXT_ANSWER_YES)
+        self.assertEqual(
+            answer["statement"], CONTEXT_ANSWER_STATEMENTS[CONTEXT_ANSWER_YES]
+        )
+        self.assertEqual(self.util(HG_CLEAN_DAY)["worst_scope"], SCOPE_MAIN)
+
+    def test_a_quiet_period_answers_no_as_a_finding(self) -> None:
+        # THE half a softer wording cannot state. Twelve measured main-thread
+        # calls, every one banded, none at or above the boundary, nothing
+        # unmeasured, unwindowed or over its window: that is a complete clean
+        # sample, and a clean corpus deserves an explicit no exactly as an `ok`
+        # health verdict is a positive statement rather than an absence.
+        answer = self.answer(HG_INSTANT_DAY)
+        self.assertEqual(answer["verdict"], CONTEXT_ANSWER_NO)
+        self.assertEqual(
+            answer["statement"], CONTEXT_ANSWER_STATEMENTS[CONTEXT_ANSWER_NO]
+        )
+        util = self.util(HG_INSTANT_DAY)
+        self.assertEqual(util["over_half_window_calls"], 0)
+        self.assertEqual(util["unmeasured_calls"], 0)
+        self.assertEqual(util["unknown_model_calls"], 0)
+        self.assertEqual(util["over_window_calls"], 0)
+        self.assertGreater(util["banded_calls"], 0)
+
+    def test_the_answer_follows_the_measurement_and_not_the_scope_name(self) -> None:
+        # THE teeth on the answer itself: on this day every saturated call is a
+        # SUBAGENT's. An answer hard-coded to the main thread, or one that
+        # reported the pooled share as the finding, is red here and nowhere
+        # else -- the pooled share is where #61's 6:1 dilution lives.
+        self.assertEqual(self.answer(HG_SUB_HEAVY_DAY)["verdict"], CONTEXT_ANSWER_YES)
+        self.assertEqual(self.util(HG_SUB_HEAVY_DAY)["worst_scope"], SCOPE_SUBAGENT)
+
+    # --- the three states that are neither yes nor no ---
+
+    def test_a_period_that_could_not_be_fully_read_is_not_a_clean_no(self) -> None:
+        # One measured call at 30% of its window and one carrying no prompt
+        # accounting at all. Nothing reached the boundary, so the tempting
+        # answer is "no" -- and it would be the milder of two true statements,
+        # which is the defect this repository keeps finding. The unmeasured
+        # call is UNKNOWN, not low.
+        answer = self.answer(HG_BLIND_DAY)
+        self.assertEqual(answer["verdict"], CONTEXT_ANSWER_INCONCLUSIVE)
+        self.assertNotEqual(answer["verdict"], CONTEXT_ANSWER_NO)
+        self.assertEqual(self.util(HG_BLIND_DAY)["unmeasured_calls"], 1)
+
+    def test_a_measured_period_with_nothing_bandable_is_unknown(self) -> None:
+        # A call on a model this build has no documented window for. Its
+        # context WAS measured, so this is not "no sample"; there is simply
+        # nothing to compare it with -- unknown, not none, and not a quiet no.
+        answer = self.answer(HG_UNKNOWN_DAY)
+        self.assertEqual(answer["verdict"], CONTEXT_ANSWER_UNKNOWN)
+        util = self.util(HG_UNKNOWN_DAY)
+        self.assertIsNone(util["worst_scope"])
+        self.assertEqual(util["unknown_model_calls"], 1)
+        self.assertGreater(self.summary(HG_UNKNOWN_DAY)["context"]["sample_calls"], 0)
+
+    def test_a_period_with_no_measured_context_says_no_sample(self) -> None:
+        # Distinct from `unknown`, and the distinction is the remedy: there is
+        # nothing to band because there is nothing measured, not because
+        # nothing could be compared.
+        answer = self.answer("2026-07-10")
+        self.assertEqual(answer["verdict"], CONTEXT_ANSWER_NO_SAMPLE)
+        self.assertEqual(self.summary("2026-07-10")["context"]["sample_calls"], 0)
+
+    # --- an unknown may weaken a `no`, and never a `yes` ---
+
+    def test_an_unwindowed_call_does_not_soften_a_proven_yes(self) -> None:
+        # Eight banded main-thread calls at 1.0 of the boundary, beside four on
+        # a model with no documented window. The four are a real unknown and
+        # they are counted -- but a proven saturation is not downgraded to
+        # "inconclusive" by the calls that could not be measured next to it.
+        answer = self.answer(HG_LATE_DAY)
+        self.assertEqual(answer["verdict"], CONTEXT_ANSWER_YES)
+        self.assertEqual(self.util(HG_LATE_DAY)["unknown_model_calls"], 4)
+
+    def test_a_call_past_its_own_window_still_answers_yes(self) -> None:
+        # 150% of a 200k window: the call IS at or above the boundary, so the
+        # answer to this question is yes. That the window table is stale is a
+        # different claim with a different remedy, and question 1 states it as
+        # the FAILURE it is (`test_a_reply_past_its_own_window_is_a_failure`).
+        self.assertEqual(self.answer(HG_OVER_DAY)["verdict"], CONTEXT_ANSWER_YES)
+        self.assertEqual(self.util(HG_OVER_DAY)["over_window_calls"], 1)
+
+    # --- the answer, the ranking and the meters are one reading ---
+
+    def test_the_answer_states_the_winners_figure_and_not_the_pooled_one(self) -> None:
+        # THE teeth on the two figures beside the answer, and they need a
+        # window where the two scopes DISAGREE: over 1 and 2 July the main
+        # thread is 8 of 20 banded (0.4) and the subagents 4 of 20 (0.2), so
+        # the pooled tally is 12 of 40 (0.3) and every one of the three numbers
+        # is different. A card that reached for the pooled count -- the easy
+        # field, sitting one line up in the same payload -- would state 12 and
+        # 30% under a sentence naming the main thread, which is #61's dilution
+        # defect wearing the answer's clothes.
+        util = self.summary(HG_CLEAN_DAY, to=HG_SUB_HEAVY_DAY)["context"][
+            "utilisation"
+        ]
+        self.assertEqual(util["worst_scope"], SCOPE_MAIN)
+        self.assertEqual(util["worst_scope_over_half_window_calls"], 8)
+        self.assertEqual(util["worst_scope_over_half_window_share"], 0.4)
+        self.assertEqual(util["over_half_window_calls"], 12)
+        self.assertNotEqual(
+            util["worst_scope_over_half_window_calls"], util["over_half_window_calls"]
+        )
+        self.assertNotEqual(
+            util["worst_scope_over_half_window_share"], util["over_half_window_share"]
+        )
+
+    def test_the_winners_figures_are_the_winning_rows_own(self) -> None:
+        # `worst_scope_over_half_window_*` is what the resting card states, and
+        # `by_scope` is what the meter one click down draws. Derived twice they
+        # would be two figures free to disagree, with the reader unable to see
+        # it because only one of them is on screen.
+        for day in (HG_CLEAN_DAY, HG_SUB_HEAVY_DAY, HG_INSTANT_DAY):
+            with self.subTest(day=day):
+                util = self.util(day)
+                winner = [
+                    s for s in util["by_scope"] if s["scope"] == util["worst_scope"]
+                ]
+                self.assertEqual(len(winner), 1)
+                self.assertEqual(
+                    util["worst_scope_over_half_window_calls"],
+                    winner[0]["over_half_window_calls"],
+                )
+                self.assertEqual(
+                    util["worst_scope_over_half_window_share"],
+                    winner[0]["over_half_window_share"],
+                )
+
+    def test_a_yes_always_names_a_scope_with_a_count_behind_it(self) -> None:
+        # The property the card's sentence depends on: "yes, and it is your X"
+        # must never name a scope whose own count is zero or absent.
+        for day in (HG_CLEAN_DAY, HG_SUB_HEAVY_DAY, HG_OVER_DAY, HG_LATE_DAY):
+            with self.subTest(day=day):
+                util = self.util(day)
+                self.assertEqual(util["answer"]["verdict"], CONTEXT_ANSWER_YES)
+                self.assertIsNotNone(util["worst_scope"])
+                self.assertGreater(util["worst_scope_over_half_window_calls"], 0)
+
+    def test_a_scope_that_ranked_nothing_has_no_figures_rather_than_zeroes(
+        self,
+    ) -> None:
+        # A share of an empty set is not 0%, and a count of an absent winner is
+        # not 0 either: rendered as zeroes they would report the most frugal
+        # possible reading over a period nobody could measure.
+        for day in (HG_UNKNOWN_DAY, "2026-07-10"):
+            with self.subTest(day=day):
+                util = self.util(day)
+                self.assertIsNone(util["worst_scope"])
+                self.assertIsNone(util["worst_scope_over_half_window_calls"])
+                self.assertIsNone(util["worst_scope_over_half_window_share"])
+
+    # --- the states are enumerated, and each is a different claim ---
+
+    def test_every_state_is_declared_and_carries_its_own_sentence(self) -> None:
+        # `CONTEXT_ANSWER_STATES` and `CONTEXT_ANSWER_STATEMENTS` are two
+        # enumerations of one set, and nothing but this ties them: a state with
+        # no sentence would raise on the day it first occurred, and a sentence
+        # for a state nothing produces is prose no reader will ever see.
+        self.assertEqual(set(CONTEXT_ANSWER_STATES), set(CONTEXT_ANSWER_STATEMENTS))
+        self.assertEqual(
+            len(set(CONTEXT_ANSWER_STATEMENTS.values())),
+            len(CONTEXT_ANSWER_STATES),
+            "two states are stated in the same words, so the payload makes a "
+            "distinction the reader cannot see",
+        )
+        for state, statement in CONTEXT_ANSWER_STATEMENTS.items():
+            with self.subTest(state=state):
+                self.assertGreater(len(statement), 40)
+
+    def test_each_sentence_leads_with_the_answer_to_the_question(self) -> None:
+        # The heading is a yes/no question, so the first WORD of the reply is
+        # the reply. A sentence that opens with its evidence has made the
+        # reader derive the answer from it, which is what the location wording
+        # did for the whole of this card's life.
+        for state, lead in (
+            (CONTEXT_ANSWER_YES, "Yes."),
+            (CONTEXT_ANSWER_NO, "No."),
+            (CONTEXT_ANSWER_INCONCLUSIVE, "Not established."),
+            (CONTEXT_ANSWER_UNKNOWN, "Unknown."),
+            (CONTEXT_ANSWER_NO_SAMPLE, "No sample."),
+        ):
+            with self.subTest(state=state):
+                self.assertTrue(
+                    CONTEXT_ANSWER_STATEMENTS[state].startswith(lead),
+                    f"the {state} answer does not lead with its answer",
+                )
+
+    def test_every_state_the_corpus_can_reach_is_reached_by_a_test_above(
+        self,
+    ) -> None:
+        # The enumeration is only a claim about completeness if something
+        # produces every member of it. Each of the five is asserted on a day of
+        # its own above; this is the tie that says the five are all of them.
+        seen = {
+            self.answer(day)["verdict"]
+            for day in (
+                HG_CLEAN_DAY, HG_INSTANT_DAY, HG_BLIND_DAY, HG_UNKNOWN_DAY,
+                "2026-07-10",
+            )
+        }
+        self.assertEqual(seen, set(CONTEXT_ANSWER_STATES))
 
 
 class GrowthCurveTest(HealthGrowthCorpusTest):
@@ -9066,12 +9322,30 @@ class OverviewRestingStateTest(unittest.TestCase):
     every figure behind them still rendered and one expansion away.
 
     ONE RULE GOVERNS THE WHOLE THING: DENSITY SCALES WITH HOW MUCH IS WRONG. A
-    reading the API places inside a healthy range collapses to a line, because
-    a healthy report should be short and quiet and that brevity is itself the
-    finding. Anything that is not healthy -- including anything INCONCLUSIVE,
-    which is not the same as healthy -- opens ITSELF, because a problem behind
-    a click the reader has to know to make is a problem this page failed to
-    report.
+    card opens ITSELF when the API has PROVEN something to act on -- a failed
+    check, a scope at or above the judged boundary, a lever -- because a
+    problem behind a click the reader has to know to make is a problem this
+    page failed to report. Everything else collapses to a line, because a
+    healthy report should be short and quiet and that brevity is itself the
+    finding.
+
+    THE CORRECTION, 2026-08-05, FOUND BY LOOKING AT THE PAGE. This class first
+    shipped saying "anything that is not healthy -- including anything
+    INCONCLUSIVE -- opens itself", and on a freshly re-ingested clean corpus
+    the health card still opened all six of its lines: the verdict was
+    `unchecked`, because `transcript-format-census` read 58 of 59 sources
+    uncensused. Those sources were ingested before the census existed and are
+    unchanged, so they are censused only when they next change -- which for
+    most of them is never. The state is PERMANENT AND BENIGN, so the card was
+    open on every load for ever, and the density rule collapsed nothing on the
+    one page state every reader sees every time.
+
+    So the rule is now: a PROVEN problem expands; an unknown and an all-clear
+    both collapse. Nothing is hidden by it -- each state states itself at rest,
+    in its own tone, with the counts that qualify it, and only the EVIDENCE
+    moves. The same correction runs through questions 2, 3 and 4, because
+    "could not be measured" is permanent there too: a project that dispatches
+    no subagent has no main-to-subagent ratio and never will.
 
     THE LIMIT, STATED PLAINLY. These pin which bindings sit inside which
     region and what decides the `open` attribute. They cannot see whether the
@@ -9097,7 +9371,18 @@ class OverviewRestingStateTest(unittest.TestCase):
     RESTING = {
         "health-note": ("summary.health.verdict", "summary.health.statement"),
         "context-note": (
+            # THE ANSWER TO THE HEADING, and both halves of it: the card asks a
+            # yes/no question, so the verdict AND the sentence that states it
+            # are the first thing on the card. Both are the API's -- a sentence
+            # composed here would be a claim nothing can check.
+            "summary.context.utilisation.answer.verdict",
+            "summary.context.utilisation.answer.statement",
             "summary.context.utilisation.worst_scope",
+            # The VALUE of the key the ranking ordered by, beside the winner it
+            # named: an answer of "yes, in your main-thread" with no figure on
+            # it is a verdict whose evidence is entirely collapsed.
+            "summary.context.utilisation.worst_scope_over_half_window_calls",
+            "summary.context.utilisation.worst_scope_over_half_window_share",
             # A ranking must name the key it orders by, and a key one click
             # away has not been named -- `serve.RANKED_BY`'s rule survives the
             # collapse.
@@ -9224,20 +9509,53 @@ class OverviewRestingStateTest(unittest.TestCase):
                 self.assertIn("<summary>", detail)
                 self.assertNotIn("x-show", detail[: detail.index(">")])
 
-    def test_a_clean_verdict_collapses_and_every_other_state_opens(self) -> None:
+    def test_only_a_failed_verdict_expands_its_own_evidence(self) -> None:
         # THE asymmetry, as a table for the reason `HEALTH_TONE` is one: a
         # chain of ifs could quietly return the same default for two states,
-        # and a test can assert this. `unchecked` is NOT a weaker `ok` -- it is
-        # a different claim, and it must not be the one the reader has to go
-        # looking for.
+        # and a test can assert this.
         table = re.search(r"const HEALTH_OPEN = \{(.*?)\};", self.html, re.S)
         self.assertIsNotNone(table, "HEALTH_OPEN is gone")
         defaults = dict(re.findall(r"(\w+):\s*(true|false)", table.group(1)))
         self.assertEqual(
             defaults,
-            {HEALTH_OK: "false", HEALTH_UNCHECKED: "true", HEALTH_FAILED: "true"},
+            {HEALTH_OK: "false", HEALTH_UNCHECKED: "false", HEALTH_FAILED: "true"},
             "a verdict collapses or expands against the rule",
         )
+
+    def test_a_failed_verdict_cannot_be_collapsed(self) -> None:
+        # One half of the rule on its own, so a table edited wholesale cannot
+        # quietly take this with it: a PROVEN failure is the one thing that
+        # must never sit behind a click the reader has to know to make.
+        table = re.search(r"const HEALTH_OPEN = \{(.*?)\};", self.html, re.S)
+        self.assertRegex(
+            table.group(1),
+            rf"\b{re.escape(HEALTH_FAILED)}:\s*true",
+            "a failing verdict hides its own checks",
+        )
+
+    def test_an_unchecked_verdict_is_not_expanded_by_default(self) -> None:
+        # THE CONVERSE, and the defect the owner found by loading the page: on
+        # a clean, freshly re-ingested corpus the verdict is `unchecked` --
+        # 58 of 59 sources uncensused, because they were ingested before the
+        # census existed and are censused only when they next change -- and the
+        # card opened all six lines on every load for ever. A state the reader
+        # cannot clear and need not act on may not be what holds a card open,
+        # or nothing on the page is ever collapsed.
+        #
+        # It is not hidden by this: `RESTING` above pins that the verdict and
+        # its statement stay on the resting card, and `HEALTH_TONE` gives
+        # `unchecked` a tone of its own, so the reader is told and can open it.
+        table = re.search(r"const HEALTH_OPEN = \{(.*?)\};", self.html, re.S)
+        self.assertRegex(
+            table.group(1),
+            rf"\b{re.escape(HEALTH_UNCHECKED)}:\s*false",
+            "an unchecked verdict forces six lines open on every load",
+        )
+
+    def test_a_verdict_this_build_does_not_know_still_opens(self) -> None:
+        # The fallback runs the other way from the rule above, and must: a
+        # state added server-side that this page has never seen might be a new
+        # FAILURE, and the one thing it must not do is render as a quiet page.
         self.assertIn("const HEALTH_OPEN_UNRECOGNISED = true;", self.html)
         self.assertIn(
             "?? HEALTH_OPEN_UNRECOGNISED", js_function_body(self.html, "get healthOpen(")
@@ -9253,41 +9571,88 @@ class OverviewRestingStateTest(unittest.TestCase):
             r"return HEALTH_OPEN_UNRECOGNISED;",
         )
 
-    def test_an_inconclusive_context_reading_is_not_a_quiet_one(self) -> None:
-        # Every way the context block can be less than a clean measured healthy
-        # reading, enumerated -- because "unknown" is not "fine", and a card
-        # that collapsed an INCONCLUSIVE reading would be hiding exactly the
-        # thing this repository refuses to soften.
-        body = js_function_body(self.html, "get contextIsQuiet(")
-        for refusal in (
-            "if (u.no_sample_reason !== null) return false;",
-            "if (u.over_half_window_calls) return false;",
-            "if (u.unmeasured_calls) return false;",
-            "if (u.unknown_model_calls) return false;",
-            "if (u.over_window_calls) return false;",
-        ):
-            with self.subTest(refusal=refusal):
-                self.assertIn(refusal, body)
-        self.assertIn("return true;", body)
-
-    def test_an_unmeasured_metric_opens_the_cards_that_rank_it(self) -> None:
-        # "No sample" and "nothing to change" must not render alike, which is
-        # the rule the table's explicit healthy entry exists for -- so an
-        # unmeasured metric opens the card exactly as a lever does.
-        body = js_function_body(self.html, "get opportunitiesAreQuiet(")
-        self.assertIn(
-            "if (Object.keys(this.summary.recommendations.unmeasured).length) "
-            "return false;",
-            body,
+    def test_only_a_proven_yes_opens_the_context_card(self) -> None:
+        # The same rule as `HEALTH_OPEN`, over the API's five answers, and a
+        # table for the same reason. `yes` is the one state the API has PROVEN
+        # -- calls measured at or above the judged boundary -- so it is the one
+        # that opens the meters. An `inconclusive` or `unknown` reading is an
+        # absence, and the absences here are permanent in exactly the way the
+        # census one is: a corpus that always carries a few calls with no
+        # context accounting, or one model this build has no window for, would
+        # hold this card open on every load for ever.
+        table = re.search(r"const CONTEXT_OPEN = \{(.*?)\};", self.html, re.S)
+        self.assertIsNotNone(table, "CONTEXT_OPEN is gone")
+        defaults = dict(re.findall(r'"([^"]+)":\s*(true|false)', table.group(1)))
+        self.assertEqual(
+            defaults,
+            {
+                CONTEXT_ANSWER_YES: "true",
+                CONTEXT_ANSWER_NO: "false",
+                CONTEXT_ANSWER_INCONCLUSIVE: "false",
+                CONTEXT_ANSWER_UNKNOWN: "false",
+                CONTEXT_ANSWER_NO_SAMPLE: "false",
+            },
+            "question 2 collapses or expands against the rule",
         )
-        self.assertIn("return this.topOpportunity === null;", body)
+        self.assertEqual(
+            set(defaults),
+            set(CONTEXT_ANSWER_STATES),
+            "the page has a default for a state the API does not send, or "
+            "none for one it does",
+        )
+        self.assertIn("const CONTEXT_OPEN_UNRECOGNISED = true;", self.html)
+        self.assertIn(
+            "?? CONTEXT_OPEN_UNRECOGNISED",
+            js_function_body(self.html, "get contextOpen("),
+        )
 
-    def test_neither_quiet_getter_holds_a_threshold_of_its_own(self) -> None:
+    def test_what_could_not_be_banded_is_stated_at_rest_not_collapsed(self) -> None:
+        # THE PRICE OF COLLAPSING ON AN UNKNOWN, and it is paid on the resting
+        # card. An `inconclusive` answer no longer opens the meters, so the
+        # three counts that make it inconclusive must be on the card itself --
+        # counted three ways, because three different absences have three
+        # different remedies and a single total would name none of them.
+        resting = self.resting("context-note", "context-detail")
+        for field in ("unmeasured_calls", "unknown_model_calls", "over_window_calls"):
+            with self.subTest(field=field):
+                self.assertIn(
+                    f"fmtCount(summary.context.utilisation.{field})",
+                    resting,
+                    f"{field} is consulted but never stated at rest",
+                )
+
+    def test_an_unmeasured_metric_is_stated_at_rest_rather_than_forced_open(
+        self,
+    ) -> None:
+        # "No sample" and "nothing to change" must not render alike, which is
+        # the rule the table's explicit healthy entry exists for. It used to be
+        # kept by opening both cards, and that is the `unchecked` defect again:
+        # a project that dispatches no subagent has no main-to-subagent ratio
+        # and never will, so both cards stood open for ever over a reading
+        # nobody can act on. The COUNT moved onto the resting card instead; the
+        # names of the metrics are evidence, and evidence is what collapses.
+        body = js_function_body(self.html, "get opportunitiesOpen(")
+        self.assertIn("return this.topOpportunity !== null;", body)
+        self.assertNotIn("unmeasured", body, "an absence still forces the card open")
+        for card_id, detail_id in (
+            ("advice-note", "optimize-detail"),
+            ("next-note", "next-detail"),
+        ):
+            with self.subTest(card=card_id):
+                resting = self.resting(card_id, detail_id)
+                self.assertIn(
+                    "Object.keys(summary.recommendations.unmeasured).length",
+                    resting,
+                    f"{card_id} collapses on an unmeasured reading without "
+                    "saying there is one",
+                )
+
+    def test_no_expansion_getter_holds_a_threshold_of_its_own(self) -> None:
         # What separates "counting" from "judging". Every boundary these
         # getters consult was drawn, dated and published by the API; a numeric
         # literal here would be a second cut point with no date and no
         # provenance -- `band_provenance`'s failure mode, in the layout layer.
-        for decl in ("get contextIsQuiet(", "get opportunitiesAreQuiet("):
+        for decl in ("get contextOpen(", "get opportunitiesOpen("):
             with self.subTest(decl=decl):
                 self.assertNotRegex(
                     js_function_body(self.html, decl),
@@ -9295,6 +9660,57 @@ class OverviewRestingStateTest(unittest.TestCase):
                     "a cut point is spelled in the page rather than read off "
                     "the payload",
                 )
+
+    def test_no_card_writes_an_answer_of_its_own(self) -> None:
+        # THE class of defect this card has now shipped twice: prose typed into
+        # a template is a claim nothing checks. The heading "And it only ever
+        # grows." was true of the database it was written against and false of
+        # the same database three hours later; "Most of it is in your X"
+        # answered a question nobody asked. Both survived a green suite.
+        #
+        # So the sentences live in `serve.CONTEXT_ANSWER_STATEMENTS`, and two
+        # things are pinned here: the page holds no copy of one (a copy is a
+        # second place to change and only one of them is dated), and no card
+        # opens an answer with a yes or a no of its own.
+        for statement in CONTEXT_ANSWER_STATEMENTS.values():
+            with self.subTest(statement=statement[:40]):
+                self.assertNotIn(
+                    statement[:40],
+                    self.html,
+                    "the page spells an answer the API already states",
+                )
+        self.assertNotIn("Most of it", self.html)
+        for card_id, detail_id in self.CARDS:
+            with self.subTest(card=card_id):
+                self.assertNotRegex(
+                    self.resting(card_id, detail_id),
+                    r">\s*(Yes|No)[.,]",
+                    f"{card_id} authors its own answer instead of rendering "
+                    "the one the API decided",
+                )
+
+    def test_the_context_answer_wears_a_tone_for_every_state(self) -> None:
+        # The word is what carries the verdict, and the tone is what a reader
+        # sees before reading it -- a YES that looks exactly like a NO is the
+        # health band's three-tone rule failing one card over. A table, for the
+        # reason `HEALTH_TONE` is one, and the fallback is the loud tone.
+        table = re.search(r"const CONTEXT_TONE = \{(.*?)\};", self.html, re.S)
+        self.assertIsNotNone(table, "CONTEXT_TONE is gone")
+        tones = dict(re.findall(r'"([^"]+)":\s*"([^"]+)"', table.group(1)))
+        self.assertEqual(set(tones), set(CONTEXT_ANSWER_STATES))
+        self.assertNotEqual(
+            tones[CONTEXT_ANSWER_YES],
+            tones[CONTEXT_ANSWER_NO],
+            "a proven yes and a measured no render in the same tone",
+        )
+        for state, css in tones.items():
+            with self.subTest(state=state):
+                self.assertRegex(self.html, rf"\.{re.escape(css)}\s*\{{[^}}]+\}}")
+        self.assertIn('const CONTEXT_TONE_UNRECOGNISED = "tag-alarm";', self.html)
+        self.assertIn(
+            "?? CONTEXT_TONE_UNRECOGNISED",
+            js_function_body(self.html, "get contextTone("),
+        )
 
     def test_the_top_opportunity_reads_the_apis_order_rather_than_ranking(
         self,
