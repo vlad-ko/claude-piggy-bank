@@ -208,13 +208,58 @@ function renderScopeNote(scope) {
       `no readable timestamp, so they belong to no date window and are counted ` +
       `here instead (corpus-wide, not window-scoped).`
     : "";
+  // #44: the PROJECT axis, annotating this same line rather than adding a
+  // panel. The plugin keeps ONE database per install, so a user-scope install
+  // ingests every project the user opens into the same file and every figure
+  // below becomes a sum across them, worded as though it described one.
+  //
+  // SILENT when the database holds a single project -- the ordinary case must
+  // not start announcing a dimension it does not have, and a notice that never
+  // varies is a notice nobody reads. Two counts, not one: `in_window` is what
+  // the figures cover, `in_database` is what the file mixes together, and a
+  // project ingested but idle in this window is a measured zero rather than an
+  // absence, so narrowing the dates must not quietly shrink the claim.
+  //
+  // COUNTS, not names. A project name is the working directory with its
+  // separators folded to `-`, so it carries the username and the repo name;
+  // eighteen of them would also swamp a one-line band. `/api/summary` carries
+  // them for anyone who needs them, exactly as the durability block carries
+  // its source paths while the banner states a count.
+  const p = scope.projects;
+  let projects = "";
+  if (p.in_database > 1) {
+    projects = p.in_window > 1
+      ? ` <strong>Across ${p.in_window} projects.</strong> Every figure below is ` +
+        `a CROSS-PROJECT total, not one project's` +
+        (p.in_database > p.in_window
+          ? `, and this database holds ${p.in_database} projects in all — the ` +
+            `other ${p.in_database - p.in_window} ` +
+            `${p.in_database - p.in_window === 1 ? "has" : "have"} no calls in ` +
+            `this period, which is a measured zero, not an absence.`
+          : `.`)
+      : ` <strong>This database holds ${p.in_database} projects</strong>, of ` +
+        `which ${p.in_window} ${p.in_window === 1 ? "has" : "have"} calls in ` +
+        `this period &mdash; so the figures below cover ` +
+        `${p.in_window === 1 ? "that one" : "none of them"}. The rest are a ` +
+        `measured zero here, not absent.`;
+    projects +=
+      ` Project names are not rendered here; <code>/api/summary</code> lists ` +
+      `them under <code>scope.projects</code>.`;
+  }
+  if (p.unattributed_calls) {
+    projects +=
+      ` <strong>${p.unattributed_calls.toLocaleString()} call(s)</strong> in ` +
+      `this period come from a path the transcript layout cannot parse, so ` +
+      `their project is <strong>UNKNOWN</strong> &mdash; counted in the totals ` +
+      `below, and in no project above.`;
+  }
   if (!cov.sessions_with_subagent_transcripts) {
     el.innerHTML =
       `<strong>Scope: MAIN-THREAD ONLY.</strong> No <code>subagents/</code> ` +
       `transcripts were found for any of the ${cov.sessions} session(s) in ` +
       `this period, so subagent spend is <strong>unmeasured, not zero</strong> ` +
       `&mdash; every figure below is a main-thread figure, not a session total.` +
-      undated;
+      projects + undated;
     return;
   }
   el.innerHTML =
@@ -223,7 +268,7 @@ function renderScopeNote(scope) {
     `${cov.sessions_with_subagent_transcripts} of ${cov.sessions} session(s) ` +
     `in this period are included. Subagent calls have no main-thread turn, so ` +
     `they appear under the "subagent" bucket in the by-turn-type chart.` +
-    undated;
+    projects + undated;
 }
 
 // ONE banner element, three things that can want it: a failed load, the

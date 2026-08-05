@@ -271,6 +271,37 @@ misconfigured wrapper cannot quietly write to a database nobody reads.
 `serve.py` does not read `CPB_DB`; point it at the same file with
 `python3 serve.py --db "$CPB_DB"`.
 
+### One database can hold several projects, and the report says which
+
+Claude Code keys transcripts on the **working directory**, so every repo — and
+every git worktree — is its own project. One database can therefore hold
+several of them: `CPB_DB` points every invocation at one file, and the plugin
+resolves one database per *install*, so a plugin enabled at user scope ingests
+every project you open into the same place.
+
+When that happens every headline figure is a sum across those projects, and the
+**scope line** above the totals says so rather than letting a cross-project
+total read like one repo's. It states two counts, because either alone
+misleads:
+
+| count | what it means |
+|---|---|
+| projects **in this period** | how many projects the figures on screen actually range over |
+| projects **in this database** | how many the file holds at all — a project you ingested but did not use in the selected window is a measured **zero**, not an absent project |
+
+A database with **one** project says nothing new: the line is unchanged, and no
+dimension is announced that your data does not have. Calls whose transcript
+path does not match the layout above are counted and named separately — they
+stay in the totals, and they are never folded into a neighbouring project.
+
+Project *names* are not printed on the page. A project directory is your
+absolute working directory with the separators folded to `-`, so it carries
+your username and your repo names; `/api/summary` lists them under
+`scope.projects` when you want them.
+
+This is the honesty floor, not the feature: filtering and grouping by project
+is [issue #7](https://github.com/vlad-ko/claude-piggy-bank/issues/7).
+
 ## Where the data comes from
 
 Claude Code writes every session to disk as JSONL. CPB reads two globs:

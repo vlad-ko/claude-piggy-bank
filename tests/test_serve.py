@@ -17,11 +17,19 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ingest import INGEST_RUNS_TABLE, ingest, record_ingest_run  # noqa: E402
+from ingest import (  # noqa: E402
+    INGEST_RUNS_TABLE,
+    SOURCE_MAIN,
+    SOURCE_SUBAGENT,
+    ingest,
+    ingest_transcript,
+    record_ingest_run,
+)
 from test_ingest import build_corpus  # noqa: E402
 from serve import (  # noqa: E402
     RANKED_BY,
@@ -33,6 +41,7 @@ from serve import (  # noqa: E402
     clamp_limit,
     day_bounds,
     eastern_day,
+    project_of,
     staleness_verdict,
 )
 
@@ -464,6 +473,498 @@ class WindowScopedCoverageTest(unittest.TestCase):
         cov = self.api.summary(start, end)["scope"]["coverage"]
         self.assertEqual(cov["subagent_files"], 0)
         self.assertIsInstance(cov["subagent_files"], int)
+
+
+# --- #44: the scope must name the PROJECT set it ranges over --------------
+#
+# The plugin (#33) resolves ONE database per INSTALL, not per project, so a
+# user-scope install ingests every project the user opens into the same file.
+# Every headline figure is then a sum across projects, rendered in the
+# vocabulary of a single one.
+#
+# Fixture design (CLAUDE.md, "a fixture must not make the defect
+# undetectable"):
+#   * every token class of every call carries a DIFFERENT value and the two
+#     projects' totals are deliberately unequal (12,130 against 100,010), so a
+#     grouping that collapsed the two -- or swapped them -- cannot pass;
+#   * one project owns a SUBAGENT transcript, which sits two directories deeper
+#     than a main one, so a derivation that simply read the containing
+#     directory would report the SESSION directory as a third project;
+#   * the two projects sit on DIFFERENT DAYS, so a window can hold one and not
+#     the other -- the measured-zero case;
+#   * a THIRD project was ingested and produced no API call at all, so the
+#     ledger (`ingest_state`) knows a project the measurements (`api_calls`)
+#     never will. That is a measured zero in every window, and a project set
+#     read off the calls alone would drop it in all of them.
+#
+# The names are synthetic and must stay so. A real project directory is the
+# absolute working directory with each separator folded to `-`, so it carries
+# the user's username and every repo name; none may enter this repository.
+PROJECT_A = "-fixture-alpha"
+PROJECT_B = "-fixture-beta"
+PROJECT_C = "-fixture-gamma"
+SESSION_A = "fixture-alpha-session"
+SESSION_B = "fixture-beta-session"
+SESSION_C = "fixture-gamma-session"
+DAY_A = "2026-03-01"
+DAY_B = "2026-03-02"
+# (input, cache_write, cache_read, output) per call.
+A_MAIN_CALLS = [(101, 202, 303, 404), (111, 222, 333, 444)]
+A_SUBAGENT_CALLS = [(1001, 2002, 3003, 4004)]
+B_MAIN_CALLS = [(10001, 20002, 30003, 40004)]
+A_TOKENS = sum(sum(c) for c in A_MAIN_CALLS + A_SUBAGENT_CALLS)  # 12,130
+B_TOKENS = sum(sum(c) for c in B_MAIN_CALLS)  # 100,010
+
+
+def build_project(
+    root: Path,
+    name: str,
+    session: str,
+    day: str,
+    main_calls: Sequence[tuple[int, int, int, int]],
+    subagent_calls: Sequence[tuple[int, int, int, int]] = (),
+) -> list[Path]:
+    """One synthetic project directory. Returns its transcripts, in order."""
+
+    def rec(obj: dict) -> str:
+        return json.dumps(obj) + "\n"
+
+    def call(
+        session_id: str,
+        n: int,
+        usage: tuple[int, int, int, int],
+        sidechain: bool,
+        agent: str | None = None,
+    ) -> str:
+        inp, cw, cr, out = usage
+        record = {
+            "type": "assistant",
+            "sessionId": session_id,
+            "timestamp": f"{day}T15:0{n}:00.000Z",
+            "isSidechain": sidechain,
+            "message": {
+                "id": f"msg-{agent or session_id}-{n}",
+                "model": "claude-sonnet-5-20260115",
+                "usage": {
+                    "input_tokens": inp,
+                    "cache_creation_input_tokens": cw,
+                    "cache_read_input_tokens": cr,
+                    "output_tokens": out,
+                },
+                "content": [{"type": "text", "text": f"{agent or session_id} {n}"}],
+            },
+        }
+        if agent is not None:
+            record["agentId"] = agent
+        return rec(record)
+
+    project = root / name
+    project.mkdir(parents=True)
+    transcript = project / f"{session}.jsonl"
+    transcript.write_text(
+        "".join(call(session, n, u, False) for n, u in enumerate(main_calls))
+    )
+    paths = [transcript]
+    if subagent_calls:
+        subagents = project / session / "subagents"
+        subagents.mkdir(parents=True)
+        agent = f"agent-{session[:5]}01"
+        agent_file = subagents / f"{agent}.jsonl"
+        agent_file.write_text(
+            "".join(
+                call(session, n, u, True, agent=agent)
+                for n, u in enumerate(subagent_calls)
+            )
+        )
+        paths.append(agent_file)
+    return paths
+
+
+def build_callless_project(root: Path, name: str, session: str, day: str) -> Path:
+    """A project whose transcript holds a prompt and no assistant reply.
+
+    Ingested exactly like any other -- it gets an `ingest_state` row -- and it
+    contributes no `api_calls` row to any window. Reachable in a second: open a
+    directory, type one message, close the session.
+    """
+    project = root / name
+    project.mkdir(parents=True)
+    transcript = project / f"{session}.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": session,
+                "timestamp": f"{day}T15:00:00.000Z",
+                "message": {"role": "user", "content": "a prompt and no reply"},
+            }
+        )
+        + "\n"
+    )
+    return transcript
+
+
+class ProjectOfPathTest(unittest.TestCase):
+    """`project_of()` reads the layout, and REFUSES rather than guessing (#44).
+
+    The three shapes are `ingest.discover_sources()`'s own: the two transcript
+    globs plus the harness task directory it reads as an index. Anything else
+    must return None -- bucketing an unreadable path into the directory that
+    happens to sit above it would attribute one project's spend to another,
+    which is the very defect this issue is about, one layer down.
+    """
+
+    def test_a_main_transcript_names_its_containing_directory(self) -> None:
+        self.assertEqual(
+            project_of(f"/x/projects/{PROJECT_A}/{SESSION_A}.jsonl", SOURCE_MAIN),
+            PROJECT_A,
+        )
+
+    def test_a_subagent_transcript_names_the_project_not_the_session(self) -> None:
+        self.assertEqual(
+            project_of(
+                f"/x/projects/{PROJECT_A}/{SESSION_A}/subagents/agent-a1.jsonl",
+                SOURCE_SUBAGENT,
+            ),
+            PROJECT_A,
+        )
+
+    def test_a_task_index_entry_names_the_project(self) -> None:
+        # The harness mirrors the project SLUG under the OS temp dir, so the
+        # same name identifies the same project from a different root.
+        self.assertEqual(
+            project_of(
+                f"/private/tmp/claude-0/{PROJECT_A}/{SESSION_A}/tasks/agent-a1.output",
+                SOURCE_SUBAGENT,
+            ),
+            PROJECT_A,
+        )
+
+    def test_a_relative_source_path_still_resolves(self) -> None:
+        # `--projects-dir ./x` is legal and stores relative paths.
+        self.assertEqual(
+            project_of(f"{PROJECT_A}/{SESSION_A}.jsonl", SOURCE_MAIN), PROJECT_A
+        )
+
+    def test_a_transcript_at_the_filesystem_root_has_no_project(self) -> None:
+        self.assertIsNone(project_of("/orphan.jsonl", SOURCE_MAIN))
+
+    def test_a_bare_filename_has_no_project(self) -> None:
+        self.assertIsNone(project_of("orphan.jsonl", SOURCE_MAIN))
+
+    def test_a_subagent_path_with_no_session_directory_has_no_project(self) -> None:
+        self.assertIsNone(project_of("/subagents/agent-a1.jsonl", SOURCE_SUBAGENT))
+
+    def test_an_unexpected_intermediate_directory_is_not_guessed(self) -> None:
+        self.assertIsNone(
+            project_of(
+                f"/x/{PROJECT_A}/{SESSION_A}/notes/agent-a1.jsonl", SOURCE_SUBAGENT
+            )
+        )
+
+    def test_an_unknown_source_kind_is_not_guessed(self) -> None:
+        self.assertIsNone(
+            project_of(f"/x/{PROJECT_A}/{SESSION_A}.jsonl", "some-future-kind")
+        )
+
+
+class ProjectScopeTest(unittest.TestCase):
+    """A cross-project total must not be indistinguishable from one project's.
+
+    Ingested ONE FILE AT A TIME, which is what the plugin's `Stop` hook does:
+    directory mode would archive the other project's sources as missing on
+    every alternate run, so single-file mode is both the production path for
+    this defect and the only one that produces the state honestly.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-project-scope-test-"))
+        cls.db_path = cls.tmp / "shared.db"
+        no_tasks = cls.tmp / "no-task-index"
+        for path in (
+            *build_project(
+                cls.tmp, PROJECT_A, SESSION_A, DAY_A, A_MAIN_CALLS, A_SUBAGENT_CALLS
+            ),
+            *build_project(cls.tmp, PROJECT_B, SESSION_B, DAY_B, B_MAIN_CALLS),
+            build_callless_project(cls.tmp, PROJECT_C, SESSION_C, DAY_B),
+        ):
+            ingest_transcript(path, cls.db_path, tasks_dir=no_tasks)
+        cls.api = Api(cls.db_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def projects(self, frm: str | None = None, to: str | None = None) -> dict:
+        return self.api.summary(*day_bounds(frm, to))["scope"]["projects"]
+
+    def test_fixture_ingested_the_corpus_these_tests_assume(self) -> None:
+        # If the corpus did not land, every assertion below is vacuous. Four
+        # calls: two main-thread and one subagent in PROJECT_A, one in
+        # PROJECT_B, and none at all in PROJECT_C.
+        s = self.api.summary(*day_bounds(None, None))
+        self.assertEqual(s["calls"], 4)
+        self.assertEqual(
+            s["input"] + s["cache_read"] + s["cache_write"] + s["output"],
+            A_TOKENS + B_TOKENS,
+        )
+        self.assertNotEqual(A_TOKENS, B_TOKENS)
+
+    def test_the_scope_counts_the_projects_the_window_ranges_over(self) -> None:
+        # PROJECT_C is ingested and made no call, so it is NOT in this set --
+        # and the two counts differ even over an unbounded window.
+        p = self.projects()
+        self.assertEqual(p["in_window"], 2)
+        self.assertEqual(p["names_in_window"], [PROJECT_A, PROJECT_B])
+
+    def test_the_scope_counts_the_projects_the_database_holds(self) -> None:
+        # Read off the FILE LEDGER, not off the calls: a project that produced
+        # no call is still a project this database mixes into its totals, and
+        # calls-only would drop it from every window there is.
+        p = self.projects()
+        self.assertEqual(p["in_database"], 3)
+        self.assertEqual(p["names_in_database"], [PROJECT_A, PROJECT_B, PROJECT_C])
+
+    def test_a_subagent_transcript_counts_toward_its_project(self) -> None:
+        # `<project>/<session>/subagents/agent-<id>.jsonl` is two directories
+        # deeper than a main transcript: reading the containing directory would
+        # name the SESSION and report a third project that does not exist.
+        p = self.projects()
+        self.assertNotIn(SESSION_A, p["names_in_database"])
+        self.assertNotIn("subagents", p["names_in_database"])
+
+    def test_a_project_with_no_calls_in_the_window_is_a_measured_zero(self) -> None:
+        # Project B has calls on DAY_B only. In DAY_A's window it contributes
+        # nothing -- but it has NOT gone away, and a scope line that named only
+        # the window would under-report what this database mixes together.
+        p = self.projects(DAY_A, DAY_A)
+        self.assertEqual(p["in_window"], 1)
+        self.assertEqual(p["names_in_window"], [PROJECT_A])
+        self.assertEqual(p["in_database"], 3)
+        self.assertIn(PROJECT_B, p["names_in_database"])
+
+    def test_an_empty_window_still_names_the_database_set(self) -> None:
+        p = self.projects("2020-01-01", "2020-01-01")
+        self.assertEqual(p["in_window"], 0)
+        self.assertEqual(p["names_in_window"], [])
+        self.assertEqual(p["in_database"], 3)
+
+    def test_no_source_path_in_this_corpus_is_unattributable(self) -> None:
+        p = self.projects()
+        self.assertEqual(p["unattributed_calls"], 0)
+        self.assertEqual(p["unattributed_sources"], 0)
+
+
+class SingleProjectScopeTest(unittest.TestCase):
+    """The ordinary case must not start announcing a dimension it does not need.
+
+    Almost every user has one project in their database. If naming the project
+    set changes what they see, this fix has traded one wrong number for a
+    permanent false alarm.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-one-project-test-"))
+        cls.db_path = cls.tmp / "one.db"
+        for path in build_project(
+            cls.tmp, PROJECT_A, SESSION_A, DAY_A, A_MAIN_CALLS, A_SUBAGENT_CALLS
+        ):
+            ingest_transcript(path, cls.db_path, tasks_dir=cls.tmp / "no-task-index")
+        cls.api = Api(cls.db_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_one_project_is_reported_as_one_project(self) -> None:
+        p = self.api.summary(*day_bounds(None, None))["scope"]["projects"]
+        self.assertEqual(p["in_window"], 1)
+        self.assertEqual(p["in_database"], 1)
+        self.assertEqual(p["unattributed_calls"], 0)
+        self.assertEqual(p["unattributed_sources"], 0)
+
+    def test_the_scope_block_gains_exactly_one_key(self) -> None:
+        # The main-vs-subagent axis is a DIFFERENT axis and must be untouched:
+        # this change annotates the scope block, it does not restructure it.
+        scope = self.api.summary(*day_bounds(None, None))["scope"]
+        self.assertEqual(
+            set(scope),
+            {"includes", "main_thread", "subagent", "coverage", "projects"},
+        )
+        self.assertEqual(scope["includes"], "main-thread + subagent")
+
+
+class UnattributableProjectPathTest(unittest.TestCase):
+    """A path the layout cannot parse is COUNTED, never bucketed or dropped.
+
+    Reachable in production: `ingest.py --transcript` (the hook's mode) accepts
+    any `.jsonl` file, so a transcript at the filesystem ROOT stores a
+    `source_path` with no project directory above it. That shape cannot be
+    created under a temp directory on this host, so the rows are written
+    directly -- the serve layer's contract is over what the database HOLDS, and
+    the alternative would be to leave the case untested.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="usage-report-unattributed-test-"))
+        self.db_path = self.tmp / "one.db"
+        for path in build_project(
+            self.tmp, PROJECT_A, SESSION_A, DAY_A, A_MAIN_CALLS
+        ):
+            ingest_transcript(path, self.db_path, tasks_dir=self.tmp / "no-task-index")
+        conn = sqlite3.connect(self.db_path)
+        with conn:
+            # TWO calls on ONE unplaceable file, deliberately unequal: a count
+            # of sources reported as a count of calls would otherwise pass.
+            conn.executemany(
+                "INSERT INTO api_calls (session_id, source_path, source_kind, ts,"
+                " model, input_tokens, cache_read, cache_write, output_tokens,"
+                " context_size, is_sidechain, message_id)"
+                " VALUES (?, '/orphan.jsonl', 'main', ?, 'claude-sonnet-5-20260115',"
+                "  7, 7, 7, 7, 21, 0, ?)",
+                [
+                    (SESSION_A, day_bounds(DAY_A, DAY_A)[0] + 3600, "msg-orphan-1"),
+                    (SESSION_A, day_bounds(DAY_A, DAY_A)[0] + 7200, "msg-orphan-2"),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO ingest_state (path, session_id, source_kind, size,"
+                " mtime, unparsed_records)"
+                " VALUES ('/orphan.jsonl', ?, 'main', 1, 1, 0)",
+                (SESSION_A,),
+            )
+        conn.close()
+        self.api = Api(self.db_path)
+
+    def tearDown(self) -> None:
+        self.api.conn.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_an_unattributable_call_is_counted_on_its_own(self) -> None:
+        # CALLS and SOURCES are separate counts of separate things: two calls
+        # in one file.
+        p = self.api.summary(*day_bounds(None, None))["scope"]["projects"]
+        self.assertEqual(p["unattributed_calls"], 2)
+        self.assertEqual(p["unattributed_sources"], 1)
+
+    def test_it_is_not_bucketed_into_the_project_beside_it(self) -> None:
+        # The failure mode: `/orphan.jsonl` silently joining PROJECT_A, or
+        # inventing a project named after the filesystem root.
+        p = self.api.summary(*day_bounds(None, None))["scope"]["projects"]
+        self.assertEqual(p["names_in_window"], [PROJECT_A])
+        self.assertEqual(p["names_in_database"], [PROJECT_A])
+        self.assertEqual(p["in_window"], 1)
+        self.assertEqual(p["in_database"], 1)
+
+    def test_the_call_is_still_in_the_totals(self) -> None:
+        # Its project is unknown; its tokens are measured. Dropping it from the
+        # aggregate would be absence rendered as a smaller number.
+        s = self.api.summary(*day_bounds(None, None))
+        self.assertEqual(s["calls"], len(A_MAIN_CALLS) + 2)
+
+
+class ProjectSetSurvivesALedgerGapTest(unittest.TestCase):
+    """The project set is read from BOTH tables, so a gap cannot shrink it.
+
+    `ingest_state` is the file ledger and `api_calls` the measurements, and
+    `ArchivedSourceDurabilityTest` pins that they agree today. Should they ever
+    diverge -- a hand-pruned row, a partial restore, a future prune that
+    forgets one table -- the set must OVER-report rather than quietly shrink:
+    under-reporting the project set is the entirety of this defect.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="usage-report-ledger-gap-test-"))
+        self.db_path = self.tmp / "one.db"
+        for path in build_project(self.tmp, PROJECT_A, SESSION_A, DAY_A, A_MAIN_CALLS):
+            ingest_transcript(path, self.db_path, tasks_dir=self.tmp / "no-task-index")
+        conn = sqlite3.connect(self.db_path)
+        with conn:
+            # A measurement whose ledger row is gone. The file need not exist:
+            # `project_of()` is pure string work over the STORED path, which is
+            # also what lets a transcript reaped months ago still name its
+            # project.
+            conn.execute(
+                "INSERT INTO api_calls (session_id, source_path, source_kind, ts,"
+                " model, input_tokens, cache_read, cache_write, output_tokens,"
+                " context_size, is_sidechain, message_id)"
+                " VALUES (?, ?, 'main', ?, 'claude-sonnet-5-20260115',"
+                "  3, 5, 7, 11, 15, 0, 'msg-unledgered')",
+                (
+                    SESSION_B,
+                    f"{self.tmp}/{PROJECT_B}/{SESSION_B}.jsonl",
+                    day_bounds(DAY_A, DAY_A)[0] + 3600,
+                ),
+            )
+        conn.close()
+        self.api = Api(self.db_path)
+
+    def tearDown(self) -> None:
+        self.api.conn.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_project_known_only_from_its_calls_is_still_in_the_set(self) -> None:
+        p = self.api.summary(*day_bounds(None, None))["scope"]["projects"]
+        self.assertEqual(p["names_in_database"], [PROJECT_A, PROJECT_B])
+        self.assertEqual(p["in_database"], 2)
+        self.assertEqual(p["unattributed_sources"], 0)
+
+
+class ProjectScopeNoteTest(unittest.TestCase):
+    """The page must SAY when its figures span projects (#44).
+
+    Structural, for the reason `BannerPrecedenceTest` gives: the project ships
+    no JS runtime, so the composition cannot be executed here. These pin the
+    branch that exists to keep the single-project case silent, and the decision
+    that the band states COUNTS rather than project names.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.body = js_function_body(
+            (Path(__file__).resolve().parent.parent / "index.html").read_text(),
+            "function renderScopeNote(",
+        )
+
+    def test_the_scope_note_reads_the_project_block(self) -> None:
+        self.assertIn("scope.projects", self.body)
+
+    def test_it_speaks_only_when_more_than_one_project_is_involved(self) -> None:
+        # The BRANCH, not a mention: without the `> 1` guard every existing
+        # single-project user gets a new sentence about a dimension their
+        # database does not have.
+        self.assertRegex(self.body, r"if \(p\.in_database > 1\) \{")
+
+    def test_it_names_both_the_window_set_and_the_database_set(self) -> None:
+        # A project with no calls in this window is a measured zero, and the
+        # reader must be able to tell it apart from one that is not there.
+        self.assertIn("in_window", self.body)
+        self.assertIn("in_database", self.body)
+
+    def test_it_surfaces_calls_whose_project_could_not_be_derived(self) -> None:
+        # Again the BRANCH: the field name also appears inside the sentence, so
+        # matching the bare substring let a disabled clause pass.
+        self.assertRegex(self.body, r"if \(p\.unattributed_calls\) \{")
+
+    def test_the_project_note_reaches_the_band_on_both_paths(self) -> None:
+        # Composed and never appended is the "fully tested, never wired"
+        # pattern SummaryPayloadIsWiredTest exists for. renderScopeNote has TWO
+        # exits -- main-thread-only and both-scopes -- and the project note
+        # belongs on both: it does not depend on that axis.
+        self.assertEqual(self.body.count("projects + undated"), 2)
+
+    def test_it_reports_counts_not_project_names(self) -> None:
+        # DECISION, pinned so it cannot drift by accident. A project name is a
+        # filesystem path with the username in it, and this band is one line:
+        # eighteen slugs would swamp it and put the reader's directory tree
+        # into every screenshot of the report. The names ride in the payload
+        # instead, exactly as `durability.sources` does.
+        self.assertNotIn("names_in_window", self.body)
+        self.assertNotIn("names_in_database", self.body)
 
 
 class ArchivedSourceDurabilityTest(unittest.TestCase):
