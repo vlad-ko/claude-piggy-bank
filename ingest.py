@@ -2,10 +2,21 @@
 
 Usage:
     python3 ingest.py [--projects-dir <dir>] [--db db/usage.db]
+    python3 ingest.py --transcript <path-to-jsonl> [--db db/usage.db]
 
 `--projects-dir` defaults to this project's own transcript directory, derived
 from the working directory via Claude Code's naming convention -- see
 `default_projects_dir()`.
+
+`--transcript` ingests EXACTLY ONE file and is the mode a Claude Code hook
+uses: the hook is handed the path that just changed, so re-scanning the tree
+is pure waste. See `ingest_transcript()` for what that mode deliberately does
+NOT do. The two modes are mutually exclusive.
+
+The database path resolves highest-first: `--db`, then the `CPB_DB`
+environment variable, then `db/usage.db` beside this script. `CPB_DB` exists
+so a plugin can point every hook invocation at its own data directory without
+threading a flag through each one.
 
 TWO transcript sources per session (#4966) -- a session's API calls are NOT
 all in one file:
@@ -61,7 +72,7 @@ import json
 import os
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -83,6 +94,18 @@ INGEST_RUNS_TABLE = "ingest_runs"
 # a magic number. A history of runs is a different feature; what the report
 # needs is "when did this database last look at the transcripts".
 INGEST_RUN_ROW_ID = 1
+# The on-disk layout, named once. `discover_sources()` globs it and
+# `source_for_transcript()` classifies a single path against it; the two must
+# describe the SAME layout or single-file mode and directory mode would derive
+# different identities for one file.
+TRANSCRIPT_SUFFIX = ".jsonl"
+SUBAGENTS_DIR = "subagents"
+TASKS_DIR = "tasks"
+
+# Environment override for the database path, sitting between `--db` and the
+# built-in default. A plugin exports it once instead of passing `--db` on
+# every hook invocation.
+DB_ENV_VAR = "CPB_DB"
 
 # EVERY table this tool creates. ONE list, used by both the probe and the drop
 # loop in `_prepare_schema` -- two lists is how `subagent_runs` and
@@ -557,7 +580,7 @@ def discover_task_index(tasks_dir: Path) -> TaskIndex:
         return index
     index.available = True
     for session_dir in sorted(tasks_dir.iterdir()):
-        tasks = session_dir / "tasks"
+        tasks = session_dir / TASKS_DIR
         if not tasks.is_dir():
             continue
         index.scanned_sessions.add(session_dir.name)
@@ -657,10 +680,10 @@ def discover_sources(
     inconclusive = {CARRIES_TRUNCATED: 0, CARRIES_UNREADABLE: 0}
     sources = [
         Source(path=p, session_id=p.stem, kind=SOURCE_MAIN)
-        for p in sorted(projects_dir.glob("*.jsonl"))
+        for p in sorted(projects_dir.glob(f"*{TRANSCRIPT_SUFFIX}"))
     ]
     canonical: set = set()
-    for p in sorted(projects_dir.glob("*/subagents/*.jsonl")):
+    for p in sorted(projects_dir.glob(f"*/{SUBAGENTS_DIR}/*{TRANSCRIPT_SUFFIX}")):
         storing = p.parent.parent.name
         # `_resolve` -- NOT a bare `p.resolve()` with the OSError swallowed. A
         # failed resolve left the path out of `canonical`, so the extra-source
@@ -707,6 +730,96 @@ def _resolve(path: Path) -> Path:
         return path.resolve()
     except OSError:
         return path
+
+
+def source_for_transcript(path: Path) -> Source:
+    """Classify ONE path into the Source `discover_sources()` would have made.
+
+    Single-file mode must derive the same identity for a file as a directory
+    scan does, or which session pays for a subagent's tokens would depend on
+    which command happened to ingest it -- and since an unchanged file is
+    thereafter SKIPPED, a divergence would never be revised. So this reads the
+    same layout constants the globs do and reuses `agent_id_from_path()`.
+
+    Raises ValueError when the path matches neither shape. That is a refusal,
+    not a no-op: a hook pointed at the wrong file must fail loudly rather than
+    report a successful ingest of nothing.
+    """
+    if path.suffix != TRANSCRIPT_SUFFIX:
+        raise ValueError(
+            f"not a transcript: expected a {TRANSCRIPT_SUFFIX} file, either"
+            f" <project>/<session>{TRANSCRIPT_SUFFIX} or"
+            f" <project>/<session>/{SUBAGENTS_DIR}/"
+            f"{AGENT_FILE_PREFIX}<id>{TRANSCRIPT_SUFFIX}"
+        )
+    if path.parent.name == SUBAGENTS_DIR:
+        storing = path.parent.parent.name
+        if not storing:
+            # `<...>/subagents/agent-x.jsonl` with no session directory above
+            # it. The glob can never produce this; a caller can. Refuse rather
+            # than storing the calls under a session id of "".
+            raise ValueError(
+                f"no session directory above {SUBAGENTS_DIR}/ -- cannot say"
+                " which session these calls belong to"
+            )
+        return Source(
+            path=path,
+            # The DISPATCHING session overrides this when the task index knows
+            # it; the storing directory is only the fallback.
+            session_id=storing,
+            kind=SOURCE_SUBAGENT,
+            agent_id=agent_id_from_path(path),
+            storing_session_id=storing,
+        )
+    return Source(path=path, session_id=path.stem, kind=SOURCE_MAIN)
+
+
+def dispatcher_for_agent(
+    tasks_dir: Path, agent_id: str, transcript: Path
+) -> Optional[str]:
+    """Which session DISPATCHED this ONE agent, per the task index.
+
+    The targeted counterpart of `discover_task_index()`, and it exists because
+    attribution is not optional: the storing directory is merely whichever
+    session was live when the file was written, and differs from the
+    dispatcher in 749 of 2834 real cases (measured 2026-08-02). Ingesting one
+    subagent transcript without consulting the index would book a quarter of
+    them against the wrong session.
+
+    Only the entry naming THIS agent is examined, and only when it resolves to
+    THIS transcript -- the same key and the same identity check the full scan
+    uses, so the two cannot disagree. Nothing here is ingested as data; the
+    task directory remains an index (most entries are symlinks into the
+    canonical store, so reading them as data would double every subagent
+    figure).
+
+    Returns None when no index, no entry, or an unreadable one -- an unknown
+    dispatcher, never an invented one.
+    """
+    if not tasks_dir.is_dir():
+        return None
+    target = _resolve(transcript)
+    dispatcher: Optional[str] = None
+    try:
+        session_dirs = sorted(tasks_dir.iterdir())
+    except OSError:
+        return None
+    for session_dir in session_dirs:
+        tasks = session_dir / TASKS_DIR
+        if not tasks.is_dir():
+            continue
+        for entry in sorted(tasks.iterdir()):
+            if agent_id_from_path(entry) != agent_id:
+                continue
+            # A dangling entry proves a dispatch but names no readable
+            # transcript, and cannot be about the file we are holding.
+            if not entry.is_symlink() or not entry.exists():
+                continue
+            if _resolve(entry) == target:
+                # Last match wins, matching the dict-overwrite semantics of
+                # `discover_task_index()` over the same sorted order.
+                dispatcher = session_dir.name
+    return dispatcher
 
 
 def parse_file(path: Path, collect_turns: bool = True) -> ParseResult:
@@ -1090,6 +1203,20 @@ def _parse_user(
     return turn_index
 
 
+def is_unchanged(state: Optional[tuple], stat: os.stat_result) -> bool:
+    """Has this source file changed since the run that recorded `state`?
+
+    ONE definition, used by both modes. When directory mode and single-file
+    mode disagreed about what "unchanged" means, a file one of them skipped
+    would be re-parsed by the other forever -- or worse, a file that really did
+    change would be skipped by whichever mode a hook happened to invoke.
+
+    `state` is the `(size, mtime, ...)` row from `ingest_state`, or None when
+    the file has never been ingested.
+    """
+    return state is not None and state[0] == stat.st_size and state[1] == stat.st_mtime
+
+
 def delete_source_rows(conn: sqlite3.Connection, source_path: str) -> None:
     """Remove every row derived from ONE transcript file.
 
@@ -1103,11 +1230,28 @@ def delete_source_rows(conn: sqlite3.Connection, source_path: str) -> None:
     conn.execute("DELETE FROM ingest_state WHERE path = ?", (source_path,))
 
 
-def store_source(conn: sqlite3.Connection, source: Source, parsed: ParseResult) -> None:
-    """Replace one transcript FILE's rows with a fresh parse (delete + insert)."""
+def store_source(
+    conn: sqlite3.Connection,
+    source: Source,
+    parsed: ParseResult,
+    stat: Optional[os.stat_result] = None,
+) -> None:
+    """Replace one transcript FILE's rows with a fresh parse (delete + insert).
+
+    `stat` is the size+mtime observed BEFORE the file was read, and both
+    callers pass it. Re-statting here instead would record the state the file
+    is in AFTER the parse -- so a transcript appended to while it was being
+    read would be recorded as fully ingested at its new size, and every
+    subsequent run would skip it. The appended calls would then be lost for
+    good, silently. Recording the pre-read stat makes the worst case one
+    redundant re-parse on the next run instead.
+
+    That race is not hypothetical for `--transcript`: a hook fires on the file
+    Claude Code is still writing.
+    """
     path = source.path
     source_path = str(path)
-    stat = path.stat()
+    stat = stat if stat is not None else path.stat()
     conn.execute("DELETE FROM api_calls WHERE source_path = ?", (source_path,))
     conn.execute("DELETE FROM turns WHERE source_path = ?", (source_path,))
     conn.execute("DELETE FROM agent_dispatches WHERE source_path = ?", (source_path,))
@@ -1192,6 +1336,45 @@ def store_source(conn: sqlite3.Connection, source: Source, parsed: ParseResult) 
     )
 
 
+def run_for_source(source: Source, dispatching_session_id: Optional[str]) -> SubagentRun:
+    """The `subagent_runs` row for one INGESTED subagent transcript.
+
+    Shared by the wholesale rebuild and by single-file mode so the two cannot
+    describe the same agent differently.
+    """
+    meta = read_agent_meta(source.path)
+    depth = meta.get("spawnDepth")
+    return SubagentRun(
+        agent_id=source.agent_id or agent_id_from_path(source.path),
+        session_id=source.session_id,
+        dispatching_session_id=dispatching_session_id,
+        storing_session_id=source.storing_session_id,
+        agent_type=meta.get("agentType"),
+        description=meta.get("description"),
+        tool_use_id=meta.get("toolUseId"),
+        spawn_depth=depth if isinstance(depth, int) else None,
+        status=STATUS_INGESTED,
+        source_path=str(source.path),
+    )
+
+
+def store_run(conn: sqlite3.Connection, run: SubagentRun) -> None:
+    """Write one dispatch row. REPLACE, so a run whose transcript came back
+    stops being reported as unavailable."""
+    conn.execute(
+        "INSERT OR REPLACE INTO subagent_runs (agent_id, session_id,"
+        " dispatching_session_id, storing_session_id, agent_type, description,"
+        " tool_use_id, spawn_depth, status, source_path, dispatched_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            run.agent_id, run.session_id, run.dispatching_session_id,
+            run.storing_session_id, run.agent_type, run.description,
+            run.tool_use_id, run.spawn_depth, run.status, run.source_path,
+            run.dispatched_at,
+        ),
+    )
+
+
 def store_subagent_runs(
     conn: sqlite3.Connection, sources: list[Source], index: TaskIndex
 ) -> None:
@@ -1213,19 +1396,8 @@ def store_subagent_runs(
     for source in sources:
         if source.kind != SOURCE_SUBAGENT or source.agent_id is None:
             continue
-        meta = read_agent_meta(source.path)
-        depth = meta.get("spawnDepth")
-        runs[source.agent_id] = SubagentRun(
-            agent_id=source.agent_id,
-            session_id=source.session_id,
-            dispatching_session_id=index.dispatcher_by_path.get(_resolve(source.path)),
-            storing_session_id=source.storing_session_id,
-            agent_type=meta.get("agentType"),
-            description=meta.get("description"),
-            tool_use_id=meta.get("toolUseId"),
-            spawn_depth=depth if isinstance(depth, int) else None,
-            status=STATUS_INGESTED,
-            source_path=str(source.path),
+        runs[source.agent_id] = run_for_source(
+            source, index.dispatcher_by_path.get(_resolve(source.path))
         )
     # A reaped transcript still gets a row -- with NO call rows and NO
     # fabricated totals. Its whole purpose is to make the gap countable.
@@ -1247,17 +1419,7 @@ def store_subagent_runs(
         )
 
     for run in runs.values():
-        conn.execute(
-            "INSERT INTO subagent_runs (agent_id, session_id, dispatching_session_id,"
-            " storing_session_id, agent_type, description, tool_use_id, spawn_depth,"
-            " status, source_path, dispatched_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                run.agent_id, run.session_id, run.dispatching_session_id,
-                run.storing_session_id, run.agent_type, run.description,
-                run.tool_use_id, run.spawn_depth, run.status, run.source_path,
-                run.dispatched_at,
-            ),
-        )
+        store_run(conn, run)
 
 
 def rebuild_sessions(conn: sqlite3.Connection) -> None:
@@ -1509,13 +1671,13 @@ def ingest(
                 "SELECT size, mtime, unparsed_records FROM ingest_state WHERE path = ?",
                 (str(source.path),),
             ).fetchone()
-            if state is not None and state[0] == stat.st_size and state[1] == stat.st_mtime:
+            if is_unchanged(state, stat):
                 summary["files_skipped"] += 1
                 summary["unparsed_records"] += state[2]
                 continue
             parsed = parse_file(source.path, collect_turns=not is_subagent)
             with conn:
-                store_source(conn, source, parsed)
+                store_source(conn, source, parsed, stat)
             summary["files_ingested"] += 1
             if is_subagent:
                 summary["subagent_files_ingested"] += 1
@@ -1571,6 +1733,140 @@ def ingest(
         # for archiving above, so it dates the run's END.
         with conn:
             record_ingest_run(conn, datetime.now(timezone.utc).timestamp())
+        return summary
+    finally:
+        conn.close()
+
+
+def ingest_transcript(
+    transcript: Path, db_path: Path, tasks_dir: Optional[Path] = None
+) -> dict[str, Any]:
+    """Ingest EXACTLY ONE transcript file. Returns a summary.
+
+    The mode a Claude Code hook uses: the hook already knows which file
+    changed, so a full scan is waste. Measured against a local transcript
+    corpus of 2,891 files on 2026-08-04, a directory run costs 1.18-2.44 s
+    when nothing changed and 4.09 s when one file did, because it stats every
+    file regardless.
+
+    Incremental and idempotent exactly as directory mode is: unchanged
+    (size+mtime) is skipped, changed has its own rows deleted by `source_path`
+    and re-parsed.
+
+    **What this mode deliberately does NOT do, and why.** It looks at one
+    file, so it is evidence about one file. Three reconciliation steps of
+    directory mode are therefore withheld, because each of them concludes
+    something about sources it did not examine:
+
+      * ARCHIVING. Directory mode marks every tracked source that is no longer
+        on disk. Inferring that from a single path would mark an entire corpus
+        as gone the first time a hook fired -- and `archived_at` is what tells
+        the report its totals are no longer reproducible. Directory mode still
+        performs the sweep; this mode simply never claims to have looked.
+      * PRUNING. Same reason, with deletion at the end of it. `--prune-missing`
+        is rejected outright alongside `--transcript`.
+      * The WHOLESALE subagent ledger rebuild. `store_subagent_runs()` clears
+        `subagent_runs` and `task_index_sessions` and re-derives them from the
+        sources of that run; reusing it here would delete every dispatch the
+        one file does not mention, including the `unavailable` rows whose
+        entire purpose is to record spend that can no longer be measured. Only
+        the ingested agent's own row is written, through the same builder.
+
+    What IS global is `rebuild_sessions()`, and safely so: it re-derives the
+    roll-up from the whole of `ingest_state`, which this mode leaves intact
+    apart from the one file. A session spans N sources, so nothing narrower
+    would be correct.
+
+    The summary carries no `files_archived` / `files_pruned` keys at all.
+    Reporting them as 0 would state that a check was run and found nothing,
+    which is not what happened (rule #12: absence is not a value).
+    """
+    if not transcript.exists():
+        raise SystemExit(
+            f"transcript not found: {transcript}\n\n"
+            "Single-file mode ingests the ONE file it is given, so a path that "
+            "is not there is an error, not an empty run."
+        )
+    if not transcript.is_file():
+        raise SystemExit(f"not a file: {transcript}")
+    try:
+        source = source_for_transcript(transcript)
+    except ValueError as exc:
+        raise SystemExit(f"{transcript}: {exc}") from exc
+
+    dispatcher: Optional[str] = None
+    if source.kind == SOURCE_SUBAGENT:
+        # <projects-dir>/<session>/subagents/agent-<id>.jsonl
+        projects_dir = transcript.parent.parent.parent
+        dispatcher = dispatcher_for_agent(
+            tasks_dir if tasks_dir is not None else default_tasks_dir(projects_dir),
+            source.agent_id or agent_id_from_path(transcript),
+            transcript,
+        )
+        if dispatcher is not None:
+            source = replace(source, session_id=dispatcher)
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        schema_rebuilt = _prepare_schema(conn)
+        source_path = str(transcript)
+        summary: dict[str, Any] = {
+            "mode": "transcript",
+            "transcript": source_path,
+            "source_kind": source.kind,
+            "session_id": source.session_id,
+            "dispatching_session_id": dispatcher,
+            "files_scanned": 1,
+            "files_ingested": 0,
+            "files_skipped": 0,
+            "schema_rebuilt": schema_rebuilt,
+            "records_parsed": 0,
+            "unparsed_records": 0,
+            "calls_without_message_id": 0,
+            "divergent_message_ids": 0,
+            "unparsed_details": [],
+        }
+        stat = transcript.stat()
+        state = conn.execute(
+            "SELECT size, mtime, unparsed_records FROM ingest_state WHERE path = ?",
+            (source_path,),
+        ).fetchone()
+        if is_unchanged(state, stat):
+            summary["files_skipped"] = 1
+            summary["unparsed_records"] = state[2]
+            # This one file is demonstrably present, so its archive mark (if a
+            # directory run left one) is stale. Scoped to the path we looked
+            # at -- the same evidence rule as everything else here.
+            with conn:
+                conn.execute(
+                    "UPDATE ingest_state SET archived_at = NULL"
+                    " WHERE path = ? AND archived_at IS NOT NULL",
+                    (source_path,),
+                )
+        else:
+            parsed = parse_file(
+                transcript, collect_turns=source.kind != SOURCE_SUBAGENT
+            )
+            with conn:
+                # `store_source` does INSERT OR REPLACE into ingest_state,
+                # which rewrites the whole row and so clears `archived_at`.
+                # `stat` is the PRE-read one -- see `store_source`.
+                store_source(conn, source, parsed, stat)
+                if source.kind == SOURCE_SUBAGENT:
+                    store_run(conn, run_for_source(source, dispatcher))
+            summary["files_ingested"] = 1
+            summary["records_parsed"] = parsed.records_parsed
+            summary["unparsed_records"] = parsed.unparsed_records
+            summary["calls_without_message_id"] = parsed.calls_without_message_id
+            summary["divergent_message_ids"] = parsed.divergent_message_ids
+            summary["unparsed_details"] = list(parsed.unparsed_details)
+
+        # Unconditional, including on the skip path: it is two statements over
+        # a small table, and it makes the roll-up self-healing rather than
+        # dependent on which mode last ran.
+        with conn:
+            rebuild_sessions(conn)
         return summary
     finally:
         conn.close()
@@ -1695,12 +1991,121 @@ def default_projects_dir(
     )
 
 
+def resolve_db_path(
+    flag: Optional[Path], env_value: Optional[str], default: Path
+) -> Path:
+    """Where to write, highest precedence first: `--db`, `CPB_DB`, default.
+
+    An empty or whitespace-only `CPB_DB` REFUSES rather than falling back. A
+    plugin that exports the variable wrongly would otherwise write every
+    measurement into a different database than the one it reads, and say
+    nothing -- and this tool's whole job is to not do that quietly.
+    """
+    if flag is not None:
+        return flag.expanduser()
+    if env_value is not None:
+        if not env_value.strip():
+            raise SystemExit(
+                f"{DB_ENV_VAR} is set but empty. Unset it to use the default "
+                f"database, or give it a path -- silently falling back would "
+                f"write to a database you did not choose."
+            )
+        return Path(env_value).expanduser()
+    return default
+
+
+def print_dedupe_note(summary: dict[str, Any]) -> None:
+    """Dedupe outcomes, surfaced identically by both modes."""
+    if summary["divergent_message_ids"] or summary["calls_without_message_id"]:
+        # Both are dedupe outcomes the keying rule could not treat as ordinary.
+        # A divergent id is genuinely ambiguous -- one real record was kept,
+        # but which one is a judgement -- and a missing id means dedupe had no
+        # key at all. Neither is an error, and neither should be invisible.
+        print(
+            "NOTE: dedupe --"
+            f" ids whose records disagreed beyond output_tokens:"
+            f" {summary['divergent_message_ids']} (one whole record kept, never"
+            " a per-field synthesis);"
+            f" records with no message.id: {summary['calls_without_message_id']}"
+            " (kept as individual calls, never merged and never dropped)."
+        )
+
+
+def print_inconclusive_note(summary: dict[str, Any]) -> None:
+    """A parse failure is never silent, in either mode."""
+    if summary["unparsed_records"]:
+        print(
+            f"INCONCLUSIVE: {summary['unparsed_records']} record(s) failed to parse;"
+            " totals may undercount. See ingest_state.unparsed_records per file."
+        )
+
+
+def run_transcript_mode(transcript: Path, db_path: Path) -> None:
+    """Single-file mode: one file in, one line out."""
+    summary = ingest_transcript(transcript, db_path)
+    for detail in summary["unparsed_details"]:
+        print(f"  unparsed: {detail}")
+    if summary["schema_rebuilt"]:
+        # Loud in this mode too: a hook that silently discarded the DB and
+        # then re-ingested one file would leave a corpus looking empty.
+        print(
+            "schema version changed: existing DB discarded and rebuilt. Only"
+            " THIS transcript has been re-ingested -- run `python3 ingest.py`"
+            " to restore the rest."
+        )
+    print(
+        f"transcript: {summary['transcript']}"
+        f" | kind: {summary['source_kind']}"
+        f" | session: {summary['session_id']}"
+        f" | ingested: {summary['files_ingested']}"
+        f" | skipped (unchanged): {summary['files_skipped']}"
+        f" | records parsed: {summary['records_parsed']}"
+        f" | unparsed_records: {summary['unparsed_records']}"
+    )
+    # Said out loud rather than implied by absent counters: this run examined
+    # ONE file and so reports nothing about any other source's presence.
+    print(
+        "NOTE: single-file mode -- no archive or prune sweep was performed;"
+        " no claim is made about any other source."
+    )
+    print_dedupe_note(summary)
+    print_inconclusive_note(summary)
+
+
 def main() -> None:
-    default_projects = default_projects_dir()
     default_db = Path(__file__).resolve().parent / "db" / "usage.db"
     parser = argparse.ArgumentParser(description="Ingest Claude Code transcripts into SQLite")
-    parser.add_argument("--projects-dir", type=Path, default=default_projects)
-    parser.add_argument("--db", type=Path, default=default_db)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--projects-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory of transcripts to scan. Defaults to THIS project's own, "
+            "derived from the repository root via Claude Code's naming "
+            "convention."
+        ),
+    )
+    mode.add_argument(
+        "--transcript",
+        type=Path,
+        default=None,
+        help=(
+            "Ingest EXACTLY ONE transcript file (main-thread or subagent) and "
+            "nothing else -- the cheap path for a Claude Code hook, which is "
+            "handed the path that just changed. Makes no claim about any other "
+            "source: it neither archives nor prunes."
+        ),
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help=(
+            f"Database path. Falls back to the {DB_ENV_VAR} environment "
+            f"variable, then to db/usage.db beside this script."
+        ),
+    )
     parser.add_argument(
         "--prune-missing",
         action="store_true",
@@ -1712,10 +2117,23 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    db_path = resolve_db_path(args.db, os.environ.get(DB_ENV_VAR), default_db)
 
+    if args.transcript is not None:
+        if args.prune_missing:
+            parser.error(
+                "--prune-missing cannot be combined with --transcript: "
+                "single-file mode examines ONE file and has no basis to "
+                "conclude that any other source has gone"
+            )
+        run_transcript_mode(args.transcript.expanduser(), db_path)
+        return
+
+    default_projects = default_projects_dir()
     summary = ingest(
-        args.projects_dir.expanduser(),
-        args.db.expanduser(),
+        (args.projects_dir if args.projects_dir is not None else default_projects)
+        .expanduser(),
+        db_path,
         prune_missing=args.prune_missing,
     )
     for detail in summary["unparsed_details"]:
@@ -1736,19 +2154,7 @@ def main() -> None:
         f" | records parsed: {summary['records_parsed']}"
         f" | unparsed_records: {summary['unparsed_records']}"
     )
-    if summary["divergent_message_ids"] or summary["calls_without_message_id"]:
-        # Both are dedupe outcomes the keying rule could not treat as ordinary.
-        # A divergent id is genuinely ambiguous -- one real record was kept,
-        # but which one is a judgement -- and a missing id means dedupe had no
-        # key at all. Neither is an error, and neither should be invisible.
-        print(
-            "NOTE: dedupe --"
-            f" ids whose records disagreed beyond output_tokens:"
-            f" {summary['divergent_message_ids']} (one whole record kept, never"
-            " a per-field synthesis);"
-            f" records with no message.id: {summary['calls_without_message_id']}"
-            " (kept as individual calls, never merged and never dropped)."
-        )
+    print_dedupe_note(summary)
     if summary["candidates_scan_truncated"] or summary["candidates_unreadable"]:
         # Loud, and separate from every other count: these candidates were
         # EXCLUDED without a verdict, so any spend they carry is unmeasured
@@ -1772,11 +2178,7 @@ def main() -> None:
             "sessions with subagent transcripts:"
             f" {summary['sessions_with_subagent_transcripts']}"
         )
-    if summary["unparsed_records"]:
-        print(
-            f"INCONCLUSIVE: {summary['unparsed_records']} record(s) failed to parse;"
-            " totals may undercount. See ingest_state.unparsed_records per file."
-        )
+    print_inconclusive_note(summary)
 
 
 if __name__ == "__main__":

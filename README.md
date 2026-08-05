@@ -132,6 +132,48 @@ was a purely additive schema change, applied in place, keeping every row.
 There is no automatic refresh yet — refreshing means running `ingest.py` again.
 Scheduling that from inside `serve.py` is [issue #20](https://github.com/vlad-ko/claude-piggy-bank/issues/20)'s
 second half and ships separately.
+### Ingesting a single transcript
+
+`--transcript` ingests **exactly one file** — a main-thread transcript or a
+subagent one — and nothing else:
+
+```bash
+python3 ingest.py --transcript ~/.claude/projects/<name>/<session-id>.jsonl
+```
+
+This is the cheap path for automation that already knows which file changed,
+such as a Claude Code hook: a directory scan stats every transcript in the
+tree whether or not anything moved. On a synthetic 2,891-file corpus (macOS,
+warm cache, checked 2026-08-04) a no-op directory run took 0.19–0.27 s against
+0.08–0.11 s for a single file, most of the latter being interpreter start-up.
+On a real corpus of the same file count the directory run measured 1.18–2.44 s
+idle and 4.09 s with one file changed, because real transcripts are much
+larger.
+
+It is incremental and idempotent exactly as the directory scan is, and it
+**makes no claim about any source it did not open**. It never archives and
+never prunes: one file is evidence about one file, and concluding from it that
+the rest of the corpus had vanished would mark a whole history as gone. Run
+`python3 ingest.py` periodically for that reconciliation. `--transcript` and
+`--projects-dir` are mutually exclusive, a path that is not a readable
+transcript is an error rather than a quiet no-op, and the exit status is 0 only
+on success — a hook that cannot see a failure is worse than no hook.
+
+### Where the database lives
+
+`ingest.py` resolves the database path highest-first:
+
+1. `--db <path>`
+2. the `CPB_DB` environment variable
+3. `db/usage.db` beside the script (the default)
+
+`CPB_DB` lets a wrapper or plugin point every invocation at its own data
+directory without threading a flag through each one. It applies to both ingest
+modes. Setting it to an empty value is refused rather than falling back, so a
+misconfigured wrapper cannot quietly write to a database nobody reads.
+
+`serve.py` does not read `CPB_DB`; point it at the same file with
+`python3 serve.py --db "$CPB_DB"`.
 
 ## Where the data comes from
 
