@@ -81,12 +81,32 @@ from recommendations import (  # noqa: E402
     Lever,
 )
 from serve import (  # noqa: E402
+    CHECK_CONTEXT_MEASURED,
+    CHECK_FORMAT_CENSUS,
+    CHECK_INGEST_AGE,
+    CHECK_MODEL_WINDOW_KNOWN,
+    CHECK_RECORDS_PARSED,
+    CHECK_WITHIN_WINDOW,
     CONTEXT_SAMPLE,
+    GROWTH_MIN_CALLS,
+    GROWTH_MIN_CALLS_PER_QUARTER,
+    GROWTH_QUARTERS,
+    GROWTH_QUARTER_NO_CALLS,
+    GROWTH_REFUSED_NO_SPAN,
+    GROWTH_REFUSED_TOO_FEW,
+    GROWTH_SCOPE,
+    HEALTH_CHECKS,
+    HEALTH_FAILED,
+    HEALTH_OK,
+    HEALTH_ORDER,
+    HEALTH_STATEMENTS,
+    HEALTH_UNCHECKED,
     MEASURED_CONTEXT_MIN,
     OVER_HALF_WINDOW_BANDS,
     PERCENTILES,
     RANKED_BY,
     RECOMMENDED_METRICS,
+    SATURATION_RANKED_BY,
     SCOPE_INCLUDES_BOTH,
     SCOPE_MAIN,
     SCOPE_ORDER,
@@ -2171,13 +2191,6 @@ SCOPE_SPLIT_IS_PLOTTED = (
     "API-calls card states the per-scope CALL counts beside it. Tabulating it "
     "here as well would be a second surface for one figure (constraint 4)."
 )
-SCOPE_CONTEXT_MEAN_HAS_NO_READER = (
-    "#4966/#25: the per-scope context MEAN and its sample counts have no "
-    "reader. The context surface is the median card and #61's per-scope "
-    "utilisation bands, which range over the same calls and say more about "
-    "them. Declared by #76, the first check able to SEE it -- putting it on "
-    "the page is a change of its own, not a line in this dict."
-)
 REAPED_IN_WINDOW_HAS_NO_READER = (
     "#41: the scope band renders `runs_undated_unavailable` -- the residue "
     "that belongs to no window -- and the sessions table marks reaped "
@@ -2293,16 +2306,10 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
         "scope.main_thread.cache_read": SCOPE_SPLIT_IS_PLOTTED,
         "scope.main_thread.cache_write": SCOPE_SPLIT_IS_PLOTTED,
         "scope.main_thread.output": SCOPE_SPLIT_IS_PLOTTED,
-        "scope.main_thread.avg_context": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
-        "scope.main_thread.context_calls": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
-        "scope.main_thread.unmeasured_calls": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
         "scope.subagent.input": SCOPE_SPLIT_IS_PLOTTED,
         "scope.subagent.cache_read": SCOPE_SPLIT_IS_PLOTTED,
         "scope.subagent.cache_write": SCOPE_SPLIT_IS_PLOTTED,
         "scope.subagent.output": SCOPE_SPLIT_IS_PLOTTED,
-        "scope.subagent.avg_context": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
-        "scope.subagent.context_calls": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
-        "scope.subagent.unmeasured_calls": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
         "scope.coverage.subagent_transcripts_unavailable": (
             REAPED_IN_WINDOW_HAS_NO_READER
         ),
@@ -2539,18 +2546,43 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
                 )
                 self.assertGreater(len(reason), 60, f"{path}: not a reason")
 
+    # How many entries the register is DECLARED to hold. Twenty-one was the
+    # count #76 found; 15 since #65, which gave the six per-scope context
+    # statistics (#82 group 1) a reader. They were consumed, not deleted -- the
+    # scoped meters needed exactly those figures, which is why #82 sequenced
+    # them here rather than removing a correct measurement.
+    EXPECTED_NOT_RENDERED = 15
+
     def test_moving_a_field_between_views_does_not_widen_the_register(self) -> None:
         # #70 splits the page into an overview and a detail view. A field that
         # MOVES between them is still rendered, so the register must not grow
         # to cover one -- an entry added by a layout change would be a field
         # quietly dropped from the report while the allowlist made it look
-        # decided. Twenty-one is the count #76 found and declared; the healthy
-        # direction is down.
+        # decided. The healthy direction is down.
         self.assertLessEqual(
             len(self.NOT_RENDERED),
-            21,
+            self.EXPECTED_NOT_RENDERED,
             "a field that stopped being rendered was exempted rather than "
             "re-homed. Moving a panel between views does not orphan a field.",
+        )
+
+    def test_the_declared_register_size_is_the_register_size(self) -> None:
+        # TEETH ON THE CEILING ITSELF. `assertLessEqual` against a literal
+        # leaves that literal free to be raised back, and nothing would notice:
+        # loosening it to 21 after #65 emptied six slots would re-open exactly
+        # the six the last change closed, and the whole suite would stay green
+        # because the register really is under 21.
+        #
+        # So the ceiling is compared to the truth as well as the truth to the
+        # ceiling. Removing an entry legitimately costs one edit to a line that
+        # states what the register holds, which is the deliberate act this
+        # register is for -- an allowlist whose size nobody restates is how it
+        # rots into a rubber stamp.
+        self.assertEqual(
+            len(self.NOT_RENDERED),
+            self.EXPECTED_NOT_RENDERED,
+            "the register's size and the size it declares disagree; the "
+            "ceiling is not a budget to spend",
         )
 
     def test_the_context_block_owes_no_exemption_at_all(self) -> None:
@@ -4942,9 +4974,43 @@ class ContextReferentIsBoundTest(unittest.TestCase):
         # An aggregate must name the set it ranges over, and a share of the
         # BANDED calls is neither a share of the sample nor of the window's
         # calls. Both come from the scope's own row, never from the pooled one.
-        for field in ("scope", "banded_calls", "calls", "sample_calls"):
+        for field in ("banded_calls", "calls", "sample_calls"):
             with self.subTest(field=field):
                 self.assertIn(f"s.{field}", self.scope_loop)
+
+    def test_the_scope_name_leads_the_line_rather_than_only_appearing_on_it(
+        self,
+    ) -> None:
+        # TIGHTENED, because the assertion above did not pin what its name
+        # claimed. `s.scope` was asserted to appear ANYWHERE in the loop, and
+        # the #70 drill-through button at the foot of that same loop renders it
+        # too ("See the models <s.scope> calls ran on ->") -- so deleting the
+        # LEAD left the suite green. Nothing was wrong on the page; the guard
+        # was.
+        #
+        # Two renderings serve two purposes and only one of them names the
+        # figure's set: a scope named only inside a link to another view is a
+        # tally whose denominator the reader must click away to learn. So the
+        # lead is pinned as ITSELF -- a marked element, asserted to come before
+        # any band, count or drill-down on the line -- rather than by counting
+        # occurrences, which would be the same weakness with a bigger number.
+        lead = re.search(
+            r'<strong class="scope-lead" x-text="s\.scope"></strong>',
+            self.scope_loop,
+        )
+        self.assertIsNotNone(
+            lead,
+            "the per-scope line does not lead with the scope's own name; a "
+            "figure whose set is named only in a link to another view has not "
+            "named its set",
+        )
+        for later in ("s.banded_calls", "s.no_sample_reason", "showPanel("):
+            with self.subTest(after=later):
+                self.assertLess(
+                    lead.start(),
+                    self.scope_loop.index(later),
+                    "the scope name does not come first on its own line",
+                )
 
     def test_a_scope_with_no_banded_sample_says_why_instead_of_drawing_zeroes(
         self,
@@ -7128,6 +7194,11 @@ CHROME_PANELS = {
     # a warning the reader can navigate away from without resolving.
     "banner",
     "data-age",
+    # #64's verdict, and it is chrome for the same reason the banner is: it
+    # qualifies EVERY figure in either view, so a rendering the reader could
+    # navigate away from would be a verdict they could leave behind unresolved.
+    # One element, no second copy to drift from.
+    "health-note",
     # The affordance itself: one click there, one click back, from either view.
     "view-tabs",
 }
@@ -7502,6 +7573,947 @@ class ReportViewSplitTest(unittest.TestCase):
             "one declaration, five in load(), one in showDetail() -- any other "
             "count is a request the split added",
         )
+
+
+# ---------------------------------------------------------------------------
+# #64 / #65: the health verdict and the growth curve.
+# ---------------------------------------------------------------------------
+#
+# ONE corpus, built so that no test below can pass by accident:
+#
+#   * the main thread's context RISES across the clean day and the subagents'
+#     FALLS across the same minutes, so a curve computed over the wrong scope,
+#     or pooled across both, produces different numbers in the opposite
+#     direction. A fixture whose two scopes agreed would let a dropped filter
+#     through;
+#   * every quarter of the clean day holds FOUR calls, which is one above
+#     `GROWTH_MIN_CALLS_PER_QUARTER`, and each quarter's four are ordered in
+#     TIME as 1st-4th-2nd-3rd, so a "first call", "last call" or "mean"
+#     standing in for the median reports a different figure;
+#   * each day strands the health verdict in a DIFFERENT state -- a call with
+#     no prompt accounting, a call on a model with no documented window, a call
+#     measuring past 100% of its own window -- because all three otherwise sit
+#     under one reassuring "nothing is broken";
+#   * one day makes the SUBAGENTS the worst-saturated scope, so a `worst_scope`
+#     hard-coded to the main thread is red;
+#   * one day gives every main-thread call the SAME timestamp, so a period with
+#     no span cannot be quartered and must say so rather than divide by zero.
+HG_SESSION = "health-growth-fixture"
+HG_AGENT = "agent-hg64a"
+HG_OPUS_1M = "claude-opus-5-20260101"
+HG_HAIKU_200K = "claude-haiku-4-5-20251001"
+HG_UNKNOWN = "claude-nosuchtier-9-20260101"
+
+HG_CLEAN_DAY = "2026-07-01"       # every check passes; the growth curve's day
+HG_SUB_HEAVY_DAY = "2026-07-02"   # the SUBAGENTS are the saturated scope
+HG_BLIND_DAY = "2026-07-03"       # a call carrying no prompt accounting
+HG_UNKNOWN_DAY = "2026-07-04"     # a call on a model with no documented window
+HG_OVER_DAY = "2026-07-05"        # a call measuring past its own window
+HG_INSTANT_DAY = "2026-07-06"     # every main-thread call at one instant
+HG_LATE_DAY = "2026-07-20"        # far enough out to leave two quarters empty
+
+HG_MAIN = SOURCE_MAIN
+HG_SUB = SOURCE_SUBAGENT
+
+# The clean day's main thread, in TIME order: four quarters of four, rising.
+# Within each quarter the order is smallest, largest, then the two middles, so
+# the median is neither the first nor the last call of its quarter.
+HG_RISING = [
+    100_000, 130_000, 110_000, 120_000,
+    300_000, 330_000, 310_000, 320_000,
+    500_000, 530_000, 510_000, 520_000,
+    900_000, 930_000, 910_000, 920_000,
+]
+# Hand-written, then checked against the list above: `nearest_rank` at p50 over
+# four values takes index 1, i.e. the SECOND SMALLEST.
+HG_QUARTER_MEDIANS = [110_000, 310_000, 510_000, 910_000]
+HG_QUARTER_UTILISATIONS = [0.11, 0.31, 0.51, 0.91]
+# The subagents over the same minutes, FALLING, and never above a quarter of
+# the window -- so a pooled or mis-scoped curve is red in shape as well as in
+# value.
+HG_FALLING = [240_000 - 10_000 * n for n in range(16)]
+
+# (day, minute, second, kind, model, context)
+HG_CALLS: list[tuple[str, int, int, str, str, int]] = [
+    *[
+        (HG_CLEAN_DAY, n, 0, HG_MAIN, HG_OPUS_1M, size)
+        for n, size in enumerate(HG_RISING)
+    ],
+    *[
+        (HG_CLEAN_DAY, n, 30, HG_SUB, HG_OPUS_1M, size)
+        for n, size in enumerate(HG_FALLING)
+    ],
+    # The subagents saturated and the main thread idle: the ranking must follow
+    # the measurement, not the scope's name.
+    *[(HG_SUB_HEAVY_DAY, n, 0, HG_MAIN, HG_OPUS_1M, 100_000) for n in range(4)],
+    *[(HG_SUB_HEAVY_DAY, n, 30, HG_SUB, HG_OPUS_1M, 950_000) for n in range(4)],
+    # One measured call and one carrying no prompt accounting at all.
+    (HG_BLIND_DAY, 0, 0, HG_MAIN, HG_OPUS_1M, 300_000),
+    (HG_BLIND_DAY, 1, 0, HG_MAIN, HG_OPUS_1M, 0),
+    # A model this build has no documented window for.
+    (HG_UNKNOWN_DAY, 0, 0, HG_MAIN, HG_UNKNOWN, 400_000),
+    # 150% of a 200k window: impossible, therefore a stale window table.
+    (HG_OVER_DAY, 0, 0, HG_MAIN, HG_HAIKU_200K, 300_000),
+    # Twelve calls -- past the floor -- sharing one instant, so the period they
+    # span is a point.
+    *[(HG_INSTANT_DAY, 0, 0, HG_MAIN, HG_OPUS_1M, 200_000 + n) for n in range(12)],
+    # The far end of the wide window: eight banded calls and four whose model
+    # has no window, so the quarter's two medians range over two sets.
+    *[(HG_LATE_DAY, n, 0, HG_MAIN, HG_OPUS_1M, 600_000 + 1_000 * n) for n in range(8)],
+    *[(HG_LATE_DAY, 8 + n, 0, HG_MAIN, HG_UNKNOWN, 700_000) for n in range(4)],
+]
+
+
+def build_health_growth_corpus(root: Path) -> Path:
+    """The corpus above, written the way Claude Code writes transcripts."""
+    project = root / "projects" / "-fixture-health-growth"
+    project.mkdir(parents=True)
+    subagents = project / HG_SESSION / "subagents"
+    subagents.mkdir(parents=True)
+
+    def record(
+        n: int, day: str, minute: int, second: int, kind: str, model: str, context: int
+    ) -> str:
+        if context:
+            # Three deliberately unequal classes summing to the target context,
+            # so a swapped column mapping cannot reproduce it.
+            usage = {
+                "input_tokens": 1_000,
+                "cache_creation_input_tokens": 2_000,
+                "cache_read_input_tokens": context - 3_000,
+                "output_tokens": n + 1,
+            }
+        else:
+            # The #25 population: the four keys PRESENT and valued zero.
+            usage = {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+            }
+        payload: dict[str, object] = {
+            "type": "assistant",
+            "sessionId": HG_SESSION,
+            "timestamp": f"{day}T15:{minute:02d}:{second:02d}.000Z",
+            "isSidechain": kind == SOURCE_SUBAGENT,
+            "message": {
+                "id": f"msg-hg64-{n}",
+                "model": model,
+                "usage": usage,
+                "content": [{"type": "text", "text": f"hg64 call {n}"}],
+            },
+        }
+        if kind == SOURCE_SUBAGENT:
+            payload["agentId"] = HG_AGENT
+        return json.dumps(payload) + "\n"
+
+    main_lines: list[str] = []
+    sub_lines: list[str] = []
+    for n, (day, minute, second, kind, model, context) in enumerate(HG_CALLS):
+        line = record(n, day, minute, second, kind, model, context)
+        (sub_lines if kind == SOURCE_SUBAGENT else main_lines).append(line)
+    (project / f"{HG_SESSION}.jsonl").write_text("".join(main_lines))
+    (subagents / f"{HG_AGENT}.jsonl").write_text("".join(sub_lines))
+    return project
+
+
+class HealthGrowthCorpusTest(unittest.TestCase):
+    """Shared fixture for the two blocks #64 and #65 added.
+
+    Every variant state is produced by COPYING the ingested database and
+    mutating the copy, so one ingest serves them all and no test can leave a
+    state behind for the next one.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-health-growth-test-"))
+        projects = build_health_growth_corpus(cls.tmp)
+        cls.db = cls.tmp / "usage.db"
+        ingest(projects, cls.db, tasks_dir=cls.tmp / "no-task-index")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def api(self, mutate=None) -> Api:
+        """An `Api` over a private COPY of the corpus, optionally mutated."""
+        copy = self.tmp / f"copy-{self.id().rsplit('.', 1)[-1]}-{id(mutate)}.db"
+        shutil.copy(self.db, copy)
+        if mutate is not None:
+            conn = sqlite3.connect(copy)
+            mutate(conn)
+            conn.commit()
+            conn.close()
+        api = Api(copy)
+        self.addCleanup(api.conn.close)
+        return api
+
+    def summary(self, day: str | None = None, to: str | None = None, mutate=None):
+        return self.api(mutate).summary(*day_bounds(day, to if to else day))
+
+    def health(self, day: str | None = None, mutate=None) -> dict:
+        return self.summary(day, mutate=mutate)["health"]
+
+    @staticmethod
+    def check(health: dict, name: str) -> dict:
+        found = [c for c in health["checks"] if c["check"] == name]
+        assert len(found) == 1, f"{name} is not reported exactly once"
+        return found[0]
+
+
+class HealthVerdictTest(HealthGrowthCorpusTest):
+    """#64: the report states whether anything is broken, and CAN say it is not.
+
+    The page reported "8,163 records parsed, 0 unparsed" and then stopped. A
+    reader scanning for alarm had to infer reassurance from the ABSENCE OF A
+    WARNING -- the exact inference this repository refuses to let a number make.
+
+    The half that makes the issue worth doing is the THIRD state. "Nothing is
+    broken" and "we could not check" have different remedies, and a corpus with
+    no `source_shape` rows has not been censused rather than been found clean.
+    A two-state verdict would report health over a corpus nobody has looked at.
+    """
+
+    # --- the reassurance is a real measurement ---
+
+    def test_a_clean_window_states_that_nothing_is_broken(self) -> None:
+        health = self.health(HG_CLEAN_DAY)
+        self.assertEqual(health["verdict"], HEALTH_OK)
+        self.assertEqual(health["statement"], HEALTH_STATEMENTS[HEALTH_OK])
+        self.assertEqual(
+            [c["state"] for c in health["checks"]],
+            [HEALTH_OK] * len(HEALTH_CHECKS),
+            "the clean day is not clean, so nothing below distinguishes a "
+            "passing check from a missing one",
+        )
+
+    def test_every_declared_check_is_computed_and_reported_in_order(self) -> None:
+        # `HEALTH_CHECKS` and `_health()` are two enumerations of one set, and
+        # nothing but this ties them: a check declared and computed nowhere
+        # would simply never be asked, and one computed and undeclared would
+        # appear in a list nothing describes.
+        health = self.health(HG_CLEAN_DAY)
+        self.assertEqual([c["check"] for c in health["checks"]], list(HEALTH_CHECKS))
+
+    def test_each_check_carries_every_field(self) -> None:
+        for check in self.health(HG_CLEAN_DAY)["checks"]:
+            with self.subTest(check=check["check"]):
+                self.assertEqual(
+                    set(check), {"check", "state", "statement", "count", "of"}
+                )
+                self.assertIn(check["state"], HEALTH_ORDER)
+                self.assertGreater(len(check["statement"]), 40)
+
+    # --- "nothing is broken" is distinguishable from "we could not check" ---
+
+    def test_an_uncensused_corpus_is_not_reported_clean(self) -> None:
+        # THE test this issue exists for. Every other check passes over this
+        # database; the one thing that would notice Claude Code renaming a
+        # token key has never run over it. A row in `source_shape` is a
+        # POSITIVE observation, so no rows means uncensused -- and a verdict
+        # that read that as health would be `source_shape`'s own rule failing
+        # at the last inch.
+        health = self.health(
+            HG_CLEAN_DAY, mutate=lambda c: c.execute("DELETE FROM source_shape")
+        )
+        self.assertEqual(health["verdict"], HEALTH_UNCHECKED)
+        self.assertNotEqual(health["verdict"], HEALTH_OK)
+        census = self.check(health, CHECK_FORMAT_CENSUS)
+        self.assertEqual(census["state"], HEALTH_UNCHECKED)
+        self.assertEqual(census["count"], 0)
+        self.assertGreater(census["of"], 0)
+
+    def test_a_partly_censused_corpus_is_unchecked_too(self) -> None:
+        # The v8-upgrade state: some sources were censused and the unchanged
+        # ones will be when they next change. "Most of it was looked at" is not
+        # "it was looked at".
+        health = self.health(
+            HG_CLEAN_DAY,
+            mutate=lambda c: c.execute(
+                "DELETE FROM source_shape WHERE path = "
+                "(SELECT MIN(path) FROM source_shape)"
+            ),
+        )
+        census = self.check(health, CHECK_FORMAT_CENSUS)
+        self.assertEqual(census["state"], HEALTH_UNCHECKED)
+        self.assertLess(census["count"], census["of"])
+        self.assertEqual(health["verdict"], HEALTH_UNCHECKED)
+
+    def test_a_database_that_cannot_census_at_all_says_so(self) -> None:
+        # `serve.py` never migrates, so a pre-v9 database simply has no table.
+        # "This build cannot ask the question" must not read as an answer.
+        health = self.health(
+            HG_CLEAN_DAY, mutate=lambda c: c.execute("DROP TABLE source_shape")
+        )
+        census = self.check(health, CHECK_FORMAT_CENSUS)
+        self.assertEqual(census["state"], HEALTH_UNCHECKED)
+        self.assertIsNone(census["count"])
+        self.assertIsNone(census["of"])
+        self.assertEqual(health["verdict"], HEALTH_UNCHECKED)
+
+    def test_the_three_verdict_statements_are_three_different_claims(self) -> None:
+        # Rendered identically, the states would be a distinction the payload
+        # made and the reader could not see.
+        self.assertEqual(len(set(HEALTH_STATEMENTS.values())), 3)
+        self.assertEqual(set(HEALTH_STATEMENTS), set(HEALTH_ORDER))
+        self.assertNotIn(
+            HEALTH_STATEMENTS[HEALTH_OK],
+            HEALTH_STATEMENTS[HEALTH_UNCHECKED],
+            "the unchecked verdict quotes the clean one",
+        )
+
+    # --- a failure outranks the reassurance ---
+
+    def test_an_unparsed_record_fails_the_verdict(self) -> None:
+        health = self.health(
+            HG_CLEAN_DAY,
+            mutate=lambda c: c.execute(
+                "UPDATE ingest_state SET unparsed_records = 3"
+                " WHERE path = (SELECT MIN(path) FROM ingest_state)"
+            ),
+        )
+        self.assertEqual(health["verdict"], HEALTH_FAILED)
+        parsed = self.check(health, CHECK_RECORDS_PARSED)
+        self.assertEqual(parsed["state"], HEALTH_FAILED)
+        self.assertEqual(parsed["count"], 3)
+
+    def test_a_failure_is_never_softened_by_the_checks_that_pass(self) -> None:
+        # Five checks pass and one fails: the verdict is the failure, and the
+        # passing five are still SHOWN -- an `ok` is a positive statement, and
+        # hiding them would make "healthy" and "not asked" render alike.
+        health = self.health(
+            HG_CLEAN_DAY,
+            mutate=lambda c: c.execute(
+                "UPDATE ingest_state SET unparsed_records = 1"
+                " WHERE path = (SELECT MIN(path) FROM ingest_state)"
+            ),
+        )
+        self.assertEqual(health["verdict"], HEALTH_FAILED)
+        self.assertEqual(
+            sum(1 for c in health["checks"] if c["state"] == HEALTH_OK),
+            len(HEALTH_CHECKS) - 1,
+        )
+
+    def test_a_failure_outranks_an_unchecked_as_well_as_an_ok(self) -> None:
+        # Both other states present at once. `unchecked` is the milder true
+        # statement, and a reader shown it while a failure went unmentioned
+        # would have been handed the milder fact -- `BannerPrecedenceTest`'s
+        # defect, one layer up.
+        def mutate(conn):
+            conn.execute("DELETE FROM source_shape")
+            conn.execute(
+                "UPDATE ingest_state SET unparsed_records = 2"
+                " WHERE path = (SELECT MIN(path) FROM ingest_state)"
+            )
+
+        health = self.health(HG_CLEAN_DAY, mutate=mutate)
+        states = {c["state"] for c in health["checks"]}
+        self.assertEqual(states, {HEALTH_OK, HEALTH_UNCHECKED, HEALTH_FAILED})
+        self.assertEqual(health["verdict"], HEALTH_FAILED)
+
+    def test_the_precedence_is_failed_then_unchecked_then_ok(self) -> None:
+        self.assertEqual(HEALTH_ORDER, (HEALTH_FAILED, HEALTH_UNCHECKED, HEALTH_OK))
+
+    def test_a_reply_past_its_own_window_is_a_failure_not_a_caveat(self) -> None:
+        # A call cannot exceed the window it had, so a measurement that says one
+        # did means this build's window table has gone stale. That is the loud
+        # half of `context_window.py`'s safety story, and it is only a safety
+        # story if a verdict states it.
+        health = self.health(HG_OVER_DAY)
+        within = self.check(health, CHECK_WITHIN_WINDOW)
+        self.assertEqual(within["state"], HEALTH_FAILED)
+        self.assertEqual(within["count"], 1)
+        self.assertEqual(health["verdict"], HEALTH_FAILED)
+
+    # --- the unchecked states, each on its own day ---
+
+    def test_an_unknown_model_leaves_the_window_check_unmade(self) -> None:
+        health = self.health(HG_UNKNOWN_DAY)
+        known = self.check(health, CHECK_MODEL_WINDOW_KNOWN)
+        self.assertEqual(known["state"], HEALTH_UNCHECKED)
+        self.assertEqual(known["count"], 1)
+        self.assertEqual(health["verdict"], HEALTH_UNCHECKED)
+
+    def test_a_call_with_no_prompt_accounting_leaves_context_unchecked(self) -> None:
+        health = self.health(HG_BLIND_DAY)
+        measured = self.check(health, CHECK_CONTEXT_MEASURED)
+        self.assertEqual(measured["state"], HEALTH_UNCHECKED)
+        self.assertEqual(measured["count"], 1)
+        self.assertEqual(measured["of"], 2)
+        self.assertEqual(health["verdict"], HEALTH_UNCHECKED)
+
+    def test_an_empty_window_is_unchecked_rather_than_clean(self) -> None:
+        # A window holding no call has nothing wrong with it and nothing right
+        # either. Reported `ok`, it would tell a reader who narrowed the dates
+        # past every call that their corpus is healthy.
+        health = self.health("2026-07-10")
+        for name in (
+            CHECK_MODEL_WINDOW_KNOWN, CHECK_WITHIN_WINDOW, CHECK_CONTEXT_MEASURED,
+        ):
+            with self.subTest(check=name):
+                self.assertEqual(self.check(health, name)["state"], HEALTH_UNCHECKED)
+        self.assertEqual(health["verdict"], HEALTH_UNCHECKED)
+
+    # --- staleness cannot be lowered by anything here (PR #60) ---
+
+    def test_a_stale_database_fails_and_the_verdict_cannot_lower_it(self) -> None:
+        health = self.health(
+            HG_CLEAN_DAY,
+            mutate=lambda c: c.execute(
+                f"UPDATE {INGEST_RUNS_TABLE} SET finished_at = ?",
+                (time.time() - STALE_AFTER_SECONDS * 10,),
+            ),
+        )
+        age = self.check(health, CHECK_INGEST_AGE)
+        self.assertEqual(age["state"], HEALTH_FAILED)
+        self.assertEqual(health["verdict"], HEALTH_FAILED)
+
+    def test_an_unknown_age_is_unchecked_and_never_fresh(self) -> None:
+        health = self.health(
+            HG_CLEAN_DAY,
+            mutate=lambda c: c.execute(f"DELETE FROM {INGEST_RUNS_TABLE}"),
+        )
+        age = self.check(health, CHECK_INGEST_AGE)
+        self.assertEqual(age["state"], HEALTH_UNCHECKED)
+        self.assertIn(STALE_UNKNOWN_NO_RUN_RECORDED, age["statement"])
+        self.assertEqual(health["verdict"], HEALTH_UNCHECKED)
+
+    def test_the_age_check_reads_the_tri_state_rather_than_the_clock(self) -> None:
+        # It maps `ingest.stale` and does no comparison of its own, which is
+        # what makes "this verdict cannot lower a staleness warning" a
+        # structural property rather than a promise: there is no arithmetic
+        # here to get the direction wrong.
+        for stale, expected in (
+            (True, HEALTH_FAILED), (False, HEALTH_OK), (None, HEALTH_UNCHECKED),
+        ):
+            with self.subTest(stale=stale):
+                self.assertEqual(
+                    Api._check_ingest_age(
+                        {"stale": stale, "stale_unknown_reason": "why"}
+                    )["state"],
+                    expected,
+                )
+
+    # --- the verdict and the figures it qualifies are ONE reading ---
+
+    def test_every_count_is_the_figure_the_rest_of_the_payload_carries(self) -> None:
+        # `_health()` takes `ingest` and `context` as ARGUMENTS rather than
+        # re-querying, so the verdict at the top of the page and the numbers
+        # below it cannot disagree. This is the tie that says so -- the same
+        # discipline `RANKED_BY` is for a heading and its ORDER BY.
+        payload = self.summary(HG_BLIND_DAY)
+        health, context = payload["health"], payload["context"]
+        util = context["utilisation"]
+        for name, count, of in (
+            (CHECK_RECORDS_PARSED, payload["ingest"]["unparsed_records"], None),
+            (CHECK_MODEL_WINDOW_KNOWN, util["unknown_model_calls"],
+             context["sample_calls"]),
+            (CHECK_WITHIN_WINDOW, util["over_window_calls"], util["banded_calls"]),
+            (CHECK_CONTEXT_MEASURED, context["unmeasured_calls"], util["calls"]),
+        ):
+            with self.subTest(check=name):
+                check = self.check(health, name)
+                self.assertEqual(check["count"], count)
+                self.assertEqual(check["of"], of)
+
+    def test_a_total_the_database_does_not_hold_is_null_and_not_zero(self) -> None:
+        # `ingest_state` records how many records FAILED to parse and not how
+        # many were read, so `records-parsed` has no denominator. Reported as 0
+        # it would say every record failed; invented, it would be exactly the
+        # defect this whole block exists to report.
+        parsed = self.check(self.health(HG_CLEAN_DAY), CHECK_RECORDS_PARSED)
+        self.assertIsNone(parsed["of"])
+        self.assertEqual(parsed["count"], 0)
+
+    def test_an_empty_ledger_is_unchecked_rather_than_a_clean_zero(self) -> None:
+        health = self.health(
+            HG_CLEAN_DAY, mutate=lambda c: c.execute("DELETE FROM ingest_state")
+        )
+        parsed = self.check(health, CHECK_RECORDS_PARSED)
+        self.assertEqual(parsed["state"], HEALTH_UNCHECKED)
+        self.assertNotEqual(parsed["state"], HEALTH_OK)
+
+
+class SaturationRankingTest(HealthGrowthCorpusTest):
+    """#65(a): which scope is the problem, named -- and the key it is named by.
+
+    A ranking must name the key it orders by and the name must BE the key
+    (`RANKED_BY`'s rule). The share is published per scope, the ranking
+    maximises that same field, and the phrase crosses the API beside the winner.
+    """
+
+    def scope(self, day: str, name: str) -> dict:
+        util = self.summary(day)["context"]["utilisation"]
+        found = [s for s in util["by_scope"] if s["scope"] == name]
+        self.assertEqual(len(found), 1)
+        return found[0]
+
+    def test_each_scope_publishes_the_share_the_ranking_orders_by(self) -> None:
+        # 8 of 16 main-thread calls at or above half the window; 0 of 16
+        # subagent ones. Deliberately unequal, so a scope reading the other's
+        # tally is red.
+        self.assertEqual(
+            self.scope(HG_CLEAN_DAY, SCOPE_MAIN)["over_half_window_calls"], 8
+        )
+        self.assertEqual(
+            self.scope(HG_CLEAN_DAY, SCOPE_MAIN)["over_half_window_share"], 0.5
+        )
+        self.assertEqual(
+            self.scope(HG_CLEAN_DAY, SCOPE_SUBAGENT)["over_half_window_calls"], 0
+        )
+        self.assertEqual(
+            self.scope(HG_CLEAN_DAY, SCOPE_SUBAGENT)["over_half_window_share"], 0.0
+        )
+
+    def test_a_scope_with_no_banded_sample_has_no_share_rather_than_zero(self) -> None:
+        # A share of an empty set is not 0%, and 0.0 here would rank a scope
+        # that measured nothing as the most frugal one.
+        sub = self.scope(HG_UNKNOWN_DAY, SCOPE_SUBAGENT)
+        self.assertEqual(sub["banded_calls"], 0)
+        self.assertIsNone(sub["over_half_window_share"])
+        self.assertEqual(sub["over_half_window_calls"], 0)
+
+    def test_the_worst_scope_is_the_one_the_measurement_names(self) -> None:
+        util = self.summary(HG_CLEAN_DAY)["context"]["utilisation"]
+        self.assertEqual(util["worst_scope"], SCOPE_MAIN)
+        self.assertEqual(util["worst_scope_ranked_by"], SATURATION_RANKED_BY)
+
+    def test_the_ranking_follows_the_figure_and_not_the_scope_name(self) -> None:
+        # THE teeth: on this day every saturated call is a SUBAGENT's. A
+        # `worst_scope` hard-coded to the main thread, or one ranked on call
+        # counts rather than on the published share, is red here and nowhere
+        # else.
+        util = self.summary(HG_SUB_HEAVY_DAY)["context"]["utilisation"]
+        self.assertEqual(util["worst_scope"], SCOPE_SUBAGENT)
+        self.assertEqual(
+            self.scope(HG_SUB_HEAVY_DAY, SCOPE_SUBAGENT)["over_half_window_share"], 1.0
+        )
+        self.assertEqual(
+            self.scope(HG_SUB_HEAVY_DAY, SCOPE_MAIN)["over_half_window_share"], 0.0
+        )
+
+    def test_a_window_no_scope_banded_names_no_worst_scope(self) -> None:
+        # None rather than a scope that measured nothing: "the worst scope is
+        # the one we never looked at" is not a ranking.
+        util = self.summary("2026-07-10")["context"]["utilisation"]
+        self.assertIsNone(util["worst_scope"])
+
+    def test_a_measured_zero_still_ranks(self) -> None:
+        # 0.0 is a real reading and must not be treated as an absence: "the
+        # pressure is in your main session, and it is currently none" is a true
+        # and useful sentence.
+        util = self.summary(HG_BLIND_DAY)["context"]["utilisation"]
+        self.assertEqual(util["worst_scope"], SCOPE_MAIN)
+
+    def test_the_recommendation_reads_the_published_share(self) -> None:
+        # One definition of "over half the window", not two. The metric that
+        # drives the advice band and the share the ranking uses are now the
+        # same field; a second summation in `_recommendations()` would be free
+        # to drift from the number the reader is looking at.
+        payload = self.summary(HG_CLEAN_DAY)
+        ranked = payload["recommendations"]["ranked"]
+        found = [
+            a for a in ranked
+            if a["metric"] == METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW
+        ]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(
+            found[0]["value"],
+            self.scope(HG_CLEAN_DAY, SCOPE_MAIN)["over_half_window_share"],
+        )
+
+
+class GrowthCurveTest(HealthGrowthCorpusTest):
+    """#65(b): the main session's context across four quarters of its own life.
+
+    Measured 2026-08-05 over this project's own transcripts: 97,436 -> 333,610
+    -> 514,413 -> 906,301, the last of them 90.6% of the window. "Your context
+    is large" and "your context only ever grows" are different findings, and
+    the report showed only the first.
+    """
+
+    def growth(self, day: str | None = None, to: str | None = None) -> dict:
+        return self.summary(day, to)["context"]["growth"]
+
+    # --- the curve names its set ---
+
+    def test_the_curve_names_which_scope_how_many_replies_and_what_period(
+        self,
+    ) -> None:
+        growth = self.growth(HG_CLEAN_DAY)
+        self.assertEqual(growth["scope"], SCOPE_MAIN)
+        self.assertEqual(growth["calls"], len(HG_RISING))
+        self.assertIn("main-thread", growth["sample_is"])
+        self.assertIsNotNone(growth["first_ts"])
+        self.assertIsNotNone(growth["last_ts"])
+        self.assertLess(growth["first_ts"], growth["last_ts"])
+
+    def test_the_scope_the_curve_names_is_the_scope_it_measures(self) -> None:
+        # The label is derived from `GROWTH_SCOPE` through `SCOPE_LABELS`, so a
+        # curve that changed scope without changing its label is impossible
+        # rather than merely unlikely.
+        self.assertEqual(GROWTH_SCOPE, SOURCE_MAIN)
+        self.assertEqual(self.growth(HG_CLEAN_DAY)["scope"], SCOPE_MAIN)
+
+    # --- the finding itself ---
+
+    def test_the_typical_context_rises_across_the_four_quarters(self) -> None:
+        quarters = self.growth(HG_CLEAN_DAY)["quarters"]
+        self.assertEqual([q["quarter"] for q in quarters], [1, 2, 3, 4])
+        self.assertEqual(
+            [q["median_context"] for q in quarters], HG_QUARTER_MEDIANS
+        )
+        self.assertEqual([q["calls"] for q in quarters], [4, 4, 4, 4])
+
+    def test_the_utilisation_median_is_published_beside_the_context_one(self) -> None:
+        # The persuasive half: by the last quarter the TYPICAL reply sits at
+        # 91% of the window it had.
+        quarters = self.growth(HG_CLEAN_DAY)["quarters"]
+        for q, expected in zip(quarters, HG_QUARTER_UTILISATIONS):
+            with self.subTest(quarter=q["quarter"]):
+                self.assertAlmostEqual(q["median_utilisation"], expected, places=9)
+
+    def test_the_curve_is_computed_over_the_main_thread_alone(self) -> None:
+        # THE mis-scoping test. Over the same minutes the subagents' context
+        # FALLS from 240k to 90k, so a curve computed over the wrong scope, or
+        # pooled across both, is red in value AND in direction.
+        quarters = self.growth(HG_CLEAN_DAY)["quarters"]
+        medians = [q["median_context"] for q in quarters]
+        self.assertEqual(medians, sorted(medians), "the curve does not rise")
+        for wrong in (
+            sorted(HG_FALLING, reverse=True)[:4],          # a subagent-only curve
+            [(a + b) // 2 for a, b in zip(HG_RISING, HG_FALLING)],  # pooled
+        ):
+            with self.subTest(wrong=wrong):
+                self.assertNotEqual(medians, wrong)
+        self.assertEqual(
+            sum(q["calls"] for q in quarters),
+            len(HG_RISING),
+            "the curve counted calls from a scope it does not name",
+        )
+
+    def test_the_median_is_neither_the_first_nor_the_last_call_of_its_quarter(
+        self,
+    ) -> None:
+        # The fixture orders each quarter smallest, largest, then the middles,
+        # so "the first call", "the last call" and the mean each report a
+        # different figure from the median.
+        quarters = self.growth(HG_CLEAN_DAY)["quarters"]
+        for i, q in enumerate(quarters):
+            block = HG_RISING[i * 4:(i + 1) * 4]
+            with self.subTest(quarter=q["quarter"]):
+                self.assertNotEqual(q["median_context"], block[0])
+                self.assertNotEqual(q["median_context"], block[-1])
+                self.assertNotEqual(q["median_context"], sum(block) // len(block))
+
+    # --- absence is never a plotted zero ---
+
+    def test_a_quarter_with_no_measured_call_is_a_named_absence(self) -> None:
+        # The window spans the clean day and a day nineteen days later, so the
+        # two middle quarters hold nothing at all. Plotted as 0 they would draw
+        # the context collapsing in a period that was merely idle -- the defect
+        # `timeseries()`'s null `avg_context` fixed for the daily chart.
+        quarters = self.growth(HG_CLEAN_DAY, HG_LATE_DAY)["quarters"]
+        empty = [q for q in quarters if q["calls"] == 0]
+        self.assertTrue(empty, "the fixture no longer leaves a quarter empty")
+        for q in empty:
+            with self.subTest(quarter=q["quarter"]):
+                self.assertEqual(q["no_sample_reason"], GROWTH_QUARTER_NO_CALLS)
+                self.assertIsNone(q["median_context"])
+                self.assertNotEqual(q["median_context"], 0)
+                self.assertIsNone(q["median_utilisation"])
+                self.assertNotEqual(q["median_utilisation"], 0)
+                self.assertEqual(q["banded_calls"], 0)
+        for q in quarters:
+            if q["calls"]:
+                with self.subTest(quarter=q["quarter"]):
+                    self.assertIsNone(q["no_sample_reason"])
+                    self.assertIsNotNone(q["median_context"])
+
+    def test_a_quarters_two_medians_range_over_two_different_samples(self) -> None:
+        # The last quarter of the wide window holds twelve calls, four of them
+        # on a model with no documented window. The context median ranges over
+        # all twelve; the utilisation median over the eight that could be
+        # banded, and `banded_calls` beside it is what keeps the two from being
+        # read as one figure.
+        last = self.growth(HG_CLEAN_DAY, HG_LATE_DAY)["quarters"][-1]
+        self.assertEqual(last["calls"], 12)
+        self.assertEqual(last["banded_calls"], 8)
+        self.assertIsNotNone(last["median_context"])
+        self.assertIsNotNone(last["median_utilisation"])
+
+    # --- a corpus too small to quarter says so ---
+
+    def test_a_period_with_too_few_replies_refuses_to_draw_a_curve(self) -> None:
+        growth = self.growth(HG_UNKNOWN_DAY)
+        self.assertEqual(growth["refused_reason"], GROWTH_REFUSED_TOO_FEW)
+        self.assertEqual(growth["minimum_calls"], GROWTH_MIN_CALLS)
+        self.assertLess(growth["calls"], GROWTH_MIN_CALLS)
+        # The counts are still published: they are true, and withholding them
+        # would answer an over-claim with an absence nobody asked for.
+        self.assertEqual(len(growth["quarters"]), GROWTH_QUARTERS)
+
+    def test_a_period_with_no_span_refuses_for_its_own_reason(self) -> None:
+        # Twelve calls -- past the floor -- all at one instant. "Too few" and
+        # "no span" are different absences with different remedies, and the
+        # wider one is named first, exactly as `_no_band_sample_reason` orders
+        # its three.
+        growth = self.growth(HG_INSTANT_DAY)
+        self.assertGreaterEqual(growth["calls"], GROWTH_MIN_CALLS)
+        self.assertEqual(growth["refused_reason"], GROWTH_REFUSED_NO_SPAN)
+        self.assertEqual(len(growth["quarters"]), GROWTH_QUARTERS)
+
+    def test_a_curve_it_can_draw_carries_no_refusal(self) -> None:
+        # Non-null EXACTLY when the curve is refused, in both directions.
+        self.assertIsNone(self.growth(HG_CLEAN_DAY)["refused_reason"])
+
+    def test_the_floor_is_derived_from_the_median_it_protects(self) -> None:
+        # The floor is not taste. `nearest_rank` at p50 takes index
+        # `ceil(n/2) - 1`, which is 0 -- the quarter's SMALLEST call -- for
+        # n <= 2, and 1 for n = 3. Three is therefore the smallest sample whose
+        # median is strictly interior, and a "typical" context that is in fact
+        # the quarter's minimum is not a typical anything.
+        self.assertEqual(GROWTH_MIN_CALLS_PER_QUARTER, 3)
+        self.assertEqual(GROWTH_MIN_CALLS, GROWTH_QUARTERS * 3)
+        sample = [10, 20, 30]
+        self.assertEqual(nearest_rank(sample[:2], 50), sample[0])
+        self.assertEqual(nearest_rank(sample, 50), sample[1])
+        self.assertNotEqual(nearest_rank(sample, 50), min(sample))
+        self.assertNotEqual(nearest_rank(sample, 50), max(sample))
+
+    def test_an_empty_scope_has_no_period_rather_than_a_zero_one(self) -> None:
+        growth = self.growth("2026-07-10")
+        self.assertEqual(growth["calls"], 0)
+        self.assertIsNone(growth["first_ts"])
+        self.assertIsNone(growth["last_ts"])
+        self.assertEqual(growth["refused_reason"], GROWTH_REFUSED_TOO_FEW)
+        for q in growth["quarters"]:
+            with self.subTest(quarter=q["quarter"]):
+                self.assertEqual(q["calls"], 0)
+                self.assertIsNone(q["median_context"])
+                self.assertEqual(q["no_sample_reason"], GROWTH_QUARTER_NO_CALLS)
+
+
+class HealthBandIsBoundTest(unittest.TestCase):
+    """#64's verdict reaches the reader, in the chrome, in three visible tones.
+
+    Structural, with the limit the rest of this file records: the project ships
+    no JS runtime (stdlib only, no Node), so these pin the bindings rather than
+    executing the render.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+        cls.band = html_element(cls.raw, 'id="health-note"')
+
+    def test_the_verdict_and_its_statement_come_from_the_api(self) -> None:
+        # The page performs no lookup and holds no threshold: which state the
+        # corpus is in, and the sentence that says so, are both measurements.
+        for field in ("verdict", "statement"):
+            with self.subTest(field=field):
+                self.assertIn(f"summary.health.{field}", self.band)
+
+    def test_the_checks_are_iterated_rather_than_spelled_out(self) -> None:
+        # A band that named its six checks would render five and look complete
+        # the day a seventh was added -- the shape #84 caught one module over.
+        loop = re.search(r'<template x-for="([^"]+)"', self.band)
+        self.assertIsNotNone(loop, "the checks are built some other way")
+        self.assertIn("summary.health.checks", loop.group(1))
+        for field in ("c.check", "c.state", "c.statement", "c.count", "c.of"):
+            with self.subTest(field=field):
+                self.assertIn(field, self.band)
+
+    def test_a_count_the_database_does_not_hold_prints_as_an_absence(self) -> None:
+        # `of` is null on `records-parsed` for ever. Run through anything but
+        # `fmtCount` it would print as 0 and state that every record failed.
+        for field in ("c.count", "c.of"):
+            with self.subTest(field=field):
+                self.assertIn(f"fmtCount({field})", self.band)
+
+    def test_the_three_states_are_three_visibly_different_tones(self) -> None:
+        # An unchecked corpus that LOOKED like a clean one would be this whole
+        # feature failing at the last inch, so the tone is asserted as a table
+        # of three distinct classes, each with a rule of its own.
+        table = re.search(r"const HEALTH_TONE = \{(.*?)\};", self.html, re.S)
+        self.assertIsNotNone(table, "HEALTH_TONE is gone")
+        classes = re.findall(r':\s*"([^"]+)"', table.group(1))
+        self.assertEqual(len(classes), 3)
+        self.assertEqual(len(set(classes)), 3, "two states share a tone")
+        for state in (HEALTH_OK, HEALTH_UNCHECKED, HEALTH_FAILED):
+            with self.subTest(state=state):
+                self.assertRegex(table.group(1), rf"\b{re.escape(state)}\s*:")
+        for cls_name in classes:
+            with self.subTest(css=cls_name):
+                self.assertRegex(self.html, rf"\.{re.escape(cls_name)}\s*\{{[^}}]+\}}")
+
+    def test_an_unrecognised_verdict_falls_back_to_the_loudest_tone(self) -> None:
+        # A state added server-side that this page has never seen is exactly
+        # the one that must not render as a clean bill of health.
+        self.assertIn(
+            "const HEALTH_TONE_UNRECOGNISED = HEALTH_TONE.failed;", self.html
+        )
+        self.assertIn("?? HEALTH_TONE_UNRECOGNISED", self.html)
+
+    def test_a_failed_load_outranks_the_servers_verdict(self) -> None:
+        # A response that never arrived cannot be reassured about. The band
+        # renders its own branch rather than comparing two verdicts, so this
+        # page holds no severity ordering that could drift from the API's.
+        self.assertIn('x-if="summary && banner.loadFailure"', self.band)
+        self.assertIn('x-if="summary && !banner.loadFailure"', self.band)
+        self.assertLess(
+            self.band.index("banner.loadFailure"),
+            self.band.index("summary.health.verdict"),
+            "the server's verdict is rendered before the load failure is ruled out",
+        )
+        self.assertIn(
+            "this.banner.loadFailure", js_function_body(self.html, "get healthTone(")
+        )
+
+    def test_the_verdict_is_rendered_once_and_in_neither_view(self) -> None:
+        # Chrome, like the banner and the data-age line: a verdict over every
+        # figure in either view must not be one the reader can navigate away
+        # from, and one element cannot disagree with itself.
+        self.assertEqual(self.html.count('id="health-note"'), 1)
+        for view in ("overview", "details"):
+            with self.subTest(view=view):
+                self.assertNotIn(
+                    'id="health-note"', view_section(self.raw, view)
+                )
+
+    def test_the_verdict_adds_no_panel(self) -> None:
+        # CLAUDE.md constraint 4. It reuses the `note-band` component the scope
+        # and context notes already use, and it DISPLACES a banner message: the
+        # "No files ingested yet" notice is gone, subsumed by the
+        # `records-parsed` check, which says the same thing and says which of
+        # "clean" and "unchecked" it is.
+        self.assertRegex(self.raw, r'<div class="note-band" id="health-note"')
+        self.assertNotIn("<table", self.band)
+        self.assertNotIn("No files ingested yet", self.html)
+        self.assertEqual(self.html.count('class="panel"'), 6, "a panel was added")
+
+    def test_the_unparsed_record_warning_is_not_removed_from_the_banner(self) -> None:
+        # The health band is a SECOND rendering of `ingest.unparsed_records`,
+        # not a replacement for it. Moved out of the banner it would become a
+        # warning about every total on the page that a reader could navigate
+        # past -- and the banner is chrome precisely so that cannot happen.
+        self.assertIn(
+            "this.summary.ingest.unparsed_records > 0",
+            js_function_body(self.html, "applySummary("),
+        )
+
+
+class GrowthCurveIsBoundTest(unittest.TestCase):
+    """#65's curve reaches the reader, and an absence never gets a bar."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+        cls.band = html_element(cls.raw, 'id="context-note"')
+
+    def test_the_curve_states_the_set_it_ranges_over(self) -> None:
+        for field in ("scope", "calls", "first_ts", "last_ts", "sample_is"):
+            with self.subTest(field=field):
+                self.assertIn(f"summary.context.growth.{field}", self.band)
+
+    def test_the_quarters_are_iterated_from_the_payload(self) -> None:
+        loops = re.findall(r'<template x-for="([^"]+)"', self.band)
+        self.assertIn(
+            "q in summary.context.growth.quarters",
+            loops,
+            "the quarters are built some other way",
+        )
+
+    def test_a_quarter_with_no_sample_gets_the_apis_reason_and_no_bar(self) -> None:
+        # The central rule of this panel, in pixels: an absence has no width. A
+        # bar of zero width is indistinguishable from a bar the page decided
+        # not to draw, and a bar drawn AT zero would show the context
+        # collapsing in a quarter that was merely idle.
+        self.assertIn('x-if="q.no_sample_reason"', self.band)
+        self.assertIn('x-if="!q.no_sample_reason"', self.band)
+        self.assertIn('x-text="q.no_sample_reason"', self.band)
+        self.assertLess(
+            self.band.index('x-if="!q.no_sample_reason"'),
+            self.band.index("growthBarWidth("),
+            "the track is drawn outside the branch that establishes a sample",
+        )
+
+    def test_a_nonzero_reading_keeps_a_visible_minimum_width(self) -> None:
+        # "Rare" and "never" must never render as the same picture, which is
+        # the acceptance criterion this issue states in pixels.
+        body = js_function_body(self.html, "function growthBarWidth(")
+        self.assertIn("Math.max(1,", body)
+        self.assertLess(
+            body.index("=== null"),
+            body.index("Math.max"),
+            "the width is computed before the absence is recognised",
+        )
+        self.assertRegex(body, r"if \(x <= 0\) return null;")
+
+    def test_the_curve_refuses_rather_than_drawing_four_bars_from_three_points(
+        self,
+    ) -> None:
+        for field in ("refused_reason", "minimum_calls"):
+            with self.subTest(field=field):
+                self.assertIn(f"summary.context.growth.{field}", self.band)
+
+    def test_the_answer_sentence_precedes_the_meters_it_is_evidenced_by(self) -> None:
+        # #65 asks for the ANSWER above the meters. Order is the whole
+        # difference between a figure that prompts an action and one that
+        # prompts none -- the same reason #61 pinned the scoped tally first.
+        self.assertLess(
+            self.band.index("summary.context.utilisation.worst_scope"),
+            self.band.index(SCOPE_LOOP_EXPR),
+            "the meters are rendered before the answer they evidence",
+        )
+        self.assertIn(
+            'x-text="summary.context.utilisation.worst_scope_ranked_by"', self.band
+        )
+
+    def test_the_page_ranks_nothing_of_its_own(self) -> None:
+        # The winner and the key are both read off the payload. A page-side
+        # comparison would be a second ranking, free to disagree with the one
+        # the recommendation table is driven by.
+        for forbidden in ("Math.max(...", ".sort(", "over_half_window_share >"):
+            with self.subTest(expr=forbidden):
+                self.assertNotIn(forbidden, self.band)
+
+    def test_the_method_and_both_provenances_move_behind_a_disclosure(self) -> None:
+        # Not deleted -- the judged boundaries must keep their date and their
+        # own voice, which is why `band_provenance` is a separate field at all.
+        # What was wrong was the WEIGHT: at the same size as the finding they
+        # buried it.
+        disclosure = html_element(self.raw, 'class="disclosure"')
+        for field in ("window_provenance", "band_provenance"):
+            with self.subTest(field=field):
+                self.assertIn(field, disclosure)
+        self.assertIn("Median, not mean", disclosure)
+        self.assertIn("One sample, one definition", disclosure)
+        self.assertIn("contextSpread", disclosure)
+        self.assertRegex(self.html, r"\.disclosure\b[^{]*\{[^}]+\}")
+
+    def test_the_per_scope_means_reached_a_reader(self) -> None:
+        # #82 group 1, consumed rather than deleted. Each scope names ITSELF
+        # from the payload, so the page invents no mapping between the bucket
+        # key and the label the meters are keyed on.
+        for kind in ("main_thread", "subagent"):
+            for field in ("scope", "avg_context", "context_calls", "unmeasured_calls"):
+                with self.subTest(kind=kind, field=field):
+                    self.assertIn(f"summary.scope.{kind}.{field}", self.band)
+        # `Math.round(null)` is 0, so the mean goes through the formatter that
+        # refuses an absence before it rounds.
+        for kind in ("main_thread", "subagent"):
+            with self.subTest(kind=kind):
+                self.assertIn(
+                    f"fmtTokRounded(summary.scope.{kind}.avg_context)", self.band
+                )
 
 
 if __name__ == "__main__":

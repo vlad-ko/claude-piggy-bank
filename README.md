@@ -45,7 +45,7 @@ that ships the numbers themselves — ingest, the server, the page — has no mo
 in it at all. This is a rule CPB imposes on itself, not one Claude Code imposes
 on plugins.
 
-CPB is **<!--cpb:version-->1.3.0<!--/cpb:version-->** and follows [Semantic
+CPB is **<!--cpb:version-->1.4.0<!--/cpb:version-->** and follows [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html). What that promises you is
 written down rather than left to be guessed at: the command line, the HTTP API,
 and **what each figure measures** are the interface, so a number that changes
