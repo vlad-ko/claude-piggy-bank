@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import cpb  # noqa: E402
 from ingest import (  # noqa: E402
     INGEST_RUNS_TABLE,
     SOURCE_MAIN,
@@ -50,9 +51,32 @@ from context_window import (  # noqa: E402
     longest_prefix_match,
     window_for_model,
 )
+from recommendations import (  # noqa: E402
+    ACTION_REDUCE,
+    ACTION_VERBS,
+    DISCOUNTED_TOKEN_CLASSES,
+    LEVER_TARGETS,
+    METRIC_CACHE_READS_PER_WRITE,
+    METRIC_CACHE_WRITE_ONLY_SHARE,
+    METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,
+    METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
+    METRICS,
+    PROVENANCE_CITED,
+    PROVENANCE_JUDGED,
+    PROVENANCE_KINDS,
+    PROVENANCE_STRUCTURAL,
+    RANKING_PROVENANCE,
+    RECOMMENDATION_PROVENANCE,
+    RECOMMENDATIONS_AS_OF,
+    SEVERITY_OK,
+    SEVERITY_RANK,
+    UNMEASURED_NOTE,
+    Lever,
+)
 from serve import (  # noqa: E402
     CONTEXT_SAMPLE,
     MEASURED_CONTEXT_MIN,
+    OVER_HALF_WINDOW_BANDS,
     PERCENTILES,
     RANKED_BY,
     SCOPE_INCLUDES_BOTH,
@@ -1918,6 +1942,9 @@ X_FOR = re.compile(r'x-for="\(?\s*([A-Za-z_$][\w$]*)[^"]*?\bin\b([^"]*)"')
 # is a real structural guarantee and not an exemption: `contextSpread` renders
 # one line per percentile without naming any of them.
 BULK_READ = re.compile(r"Object\.(?:keys|values|entries)\(([^()]*)\)")
+# `get shownModels() {`: a component getter, which is the one indirection this
+# walk follows between an `x-for` and the payload it renders (#70).
+GETTER_DECL = re.compile(r"\bget\s+([A-Za-z_$][\w$]*)\s*\(\s*\)\s*\{")
 
 # Never a plausible substitute for a resolved node (rule #12 in the test layer).
 UNRESOLVED = object()
@@ -1951,16 +1978,51 @@ def reads_any(source: str, exprs) -> bool:
     return any(binding_regex(expr).search(source) for expr in exprs)
 
 
-def iteration_aliases(surface: str, exprs) -> frozenset:
-    """The loop variables the page binds a list's ELEMENTS to.
+def getter_bodies(surface: str) -> dict[str, str]:
+    """Every `get name() { ... }` in the page, by name.
 
-    Containment rather than equality on the iterated expression, because the
-    page legitimately guards one: `x-for="(r, i) in (summary ? summary.models :
-    [])"` iterates `summary.models` through a ternary, and a rule that demanded
-    the bare expression would call that list uniterated.
+    Brace-matched through `js_function_body`, so a nested block cannot end a
+    body early and a getter that merely MENTIONS a field in a comment cannot
+    stand in for one that reads it.
     """
+    return {
+        name: js_function_body(surface, f"get {name}(")
+        for name in GETTER_DECL.findall(surface)
+    }
+
+
+def iterates(surface: str, iterated: str, exprs) -> bool:
+    """Does this `x-for`'s expression iterate the node `exprs` names?
+
+    Containment rather than equality on the expression, because the page
+    legitimately guards one: `x-for="(r, i) in (summary ? summary.models : [])"`
+    iterates `summary.models` through a ternary, and a rule that demanded the
+    bare expression would call that list uniterated.
+
+    #70 added the second clause. A view that FILTERS a table iterates a getter
+    -- `x-for="(r, i) in (shownModels ?? [])"` -- and the payload it renders is
+    one hop away, inside that getter. A guard that stopped at the loop would
+    report the whole of `summary.models` unwired the moment a deep-link filter
+    was added to the panel that renders it, which is a check reporting an
+    absence it can see is not there.
+
+    EXACTLY ONE HOP, through a getter DEFINED IN THIS PAGE, and the hop must
+    itself read the payload. A getter that stopped reading `summary.models`
+    turns the guard red again, which is the property worth having: the
+    indirection is followed, not excused.
+    """
+    if reads_any(iterated, exprs):
+        return True
+    return any(
+        re.search(rf"\b{re.escape(name)}\b", iterated) and reads_any(body, exprs)
+        for name, body in getter_bodies(surface).items()
+    )
+
+
+def iteration_aliases(surface: str, exprs) -> frozenset:
+    """The loop variables the page binds a list's ELEMENTS to."""
     return frozenset(
-        var for var, iterated in X_FOR.findall(surface) if reads_any(iterated, exprs)
+        var for var, iterated in X_FOR.findall(surface) if iterates(surface, iterated, exprs)
     )
 
 
@@ -2467,6 +2529,20 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
                     f"{path} is exempted without citing the decision it records",
                 )
                 self.assertGreater(len(reason), 60, f"{path}: not a reason")
+
+    def test_moving_a_field_between_views_does_not_widen_the_register(self) -> None:
+        # #70 splits the page into an overview and a detail view. A field that
+        # MOVES between them is still rendered, so the register must not grow
+        # to cover one -- an entry added by a layout change would be a field
+        # quietly dropped from the report while the allowlist made it look
+        # decided. Twenty-one is the count #76 found and declared; the healthy
+        # direction is down.
+        self.assertLessEqual(
+            len(self.NOT_RENDERED),
+            21,
+            "a field that stopped being rendered was exempted rather than "
+            "re-homed. Moving a panel between views does not orphan a field.",
+        )
 
     def test_the_context_block_owes_no_exemption_at_all(self) -> None:
         # #61 and #76 are one change on purpose: the guard that starts seeing
@@ -4527,10 +4603,19 @@ class DeclarativeRenderLayerTest(unittest.TestCase):
 
     # table id -> the state the rows must be iterated FROM.
     ROW_SOURCES = {
-        "models": "summary.models",
+        "models": "shownModels",
         "sessions": "sessions",
         "agents": "agents",
-        "outliers": "outliers",
+        "outliers": "shownOutliers",
+    }
+    # #70: two of those are DERIVED -- a deep link filters them -- so the
+    # source above is a getter rather than the payload itself. That indirection
+    # is exactly how "iterating a literal []" would come back wearing a
+    # respectable name, so each derived source is pinned to the state it must
+    # read. Getter -> the payload it derives from.
+    DERIVED_ROW_SOURCES = {
+        "shownModels": "this.summary.models",
+        "shownOutliers": "this.outliers",
     }
 
     def test_every_table_body_is_produced_by_iterating_the_payload(self) -> None:
@@ -4553,6 +4638,15 @@ class DeclarativeRenderLayerTest(unittest.TestCase):
                     rf"\bin\s+.*\b{re.escape(source)}\b",
                     f"#{table_id} does not iterate {source}",
                 )
+
+    def test_a_derived_row_source_still_reads_the_payload(self) -> None:
+        # The hop, checked. A filtered table iterates a getter, and a getter
+        # that stopped reading the payload would render nothing while every
+        # field it mentions still looked wired -- which is the original defect
+        # (`summary.models`) with one more step in front of it.
+        for getter, source in self.DERIVED_ROW_SOURCES.items():
+            with self.subTest(getter=getter):
+                self.assertIn(source, js_function_body(self.html, f"get {getter}("))
 
     def test_a_not_yet_loaded_table_is_not_an_empty_one(self) -> None:
         # Three states, not two. "No sessions in this period" is a claim about
@@ -5883,6 +5977,1141 @@ class ClientSideAgeRecomputeTest(unittest.TestCase):
         # Constraint 4: it ANNOTATES the data-age line the recompute moves,
         # rather than adding a surface of its own.
         self.assertIn('x-text="elapsedNote"', html_element(self.raw, 'id="data-age"'))
+
+
+# --- #78: the recommendation table's consumer ------------------------------
+#
+# FIXTURE DESIGN. Five days, each isolating one thing the block has to get
+# right, and every token class of every call deliberately unequal so a swapped
+# column mapping cannot reproduce a figure.
+#
+#   * REC_FULL_DAY runs both scopes and pins all four metrics at once. Its
+#     values are chosen to land in FOUR DIFFERENT places in the table -- an
+#     `act` above an open-ended range, a `watch` inside a range whose lower
+#     edge is CITED and whose upper edge is JUDGED, and so on -- so one fixture
+#     exercises every provenance kind the payload can carry.
+#   * REC_SOLO_DAY dispatches no subagent. `main_vs_subagent_tokens_per_reply`
+#     is then UNMEASURED, which is the zero-denominator case this whole block
+#     turns on: no subagent reply is not a ratio of zero.
+#   * REC_NO_CACHE_DAY runs calls that wrote no cache at all, so BOTH cache
+#     metrics lose their denominators -- one a token sum, one a call count,
+#     which vanish together here and are checked separately in the code.
+#   * REC_UNWINDOWED_DAY runs the main thread on a model with no documented
+#     window, so `main_thread_share_over_half_window` has no denominator while
+#     the other three still do.
+#   * REC_EMPTY_DAY holds nothing, so all four are unmeasured and `ranked` is
+#     empty -- the state in which a page that rendered absence as health would
+#     tell the reader everything is fine.
+REC_SESSION = "recommendation-fixture"
+REC_AGENT = "agent-rec78a"
+REC_FULL_DAY = "2026-07-01"
+REC_SOLO_DAY = "2026-07-02"
+REC_NO_CACHE_DAY = "2026-07-03"
+REC_UNWINDOWED_DAY = "2026-07-04"
+REC_EMPTY_DAY = "2026-07-05"
+
+REC_OPUS_1M = "claude-opus-5-20260101"          # 1,000,000-token window
+REC_HAIKU_200K = "claude-haiku-4-5-20251001"    # 200,000-token window
+REC_UNKNOWN_MODEL = "claude-nosuchtier-9-20260101"
+
+# (day, kind, model, input, cache_write, cache_read, output). `context_size` is
+# input + cache_write + cache_read, which is how `ingest.py` derives it, so the
+# main-thread contexts below are engineered to sit in known bands against a
+# 1M window: 600k (50-90), 950k (>=90), 300k, 100k, 38k.
+REC_CALLS: list[tuple[str, str, str, int, int, int, int]] = [
+    # --- the full day, main thread: two of five calls over half the window ---
+    (REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 10_000, 120_000, 470_000, 2_000),
+    (REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 11_000, 121_000, 818_000, 2_200),
+    (REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 12_000, 122_000, 166_000, 2_400),
+    (REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 13_000, 23_000, 64_000, 2_600),
+    # Wrote cache and read NOTHING back -- one half of `cache_write_only_share`.
+    (REC_FULL_DAY, SOURCE_MAIN, REC_OPUS_1M, 14_000, 24_000, 0, 2_800),
+    # --- the full day, subagents ---
+    (REC_FULL_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 5_000, 6_000, 7_000, 8_000),
+    # The second write-only call, in the OTHER scope: the share ranges over
+    # both, so a query that filtered to one would come out 1/5 or 1/2 here
+    # rather than 2/7.
+    (REC_FULL_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 5_100, 6_100, 0, 8_100),
+    # Wrote no cache at all, so it is in NEITHER the numerator nor the
+    # denominator of the write-only share -- a call that never stored a prefix
+    # cannot have failed to read one back.
+    (REC_FULL_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 5_200, 0, 0, 8_200),
+    # --- a day the main thread ran alone ---
+    (REC_SOLO_DAY, SOURCE_MAIN, REC_OPUS_1M, 1_000, 2_000, 3_000, 4_000),
+    (REC_SOLO_DAY, SOURCE_MAIN, REC_OPUS_1M, 1_100, 2_100, 3_100, 4_100),
+    # --- a day nothing wrote cache ---
+    (REC_NO_CACHE_DAY, SOURCE_MAIN, REC_OPUS_1M, 5_000, 0, 0, 6_000),
+    (REC_NO_CACHE_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 7_000, 0, 0, 8_000),
+    # --- a day the main thread ran on a model with no documented window ---
+    (REC_UNWINDOWED_DAY, SOURCE_MAIN, REC_UNKNOWN_MODEL, 1_000, 2_000, 3_000, 4_000),
+    (REC_UNWINDOWED_DAY, SOURCE_SUBAGENT, REC_HAIKU_200K, 1_100, 2_100, 3_100, 4_100),
+]
+
+# Hand-written from the table above, then checked against it by
+# `test_the_fixture_holds_what_the_expectations_claim`. Derived-only
+# expectations would agree with a fixture that had drifted.
+REC_FULL_MAIN_CALLS = 5
+REC_FULL_MAIN_TOTAL = 2_000_000
+REC_FULL_MAIN_BANDED = 5
+REC_FULL_MAIN_OVER_HALF = 2
+REC_FULL_SUB_CALLS = 3
+REC_FULL_SUB_TOTAL = 58_700
+REC_FULL_CACHE_READS = 1_525_000
+REC_FULL_CACHE_WRITES = 422_100
+REC_FULL_WRITING_CALLS = 7
+REC_FULL_WRITE_ONLY_CALLS = 2
+
+
+def build_recommendation_corpus(root: Path) -> Path:
+    """One session over five days, laid out as `discover_sources()` expects."""
+    project = root / "projects" / "-fixture-recommendations"
+    project.mkdir(parents=True)
+    subagents = project / REC_SESSION / "subagents"
+    subagents.mkdir(parents=True)
+
+    def record(n: int, call: tuple) -> str:
+        day, kind, model, inp, write, read, out = call
+        payload: dict[str, object] = {
+            "type": "assistant",
+            "sessionId": REC_SESSION,
+            "timestamp": f"{day}T15:{n // 60:02d}:{n % 60:02d}.000Z",
+            "isSidechain": kind == SOURCE_SUBAGENT,
+            "message": {
+                # Unique per call: `_dedupe_calls()` keys on this, and two calls
+                # sharing an id would collapse into one and quietly change every
+                # denominator below.
+                "id": f"msg-rec78-{n}",
+                "model": model,
+                "usage": {
+                    "input_tokens": inp,
+                    "cache_creation_input_tokens": write,
+                    "cache_read_input_tokens": read,
+                    "output_tokens": out,
+                },
+                "content": [{"type": "text", "text": f"rec78 call {n}"}],
+            },
+        }
+        if kind == SOURCE_SUBAGENT:
+            payload["agentId"] = REC_AGENT
+        return json.dumps(payload) + "\n"
+
+    main_lines: list[str] = []
+    sub_lines: list[str] = []
+    for n, call in enumerate(REC_CALLS):
+        line = record(n, call)
+        (sub_lines if call[1] == SOURCE_SUBAGENT else main_lines).append(line)
+    (project / f"{REC_SESSION}.jsonl").write_text("".join(main_lines))
+    (subagents / f"{REC_AGENT}.jsonl").write_text("".join(sub_lines))
+    return project
+
+
+class RecommendationApiTest(unittest.TestCase):
+    """#78: `/api/summary` evaluates the table, and says what it could not.
+
+    Asserted through the real ingest path, so every figure is measured over
+    rows written the way production writes them -- including `source_kind`,
+    which two of the four metrics divide by and which the ingester derives from
+    the source's own path.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-rec78-test-"))
+        projects = build_recommendation_corpus(cls.tmp)
+        db_path = cls.tmp / "usage.db"
+        ingest(projects, db_path, tasks_dir=cls.tmp / "no-task-index")
+        cls.api = Api(db_path)
+        cls.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def block(self, day: str | None = None) -> dict:
+        return self.api.summary(*day_bounds(day, day))["recommendations"]
+
+    def summary(self, day: str | None = None) -> dict:
+        return self.api.summary(*day_bounds(day, day))
+
+    def reading(self, day: str, metric: str) -> dict:
+        found = [a for a in self.block(day)["ranked"] if a["metric"] == metric]
+        self.assertEqual(len(found), 1, f"{metric} is not ranked exactly once on {day}")
+        return found[0]
+
+    # --- the fixture holds what it claims to ---
+
+    def test_the_fixture_holds_what_the_expectations_claim(self) -> None:
+        # The expectations above are hand-written; this is where they meet the
+        # table. A fixture edited without them would otherwise move every
+        # figure below and every assertion with it.
+        full = [c for c in REC_CALLS if c[0] == REC_FULL_DAY]
+        main = [c for c in full if c[1] == SOURCE_MAIN]
+        sub = [c for c in full if c[1] == SOURCE_SUBAGENT]
+        self.assertEqual(len(main), REC_FULL_MAIN_CALLS)
+        self.assertEqual(len(sub), REC_FULL_SUB_CALLS)
+        self.assertEqual(sum(sum(c[3:]) for c in main), REC_FULL_MAIN_TOTAL)
+        self.assertEqual(sum(sum(c[3:]) for c in sub), REC_FULL_SUB_TOTAL)
+        self.assertEqual(sum(c[5] for c in full), REC_FULL_CACHE_READS)
+        self.assertEqual(sum(c[4] for c in full), REC_FULL_CACHE_WRITES)
+        self.assertEqual(len([c for c in full if c[4] > 0]), REC_FULL_WRITING_CALLS)
+        self.assertEqual(
+            len([c for c in full if c[4] > 0 and c[5] == 0]),
+            REC_FULL_WRITE_ONLY_CALLS,
+        )
+
+    def test_the_fixture_reaches_every_provenance_kind(self) -> None:
+        # A fixture whose readings all landed on judged boundaries could not
+        # tell a cited edge from a judged one however carefully the payload
+        # carried the difference, so the tests below would pass over a page
+        # that had merged them.
+        kinds = set()
+        for day in (REC_FULL_DAY, REC_SOLO_DAY):
+            for reading in self.block(day)["ranked"]:
+                for edge in ("lower_provenance", "upper_provenance"):
+                    if reading[edge]:
+                        kinds.add(reading[edge]["kind"])
+        self.assertEqual(kinds, set(PROVENANCE_KINDS))
+
+    # --- every metric is computed, and computed from its `measurement` ---
+
+    def test_every_metric_in_the_table_is_assessed_or_named_unmeasured(self) -> None:
+        # `assess_all()` refuses a partial mapping, so a forgotten metric would
+        # raise rather than pass -- but only if `_recommendations()` keeps
+        # passing every key. This asserts the state that proves it did: the two
+        # halves of the payload partition `METRICS` exactly, on every window.
+        for day in (
+            REC_FULL_DAY,
+            REC_SOLO_DAY,
+            REC_NO_CACHE_DAY,
+            REC_UNWINDOWED_DAY,
+            REC_EMPTY_DAY,
+            None,
+        ):
+            with self.subTest(day=day):
+                block = self.block(day)
+                ranked = {a["metric"] for a in block["ranked"]}
+                unmeasured = set(block["unmeasured"])
+                self.assertEqual(ranked | unmeasured, set(METRICS))
+                self.assertEqual(ranked & unmeasured, set())
+
+    def test_cache_reads_per_write_divides_the_tokens_its_measurement_names(
+        self,
+    ) -> None:
+        # TOKENS over TOKENS, both scopes -- not calls, and not the main thread
+        # alone. The fixture's subagent cache traffic is a small fraction of the
+        # main thread's, so a query that dropped it still returns a plausible
+        # ratio; it just returns the wrong one.
+        self.assertAlmostEqual(
+            self.reading(REC_FULL_DAY, METRIC_CACHE_READS_PER_WRITE)["value"],
+            REC_FULL_CACHE_READS / REC_FULL_CACHE_WRITES,
+        )
+
+    def test_cache_write_only_share_counts_calls_not_tokens(self) -> None:
+        # CALLS over CALLS, over the calls that wrote cache -- 2 of 7 here. The
+        # same day's write-only TOKEN share is a completely different number, so
+        # a denominator taken from the token sums cannot pass.
+        self.assertAlmostEqual(
+            self.reading(REC_FULL_DAY, METRIC_CACHE_WRITE_ONLY_SHARE)["value"],
+            REC_FULL_WRITE_ONLY_CALLS / REC_FULL_WRITING_CALLS,
+        )
+
+    def test_a_call_that_wrote_no_cache_is_outside_the_write_only_share(self) -> None:
+        # Both ends of it: the fixture's third subagent call stored nothing, so
+        # it is in neither the numerator nor the denominator. Counting it in the
+        # denominator would read 2/8, and in both 3/8 -- both plausible.
+        value = self.reading(REC_FULL_DAY, METRIC_CACHE_WRITE_ONLY_SHARE)["value"]
+        full = [c for c in REC_CALLS if c[0] == REC_FULL_DAY]
+        self.assertNotAlmostEqual(value, REC_FULL_WRITE_ONLY_CALLS / len(full))
+        self.assertNotAlmostEqual(value, (REC_FULL_WRITE_ONLY_CALLS + 1) / len(full))
+
+    def test_the_reply_ratio_is_per_api_call_as_its_measurement_says(self) -> None:
+        # The metric's KEY says "per reply"; its `measurement` says "per API
+        # call", and the measurement is the field that names what is divided by
+        # what. The fixture's two scopes run different numbers of calls (5 and
+        # 3), so a ratio of the raw token SUMS -- the reading the key invites --
+        # is a different number, and is pinned here as one this must not be.
+        value = self.reading(REC_FULL_DAY, METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY)
+        self.assertAlmostEqual(
+            value["value"],
+            (REC_FULL_MAIN_TOTAL / REC_FULL_MAIN_CALLS)
+            / (REC_FULL_SUB_TOTAL / REC_FULL_SUB_CALLS),
+        )
+        self.assertNotAlmostEqual(
+            value["value"], REC_FULL_MAIN_TOTAL / REC_FULL_SUB_TOTAL
+        )
+
+    def test_the_saturation_share_is_the_bands_the_page_already_renders(self) -> None:
+        # ONE definition of "over half the window", not two. The value is
+        # checked against the per-scope band tally in the SAME payload, so a
+        # second query here could not drift from the figures beside it -- and
+        # against the hand-written count, so the two agreeing wrongly is not
+        # enough to pass.
+        summary = self.summary(REC_FULL_DAY)
+        main = [
+            s
+            for s in summary["context"]["utilisation"]["by_scope"]
+            if s["scope"] == SCOPE_MAIN
+        ][0]
+        over_half = sum(
+            b["calls"] for b in main["bands"] if b["band"] in OVER_HALF_WINDOW_BANDS
+        )
+        self.assertEqual(over_half, REC_FULL_MAIN_OVER_HALF)
+        self.assertEqual(main["banded_calls"], REC_FULL_MAIN_BANDED)
+        served = [
+            a
+            for a in summary["recommendations"]["ranked"]
+            if a["metric"] == METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW
+        ][0]
+        self.assertAlmostEqual(served["value"], over_half / main["banded_calls"])
+        self.assertAlmostEqual(
+            served["value"], REC_FULL_MAIN_OVER_HALF / REC_FULL_MAIN_BANDED
+        )
+
+    def test_the_saturation_share_excludes_the_subagent_scope(self) -> None:
+        # Its denominator is MAIN-THREAD calls with a known window. The
+        # fixture's subagent calls all sit under a quarter of their window, so
+        # pooling the two scopes leaves a plausible smaller share -- 2/8 rather
+        # than 2/5 -- which is the dilution #61 exists to refuse, arriving here
+        # through a metric instead of through a band.
+        pooled = self.summary(REC_FULL_DAY)["context"]["utilisation"]["banded_calls"]
+        self.assertGreater(pooled, REC_FULL_MAIN_BANDED)
+        self.assertNotAlmostEqual(
+            self.reading(REC_FULL_DAY, METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW)[
+                "value"
+            ],
+            REC_FULL_MAIN_OVER_HALF / pooled,
+        )
+
+    # --- a zero denominator is None, and is NAMED ---
+
+    def test_a_project_that_dispatched_no_subagent_has_no_ratio(self) -> None:
+        # THE case. Zero subagent replies is not a ratio of zero -- it is no
+        # ratio -- and a `0.0` here would band as the healthiest possible
+        # reading and tell the reader their work is already landing where it is
+        # cheapest to run.
+        block = self.block(REC_SOLO_DAY)
+        self.assertIn(METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY, block["unmeasured"])
+        self.assertNotIn(
+            METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
+            [a["metric"] for a in block["ranked"]],
+        )
+
+    def test_no_call_wrote_cache_so_both_cache_metrics_are_unmeasured(self) -> None:
+        # Two denominators that vanish together here and are different
+        # quantities -- a token sum and a call count. A ratio of 0/0 is not 0,
+        # and `0.0` reads per write would fire the table's worst entry at a
+        # project whose cache nobody used.
+        block = self.block(REC_NO_CACHE_DAY)
+        for metric in (METRIC_CACHE_READS_PER_WRITE, METRIC_CACHE_WRITE_ONLY_SHARE):
+            with self.subTest(metric=metric):
+                self.assertIn(metric, block["unmeasured"])
+
+    def test_an_unwindowed_main_thread_has_no_saturation_share(self) -> None:
+        # A share of an empty set is not 0%. Every main-thread call this day ran
+        # on a model with no documented window, so nothing was banded and there
+        # is no denominator -- while the other three metrics still have one,
+        # which is what stops a blanket "this day is unmeasured" from passing.
+        block = self.block(REC_UNWINDOWED_DAY)
+        self.assertIn(METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW, block["unmeasured"])
+        self.assertNotEqual(block["ranked"], [])
+
+    def test_an_empty_window_is_four_unmeasured_metrics_and_no_advice(self) -> None:
+        # The state a page that rendered absence as health would describe as a
+        # clean bill: nothing measured, so nothing to advise -- said out loud
+        # rather than by an empty block.
+        block = self.block(REC_EMPTY_DAY)
+        self.assertEqual(block["ranked"], [])
+        self.assertEqual(set(block["unmeasured"]), set(METRICS))
+
+    def test_an_unmeasured_metric_is_named_with_what_would_have_been_measured(
+        self,
+    ) -> None:
+        # Not merely absent from `ranked`: present, named, and carrying the
+        # measurement it could not take, so the reader can see WHICH figure is
+        # missing rather than inferring it from a gap.
+        block = self.block(REC_EMPTY_DAY)
+        for metric, measurement in block["unmeasured"].items():
+            with self.subTest(metric=metric):
+                self.assertEqual(measurement, METRICS[metric].measurement)
+        self.assertEqual(block["unmeasured_note"], UNMEASURED_NOTE)
+
+    def test_no_metric_is_ever_reported_as_a_measured_zero(self) -> None:
+        # The rule in one assertion, over every window: a metric is either in
+        # `ranked` with a real reading or in `unmeasured` with none. There is no
+        # third state, and in particular no entry whose value is a 0 that
+        # arithmetic produced from an empty denominator.
+        for day in (REC_NO_CACHE_DAY, REC_UNWINDOWED_DAY, REC_EMPTY_DAY, REC_SOLO_DAY):
+            for reading in self.block(day)["ranked"]:
+                with self.subTest(day=day, metric=reading["metric"]):
+                    self.assertIsNotNone(reading["value"])
+
+    # --- provenance, per boundary, with its kind ---
+
+    def test_a_cited_boundary_and_a_judged_one_are_distinguishable(self) -> None:
+        # THE requirement of #78, at the payload boundary. The fixture's
+        # reads-per-write reading sits in a range whose LOWER edge is a
+        # documented fact and whose UPPER edge is a product-owner judgment --
+        # one range, two kinds -- so a payload that carried one provenance for
+        # the pair could not pass.
+        reading = self.reading(REC_FULL_DAY, METRIC_CACHE_READS_PER_WRITE)
+        self.assertEqual(reading["lower_provenance"]["kind"], PROVENANCE_CITED)
+        self.assertEqual(reading["upper_provenance"]["kind"], PROVENANCE_JUDGED)
+        self.assertNotEqual(
+            reading["lower_provenance"]["statement"],
+            reading["upper_provenance"]["statement"],
+        )
+
+    def test_a_cited_boundary_carries_its_source_check_date_and_coverage(self) -> None:
+        # A citation whose coverage is unstated is the one that gets applied to
+        # the case it was never checked against -- which is exactly what
+        # happened to the `1.0` boundary before #83 split it in two.
+        cited = self.reading(REC_FULL_DAY, METRIC_CACHE_READS_PER_WRITE)[
+            "lower_provenance"
+        ]
+        self.assertTrue(cited["source"])
+        self.assertRegex(cited["checked"], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertTrue(cited["covers"])
+
+    def test_a_judged_boundary_crosses_the_api_with_no_source_at_all(self) -> None:
+        # NULL, not "" and not "n/a": the page has to be able to tell that a
+        # judgment HAS no source from the payload alone. The module refuses to
+        # construct one with a source, and this is the other end of that -- a
+        # serialiser that substituted a plausible string would undo it.
+        for day, metric in (
+            (REC_FULL_DAY, METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW),
+            (REC_FULL_DAY, METRIC_CACHE_WRITE_ONLY_SHARE),
+        ):
+            with self.subTest(metric=metric):
+                lower = self.reading(day, metric)["lower_provenance"]
+                self.assertEqual(lower["kind"], PROVENANCE_JUDGED)
+                self.assertIsNone(lower["source"])
+                self.assertIsNone(lower["covers"])
+
+    def test_a_structural_boundary_carries_neither_source_nor_check_date(self) -> None:
+        # There is nothing to re-check about "a share cannot be negative", and a
+        # date beside it would claim a currency it does not have.
+        lower = self.reading(REC_SOLO_DAY, METRIC_CACHE_WRITE_ONLY_SHARE)[
+            "lower_provenance"
+        ]
+        self.assertEqual(lower["kind"], PROVENANCE_STRUCTURAL)
+        self.assertIsNone(lower["source"])
+        self.assertIsNone(lower["checked"])
+
+    def test_an_open_ended_range_has_no_upper_provenance(self) -> None:
+        # None, because there is no boundary there -- not a provenance for a
+        # ceiling nobody set.
+        reading = self.reading(REC_FULL_DAY, METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY)
+        self.assertIsNone(reading["range_upper"])
+        self.assertIsNone(reading["upper_provenance"])
+
+    def test_both_table_level_provenances_cross_the_api(self) -> None:
+        block = self.block(REC_FULL_DAY)
+        self.assertEqual(block["provenance"], RECOMMENDATION_PROVENANCE)
+        self.assertEqual(block["ranking_provenance"], RANKING_PROVENANCE)
+        self.assertEqual(block["as_of"], RECOMMENDATIONS_AS_OF)
+        # Two SEPARATE statements, as the window's and the bands' are: the
+        # entries and the order they are shown in are different judgments, and
+        # one sentence covering both would let a reader attach it to whichever
+        # they were reading.
+        self.assertNotEqual(block["provenance"], block["ranking_provenance"])
+
+    # --- the ranking is derived, never authored ---
+
+    def test_the_ranking_is_severity_then_depth_then_key(self) -> None:
+        # Recomputed from the payload's OWN fields, so the order and the key it
+        # claims to use cannot disagree -- `RANKED_BY`'s rule where the key is a
+        # derived depth rather than a column.
+        ranked = self.block(REC_FULL_DAY)["ranked"]
+        self.assertEqual(
+            [a["metric"] for a in ranked],
+            [
+                a["metric"]
+                for a in sorted(
+                    ranked,
+                    key=lambda a: (
+                        -SEVERITY_RANK[a["severity"]],
+                        -a["depth_in_severity"],
+                        a["metric"],
+                    ),
+                )
+            ],
+        )
+
+    def test_the_ranking_is_not_the_tables_authoring_order(self) -> None:
+        # Teeth on the test above, which a table whose authoring order happened
+        # to be the ranked order would pass without saying anything. The fixture
+        # is built so the two visibly differ.
+        ranked = [a["metric"] for a in self.block(REC_FULL_DAY)["ranked"]]
+        self.assertNotEqual(ranked, [k for k in METRICS if k in ranked])
+
+    def test_the_worst_severity_is_ranked_first(self) -> None:
+        severities = [
+            SEVERITY_RANK[a["severity"]] for a in self.block(REC_FULL_DAY)["ranked"]
+        ]
+        self.assertEqual(severities, sorted(severities, reverse=True))
+        # And the fixture actually holds more than one severity, so a sort that
+        # never ran would not pass here.
+        self.assertGreater(len(set(severities)), 1)
+
+    # --- an `ok` is a positive statement ---
+
+    def test_a_healthy_reading_is_ranked_rather_than_dropped(self) -> None:
+        # "Nothing to change here" is a FINDING. Represented by absence, it
+        # would be indistinguishable from a metric nobody measured -- which is
+        # the rule this whole repository is built on, and the reason the healthy
+        # range is an entry in the table rather than the gap between two.
+        healthy = [
+            a
+            for a in self.block(REC_SOLO_DAY)["ranked"]
+            if a["severity"] == SEVERITY_OK
+        ]
+        self.assertNotEqual(healthy, [])
+        for reading in healthy:
+            with self.subTest(metric=reading["metric"]):
+                self.assertTrue(reading["recommendation"].strip())
+                # A healthy entry carries no lever by construction: "nothing to
+                # change" and "change this" cannot both be true.
+                self.assertIsNone(reading["lever"])
+
+    def test_a_firing_reading_always_names_the_lever_to_pull(self) -> None:
+        for reading in self.block(REC_FULL_DAY)["ranked"]:
+            if reading["severity"] == SEVERITY_OK:
+                continue
+            with self.subTest(metric=reading["metric"]):
+                self.assertIsNotNone(reading["lever"])
+                self.assertIn(reading["lever"]["action"], ACTION_VERBS)
+                self.assertIn(reading["lever"]["target"], LEVER_TARGETS)
+
+    # --- the discounted class stays unreducible ---
+
+    def test_no_served_advice_asks_for_less_of_a_discounted_class(self) -> None:
+        # Cache read is the 0.1x class. Advice to shrink it would be advice to
+        # re-send the prefix uncached at ten times the tokens, and the report
+        # would be confidently recommending the more expensive of two options.
+        for day in (REC_FULL_DAY, REC_SOLO_DAY, REC_NO_CACHE_DAY, REC_UNWINDOWED_DAY):
+            for reading in self.block(day)["ranked"]:
+                lever = reading["lever"]
+                if lever is None:
+                    continue
+                with self.subTest(day=day, metric=reading["metric"]):
+                    self.assertFalse(
+                        lever["action"] == ACTION_REDUCE
+                        and lever["target"] in DISCOUNTED_TOKEN_CLASSES
+                    )
+
+    def test_the_served_directive_is_the_modules_own_words(self) -> None:
+        # `lever()` refuses to build a reduce-directive over a discounted class,
+        # and `Lever.directive` composes from a closed registry. A directive
+        # assembled in `serve.py` from `action` and `target` would route around
+        # both guards while looking identical on this fixture, so the served
+        # string is pinned to the one the module composes.
+        for reading in self.block(REC_FULL_DAY)["ranked"]:
+            lever = reading["lever"]
+            if lever is None:
+                continue
+            with self.subTest(metric=reading["metric"]):
+                self.assertEqual(
+                    lever["directive"],
+                    Lever(action=lever["action"], target=lever["target"]).directive,
+                )
+
+    def test_the_reduce_lever_the_fixture_fires_is_a_full_price_class(self) -> None:
+        # Teeth: a corpus that never fired a `reduce` at all would pass the two
+        # tests above without exercising them. The write-only share fires one
+        # here, on `cache_write` -- the 1.25x class, which IS reducible.
+        levers = [
+            a["lever"]
+            for a in self.block(REC_FULL_DAY)["ranked"]
+            if a["lever"] and a["lever"]["action"] == ACTION_REDUCE
+        ]
+        self.assertNotEqual(levers, [])
+        for lever in levers:
+            self.assertNotIn(lever["target"], DISCOUNTED_TOKEN_CLASSES)
+
+    # --- no money, still ---
+
+    def test_the_block_carries_no_money_shaped_field(self) -> None:
+        # #30 reaches new payloads too. The table is about token multipliers;
+        # the currency figure they would imply is exactly the arithmetic this
+        # project deleted rather than qualified.
+        blob = json.dumps(self.block(REC_FULL_DAY)).lower()
+        for token in ("cost", "usd", "dollar", "$", "price", "spend"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, blob)
+
+
+class RecommendationRenderTest(unittest.TestCase):
+    """#78: the page renders what it is handed, and holds no table of its own.
+
+    The wiring guard already proves every field reaches a binding. These are
+    the properties a binding alone does not give: that the page cannot decide
+    anything, that a healthy entry is not filtered out on the way to the
+    screen, and that the two provenance voices stay apart.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+        cls.band = html_element(cls.raw, 'id="advice-note"')
+
+    def test_the_page_holds_none_of_the_tables_prose(self) -> None:
+        # THE property #78 asks for: "the page performs no lookup and holds no
+        # threshold". Advice hard-coded here would be advice with no date, no
+        # provenance and nothing to redline -- which is the alternative the
+        # module was written to replace.
+        for metric in METRICS.values():
+            for entry in metric.ranges:
+                with self.subTest(metric=metric.key):
+                    self.assertNotIn(entry.recommendation.detail.strip(), self.html)
+
+    def test_the_page_holds_no_lever_directive_of_its_own(self) -> None:
+        for target, phrase in LEVER_TARGETS.items():
+            with self.subTest(target=target):
+                self.assertNotIn(phrase, self.html)
+
+    def test_the_unmeasured_note_comes_from_the_api_not_the_page(self) -> None:
+        # A copy here would drift from the module's, and the page would tell
+        # two different stories about the same absence on two different days.
+        self.assertNotIn(UNMEASURED_NOTE, self.html)
+        self.assertIn("summary.recommendations.unmeasured_note", self.html)
+
+    def test_neither_table_level_provenance_is_copied_into_the_page(self) -> None:
+        self.assertNotIn(RECOMMENDATION_PROVENANCE, self.html)
+        self.assertNotIn(RANKING_PROVENANCE, self.html)
+
+    def test_the_page_iterates_every_ranked_reading(self) -> None:
+        # An `ok` rendered as absence is the mutation this catches: a filter in
+        # the loop would hide healthy readings, and healthy and unmeasured would
+        # then look identical on screen -- which is the defect the table's
+        # explicit healthy entry exists to prevent.
+        loops = re.findall(r'x-for="[^"]*\bin\s*([^"]+)"', self.band)
+        ranked = [
+            iterated.strip()
+            for iterated in loops
+            if "recommendations.ranked" in iterated
+        ]
+        self.assertEqual(ranked, ["summary.recommendations.ranked"])
+
+    def test_the_healthy_case_renders_a_statement_rather_than_a_blank(self) -> None:
+        # The other half: a reading with no lever must SAY it has none, or the
+        # reader sees a row where the others have a directive and cannot tell
+        # "nothing to change" from "we forgot".
+        self.assertIn('x-if="!a.lever"', self.band)
+
+    def test_the_two_provenance_voices_are_distinct_classes(self) -> None:
+        # A judged boundary rendered in a cited one's voice is the mutation
+        # here. The mapping is a table in the page precisely so this can assert
+        # over every kind rather than over the two somebody remembered.
+        voices = dict(
+            re.findall(
+                r"(\w+):\s*\"(advice-\w+)\"",
+                js_function_body(self.raw, "const PROVENANCE_VOICE"),
+            )
+        )
+        self.assertEqual(set(voices), set(PROVENANCE_KINDS))
+        self.assertEqual(
+            len(set(voices.values())),
+            len(PROVENANCE_KINDS),
+            f"two provenance kinds render in one voice: {voices}",
+        )
+
+    def test_every_provenance_voice_has_a_style_that_marks_it(self) -> None:
+        # A class with no rule is a distinction that exists only in the DOM.
+        for kind in PROVENANCE_KINDS:
+            with self.subTest(kind=kind):
+                self.assertRegex(self.raw, rf"\.advice-{kind}\s*\{{[^}}]+\}}")
+
+    def test_both_edges_take_their_voice_from_the_payloads_own_kind(self) -> None:
+        # Not from where the boundary sits and not from the metric: a hard-coded
+        # class on either edge would survive every test above.
+        for edge in ("lower_provenance", "upper_provenance"):
+            with self.subTest(edge=edge):
+                self.assertIn(f':class="provenanceVoice(a.{edge})"', self.band)
+
+    def test_the_unmeasured_mapping_is_consumed_whole(self) -> None:
+        # The wiring guard CANNOT check this one, and the gap is worth stating.
+        # Its fixture measures all four metrics, so `unmeasured` is `{}` there;
+        # an empty mapping has no members for the walk to adjudicate, so naming
+        # the path is enough to satisfy it (mutation-checked: replacing the
+        # `Object.entries` consumer with a bare `summary.recommendations
+        # .unmeasured.rows` leaves the guard GREEN).
+        #
+        # What makes every member reachable is therefore not the fixture but
+        # the shape: the keys are metric names the SERVER decides, so the page
+        # cannot name them in advance, and consuming the mapping whole is the
+        # structural guarantee that covers all of them however many there are.
+        # `context.percentiles` is the same pattern, and `walk_payload` blesses
+        # it for the same reason. This asserts it directly rather than leaving
+        # it to a corpus that happens to be complete.
+        # `is_read_whole` alone is too weak to assert here: the x-if guard
+        # spells `Object.keys(...).length`, which satisfies it while rendering
+        # not one member. What has to hold is that the mapping is ITERATED, so
+        # the assertion is on the loop.
+        self.assertNotEqual(
+            iteration_aliases(self.html, {"summary.recommendations.unmeasured"}),
+            frozenset(),
+            "nothing iterates the unmeasured mapping, so the metrics it names "
+            "reach no reader -- and the wiring guard cannot say so, because "
+            "its fixture measures all four and leaves this mapping empty",
+        )
+        self.assertTrue(
+            is_read_whole(self.html, {"summary.recommendations.unmeasured"}),
+            "the unmeasured metrics are keyed on names the SERVER chooses, so "
+            "the page cannot name them in advance: consuming the mapping whole "
+            "is what makes every member reachable however many there are",
+        )
+
+    def test_the_band_annotates_rather_than_adding_a_table(self) -> None:
+        # Constraint 4. `note-band` is this page's idiom for annotating the
+        # figures above it -- `#scope-note` and `#context-note` are the two that
+        # came first -- and a `<table>` here would be the appended surface the
+        # constraint names.
+        self.assertIn('class="note-band"', self.band)
+        self.assertNotIn("<table", self.band)
+
+
+class RecommendationVersionTest(unittest.TestCase):
+    """A new payload field is a MINOR release, and the manifest carries it.
+
+    `docs/versioning.md`: the HTTP API's payload fields are a governed surface,
+    and "a new payload field" is listed there as minor. The manifest matters on
+    its own -- Claude Code's plugin loader reads that JSON without running any
+    Python and uses the version as its update cache key, so an unbumped one
+    means an installed user is never offered the change. `tests/test_cpb.py`
+    already pins the manifest equal to `cpb.VERSION`; this pins the floor that
+    shipping `recommendations` puts under both.
+    """
+
+    RECOMMENDATIONS_MINOR = (1, 2, 0)
+
+    def test_serving_the_recommendation_block_owes_a_minor_bump(self) -> None:
+        self.assertIn("recommendations", Api.summary.__doc__ or "")
+        parsed = tuple(int(p) for p in cpb.VERSION.split("."))
+        self.assertGreaterEqual(
+            parsed,
+            self.RECOMMENDATIONS_MINOR,
+            "/api/summary carries a `recommendations` block, which is a new "
+            "payload field and so a MINOR release (docs/versioning.md). The "
+            "plugin manifest is Claude Code's update cache key: left unbumped, "
+            "installed users receive nothing.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# #70: two views of one payload.
+# ---------------------------------------------------------------------------
+#
+# The report used to be one page serving two readers. It is now an OVERVIEW
+# (the landing view) and a DETAILS & RAW DATA view one click away, and the
+# whole risk of that split is stated in one sentence: two renderings of one
+# figure that can drift is "one sample, one definition" with a navigation step
+# hidden in the middle.
+#
+# Three mechanisms answer it, and each has its own test below:
+#
+#   * what BOTH views need is rendered ONCE, above them, in neither section --
+#     the banner and the data-age line are single elements, so they cannot
+#     disagree because there is no second rendering to disagree with;
+#   * no `summary.<path>` may be bound in both sections. A figure needed by
+#     both goes through ONE named getter, which is the only shape in which
+#     "there is a single definition" is a checkable statement;
+#   * the period every figure covers is `periodLabel`, defined once and bound
+#     in both, and neither view may compose one from `from`/`to` itself.
+#
+# These are structural assertions with the limit the rest of this file records:
+# the project ships no JS runtime (stdlib only, no Node), so they pin the
+# bindings rather than executing the render. What they CANNOT catch is two
+# DIFFERENT fields presented as one figure -- no static check can -- which is
+# exactly what the single-getter rule exists to make unnecessary.
+
+# The panels that make up the report, and which of the three regions each one
+# lives in. This dict IS the acceptance criterion "every panel on the report
+# today survives": a panel dropped from the detail view leaves its id in no
+# section and turns `test_every_panel_survives_in_a_named_view` red.
+CHROME_PANELS = {
+    # Rendered ONCE for both views. A warning is the worst possible thing to
+    # render twice: two copies free to disagree is a reader shown the milder
+    # of two true statements with no sign the other exists (BannerPrecedence-
+    # Test's defect, one level up), and a warning visible on only one view is
+    # a warning the reader can navigate away from without resolving.
+    "banner",
+    "data-age",
+    # The affordance itself: one click there, one click back, from either view.
+    "view-tabs",
+}
+OVERVIEW_PANELS = {"overview-period", "cards", "scope-note", "context-note", "advice-note"}
+DETAIL_PANELS = {
+    "filters", "chart-panel", "models", "detail", "sessions", "agents", "outliers",
+}
+
+# Every JS member name that can sit on the tail of a payload read. Stripped
+# before two views' bindings are compared, so `summary.calls` in one view and
+# `summary.calls.toLocaleString()` in the other are recognised as the same
+# field read twice rather than as two different paths.
+JS_MEMBERS = frozenset({
+    "length", "join", "includes", "toLocaleString", "toFixed", "toPrecision",
+    "slice", "filter", "map", "split", "entries", "keys", "values", "some",
+    "every", "find", "indexOf", "sort", "reverse", "concat", "push",
+})
+SUMMARY_PATH = re.compile(
+    r"\bsummary(?:\??\.[A-Za-z_$][\w$]*)+"
+)
+# The attributes through which a value reaches the page. A binding is one of
+# these; a mention in prose is not.
+BINDING_ATTR = re.compile(r'(?:x-text|x-model|x-if|x-show|x-for|:value|:class|:title)="([^"]*)"')
+
+
+def view_section(html: str, view: str) -> str:
+    """The markup of one of #70's two views, comments stripped."""
+    return html_element(html, f'id="view-{view}"')
+
+
+def view_surface(html: str, section: str) -> str:
+    """Everything one view can read the payload THROUGH.
+
+    Not the section markup alone. A view renders `x-for="(c, i) in cards"`, and
+    the figures that loop puts on screen are spelled in the `cards` GETTER --
+    so a check that compared the two sections' markup would call the six
+    summary cards unbound and, worse, would let the detail view re-render the
+    median card's own figure without noticing. The surface of a view is its
+    markup plus the body of every getter it names, transitively.
+
+    Transitively because `cards` reads `contextSampleLine`, which is where that
+    card's sample is composed: one hop would stop exactly where the fields are.
+    """
+    bodies = getter_bodies(strip_comments(html))
+    surface, seen = section, set()
+    while True:
+        named = {
+            name for name in bodies
+            if name not in seen and re.search(rf"\b{re.escape(name)}\b", surface)
+        }
+        if not named:
+            return surface
+        seen |= named
+        surface += "\n" + "\n".join(bodies[name] for name in sorted(named))
+
+
+def summary_paths(source: str) -> set[str]:
+    """Every `/api/summary` path `source` reads, normalised.
+
+    Normalised by dropping JS member names from the tail, so the comparison is
+    between FIELDS rather than between spellings of a read.
+    """
+    paths = set()
+    for match in SUMMARY_PATH.findall(source):
+        parts = match.replace("?.", ".").split(".")[1:]
+        while parts and parts[-1] in JS_MEMBERS:
+            parts.pop()
+        if parts:
+            paths.add(".".join(parts))
+    return paths
+
+
+class ReportViewSplitTest(unittest.TestCase):
+    """The overview is the front door; the detail view keeps every panel (#70).
+
+    The owner's decision, taken before this was built: the overview is the
+    landing view and the details view is one click away. It costs the heaviest
+    reader -- the person who has been reading the tables all along -- one extra
+    click, forever, which is why two of these tests are load-bearing rather
+    than tidy. One click there and one click BACK, or the extra click compounds
+    instead of being paid once. And the view is in the URL, or anyone who has
+    bookmarked this report loses their bookmark silently.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+        cls.overview = view_section(cls.raw, "overview")
+        cls.details = view_section(cls.raw, "details")
+
+    def component(self, decl: str) -> str:
+        return js_function_body(self.html, decl)
+
+    # --- the landing view and the way back ---------------------------------
+
+    def test_the_overview_is_the_landing_view(self) -> None:
+        # The DEFAULT, not merely a reachable state: a page that opens on the
+        # details view has not been split, it has been rearranged.
+        component = self.component("function report(")
+        self.assertRegex(component, re.compile(r'^\s*view: DEFAULT_VIEW,$', re.M))
+        self.assertRegex(
+            self.html, r'const DEFAULT_VIEW = "overview";'
+        )
+        self.assertIn("""x-show="view === 'overview'\"""", self.raw)
+        self.assertIn("""x-show="view === 'details'\"""", self.raw)
+
+    def test_one_click_reaches_details_and_one_click_returns(self) -> None:
+        # Symmetry is the whole point. The tabs sit in NEITHER section, so both
+        # are on screen whichever view is showing -- a "back" that is reachable
+        # only from the top of a long scrolled page is not one click.
+        tabs = html_element(self.raw, 'id="view-tabs"')
+        for view in ("overview", "details"):
+            with self.subTest(view=view):
+                self.assertIn(f"setView('{view}')", tabs)
+        self.assertNotIn('id="view-tabs"', self.overview)
+        self.assertNotIn('id="view-tabs"', self.details)
+
+    # --- nothing is removed ------------------------------------------------
+
+    def test_every_panel_survives_in_a_named_view(self) -> None:
+        # THE acceptance criterion: every panel on the report before the split
+        # is still on it, in a named place. A dropped detail panel is red here
+        # and nowhere else -- the wiring guard would not see it, because the
+        # payload field it renders may well still be read somewhere.
+        for panel in sorted(OVERVIEW_PANELS):
+            with self.subTest(panel=panel, view="overview"):
+                self.assertIn(f'id="{panel}"', self.overview)
+                self.assertNotIn(f'id="{panel}"', self.details)
+        for panel in sorted(DETAIL_PANELS):
+            with self.subTest(panel=panel, view="details"):
+                self.assertIn(f'id="{panel}"', self.details)
+                self.assertNotIn(f'id="{panel}"', self.overview)
+
+    def test_each_panel_exists_exactly_once_in_the_page(self) -> None:
+        # A panel duplicated into both views is the disagreement this issue is
+        # about, in its most literal form.
+        for panel in sorted(CHROME_PANELS | OVERVIEW_PANELS | DETAIL_PANELS):
+            with self.subTest(panel=panel):
+                self.assertEqual(self.html.count(f'id="{panel}"'), 1)
+
+    def test_the_shared_chrome_belongs_to_neither_view(self) -> None:
+        # The strongest form of "cannot disagree": not two bindings kept equal,
+        # but ONE element that both views are looking at.
+        for panel in sorted(CHROME_PANELS):
+            with self.subTest(panel=panel):
+                self.assertIn(f'id="{panel}"', self.html)
+                self.assertNotIn(f'id="{panel}"', self.overview)
+                self.assertNotIn(f'id="{panel}"', self.details)
+
+    # --- the two views cannot disagree -------------------------------------
+
+    def test_no_summary_field_is_bound_in_both_views(self) -> None:
+        # A field read in both views is two renderings of one figure with a
+        # navigation step between them, and nothing keeps them equal. The
+        # remedy is not "keep them in sync": it is one getter, named once, so
+        # that there is one definition to be right or wrong.
+        #
+        # Over the view SURFACE, not the markup: the six summary cards are
+        # composed in a getter, and a detail panel that re-rendered one of
+        # their figures would be invisible to a check that read templates only.
+        both = (
+            summary_paths(view_surface(self.raw, self.overview))
+            & summary_paths(view_surface(self.raw, self.details))
+        )
+        self.assertEqual(
+            sorted(both),
+            [],
+            f"{sorted(both)} is bound in BOTH views. Two renderings of one "
+            "figure can drift; route it through a single named getter instead.",
+        )
+
+    def test_the_period_is_named_by_one_binding_in_both_views(self) -> None:
+        # The one figure both views genuinely need, and therefore the test case
+        # for the rule above: the overview names the period it describes, the
+        # detail view opens on the same one, and there is ONE definition.
+        self.assertEqual(self.html.count("get periodLabel("), 1)
+        for view, section in (("overview", self.overview), ("details", self.details)):
+            with self.subTest(view=view):
+                self.assertIn("periodLabel", section)
+
+    def test_neither_view_composes_a_period_of_its_own(self) -> None:
+        # How the rule above would be defeated: not by binding the same path
+        # twice, but by rebuilding the same sentence out of the range state.
+        # The picker owns `from`/`to`/`range`; everything else asks
+        # `periodLabel`.
+        for expr in BINDING_ATTR.findall(self.overview):
+            with self.subTest(binding=expr):
+                self.assertNotRegex(expr, r"\b(from|to|range)\b")
+        picker = html_element(self.raw, 'id="filters"')
+        for expr in BINDING_ATTR.findall(self.details.replace(picker, "")):
+            with self.subTest(binding=expr):
+                self.assertNotRegex(expr, r"\b(from|to)\b")
+
+    def test_a_figure_unmeasured_in_one_view_is_unmeasured_in_the_other(self) -> None:
+        # Absence must not become a value by changing level, so both views run
+        # every figure through the SAME formatters -- the ones
+        # `AbsenceIsNeverRenderedAsAValueTest` pins as answering absence before
+        # they compute. A second copy of one would be a second rule.
+        for formatter in ("fmtTok", "fmtCount", "fmtPct"):
+            with self.subTest(formatter=formatter):
+                self.assertEqual(self.html.count(f"function {formatter}("), 1)
+        self.assertIn("fmtTok(", self.overview)
+        self.assertIn("fmtTok(", self.details)
+
+    # --- the view is in the URL --------------------------------------------
+
+    def test_the_view_is_written_to_the_url(self) -> None:
+        # A details view that cannot be linked or reloaded is a silent
+        # regression for everyone who has bookmarked this report.
+        body = self.component("writeUrl() {")
+        self.assertIn('p.set("view", this.view)', body)
+        self.assertIn("history.replaceState", body)
+        self.assertIn("this.writeUrl()", self.component("setView(view) {"))
+
+    def test_the_url_is_read_back_on_load_and_on_navigation(self) -> None:
+        body = self.component("applyUrl() {")
+        self.assertIn("location.hash", body)
+        self.assertIn("this.applyUrl()", self.component("init() {"))
+        # Alpine's own event modifier, not `addEventListener` (#8): the page
+        # reaches no DOM API. A bookmark opened in an already-loaded tab, or a
+        # back button, must land on the view the URL names.
+        self.assertIn('x-on:hashchange.window="applyUrl()"', self.raw)
+
+    def test_an_unknown_view_in_the_url_falls_back_to_the_overview(self) -> None:
+        # A hash is not a route -- there is no request to answer with a 404 --
+        # so the page states the view it CAN show rather than a view it cannot.
+        body = self.component("applyUrl() {")
+        self.assertRegex(body, r"VIEWS\.includes\(\w+\)\s*\?\s*\w+\s*:\s*DEFAULT_VIEW")
+
+    # --- deep links carry their filter -------------------------------------
+
+    # An overview figure, the detail panel it drills into, and the filter the
+    # link carries. A bare "Details" link makes the reader do the join
+    # themselves, which is the thing this issue names.
+    DEEP_LINKS = (
+        # #61's per-scope saturation band -> the models table, filtered to that
+        # scope. The filter value is the payload's OWN scope label on both
+        # ends (`by_scope[].scope` and `models[].scope` are both
+        # `serve.SCOPE_LABELS`), so the page invents no equivalence.
+        ("context-note", "showPanel('models', { scope: s.scope })"),
+        # The unknown-window models -> the heaviest calls that ran on them.
+        # Again both ends are server strings: `unknown_models` and
+        # `outliers[].model`.
+        (
+            "context-note",
+            "showPanel('outliers', { models: summary.context.utilisation.unknown_models })",
+        ),
+        # The scope band already told the reader that subagent calls appear
+        # under their own bucket in the by-turn-type chart. Now it takes them
+        # there, with that grouping selected.
+        ("scope-note", "showPanel('chart', { by: 'turntype' })"),
+    )
+
+    def test_every_deep_link_names_a_panel_and_carries_its_filter(self) -> None:
+        for element, call in self.DEEP_LINKS:
+            with self.subTest(link=call):
+                self.assertIn(call, html_element(self.raw, f'id="{element}"'))
+
+    def test_a_deep_link_lands_on_the_detail_view(self) -> None:
+        body = self.component("showPanel(panel, opts) {")
+        self.assertIn('this.view = "details"', body)
+        self.assertIn("this.writeUrl()", body)
+        # And says where it landed: a filter nobody can see is a table that
+        # silently disagrees with the figure that linked to it.
+        self.assertIn("scrollIntoView", body)
+
+    def test_the_filter_is_carried_in_the_url_too(self) -> None:
+        # Otherwise the deep link survives the click and not the reload, which
+        # is the same regression as losing the view.
+        body = self.component("writeUrl() {")
+        for param in ("panel", "scope", "models", "by"):
+            with self.subTest(param=param):
+                self.assertIn(f'p.set("{param}"', body)
+
+    def test_a_filtered_table_says_what_it_is_hiding(self) -> None:
+        # An unexplained filter is a table that disagrees with the figure that
+        # linked to it. Every filtered panel states the filter, the two counts
+        # and the way out of it.
+        for table in ("models", "outliers"):
+            with self.subTest(table=table):
+                panel = html_element(self.raw, f'id="{table}-panel"')
+                self.assertIn("clearFilters()", panel)
+                self.assertIn("filterNote", panel)
+                self.assertIn("Showing", panel)
+
+    def test_the_page_spells_no_scope_label_of_its_own(self) -> None:
+        # The filter compares one payload string against another. A page-side
+        # map from `is_sidechain` to a scope label would be the page inventing
+        # an equivalence the API never stated -- `is_sidechain` is the record's
+        # own flag and `scope` is derived from `source_kind`, two different
+        # measurements -- and that is this issue's defect one level down.
+        for decl in ("get shownModels(", "get shownOutliers(", "showPanel(panel, opts) {"):
+            with self.subTest(decl=decl):
+                body = self.component(decl)
+                for label in (SCOPE_MAIN, SCOPE_SUBAGENT):
+                    self.assertNotIn(f'"{label}"', body)
+                    self.assertNotIn(f"'{label}'", body)
+
+    def test_a_filter_never_turns_an_absence_into_an_empty_window(self) -> None:
+        # "Not fetched yet" and "the window holds none" are different facts and
+        # only the second may say "No calls in this period" -- so a filtered
+        # view of a null payload is null, never []. And a filter that excludes
+        # every row says THAT, rather than reporting an empty window.
+        self.assertIn("if (this.outliers === null) return null;", self.component("get shownOutliers("))
+        self.assertIn("if (!this.summary) return null;", self.component("get shownModels("))
+        for table in ("models", "outliers"):
+            with self.subTest(table=table):
+                self.assertIn("No rows match the filter", html_element(self.raw, f'id="{table}"'))
+
+    # --- the detail view keeps its behaviour -------------------------------
+
+    def test_the_time_picker_still_filters(self) -> None:
+        # EVERY control, individually: a picker with one dead button is a
+        # picker that silently shows the wrong window for one of its four
+        # presets, which is worse than one that visibly does nothing.
+        picker = html_element(self.raw, 'id="filters"')
+        clicks = re.findall(r'@click="([^"]+)"', picker)
+        self.assertEqual(
+            clicks,
+            ["setRange(1)", "setRange(7)", "setRange(30)", "setRange('all')",
+             "applyCustomRange()"],
+            "a range control is bound to something other than the picker",
+        )
+        # The picker is inert unless it re-reads, and inert unless what it
+        # re-reads carries the window: a range that changes state and fetches
+        # nothing, or fetches without its dates, is a filter that does not
+        # filter.
+        for decl in ("setRange(days) {", "applyCustomRange() {"):
+            with self.subTest(decl=decl):
+                self.assertIn("this.load()", self.component(decl))
+        qs = self.component("rangeQS() {")
+        self.assertIn('p.set("from", this.from)', qs)
+        self.assertIn('p.set("to", this.to)', qs)
+        self.assertIn("this.rangeQS()", self.component("async load("))
+
+    def test_the_chart_still_switches_groupings(self) -> None:
+        # EVERY radio, not "the panel mentions a load()". One grouping left
+        # bound to the model and not to the fetch is a control that changes the
+        # legend and not the data -- the chart would then be labelled by one
+        # grouping and drawn by another, which is a wrong number wearing a
+        # right heading.
+        panel = html_element(self.raw, 'id="chart-panel"')
+        radios = re.findall(r"<input[^>]*type=\"radio\"[^>]*>", panel)
+        self.assertEqual(
+            sorted(re.search(r'value="([^"]+)"', r).group(1) for r in radios),
+            ["class", "scope", "turntype"],
+        )
+        for radio in radios:
+            with self.subTest(radio=radio):
+                self.assertIn('x-model="by"', radio)
+                self.assertIn('@change="load()"', radio)
+        self.assertIn("this.by", self.component("async load("))
+
+    def test_the_chart_is_resized_when_its_view_becomes_visible(self) -> None:
+        # Chart.js sizes to its container, and `x-show` gives a hidden one no
+        # size at all -- so a chart drawn while the overview was showing comes
+        # up 0px high unless it is told to re-measure.
+        self.assertIn("this.chart.resize()", self.component("setView(view) {"))
+
+    def test_the_split_introduces_no_new_fetch(self) -> None:
+        # The page already retrieves everything both views need. A split that
+        # multiplied requests would pay for the structure with the one budget
+        # this tool does not have -- `serve.py` is a single-threaded
+        # HTTPServer.
+        self.assertEqual(self.html.count("await fetch("), 1)
+        self.assertEqual(
+            self.html.count("getJSON("),
+            7,
+            "one declaration, five in load(), one in showDetail() -- any other "
+            "count is a request the split added",
+        )
 
 
 if __name__ == "__main__":

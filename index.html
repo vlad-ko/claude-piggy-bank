@@ -52,7 +52,38 @@
      fact; it must not look like the sentence above it. */
   .context-line { display:block; margin-top:5px; }
   .context-judged { font-style:italic; border-left:3px solid #818cf8; padding-left:8px; }
+  /* #78's advice band. `advice-line` is the sub-line of one assessment; the two
+     provenance classes are the per-BOUNDARY grain of the same rule
+     `context-judged` applies to the bands -- a judged cut point must not look
+     like a documented one, and here the two can sit on the two ends of a single
+     range, so the marking is on the edge rather than on the block. */
+  .advice-line { display:block; margin-top:2px; padding-left:14px; }
+  .advice-judged { font-style:italic; border-left:3px solid #818cf8; padding-left:8px; margin-left:6px; }
+  .advice-cited { border-left:3px solid #0f766e; padding-left:8px; margin-left:6px; }
+  .advice-structural { border-left:3px solid #9ca3af; padding-left:8px; margin-left:6px; }
   .util-band { display:inline-block; margin:0 16px 0 0; }
+  /* #70's two views, and the affordance between them. Named classes, never an
+     inline style string: the tab, the period line, the drill-down and the
+     filter notice are each a repeated pattern, and this page's rule is that a
+     repeated pattern gets a name. */
+  .tabs { display:flex; gap:4px; background:#e9ecef; padding:4px; border-radius:10px; margin-bottom:14px; }
+  .tabs button { flex:0 0 auto; border:none; background:none; padding:7px 15px; border-radius:7px;
+                 font:inherit; font-size:13px; font-weight:600; color:var(--muted); cursor:pointer; }
+  .tabs button.on { background:var(--card); color:var(--ink); box-shadow:0 1px 2px rgba(0,0,0,.07); }
+  .tabs .hint { flex:1; text-align:right; align-self:center; font-size:11.5px; color:var(--muted); padding-right:6px; }
+  .period { color:var(--muted); font-size:12px; margin-bottom:12px; }
+  .period strong { color:var(--ink); }
+  /* A drill-down NAMES its destination and carries its filter, so it is a
+     button rather than a bare link: it changes state on this page. */
+  .drill { display:inline-block; margin-top:2px; font-size:12px; color:var(--accent); background:none;
+           border:none; padding:0; font:inherit; text-align:left; cursor:pointer; }
+  .drill:hover { text-decoration:underline; }
+  /* A filter nobody can see is a table that silently disagrees with the figure
+     that linked to it, so it is marked in the same register as the banner. */
+  .filter-note { font-weight:normal; color:#78350f; background:#fef3c7; border:1px solid #f59e0b;
+                 border-radius:6px; padding:2px 8px; font-size:12px; }
+  .filter-note button { background:none; border:none; color:var(--accent); font:inherit;
+                        cursor:pointer; padding:0 0 0 6px; }
   tbody tr.unmeasured { color:var(--muted); }
   .chartbox { position:relative; height:340px; }
   #detail .close { float:right; cursor:pointer; color:var(--muted); background:none; border:none; font:inherit; padding:0; }
@@ -66,9 +97,56 @@
      stops recomputing, and is brought back up to date the moment it is looked
      at again, so returning to a tab never shows an age up to a tick out of
      date. -->
-<div class="wrap" x-data="report()" x-on:visibilitychange.document="tickAge()">
+<!-- The hash binding is Alpine's own event modifier for the same reason the
+     visibility one is: no code in this page reaches the DOM (#8). It is what
+     makes a bookmarked or pasted URL land on the view it names in a tab that
+     is already open, and what makes the browser's back button move between
+     views rather than out of the report. -->
+<div class="wrap" x-data="report()" x-on:visibilitychange.document="tickAge()"
+     x-on:hashchange.window="applyUrl()">
   <h1>Claude Code Usage Report</h1>
   <div class="sub">Token usage from local session transcripts. Dates are America/New_York.</div>
+
+  <!-- #70: TWO VIEWS, ONE PAYLOAD.
+       ============================
+
+       The report served two readers with one page and neither well: someone
+       opening it for the first time met a time picker, six cards, a stacked
+       chart and four tables before anything said whether their situation was
+       good or bad, and the reader who WANTED those tables had them buried
+       under prose written for the first one. These are two levels of one set
+       of numbers, not two designs.
+
+       The overview is the landing view and the detail view is one click away
+       -- an owner's decision taken before this was built, because it costs the
+       heaviest reader an extra click forever. Two consequences are structural
+       rather than cosmetic, and both are pinned by tests:
+
+         * ONE CLICK THERE, ONE CLICK BACK. These tabs sit outside both views,
+           so the way back is on screen wherever the reader has scrolled to. A
+           return that is harder than the arrival makes the extra click
+           compound instead of being paid once.
+         * THE VIEW IS IN THE URL. Anyone who has bookmarked this report keeps
+           their bookmark, and a deep link into a filtered table survives being
+           pasted, reloaded and shared.
+
+       And the rule a split makes easiest to break: BOTH VIEWS READ THE SAME
+       PAYLOAD AND CANNOT DISAGREE. Two renderings of one figure that can drift
+       is "one sample, one definition" with a navigation step hidden in the
+       middle. It is answered three ways -- what both views need is rendered
+       ONCE below, in neither section; no summary path may be bound in both
+       sections; and the one figure they genuinely share, the period, is a
+       single getter. tests/test_serve.py's ReportViewSplitTest is the check. -->
+  <nav class="tabs" id="view-tabs">
+    <button type="button" :class="{ on: view === 'overview' }"
+            :aria-current="view === 'overview' ? 'page' : false"
+            @click="setView('overview')">Overview</button>
+    <button type="button" :class="{ on: view === 'details' }"
+            :aria-current="view === 'details' ? 'page' : false"
+            @click="setView('details')">Details &amp; raw data</button>
+    <span class="hint">Same numbers, two levels &mdash; the detail view holds every
+      panel this report has ever had.</span>
+  </nav>
 
   <!-- ONE banner element, three things that can want it: a failed load, the
        staleness warning, and the routine data-quality notices. Each used to
@@ -85,96 +163,15 @@
   <div class="banner" id="banner" x-cloak x-show="bannerMessages.length"
        x-text="bannerMessages.join(' ')"></div>
 
-  <!-- #4966: every figure on this page names the SCOPE it ranges over. Subagent
-       API calls live in separate `<session>/subagents/agent-*.jsonl`
-       transcripts; when none were ingested the numbers are main-thread-only and
-       this band says so, because "no subagent transcripts on disk" and
-       "subagents spent nothing" are different facts (rule #12) and must not
-       render identically. -->
-  <div class="note-band" id="scope-note">
-    <template x-if="!summary"><span>Loading scope&hellip;</span></template>
-    <template x-if="summary"><span>
-      <template x-if="!summary.scope.coverage.sessions_with_subagent_transcripts"><span>
-        <strong>Scope: MAIN-THREAD ONLY.</strong> No <code>subagents/</code> transcripts
-        were found for any of the
-        <span x-text="summary.scope.coverage.sessions"></span> session(s) in this
-        period, so subagent spend is <strong>unmeasured, not zero</strong>
-        &mdash; every figure below is a main-thread figure, not a session total.
-      </span></template>
-      <template x-if="summary.scope.coverage.sessions_with_subagent_transcripts"><span>
-        <strong>Scope: main-thread + subagent.</strong>
-        <span x-text="summary.scope.coverage.subagent_files.toLocaleString()"></span>
-        subagent transcript(s) across
-        <span x-text="summary.scope.coverage.sessions_with_subagent_transcripts"></span> of
-        <span x-text="summary.scope.coverage.sessions"></span> session(s) in this period
-        are included. Subagent calls have no main-thread turn, so they appear
-        under the "subagent" bucket in the by-turn-type chart.
-      </span></template>
-
-      <!-- #44: the PROJECT axis, annotating this same band rather than adding a
-           panel. The plugin keeps ONE database per install, so a user-scope
-           install ingests every project the user opens into the same file and
-           every figure below becomes a sum across them, worded as though it
-           described one.
-
-           SILENT when the database holds a single project -- the ordinary case
-           must not start announcing a dimension it does not have, and a notice
-           that never varies is a notice nobody reads. Two counts, not one:
-           `in_window` is what the figures cover, `in_database` is what the file
-           mixes together, and a project ingested but idle in this window is a
-           measured zero rather than an absence, so narrowing the dates must not
-           quietly shrink the claim.
-
-           COUNTS, not names. A project name is the working directory with its
-           separators folded to `-`, so it carries the username and the repo
-           name; eighteen of them would also swamp a one-line band.
-           `/api/summary` carries them for anyone who needs them, exactly as the
-           durability block carries its source paths while the banner states a
-           count. -->
-      <template x-if="summary.scope.projects.in_database > 1"><span>
-        <template x-if="summary.scope.projects.in_window > 1"><span><strong>Across
-          <span x-text="summary.scope.projects.in_window"></span>
-          projects.</strong> Every figure below is a CROSS-PROJECT total, not one
-          project's<span x-text="crossProjectTail"></span></span></template>
-        <template x-if="summary.scope.projects.in_window <= 1"><span><strong>This database holds
-          <span x-text="summary.scope.projects.in_database"></span>
-          projects</strong><span x-text="narrowProjectTail"></span></span></template>
-        Project names are not rendered here; <code>/api/summary</code> lists them
-        under <code>scope.projects</code>.
-      </span></template>
-      <template x-if="summary.scope.projects.unattributed_calls"><span>
-        <strong><span x-text="summary.scope.projects.unattributed_calls.toLocaleString()"></span>
-        call(s)</strong> in this period come from a path the transcript layout
-        cannot parse, so their project is <strong>UNKNOWN</strong> &mdash; counted
-        in the totals below, and in no project above.
-      </span></template>
-
-      <!-- Every count above is scoped to the SELECTED WINDOW, exactly like the
-           buckets it describes -- except `runs_undated_unavailable`, which is
-           corpus-wide because those runs carry no timestamp to window by, and
-           which is labelled as such here rather than blended in. -->
-      <template x-if="summary.scope.coverage.runs_undated_unavailable"><span>
-        <strong><span x-text="summary.scope.coverage.runs_undated_unavailable"></span>
-        reaped dispatch(es)</strong> carry no readable timestamp, so they belong
-        to no date window and are counted here instead (corpus-wide, not
-        window-scoped).
-      </span></template>
-    </span></template>
-  </div>
-
-  <div class="filters" id="filters">
-    <button :class="{ active: range === '1' }" @click="setRange(1)">24h</button>
-    <button :class="{ active: range === '7' }" @click="setRange(7)">7d</button>
-    <button :class="{ active: range === '30' }" @click="setRange(30)">30d</button>
-    <button :class="{ active: range === 'all' }" @click="setRange('all')">All</button>
-    <span>Custom:</span>
-    <input type="date" id="from" :value="from ?? ''" @input="from = $event.target.value || null">
-    <input type="date" id="to" :value="to ?? ''" @input="to = $event.target.value || null">
-    <button id="apply" @click="applyCustomRange()">Apply</button>
-  </div>
-
   <!-- #20: how old these numbers are, immediately above the numbers -- a
        freshness note in a corner is one nobody reads before trusting a total.
+
+       #70 PUT IT HERE, ABOVE BOTH VIEWS, and that placement is the strongest
+       form of "the two views cannot disagree": there is no second rendering to
+       drift from. It qualifies every figure in either view, and a staleness
+       warning visible on only one of them is a warning the reader can navigate
+       away from without resolving. The banner above is here for the same
+       reason.
 
        TWO facts, never collapsed into a single "data age" number. `last_run_at`
        is when this tool last LOOKED at the transcripts; `newest_call_ts` is the
@@ -240,6 +237,116 @@
          of its own (CLAUDE.md constraint 4), and stays empty until a tick has
          actually moved them. -->
     <template x-if="elapsedNote"><span x-text="elapsedNote"></span></template>
+  </div>
+
+  <!-- ===================================================================
+       THE OVERVIEW. The landing view: what these numbers are, at what scale,
+       and what the dated recommendation table says about them.
+
+       The four questions #62 asks -- is anything blowing up, am I wasting
+       context, where can I optimise, what do I do next -- are #63 through #68
+       and are NOT here. This change is the container they fill; what it holds
+       today is what the report already had at this level, moved rather than
+       rewritten.
+       =================================================================== -->
+  <section id="view-overview" x-cloak x-show="view === 'overview'">
+
+    <!-- The period every figure below covers, NAMED. The time picker lives in
+         the detail view, so this view must say which window it is describing
+         rather than leave the reader to assume one -- and it says it through
+         the same `periodLabel` the detail view's picker reports, because a
+         period stated twice from two compositions is the drift this split
+         exists to prevent. -->
+    <div class="period" id="overview-period">Covering <strong x-text="periodLabel"></strong>.
+      <button type="button" class="drill" @click="setView('details')">Change the
+        period, or see every number behind this &rarr;</button>
+    </div>
+
+  <!-- #4966: every figure on this page names the SCOPE it ranges over. Subagent
+       API calls live in separate `<session>/subagents/agent-*.jsonl`
+       transcripts; when none were ingested the numbers are main-thread-only and
+       this band says so, because "no subagent transcripts on disk" and
+       "subagents spent nothing" are different facts (rule #12) and must not
+       render identically. -->
+  <div class="note-band" id="scope-note">
+    <template x-if="!summary"><span>Loading scope&hellip;</span></template>
+    <template x-if="summary"><span>
+      <template x-if="!summary.scope.coverage.sessions_with_subagent_transcripts"><span>
+        <strong>Scope: MAIN-THREAD ONLY.</strong> No <code>subagents/</code> transcripts
+        were found for any of the
+        <span x-text="summary.scope.coverage.sessions"></span> session(s) in this
+        period, so subagent spend is <strong>unmeasured, not zero</strong>
+        &mdash; every figure below is a main-thread figure, not a session total.
+      </span></template>
+      <template x-if="summary.scope.coverage.sessions_with_subagent_transcripts"><span>
+        <strong>Scope: main-thread + subagent.</strong>
+        <span x-text="summary.scope.coverage.subagent_files.toLocaleString()"></span>
+        subagent transcript(s) across
+        <span x-text="summary.scope.coverage.sessions_with_subagent_transcripts"></span> of
+        <span x-text="summary.scope.coverage.sessions"></span> session(s) in this period
+        are included. Subagent calls have no main-thread turn, so they appear
+        under the "subagent" bucket in the by-turn-type chart.
+        <!-- #70: the link NAMES its destination and CARRIES its filter. This
+             sentence already sent the reader to a chart in another view; a
+             bare "Details" link would have left them to find it and to set
+             the grouping themselves, which is the join this issue refuses to
+             make the reader do. `by` is the grouping the chart already
+             supports and /api/timeseries already validates, so nothing new is
+             invented to carry it. -->
+        <button type="button" class="drill"
+                @click="showPanel('chart', { by: 'turntype' })">See the daily chart
+          split by turn type &rarr;</button>
+      </span></template>
+
+      <!-- #44: the PROJECT axis, annotating this same band rather than adding a
+           panel. The plugin keeps ONE database per install, so a user-scope
+           install ingests every project the user opens into the same file and
+           every figure below becomes a sum across them, worded as though it
+           described one.
+
+           SILENT when the database holds a single project -- the ordinary case
+           must not start announcing a dimension it does not have, and a notice
+           that never varies is a notice nobody reads. Two counts, not one:
+           `in_window` is what the figures cover, `in_database` is what the file
+           mixes together, and a project ingested but idle in this window is a
+           measured zero rather than an absence, so narrowing the dates must not
+           quietly shrink the claim.
+
+           COUNTS, not names. A project name is the working directory with its
+           separators folded to `-`, so it carries the username and the repo
+           name; eighteen of them would also swamp a one-line band.
+           `/api/summary` carries them for anyone who needs them, exactly as the
+           durability block carries its source paths while the banner states a
+           count. -->
+      <template x-if="summary.scope.projects.in_database > 1"><span>
+        <template x-if="summary.scope.projects.in_window > 1"><span><strong>Across
+          <span x-text="summary.scope.projects.in_window"></span>
+          projects.</strong> Every figure below is a CROSS-PROJECT total, not one
+          project's<span x-text="crossProjectTail"></span></span></template>
+        <template x-if="summary.scope.projects.in_window <= 1"><span><strong>This database holds
+          <span x-text="summary.scope.projects.in_database"></span>
+          projects</strong><span x-text="narrowProjectTail"></span></span></template>
+        Project names are not rendered here; <code>/api/summary</code> lists them
+        under <code>scope.projects</code>.
+      </span></template>
+      <template x-if="summary.scope.projects.unattributed_calls"><span>
+        <strong><span x-text="summary.scope.projects.unattributed_calls.toLocaleString()"></span>
+        call(s)</strong> in this period come from a path the transcript layout
+        cannot parse, so their project is <strong>UNKNOWN</strong> &mdash; counted
+        in the totals below, and in no project above.
+      </span></template>
+
+      <!-- Every count above is scoped to the SELECTED WINDOW, exactly like the
+           buckets it describes -- except `runs_undated_unavailable`, which is
+           corpus-wide because those runs carry no timestamp to window by, and
+           which is labelled as such here rather than blended in. -->
+      <template x-if="summary.scope.coverage.runs_undated_unavailable"><span>
+        <strong><span x-text="summary.scope.coverage.runs_undated_unavailable"></span>
+        reaped dispatch(es)</strong> carry no readable timestamp, so they belong
+        to no date window and are counted here instead (corpus-wide, not
+        window-scoped).
+      </span></template>
+    </span></template>
   </div>
 
   <div class="cards" id="cards">
@@ -384,6 +491,24 @@
             <strong>INCONCLUSIVE:</strong>
             <span x-text="fmtCount(s.over_window_calls)"></span> above 100% of the
             window</span></template>
+          <!-- #70: this scope's counterpart in the detail view, NAMED and
+               FILTERED. Utilisation is measured against each model's OWN
+               documented window, so "which models did this scope's calls run
+               on, and what did they cost" is the row set behind this line.
+
+               The filter is `s.scope` compared against `models[].scope`: BOTH
+               ends are the payload's own `SCOPE_LABELS` string, so the page
+               invents no equivalence between them. That is why the link is
+               not into the outlier table, which would look like the sharper
+               drill-down: an outlier row carries `is_sidechain`, the record's
+               own flag, and NOT the `source_kind` every scoped figure on this
+               page is derived from. They agree in practice and they are two
+               different measurements, and a page that quietly equated them
+               would be this issue's own defect -- two views of one figure,
+               free to disagree -- hidden one level further down. -->
+          <button type="button" class="drill"
+                  @click="showPanel('models', { scope: s.scope })">See the models
+            <span x-text="s.scope"></span> calls ran on &rarr;</button>
         </span>
       </template>
 
@@ -421,6 +546,14 @@
         (<span x-text="summary.context.utilisation.unknown_models.join(', ')"></span>), so
         their utilisation is <strong>UNKNOWN, not low</strong> &mdash; their context is
         counted in the spread above and they are banded nowhere.
+        <!-- The second deep link, and the same rule: `unknown_models` and
+             `outliers[].model` are both the API's own model strings, so the
+             filter is one payload string matched against another. Banded
+             nowhere is exactly the case where the reader has to look at the
+             calls themselves, and this takes them to the heaviest of them. -->
+        <button type="button" class="drill"
+                @click="showPanel('outliers', { models: summary.context.utilisation.unknown_models })">See
+          the heaviest calls on those models &rarr;</button>
       </span></template>
       <template x-if="summary.context.utilisation.over_window_calls"><span class="context-line">
         <strong>INCONCLUSIVE:</strong>
@@ -443,7 +576,172 @@
     </span></template>
   </div>
 
-  <div class="panel">
+  <!-- #78/#79: the recommendation table's consumer.
+       ==============================================
+
+       CONSTRAINT 4 (do not overwhelm the UI). This is a note-band, not a
+       table, and it is the page's existing idiom for ANNOTATING the figures
+       above rather than restating them: `#scope-note` annotates the cards and
+       `#context-note` annotates the context card. Every one of the four
+       assessments is a lookup of a figure this page already carries the inputs
+       for -- the saturation share off the per-scope bands directly above, the
+       two cache figures off the cache-read and cache-write cards, the reply
+       ratio off the main-vs-subagent split -- so what earns the space is the
+       verdict on those numbers, not a second copy of them.
+
+       THE RENDERING IS DELIBERATELY PROVISIONAL. #70 splits the report into an
+       overview and a details view; the ranked levers belong on the overview
+       under #66 (ranked opportunities) and #67 (next steps), which is where
+       their shape gets decided. This band exists so the assessments are
+       visible and auditable NOW, not as a layout anyone should preserve. Do
+       not mistake it for a decision.
+
+       THE PAGE PERFORMS NO LOOKUP AND HOLDS NO THRESHOLD (#78). Every
+       boundary, every severity, every word of advice and both provenances are
+       read off `/api/summary`. `tests/test_serve.py` asserts that none of the
+       table's prose appears in this file: advice that could be edited here
+       would be advice with no date, no provenance and no redline.
+
+       AN `ok` IS A POSITIVE STATEMENT and is rendered as one. Healthy entries
+       are shown, not omitted -- if "nothing to change here" were represented
+       by absence, healthy and unmeasured would render identically, which is
+       the rule this repository is built on. Unmeasured metrics get the API's
+       own `unmeasured_note` for the same reason, never a dash and never a 0.
+
+       TWO VOICES, PER BOUNDARY. `#context-note` keeps the documented window
+       and the judged band boundaries in two separately marked voices. Here the
+       same rule runs one level down: a single range can have a CITED lower
+       edge and a JUDGED upper edge, so the marking is on the edge. A judged
+       cut point rendered in a cited one's voice would borrow an authority
+       nobody earned -- which is why the API carries `kind` per boundary and
+       why a judged provenance structurally cannot carry a source. -->
+  <div class="note-band" id="advice-note">
+    <template x-if="!summary"><span>Loading recommendations&hellip;</span></template>
+    <template x-if="summary"><span>
+      <strong>What to change, worst first.</strong>
+      Each line looks one figure above up in a dated table of ranges
+      (decided <span x-text="summary.recommendations.as_of"></span>).
+      <span class="context-line context-judged">Table:
+        <span x-text="summary.recommendations.provenance"></span></span>
+      <span class="context-line context-judged">Order:
+        <span x-text="summary.recommendations.ranking_provenance"></span></span>
+
+      <template x-for="(a, i) in summary.recommendations.ranked" :key="a.metric">
+        <span class="context-line">
+          <strong x-text="'#' + (i + 1) + ' ' + a.severity.toUpperCase()"></strong>
+          &mdash; <strong x-text="a.metric"></strong> =
+          <strong x-text="fmtMetric(a.value)"></strong>
+          <span class="advice-line">Measures: <span x-text="a.measurement"></span>.</span>
+          <span class="advice-line" x-text="a.recommendation"></span>
+          <!-- The lever is the machine-readable half, shown beside the prose so
+               a reader can see WHAT is being changed and WHICH WAY without
+               parsing the sentence. `directive` is composed in the module from
+               a closed registry -- never here -- which is what makes "reduce
+               your cache-read" unrepresentable rather than merely absent. -->
+          <template x-if="a.lever"><span class="advice-line">Lever:
+            <strong x-text="a.lever.directive"></strong>
+            (<span x-text="a.lever.action"></span>
+            <span class="mono" x-text="a.lever.target"></span>).</span></template>
+          <!-- A healthy entry carries NO lever by construction, and says so
+               rather than showing an empty space where the other rows have
+               one. Absence with no explanation is the thing this page refuses
+               to render. -->
+          <template x-if="!a.lever"><span class="advice-line">No lever: this is a
+            healthy reading, so there is nothing here to change.</span></template>
+          <span class="advice-line">Range
+            <strong x-text="fmtMetric(a.range_lower)"></strong> to
+            <strong x-text="a.range_upper === null ? 'no ceiling' : fmtMetric(a.range_upper)"></strong>,
+            <!-- The key the order was derived from, published beside the order
+                 it produced: `RANKED_BY`'s rule, and the reason
+                 `ranking_provenance` above is a field rather than a comment. -->
+            ranked <span x-text="fmtMetric(a.depth_in_severity)"></span> into the
+            <span x-text="a.severity"></span> band.</span>
+          <!-- The two edges, each in its own voice. Written out twice rather
+               than looped, because a helper that reshaped them would spell the
+               field names in JavaScript where the wiring guard cannot follow
+               them to the payload. `covers` rides in the tooltip: it is a
+               paragraph qualifying exactly what the citation does and does not
+               cover, and it must be READABLE without displacing the verdict. -->
+          <span class="advice-line" :class="provenanceVoice(a.lower_provenance)">
+            Lower edge <span x-text="fmtMetric(a.range_lower)"></span> &mdash;
+            <strong x-text="a.lower_provenance.kind"></strong>:
+            <span x-text="a.lower_provenance.statement"></span>
+            <template x-if="a.lower_provenance.checked"><span>(<span
+              x-text="a.lower_provenance.checked"></span>)</span></template>
+            <template x-if="a.lower_provenance.source"><span>Source:
+              <span class="mono" :title="a.lower_provenance.covers"
+                    x-text="a.lower_provenance.source"></span>
+              &mdash; hover for what it covers.</span></template>
+          </span>
+          <template x-if="a.upper_provenance">
+            <span class="advice-line" :class="provenanceVoice(a.upper_provenance)">
+              Upper edge <span x-text="fmtMetric(a.range_upper)"></span> &mdash;
+              <strong x-text="a.upper_provenance.kind"></strong>:
+              <span x-text="a.upper_provenance.statement"></span>
+              <template x-if="a.upper_provenance.checked"><span>(<span
+                x-text="a.upper_provenance.checked"></span>)</span></template>
+              <template x-if="a.upper_provenance.source"><span>Source:
+                <span class="mono" :title="a.upper_provenance.covers"
+                      x-text="a.upper_provenance.source"></span>
+                &mdash; hover for what it covers.</span></template>
+            </span>
+          </template>
+        </span>
+      </template>
+
+      <!-- UNMEASURED IS NAMED, NEVER DROPPED. A metric with no sample that
+           simply vanished would be indistinguishable from a healthy one, which
+           is the defect the whole table exists to avoid -- so the API's own
+           note is rendered against each, and never a dash or a 0.
+
+           Consumed WHOLE, like `context.percentiles`: the keys are metric
+           names the server decides, so the page cannot name them in advance
+           and does not try. `e[0]` is the metric, `e[1]` what would have been
+           measured. -->
+      <template x-if="Object.keys(summary.recommendations.unmeasured).length"><span
+            class="context-line">
+        <strong>Not measured in this period.</strong>
+        <template x-for="e in Object.entries(summary.recommendations.unmeasured)" :key="e[0]">
+          <span class="advice-line">
+            <strong x-text="e[0]"></strong> &mdash;
+            <span x-text="summary.recommendations.unmeasured_note"></span>
+            Would measure: <span x-text="e[1]"></span>.
+          </span>
+        </template>
+      </span></template>
+    </span></template>
+  </div>
+  </section>
+
+  <!-- ===================================================================
+       DETAILS & RAW DATA. Every panel this report has ever had, with its
+       behaviour intact: the time picker still filters, the chart still
+       switches groupings, every table still sorts by the key its heading
+       names. Nothing was removed by the split -- the panels below are the
+       page as it stood, moved one level down and reachable in one click.
+       =================================================================== -->
+  <section id="view-details" x-cloak x-show="view === 'details'">
+
+    <!-- The same `periodLabel` the overview names, so the two views cannot
+         state different periods: one getter, two bindings. The picker below
+         is the only thing on this page that OWNS `from`/`to`. -->
+    <div class="period" id="details-period">Showing <strong x-text="periodLabel"></strong>.
+      <button type="button" class="drill" @click="setView('overview')">&larr; Back to
+        the overview</button>
+    </div>
+
+  <div class="filters" id="filters">
+    <button :class="{ active: range === '1' }" @click="setRange(1)">24h</button>
+    <button :class="{ active: range === '7' }" @click="setRange(7)">7d</button>
+    <button :class="{ active: range === '30' }" @click="setRange(30)">30d</button>
+    <button :class="{ active: range === 'all' }" @click="setRange('all')">All</button>
+    <span>Custom:</span>
+    <input type="date" id="from" :value="from ?? ''" @input="from = $event.target.value || null">
+    <input type="date" id="to" :value="to ?? ''" @input="to = $event.target.value || null">
+    <button id="apply" @click="applyCustomRange()">Apply</button>
+  </div>
+
+  <div class="panel" id="chart-panel" x-ref="panelChart">
     <h2>Daily token usage
       <span class="toggle">
         <label><input type="radio" name="by" value="class" checked x-model="by" @change="load()"> by token class</label>
@@ -454,7 +752,7 @@
     <div class="chartbox"><canvas id="chart" x-ref="chart"></canvas></div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="models-panel" x-ref="panelModels">
     <!-- Named for what it shows and what it sorts on. It was "Spend by model"
          while ordering by cache-read, the same heading-vs-query drift #30
          fixes in the dispatch panel below -- smaller only because no dollar
@@ -462,6 +760,17 @@
     <h2>Token usage by model (largest cache-read first)
       <span class="toggle toggle-note">
         the same model is a separate row per scope -- main-thread and subagent are never merged
+      </span>
+      <!-- #70: a deep link that filtered this table SILENTLY would be a panel
+           disagreeing with the figure that linked to it -- the reader would
+           read a total over a subset as a total over the window. So the
+           filter states itself, states both counts, and carries its own way
+           out. `filterNote` is composed once for every filtered panel. -->
+      <span class="toggle-note panel-note" x-cloak x-show="isFiltered">
+        <span class="filter-note"><span x-text="filterNote"></span>
+          Showing <span x-text="fmtCount((shownModels ?? []).length)"></span> of
+          <span x-text="fmtCount(summary ? summary.models.length : null)"></span> row(s).
+          <button type="button" @click="clearFilters()">show every row</button></span>
       </span>
     </h2>
     <!-- Window-level token usage by model. `models()` splits every model by
@@ -476,7 +785,7 @@
       <th>Model</th><th>Scope</th><th>Calls</th>
       <th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th>
     </tr></thead><tbody>
-      <template x-for="(r, i) in (summary ? summary.models : [])" :key="i">
+      <template x-for="(r, i) in (shownModels ?? [])" :key="i">
         <tr>
           <td x-text="r.model"></td>
           <td x-text="r.scope"></td>
@@ -486,6 +795,14 @@
       </template>
       <template x-if="summary && !summary.models.length">
         <tr><td colspan="7">No API calls in this period.</td></tr>
+      </template>
+      <!-- THREE states, not two. "No API calls in this period" is a claim
+           about the WINDOW; a filter that excludes every row is a claim about
+           the FILTER, and rendering the first for the second would report an
+           empty window that is not empty. -->
+      <template x-if="summary && summary.models.length && !shownModels.length">
+        <tr><td colspan="7">No rows match the filter &mdash; the window itself is
+          not empty.</td></tr>
       </template>
     </tbody></table></div>
   </div>
@@ -564,7 +881,7 @@
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="sessions-panel" x-ref="panelSessions">
     <h2>Sessions</h2>
     <div style="overflow-x:auto"><table id="sessions"><thead><tr>
       <th>Session</th><th>Last activity</th><th>API calls</th>
@@ -606,7 +923,7 @@
     </tbody></table></div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="agents-panel" x-ref="panelAgents">
     <!-- The heading names the ORDERING KEY, and `serve.RANKED_BY` is the one
          place that phrase is decided (#30). It read "by spend" for its whole
          life while the query ordered by cache-read alone. -->
@@ -655,13 +972,23 @@
     </tbody></table></div>
   </div>
 
-  <div class="panel">
-    <h2>Outlier API calls (by cache-read, period-wide)</h2>
+  <div class="panel" id="outliers-panel" x-ref="panelOutliers">
+    <h2>Outlier API calls (by cache-read, period-wide)
+      <!-- The same filter notice the model table carries, for the same
+           reason: a table showing a subset under a heading that claims the
+           period is a panel disagreeing with the figure that linked to it. -->
+      <span class="toggle-note panel-note" x-cloak x-show="isFiltered">
+        <span class="filter-note"><span x-text="filterNote"></span>
+          Showing <span x-text="fmtCount((shownOutliers ?? []).length)"></span> of
+          <span x-text="fmtCount(outliers ? outliers.length : null)"></span> row(s).
+          <button type="button" @click="clearFilters()">show every row</button></span>
+      </span>
+    </h2>
     <div style="overflow-x:auto"><table id="outliers"><thead><tr>
       <th>When</th><th>Session</th><th>Model</th><th>Turn type</th><th>Cache read</th>
       <th>Context</th><th>Turn preview</th>
     </tr></thead><tbody>
-      <template x-for="(r, i) in (outliers ?? [])" :key="i">
+      <template x-for="(r, i) in (shownOutliers ?? [])" :key="i">
         <tr>
           <td x-text="fmtTs(r.ts)"></td>
           <td class="mono" x-text="r.session_id.slice(0, 8)"></td>
@@ -675,8 +1002,15 @@
       <template x-if="outliers && !outliers.length">
         <tr><td colspan="7">No calls in this period.</td></tr>
       </template>
+      <!-- The third state again: "no calls in this period" is a claim about
+           the window, and a filter that matched nothing is not one. -->
+      <template x-if="outliers && outliers.length && !shownOutliers.length">
+        <tr><td colspan="7">No rows match the filter &mdash; the window itself is
+          not empty.</td></tr>
+      </template>
     </tbody></table></div>
   </div>
+  </section>
 </div>
 
 <script>
@@ -723,6 +1057,37 @@ function bandRange(b) {
 function fmtRatio(x) {
   if (x === null || x === undefined) return "—";
   return x.toFixed(2) + "×";
+}
+// #78's readings are shares (0-1) and unbounded ratios in one list, so they get
+// one significant-figures formatter rather than a per-metric unit the payload
+// would have to carry. What each number IS, is stated beside it by the metric's
+// own `measurement` string, which is the field that names what was divided by
+// what -- so the page never has to guess whether it is holding a percentage.
+//
+// Absence first, as everywhere: `(0).toPrecision` is a real 0 and `null` is not
+// a reading at all, and a formatter that let the second print like the first
+// would undo the rule the whole block is built on.
+function fmtMetric(x) {
+  if (x === null || x === undefined) return "—";
+  return String(Number(x.toPrecision(4)));
+}
+// Which VOICE a boundary is stated in -- one class per provenance KIND, and
+// the three must stay visibly different. A judged cut point rendered like a
+// cited one inherits an authority nobody earned, which is #31's
+// `band_provenance` failure mode at #78's per-boundary grain; the page carries
+// it as a TABLE so a test can assert the three are distinct, rather than as a
+// chain of ifs where two branches could quietly return the same class.
+const PROVENANCE_VOICE = {
+  cited: "advice-cited",
+  judged: "advice-judged",
+  structural: "advice-structural",
+};
+// An unrecognised kind falls back to the JUDGED marking, the most cautious of
+// the three, never to the cited one and never to no marking at all: a boundary
+// this page cannot classify is exactly the one that must not read as
+// documented.
+function provenanceVoice(p) {
+  return PROVENANCE_VOICE[p.kind] ?? PROVENANCE_VOICE.judged;
 }
 function fmtTokRounded(n) {
   // The guard comes BEFORE the rounding on purpose: `Math.round(null)` is 0,
@@ -864,6 +1229,48 @@ const SUBAGENT_STATUS = {
   "unknown": [" ?", "The task index was never scanned for this session, so subagent spend is UNMEASURED, not zero."],
 };
 
+// ---------------------------------------------------------------------------
+// #70: the two views, and the URL that names one.
+//
+// A details view that cannot be linked or reloaded is a silent regression for
+// everyone who has bookmarked this report, so the view -- and any deep link's
+// filter with it -- lives in the URL hash. The hash rather than a query string
+// because it needs no route: `serve.py` serves `/` and the hash never reaches
+// it, so this adds no handler, no parameter to validate and no request.
+// ---------------------------------------------------------------------------
+
+const VIEWS = ["overview", "details"];
+// The LANDING view. The owner's decision, and the one thing about this split
+// that is not a preference: the overview answers the question most people
+// arrive with, and the reader who wants raw data knows that they do.
+const DEFAULT_VIEW = "overview";
+const DEFAULT_RANGE_DAYS = 7;
+// The range presets the picker offers, as the URL spells them. Anything else
+// in `range=` is not a preset and is ignored in favour of an explicit
+// `from`/`to` pair or the default window -- the page states a period it can
+// show rather than one it cannot.
+const PRESET_RANGES = ["1", "7", "30", "all"];
+const RANGE_LABELS = {
+  "1": "the last 24 hours",
+  "7": "the last 7 days",
+  "30": "the last 30 days",
+};
+// The groupings `/api/timeseries` accepts. Spelled here so an unrecognised
+// `by=` in a pasted URL falls back rather than being sent to an endpoint that
+// would answer it with a 400 the page has no way to explain.
+const CHART_GROUPINGS = ["class", "turntype", "scope"];
+// The detail panels a deep link may land on, and the `x-ref` each one scrolls
+// to. A panel not in this map is not a destination: an unrecognised `panel=`
+// leaves the reader on the detail view with no filter and no scroll, rather
+// than pointing at something that is not there.
+const DETAIL_PANEL_REFS = {
+  chart: "panelChart",
+  models: "panelModels",
+  sessions: "panelSessions",
+  agents: "panelAgents",
+  outliers: "panelOutliers",
+};
+
 function report() {
   return {
     // --- state -----------------------------------------------------------
@@ -874,6 +1281,15 @@ function report() {
     from: null,
     to: null,
     by: "class",
+    // #70. `view` is the whole of the split's state; `panel` and `filters` are
+    // what a deep link carries with it. `filters` is an object with a key per
+    // filter rather than a bare value, so a second filter cannot be added by
+    // overloading the first one's meaning -- and both are NULL rather than ""
+    // or [], because "no filter" and "a filter that matches nothing" are the
+    // two facts the tables below have to keep apart.
+    view: DEFAULT_VIEW,
+    panel: null,
+    filters: { scope: null, models: null },
     summary: null,
     sessions: null,
     agents: null,
@@ -894,13 +1310,189 @@ function report() {
     loadedAt: null,
 
     init() {
-      this.setRange(7);
+      // #70: the URL decides the view, the period and any deep-link filter, so
+      // a bookmarked or pasted link opens on exactly what it names. With no
+      // hash at all it falls back to the overview over the default window,
+      // which is what this report has always opened on.
+      this.applyUrl();
       // The page's ONLY timer, and it fetches NOTHING (#24). Before it, the
       // freshness verdict was computed server-side once and frozen in the DOM:
       // a tab that loaded at an age of 120 s still read "2 minutes ago, not
       // stale" two hours later, so the banner could never fire on a tab that
       // stayed open -- the staleness indicator itself went stale.
       setInterval(() => this.tickAge(), AGE_TICK_MS);
+    },
+
+    // --- the two views ----------------------------------------------------
+    // Read the whole of the split's state back out of the URL (#70). Called on
+    // boot AND on `hashchange`, so a link pasted into an already-open tab, or
+    // the browser's back button, lands where it says it does.
+    //
+    // Every value is validated against what this page can actually show, and
+    // an unrecognised one falls back rather than being carried. A hash is not
+    // a route -- there is no request to answer with a 400 or a 404 -- so the
+    // only honest thing it can do is state the view it has.
+    applyUrl() {
+      const p = new URLSearchParams(location.hash.replace(/^#/, ""));
+      const view = p.get("view");
+      this.view = VIEWS.includes(view) ? view : DEFAULT_VIEW;
+      const by = p.get("by");
+      this.by = CHART_GROUPINGS.includes(by) ? by : "class";
+      const panel = p.get("panel");
+      // `hasOwn`, not `panel in`: every object inherits `constructor` and
+      // `toString`, so `in` would accept `panel=constructor` as a destination.
+      this.panel = Object.hasOwn(DETAIL_PANEL_REFS, panel) ? panel : null;
+      this.filters = {
+        scope: p.get("scope"),
+        models: p.get("models") ? p.get("models").split(",") : null,
+      };
+      const range = p.get("range");
+      // A PRESET is re-derived from today's date, not from the dates it
+      // produced when the link was made: "the last 7 days" means the last
+      // seven days whenever the link is opened. A CUSTOM range is the opposite
+      // -- explicit dates, carried verbatim, because that is what was asked
+      // for. Losing that distinction would make a bookmark quietly describe a
+      // different window from the one whose figures it was saved for.
+      if (PRESET_RANGES.includes(range)) {
+        this.setRange(range === "all" ? "all" : Number(range));
+        return;
+      }
+      if (p.get("from") || p.get("to")) {
+        this.range = null;
+        this.from = p.get("from");
+        this.to = p.get("to");
+        this.load();
+        return;
+      }
+      this.setRange(DEFAULT_RANGE_DAYS);
+    },
+
+    // The other half, and the reason `history.replaceState` rather than an
+    // assignment to `location.hash`: assigning fires `hashchange`, which this
+    // component listens to, so the page would re-read -- and re-fetch -- the
+    // state it had just written, on every click of the time picker.
+    //
+    // Written on every load and every view change, so the URL is never a
+    // stale description of what is on screen. Only non-default values are
+    // spelled: a URL that carries a filter is a URL that HAS one.
+    writeUrl() {
+      const p = new URLSearchParams();
+      p.set("view", this.view);
+      if (this.range !== null) p.set("range", this.range);
+      if (this.range === null && this.from) p.set("from", this.from);
+      if (this.range === null && this.to) p.set("to", this.to);
+      if (this.by !== "class") p.set("by", this.by);
+      if (this.panel) p.set("panel", this.panel);
+      if (this.filters.scope) p.set("scope", this.filters.scope);
+      if (this.filters.models) p.set("models", this.filters.models.join(","));
+      history.replaceState(null, "", "#" + p.toString());
+    },
+
+    setView(view) {
+      this.view = view;
+      this.writeUrl();
+      // Chart.js measures the element it draws into, and `x-show` leaves a
+      // hidden one with no size at all -- so a chart first drawn while the
+      // overview was showing comes up 0 px high. `resize()` re-measures it. It
+      // re-reads NOTHING: no request is made by changing view.
+      if (view === "details") this.$nextTick(() => {
+        if (this.chart) this.chart.resize();
+      });
+    },
+
+    // A DEEP LINK. It names the panel it lands on and carries the filter that
+    // makes that panel show the rows the overview figure was about -- a bare
+    // "see details" link leaves the reader to do that join themselves, which
+    // is the thing this issue exists to stop.
+    //
+    // The filter values are the PAYLOAD'S OWN STRINGS on both ends (a scope
+    // label against `models[].scope`, a model name against `outliers[].model`),
+    // so nothing here invents an equivalence the API never stated.
+    showPanel(panel, opts) {
+      const asked = opts || {};
+      this.view = "details";
+      this.panel = Object.hasOwn(DETAIL_PANEL_REFS, panel) ? panel : null;
+      this.filters = { scope: asked.scope ?? null, models: asked.models ?? null };
+      const regroup = Boolean(asked.by) && asked.by !== this.by;
+      if (regroup) this.by = asked.by;
+      this.writeUrl();
+      // The chart's grouping is a parameter of `/api/timeseries`, so a link
+      // that changes it re-reads the endpoint the radio buttons already
+      // re-read on exactly the same event. That is the existing request with a
+      // different `by`, not a request the split introduced.
+      if (regroup) this.load();
+      this.$nextTick(() => {
+        if (this.chart) this.chart.resize();
+        const ref = this.$refs[DETAIL_PANEL_REFS[this.panel]];
+        if (ref) ref.scrollIntoView({ behavior: "smooth" });
+      });
+    },
+
+    clearFilters() {
+      this.filters = { scope: null, models: null };
+      this.panel = null;
+      this.writeUrl();
+    },
+
+    get isFiltered() {
+      return Boolean(this.filters.scope || this.filters.models);
+    },
+
+    // What is being hidden, and by what. A filter nobody can see is a table
+    // that silently disagrees with the figure that linked to it: the reader
+    // takes a total over a subset for a total over the window. The counts ride
+    // beside this line in each panel, because they are per table.
+    get filterNote() {
+      const named = [];
+      if (this.filters.scope) named.push(`scope ${this.filters.scope}`);
+      if (this.filters.models) {
+        named.push(`model(s) ${this.filters.models.join(", ")}`);
+      }
+      return `Filtered to ${named.join(" and ")} — the rows outside it are `
+        + `hidden here, not absent, and no total in this window changed.`;
+    },
+
+    // The period every figure covers, composed ONCE (#70). The overview names
+    // it because it has no picker of its own; the detail view names it because
+    // it does. Two compositions of one period would be free to disagree, and
+    // the reader would have no way to tell which described the numbers in
+    // front of them -- which is this split's whole risk in miniature.
+    get periodLabel() {
+      if (this.from === null && this.to === null) return "all ingested data";
+      const preset = RANGE_LABELS[this.range];
+      const dates = `${this.from ?? "the earliest call"} to `
+        + `${this.to ?? "the latest call"}, America/New_York`;
+      return preset ? `${preset} (${dates})` : dates;
+    },
+
+    // The rows a filter leaves visible.
+    //
+    // NULL STAYS NULL. "Not fetched yet" and "the window holds none" are
+    // different facts and only the second may render "No calls in this
+    // period", so a filtered view of a payload that has not arrived is absent
+    // too -- `?? []` here would make every table claim an empty window for as
+    // long as the first load takes.
+    get shownModels() {
+      if (!this.summary) return null;
+      if (!this.isFiltered) return this.summary.models;
+      return this.summary.models.filter(
+        r => (!this.filters.scope || r.scope === this.filters.scope)
+          && (!this.filters.models || this.filters.models.includes(r.model))
+      );
+    },
+
+    get shownOutliers() {
+      if (this.outliers === null) return null;
+      // NO SCOPE FILTER HERE, and that is a decision rather than an omission:
+      // an outlier row carries `is_sidechain`, the transcript record's own
+      // flag, and NOT the `source_kind` every scoped figure on this page is
+      // derived from. The two agree in practice and they are two different
+      // measurements, so equating them here would put a figure in one view
+      // that could disagree with the same figure in the other -- this issue's
+      // own defect, one level down. The model filter has no such problem:
+      // `unknown_models` and `outliers[].model` are one string from one place.
+      if (!this.filters.models) return this.outliers;
+      return this.outliers.filter(r => this.filters.models.includes(r.model));
     },
 
     // --- the local clock --------------------------------------------------
@@ -1202,6 +1794,9 @@ function report() {
     },
 
     async load() {
+      // #70: the URL describes what is on screen, so it is rewritten wherever
+      // the window changes -- which is every path that reaches this method.
+      this.writeUrl();
       const qs = this.rangeQS();
       let summary, ts, sessions, agents, outliers;
       try {

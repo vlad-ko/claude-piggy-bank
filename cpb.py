@@ -53,7 +53,13 @@ from typing import NamedTuple, Optional, Sequence
 # NOT governed is SCHEMA_VERSION, so long as an existing database upgrades
 # without data loss and without a refusal; the migration machinery in
 # `ingest.py`, not this number, is what carries that guarantee.
-VERSION = "1.1.0"
+# 1.1.0 -> 1.2.0 (#78): `/api/summary` gained a `recommendations` block. New
+# payload fields, nothing removed, renamed or redefined -- which
+# `docs/versioning.md` calls MINOR in as many words ("a new payload field"). The
+# manifest below repeats it because Claude Code's plugin loader reads that JSON
+# without running Python and uses the version as its update cache key: an
+# unbumped manifest means installed users are never offered the change.
+VERSION = "1.2.0"
 
 PROG = "cpb"
 
