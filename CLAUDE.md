@@ -75,9 +75,11 @@ Claude Code persists thinking blocks with empty text — recording `0` would mak
 the composition table state that thinking is free. `subagent_runs.status =
 'unavailable'` means a dispatch is proven but its transcript is gone, which is
 unmeasured spend, not zero — including in `total_tokens`, the column its panel
-ranks on. `_last_ingest_run()` returns `None` for a database that predates run
-stamping, and `ingest.stale` is tri-state, so "never recorded" reads as an
-unknown age rather than an ingest at the epoch.
+ranks on. `_last_ingest_run()` returns `None` for more than one reason — a database
+predating run stamping, one upgraded but not yet re-ingested, or a run that
+raised before stamping — so the payload carries `stale_unknown_reason` and the
+page never asserts which. `ingest.stale` is tri-state, so "never recorded" and
+a negative age both read as an unknown age rather than as a verdict.
 
 **No dollar figures anywhere (#30).** Tokens are measured; dollars were derived
 from a hand-maintained list-rate table that went stale twice and diverged from
