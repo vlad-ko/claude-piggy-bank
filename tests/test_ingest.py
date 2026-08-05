@@ -2963,24 +2963,66 @@ class PreV5ShortcutIsGatedOnDropColumnTest(unittest.TestCase):
     the "not reached" assertion is not passing for want of a code path.
     """
 
+    # The pre-v5 shape of `ingest_state`, STATED rather than derived by
+    # dropping `archived_at` off the current one.
+    #
+    # The first version of this fixture did derive it, and it passed here on
+    # SQLite 3.53.3 while failing every CI leg on 3.45.1 with "error in table
+    # ingest_state after drop column: incomplete input". `archived_at` is the
+    # LAST column of `ingest_state` and the text immediately before it is a
+    # four-line `--` comment; DROP COLUMN rewrites the table's stored CREATE
+    # text, and where the dropped column is last the closing paren is
+    # re-appended at the truncation point -- which on that shape falls inside
+    # a commented-out line, so the reconstructed statement never closes.
+    # (Measured on 3.53.3: the drop discards the comment block entirely and
+    # emits `last_ts REAL)`, which is why the newer library tolerates it. The
+    # 3.45.1 mechanism is inferred from the error string, not observed here.)
+    #
+    # Deriving a historical schema by mutating the current one through an
+    # operation with its own version-dependent constraints is what made a test
+    # about a version gate itself version-dependent.
+    PRE_V5_INGEST_STATE = """
+        CREATE TABLE ingest_state (
+            path TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            unparsed_records INTEGER NOT NULL,
+            first_ts REAL,
+            last_ts REAL
+        )
+    """
+
     def _pre_v5_database(self) -> sqlite3.Connection:
-        """A v8 schema wound back to the pre-v5 shape: no `archived_at`.
+        """A pre-v5 database: no `ingest_state.archived_at`, `cost_usd` present.
 
         `ingest_state` is left EMPTY so the reaped-source guard upstream has
         nothing to refuse over -- this test is about the gate below it.
+
+        `cost_usd` is added rather than stated because ADD COLUMN only appends
+        to the stored CREATE text: it triggers no schema reconstruction and so
+        carries none of the version-dependent risk DROP COLUMN does. It is
+        also how `CostColumnRemovalUpgradeTest._downgrade_to_v7` builds the
+        same column.
         """
         tmp = Path(tempfile.mkdtemp(prefix="cpb-prev5-gate-test-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         conn = sqlite3.connect(tmp / "usage.db")
         self.addCleanup(conn.close)
         ingest_mod._prepare_schema(conn)
-        conn.execute("ALTER TABLE ingest_state DROP COLUMN archived_at")
+        conn.execute("DROP TABLE ingest_state")
+        conn.execute(self.PRE_V5_INGEST_STATE)
+        conn.execute("ALTER TABLE api_calls ADD COLUMN cost_usd REAL")
         conn.execute("PRAGMA user_version = 4")
         conn.commit()
         columns = ingest_mod._table_columns(conn, "ingest_state")
         # The branch's own preconditions, asserted rather than assumed.
         self.assertNotIn("archived_at", columns)
         self.assertIn("source_kind", columns)
+        # ...and the retired column really is there to be shed, so the
+        # assertion that the rebuild sheds it is not vacuous.
+        self.assertIn("cost_usd", ingest_mod._table_columns(conn, "api_calls"))
         return conn
 
     def test_a_modern_sqlite_takes_the_shortcut(self) -> None:
