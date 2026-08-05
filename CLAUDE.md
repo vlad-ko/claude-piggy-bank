@@ -73,9 +73,13 @@ operator-visible message — rather than return a plausible number.
 Worked examples in the code: `ContentBlock.chars` is `Optional[int]` because
 Claude Code persists thinking blocks with empty text — recording `0` would make
 the composition table state that thinking is free. `subagent_runs.status =
-'unavailable'` means a dispatch is proven but its transcript is gone, which is
-unmeasured spend, not zero — including in `total_tokens`, the column its panel
-ranks on. `_last_ingest_run()` returns `None` for more than one reason — a database
+'unavailable'` means a dispatch is proven but its transcript is gone. Whether
+that is unmeasured spend depends on *when* it was reaped: a run reaped before
+CPB ever read it has no rows and reports `unavailable`, every measured field
+null; a run reaped *after* ingest keeps its `api_calls` rows, and those are the
+only surviving copy — it reports `archived` and shows them. The panel derives
+that distinction from whether call rows exist, never from a stored flag.
+`_last_ingest_run()` returns `None` for more than one reason — a database
 predating run stamping, one upgraded but not yet re-ingested, or a run that
 raised before stamping — so the payload carries `stale_unknown_reason` and the
 page never asserts which. `ingest.stale` is tri-state, so "never recorded" and
