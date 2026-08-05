@@ -115,8 +115,13 @@
          life while the query ordered by cache-read alone. -->
     <h2>Top subagent dispatches (by total tokens)
       <span class="toggle" style="font-weight:normal;color:var(--muted);font-size:12px;">
-        model is shown because tokens are not tiers -- "unavailable" = transcript reaped from /private/tmp, so usage is UNKNOWN, never 0
+        model is shown because tokens are not tiers -- "unavailable" = transcript reaped BEFORE it was ever measured, so usage is UNKNOWN, never 0
       </span>
+      <!-- #41: how many rows below are measurements that outlived their
+           source. Filled from the rows already fetched -- an annotation on
+           this panel, in the same shape as the "(n unmeasured)" counters
+           below it, not another table. -->
+      <span id="agents-archived" style="display:block;font-weight:normal;color:var(--muted);font-size:12px;"></span>
     </h2>
     <div style="overflow-x:auto"><table id="agents"><thead><tr>
       <th>Agent</th><th>Type</th><th>Description</th><th>Session</th>
@@ -452,14 +457,39 @@ function renderSessions(rows) {
   });
 }
 
+// The three states a dispatch can be in, spelled once: label, and the tooltip
+// that says what the figures beside it are worth (#41). "Reaped" is not one
+// state -- a transcript deleted BEFORE it was ingested left no measurement at
+// all, while one deleted AFTER left figures this database is now the only copy
+// of. They are shown differently because they are different claims.
+const AGENT_STATUS = {
+  ingested: ["ingested",
+    "Measured from a subagent transcript still on disk. Re-ingesting reproduces these figures."],
+  archived: ["archived (reaped, measurements kept)",
+    "The transcript is gone, but it was ingested first, so its measurements survive it. This database is the only copy — no re-ingest can reproduce these figures."],
+  unavailable: ["unavailable (transcript reaped)",
+    "The transcript was reaped before it was ever measured, so this dispatch's usage is UNKNOWN — never 0."],
+};
+
 function renderAgents(rows) {
   // #4966: this is "which agent consumed that" in one look -- the exact gap
   // the issue's live evidence found (the biggest agent appeared nowhere in the
   // tool's output). #30 made the heading true: the rows are ordered by TOTAL
   // TOKENS, the column shown here, with the model beside it so the reader
-  // weighs the tier themselves. An `unavailable` run's figures are NULL from
-  // the API and fmtTok renders null as "—", never "0".
-  document.querySelector("#agents tbody").innerHTML = rows.map(r => `
+  // weighs the tier themselves. A run with NO measurement has NULL figures from
+  // the API and fmtTok renders null as "—", never "0"; an `archived` run has
+  // real ones and is rendered like the measured rows it ranks among, with the
+  // status column carrying why they cannot be regenerated.
+  const archived = rows.filter(r => r.status === "archived").length;
+  document.getElementById("agents-archived").textContent = archived
+    ? `${archived} of these dispatches ${archived === 1 ? "is" : "are"} archived: `
+      + "measured, then the transcript was reaped. Their figures are complete "
+      + "but irreplaceable — this database is their only copy, and no re-ingest "
+      + "can reproduce them."
+    : "";
+  document.querySelector("#agents tbody").innerHTML = rows.map(r => {
+    const [label, why] = AGENT_STATUS[r.status] ?? [r.status, ""];
+    return `
     <tr${r.status === "unavailable" ? ' style="color:var(--muted)"' : ""}>
       <td class="mono">${esc((r.agent_id || "").slice(0, 10))}</td>
       <td>${esc(r.agent_type ?? "(unknown)")}</td>
@@ -469,8 +499,9 @@ function renderAgents(rows) {
       <td>${r.calls === null ? "—" : r.calls.toLocaleString()}</td>
       <td>${fmtTok(r.cache_read)}</td>
       <td>${fmtTok(r.total_tokens)}</td>
-      <td>${r.status === "unavailable" ? "unavailable (transcript reaped)" : "ingested"}</td>
-    </tr>`).join("") || `<tr><td colspan="9">No subagent dispatches in this period.</td></tr>`;
+      <td title="${esc(why)}">${esc(label)}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="9">No subagent dispatches in this period.</td></tr>`;
 }
 
 function renderOutliers(rows) {
