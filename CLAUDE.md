@@ -36,7 +36,7 @@ anyone who has it in a script. `_exit_status()` reproduces CPython's own
 report a run that measured nothing as a run that measured zero. `VERSION` lives
 in `cpb.py`; `.claude-plugin/plugin.json` repeats it as a literal because the
 plugin loader reads that JSON without running Python, and `tests/test_cpb.py`
-pins the two equal. CPB is **<!--cpb:version-->1.3.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
+pins the two equal. CPB is **<!--cpb:version-->1.6.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
 authority; this line lagged a release once already and may again), and what a
 bump *means* is `docs/versioning.md` — see Commits and PRs below.
 

@@ -113,6 +113,13 @@ citation names cannot drift away from the boundary it justifies.
   * Ranking across metrics is DERIVED -- severity, then how far into its range
     the value sits -- so it cannot come from the order entries were typed in.
     #66 depends on that.
+  * Every metric SAYS WHAT ITS NUMBER MEANS to a reader (`Metric.means`) and
+    WHAT KIND OF NUMBER IT IS (`Metric.unit`), and `Metric.__post_init__`
+    refuses one that does neither. Both are properties of the metric, so both
+    live beside `measurement`; a metric added later cannot reach a summary row
+    as two lines of jargon or as a raw float, because it cannot be built.
+    `means` is held to the same prose guard the advice is: it too cannot say
+    "reduce your cache reads".
 
 **What it does not do.** It describes the present only. A recommendation that
 stops firing is indistinguishable from a detector that broke unless the report
@@ -565,6 +572,35 @@ def _refuse_forbidden_prose(detail: str) -> None:
 
 WORSE_WHEN_HIGHER = "higher"
 WORSE_WHEN_LOWER = "lower"
+WORSE_WHEN_DIRECTIONS = (WORSE_WHEN_HIGHER, WORSE_WHEN_LOWER)
+
+# WHAT KIND OF NUMBER A METRIC'S READINGS ARE, so a reader is shown `30.3%`
+# rather than `0.3034` and `3.20x` rather than `3.195` (#89 review).
+#
+# A share and a ratio are different kinds of quantity and a reader holds them
+# in percent and in multiples, not in four significant figures. The page had
+# one formatter for both because nothing told it them apart.
+#
+# THE PAGE MUST NEVER LEARN A METRIC KEY. An `if (metric === 'cache_reads_per_
+# write')` in `index.html` would be a third enumeration of the metric set, in
+# the one file no import guard can reach -- so the unit crosses on the payload,
+# per reading, and the page holds one formatter per UNIT.
+#
+# WHY IT LIVES HERE. It shipped in `serve.py` as a parallel `METRIC_UNITS`
+# mapping under an import-time totality guard, because the branch that added it
+# could not edit this module. A mapping beside a table is one enumeration of a
+# set too many, and its own note said where it belonged: the unit is a property
+# of the metric, like `measurement` and `worse_when`. The guard's PROPERTY is
+# kept and made stronger -- a metric with no unit, or one outside this
+# vocabulary, now fails at CONSTRUCTION rather than at `import serve`, so it
+# cannot exist even in a caller that never imports the serving layer.
+METRIC_UNIT_SHARE = "share"
+METRIC_UNIT_RATIO = "ratio"
+METRIC_UNIT_COUNT = "count"
+# The closed vocabulary. `count` has no metric today and is declared anyway:
+# the page carries one formatter per member, and a unit reaching it with no
+# formatter is the failure this vocabulary exists to make impossible.
+METRIC_UNIT_KINDS = (METRIC_UNIT_SHARE, METRIC_UNIT_RATIO, METRIC_UNIT_COUNT)
 
 
 @dataclass(frozen=True)
@@ -628,12 +664,67 @@ class Metric:
     by what, so a reader can check the advice against the number and the two
     cannot drift apart. `serve.py` computing something else under this key is
     then a visible contradiction rather than a silent one.
+
+    `means` IS NOT A SECOND `measurement` AND DOES NOT REPLACE IT. The two
+    answer different questions and both are needed: `measurement` says what was
+    divided by what, which is what an auditor checks the figure against;
+    `means` says what the figure tells the person reading it, which is what a
+    summary row needs. The summary showed `measurement` because nothing else
+    existed -- "share of main-thread API calls whose context reaches at least
+    half the model's documented window (context_window bands 50-to-90 and
+    at-least-90), over main-thread calls with a known window" is exactly right
+    one level down and is two lines of jargon on a row of advice.
+
+    Written HERE rather than in `index.html` for the reason no advice on that
+    page is authored there: a sentence about what a metric means is a claim
+    about the measurement, and one typed into the page would have no date, no
+    owner and nothing to check it against. It is held to the same prose guard
+    the advice is (`_refuse_forbidden_prose`), so "reduce your cache reads"
+    cannot be smuggled in through the plain-English field either.
+
+    `unit` says what KIND of number the readings are, so the page can print a
+    share as a percentage and a ratio as a multiple without ever learning a
+    metric key. See `METRIC_UNIT_KINDS`.
+
+    `__post_init__` refuses a metric missing any of them. A metric added later
+    cannot ship with no reader copy, with an unrecognised unit or with a
+    direction nothing can read: it would not be constructible, which is
+    stronger than a guard that fires when some other module is imported.
     """
 
     key: str
     measurement: str
+    means: str
+    unit: str
     worse_when: str
     ranges: tuple[Range, ...]
+
+    def __post_init__(self) -> None:
+        if not self.key.strip():
+            raise ValueError("a metric with no key cannot be looked up")
+        if not self.measurement.strip():
+            raise ValueError(
+                f"{self.key}: a metric with no measurement names nothing that "
+                "was divided by anything, so no reader can check it"
+            )
+        if not self.means.strip():
+            raise ValueError(
+                f"{self.key}: a metric with no reader sentence reaches a "
+                "summary row as its `measurement`, which is a specification "
+                "and not a sentence. Say what the number means to the person "
+                "reading it, beside `measurement` and never instead of it"
+            )
+        _refuse_forbidden_prose(self.means)
+        if self.unit not in METRIC_UNIT_KINDS:
+            raise ValueError(
+                f"{self.key}: unit {self.unit!r} is not one of "
+                f"{list(METRIC_UNIT_KINDS)}. The page carries one formatter per "
+                "unit, so a reading in an unnamed one prints as a raw float"
+            )
+        if self.worse_when not in WORSE_WHEN_DIRECTIONS:
+            raise ValueError(f"{self.key}: unknown direction {self.worse_when!r}")
+        if not self.ranges:
+            raise ValueError(f"{self.key}: a metric with no range assesses nothing")
 
     def range_for(self, value: float) -> Range:
         for entry in self.ranges:
@@ -765,6 +856,15 @@ METRICS: dict[str, Metric] = {
             "the model's documented window (context_window bands 50-to-90 and "
             "at-least-90), over main-thread calls with a known window"
         ),
+        # "at least half", not "more than half": the bands this counts are
+        # 50-to-90 and at-least-90, so a call sitting exactly on half is one of
+        # these.
+        means=(
+            "How often your main session is already carrying at least half its "
+            "context window when it calls the API. Past that point every reply "
+            "re-reads a long history."
+        ),
+        unit=METRIC_UNIT_SHARE,
         worse_when=WORSE_WHEN_HIGHER,
         ranges=(
             Range(
@@ -820,6 +920,17 @@ METRICS: dict[str, Metric] = {
             "per-prefix arithmetic. Undefined, and so unmeasured, when no call "
             "wrote cache"
         ),
+        # DELIBERATELY DOES NOT NAME A BREAK-EVEN. "repays on the first reuse"
+        # is true of the 5-minute write and false of the 1-hour one (TA-8), and
+        # this flat ratio is precisely the reading that cannot say which -- the
+        # slogan TA-8 warns against, and the thing the metric below it exists
+        # to call. So the sentence says only what holds either way: reuse is
+        # what pays the markup back.
+        means=(
+            "How many tokens are read back for each token stored. Storing adds "
+            "a markup that only reuse pays back, so higher is better."
+        ),
+        unit=METRIC_UNIT_RATIO,
         worse_when=WORSE_WHEN_LOWER,
         ranges=(
             Range(
@@ -908,6 +1019,16 @@ METRICS: dict[str, Metric] = {
             "every call ingested before the split was read (#84) and so of "
             "most of any database that predates it"
         ),
+        # "twice as much reading" is the two break-evens themselves --
+        # READ_TOKENS_TO_REPAY_A_1H_WRITE_TOKEN over its 5-minute twin -- and
+        # not a rounding of the 2x/1.25x write markups, which are a different
+        # pair of numbers.
+        means=(
+            "The same reuse check, weighted by how long each stored copy was "
+            "asked to last. A one-hour copy takes twice as much reading to pay "
+            "for itself as a five-minute one."
+        ),
+        unit=METRIC_UNIT_RATIO,
         worse_when=WORSE_WHEN_LOWER,
         ranges=(
             Range(
@@ -972,6 +1093,15 @@ METRICS: dict[str, Metric] = {
             "cache_write > 0. Undefined, and so unmeasured, when no call wrote "
             "cache"
         ),
+        # PER CALL, which is what is measured -- not "a prefix that was never
+        # read again", which would be a claim about what later calls did. A
+        # call that stored something and read nothing back is one of these
+        # whatever happens next, and the first call of a session always is.
+        means=(
+            "How often a call stored a prefix and read none back. Each of those "
+            "paid the write markup and got nothing for it."
+        ),
+        unit=METRIC_UNIT_SHARE,
         worse_when=WORSE_WHEN_HIGHER,
         ranges=(
             Range(
@@ -1027,6 +1157,15 @@ METRICS: dict[str, Metric] = {
             "unmeasured, unless both scopes have at least one call -- a project "
             "that never dispatched a subagent has no ratio, not a bad one"
         ),
+        # "how many TIMES more", because the reading is a multiple: the mean
+        # main-thread call over the mean subagent call. "How much more" would
+        # read as a difference in tokens, which is a different number.
+        means=(
+            "How many times more tokens a main-session reply takes than a "
+            "subagent reply. The main session carries the whole history; a "
+            "subagent starts clean."
+        ),
+        unit=METRIC_UNIT_RATIO,
         worse_when=WORSE_WHEN_HIGHER,
         ranges=(
             Range(

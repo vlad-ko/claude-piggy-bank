@@ -118,11 +118,14 @@ CORPUS_2026_08_05 = {
 }
 
 
-def synthetic_metric(key, worse_when, cuts, severities):
+def synthetic_metric(key, worse_when, cuts, severities, unit=rec.METRIC_UNIT_RATIO):
     """A metric with `cuts` interior boundaries and one severity per range.
 
     Built the way the real table is built -- adjacent ranges SHARE a boundary
     object -- so a test using it is testing the same shape the module ships.
+    That now includes a reader sentence and a unit, because `Metric` refuses a
+    metric without either: a synthetic that could be built with less would be
+    testing a shape the module cannot ship.
     """
     edges = [Boundary(0.0, structural("synthetic floor"))]
     edges += [Boundary(c, judged(f"synthetic cut at {c}")) for c in cuts]
@@ -145,6 +148,8 @@ def synthetic_metric(key, worse_when, cuts, severities):
     return Metric(
         key=key,
         measurement=f"synthetic measurement for {key}, long enough to be real",
+        means=f"synthetic reader sentence for {key}.",
+        unit=unit,
         worse_when=worse_when,
         ranges=tuple(ranges),
     )
@@ -223,6 +228,8 @@ class RangesPartitionTheDomainTest(unittest.TestCase):
         holed = Metric(
             key="holed",
             measurement="synthetic measurement, long enough to be real",
+            means="What this synthetic number means.",
+            unit=rec.METRIC_UNIT_SHARE,
             worse_when=WORSE_WHEN_HIGHER,
             ranges=(
                 Range(
@@ -249,6 +256,8 @@ class RangesPartitionTheDomainTest(unittest.TestCase):
         overlapped = Metric(
             key="overlapped",
             measurement="synthetic measurement, long enough to be real",
+            means="What this synthetic number means.",
+            unit=rec.METRIC_UNIT_SHARE,
             worse_when=WORSE_WHEN_HIGHER,
             ranges=(
                 Range(
@@ -1480,6 +1489,261 @@ class AssessmentCarriesItsEvidenceTest(unittest.TestCase):
                 self.assertIn("unmeasured", METRICS[key].measurement)
 
 
+class EveryMetricSpeaksToTheReaderTest(unittest.TestCase):
+    """#89: a metric says what its number MEANS, beside what it measures.
+
+    The summary's knob rows printed `measurement`, which is a specification --
+    "share of main-thread API calls whose context reaches at least half the
+    model's documented window (context_window bands 50-to-90 and at-least-90),
+    over main-thread calls with a known window". Correct, checkable, and two
+    lines of jargon on a row of advice; it was the page's largest remaining
+    source of density.
+
+    `means` is the sentence a reader gets instead, and these tests pin the
+    three properties that make it safe to have: it cannot be MISSING (a metric
+    added later would otherwise ship with no reader copy), it cannot REPLACE
+    the measurement it sits beside, and it cannot say the one thing this module
+    exists to make unsayable.
+    """
+
+    def test_every_metric_carries_a_reader_sentence(self):
+        for key, metric in METRICS.items():
+            with self.subTest(metric=key):
+                self.assertTrue(metric.means.strip())
+                self.assertTrue(
+                    metric.means.rstrip().endswith("."),
+                    "a reader sentence is a sentence",
+                )
+
+    def test_a_metric_with_no_reader_sentence_cannot_be_built(self):
+        # THE mutation this field exists to survive: a sixth metric added with
+        # everything else filled in. It must fail at CONSTRUCTION, not when
+        # some page happens to render it -- `import recommendations` is what
+        # every caller does, and `import serve` is not.
+        with self.assertRaises(TypeError):
+            Metric(
+                key="k",
+                measurement="a measurement, stated at length so it is real",
+                unit=rec.METRIC_UNIT_RATIO,
+                worse_when=WORSE_WHEN_HIGHER,
+                ranges=METRICS[METRIC_CACHE_READS_PER_WRITE].ranges,
+            )
+
+    def test_a_blank_reader_sentence_is_refused_rather_than_rendered_empty(self):
+        # An empty string satisfies "the field exists" and renders as a blank
+        # line under the imperative -- a row that says nothing where the others
+        # say why. Whitespace is the same defect wearing a character.
+        for blank in ("", "   ", "\n"):
+            with self.subTest(means=repr(blank)):
+                with self.assertRaises(ValueError) as caught:
+                    synthetic_metric_with_means(blank)
+                self.assertIn("reader sentence", str(caught.exception))
+
+    def test_the_reader_sentence_cannot_advise_shrinking_the_discount(self):
+        # The prose guard `Recommendation` runs on its `detail`, over the field
+        # that is written in plain English and is therefore likeliest to reach
+        # for the slogan. "Reduce your cache reads" is wrong at every scale;
+        # making it unrepresentable in ONE field and not the other beside it
+        # would be a guard with a door in it.
+        with self.assertRaises(ValueError) as caught:
+            synthetic_metric_with_means(
+                "This counts your prefixes. Reduce cache reads to save tokens."
+            )
+        self.assertIn("discounted token class", str(caught.exception))
+
+    def test_a_sentence_that_merely_mentions_the_discount_is_allowed(self):
+        # Teeth on the guard above: a check that refused every mention would be
+        # unusable, and the table would route around it.
+        metric = synthetic_metric_with_means(
+            "How much a stored prefix is read back. Cache reads are the cheap "
+            "class, so more of them is better."
+        )
+        self.assertIn("Cache reads", metric.means)
+
+    def test_the_reader_sentence_is_not_the_measurement_and_is_shorter(self):
+        # Two fields, two jobs. A `means` that repeated the measurement would
+        # satisfy every containment check above while changing nothing on the
+        # page, which is the cheapest way to look like this was done.
+        for key, metric in METRICS.items():
+            with self.subTest(metric=key):
+                self.assertNotEqual(metric.means, metric.measurement)
+                self.assertLess(
+                    len(metric.means),
+                    len(metric.measurement),
+                    "the reader sentence is longer than the specification it "
+                    "was supposed to spare the reader",
+                )
+
+    def test_no_two_metrics_share_a_reader_sentence(self):
+        # One copied sentence describes the wrong number on one of the two rows
+        # and nothing would say which.
+        sentences = [metric.means for metric in METRICS.values()]
+        self.assertEqual(len(set(sentences)), len(METRICS))
+
+    def test_the_measurements_were_not_touched_on_the_way_past(self):
+        # `means` is ADDED, never a rename of `measurement` -- the diagnosis
+        # card and the disclosure both still state what was divided by what.
+        for key, metric in METRICS.items():
+            with self.subTest(metric=key):
+                self.assertTrue(metric.measurement.strip())
+                self.assertGreater(len(metric.measurement), 40)
+
+    def test_the_flat_ratios_sentence_does_not_name_a_break_even(self):
+        # THE accuracy correction, pinned. A draft read "repays on the first
+        # reuse", which is true of the 5-minute write (1.25x) and false of the
+        # 1-hour one (2x) -- TA-8's two break-evens, and this flat ratio is
+        # precisely the reading that cannot say which applied. The metric
+        # BESIDE it is the one that calls it, and its own sentence is where the
+        # two TTLs are named.
+        flat = METRICS[METRIC_CACHE_READS_PER_WRITE].means
+        for slogan in ("first reuse", "first read", "one read", "break-even"):
+            with self.subTest(slogan=slogan):
+                self.assertNotIn(slogan, flat.lower())
+        resolved = METRICS[METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL].means
+        self.assertIn("one-hour", resolved)
+        self.assertIn("five-minute", resolved)
+        self.assertIn("twice", resolved)
+
+    def test_the_share_metrics_sentences_describe_shares_of_calls(self):
+        # Both shares are over CALLS, and both sentences say "how often"
+        # rather than naming a quantity of tokens: a sentence that described
+        # the wrong denominator would be a claim the measurement contradicts.
+        for key in (
+            METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,
+            METRIC_CACHE_WRITE_ONLY_SHARE,
+        ):
+            with self.subTest(metric=key):
+                self.assertIn("How often", METRICS[key].means)
+
+    def test_the_window_sentence_says_at_least_half_and_not_more_than_half(self):
+        # The bands counted are 50-to-90 and at-least-90, so a call sitting
+        # exactly on half IS one of these. "More than half" would exclude it in
+        # words while the arithmetic includes it.
+        means = METRICS[METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW].means
+        self.assertIn("at least half", means)
+        self.assertNotIn("more than half", means)
+
+
+def synthetic_metric_with_means(means):
+    """A metric identical to a real one but for its reader sentence."""
+    real = METRICS[METRIC_CACHE_READS_PER_WRITE]
+    return Metric(
+        key="synthetic_reader_copy",
+        measurement=real.measurement,
+        means=means,
+        unit=real.unit,
+        worse_when=real.worse_when,
+        ranges=real.ranges,
+    )
+
+
+class MetricUnitBelongsToTheMetricTest(unittest.TestCase):
+    """#89 review, then #89: what KIND of number a reading is, and where it lives.
+
+    The unit shipped as `serve.METRIC_UNITS`, a mapping beside this table, with
+    an import-time guard making it total in both directions -- because the
+    branch that added it could not edit this module. Its own note said where it
+    belonged. It is here now, and the guard's PROPERTY is what had to survive
+    the move: a metric with no unit, or with one no formatter exists for,
+    reaches a reader as a raw float.
+
+    It survives in a stronger form. The mapping could only fail when something
+    imported `serve`; a field on the dataclass cannot be omitted at all, and an
+    unrecognised value fails where the metric is written.
+    """
+
+    def test_every_metric_declares_a_unit_from_the_vocabulary(self):
+        for key, metric in METRICS.items():
+            with self.subTest(metric=key):
+                self.assertIn(metric.unit, rec.METRIC_UNIT_KINDS)
+
+    def test_shares_and_ratios_are_not_all_one_unit(self):
+        # Teeth on the table: a build that answered "ratio" for everything
+        # would satisfy the assertion above while printing two of the five
+        # readings as multiples of one.
+        self.assertEqual(
+            {
+                METRICS[METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW].unit,
+                METRICS[METRIC_CACHE_WRITE_ONLY_SHARE].unit,
+            },
+            {rec.METRIC_UNIT_SHARE},
+        )
+        self.assertEqual(
+            {
+                METRICS[METRIC_CACHE_READS_PER_WRITE].unit,
+                METRICS[METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL].unit,
+                METRICS[METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY].unit,
+            },
+            {rec.METRIC_UNIT_RATIO},
+        )
+
+    def test_a_metric_with_no_unit_cannot_be_built(self):
+        with self.assertRaises(TypeError):
+            Metric(
+                key="k",
+                measurement="a measurement, stated at length so it is real",
+                means="What this number means.",
+                worse_when=WORSE_WHEN_HIGHER,
+                ranges=METRICS[METRIC_CACHE_READS_PER_WRITE].ranges,
+            )
+
+    def test_a_unit_outside_the_vocabulary_is_refused(self):
+        # THE mutation the import guard used to catch: a unit invented at the
+        # table with no formatter behind it, which reaches the page and falls
+        # through to the unitless formatter -- `0.3034` again, arriving later
+        # through an unhandled member.
+        with self.assertRaises(ValueError) as caught:
+            synthetic_metric(
+                "synthetic_unit",
+                WORSE_WHEN_HIGHER,
+                cuts=(1.0,),
+                severities=(SEVERITY_OK, SEVERITY_ACT),
+                unit="furlongs",
+            )
+        self.assertIn("furlongs", str(caught.exception))
+
+    def test_the_vocabulary_names_each_unit_once(self):
+        self.assertEqual(
+            len(set(rec.METRIC_UNIT_KINDS)), len(rec.METRIC_UNIT_KINDS)
+        )
+
+    def test_the_vocabulary_may_name_a_unit_no_metric_uses_yet(self):
+        # `count` has no metric today and is declared anyway: the page carries
+        # one formatter per member, and the failure this vocabulary prevents is
+        # a unit arriving with no formatter. Pinned so a tidy-up that deleted
+        # the unused member has to argue for it.
+        self.assertIn(rec.METRIC_UNIT_COUNT, rec.METRIC_UNIT_KINDS)
+        self.assertNotIn(
+            rec.METRIC_UNIT_COUNT, {metric.unit for metric in METRICS.values()}
+        )
+
+    def test_a_metric_with_an_unreadable_direction_is_refused(self):
+        # The third field the constructor now checks. `worse_when` decides
+        # which way the page's arrow points, and a value nothing can read would
+        # reach `aimWord`'s fallback and print "target" beside a boundary that
+        # has a side.
+        with self.assertRaises(ValueError):
+            Metric(
+                key="k",
+                measurement="a measurement, stated at length so it is real",
+                means="What this number means.",
+                unit=rec.METRIC_UNIT_RATIO,
+                worse_when="sideways",
+                ranges=METRICS[METRIC_CACHE_READS_PER_WRITE].ranges,
+            )
+
+    def test_a_metric_with_no_range_assesses_nothing_and_is_refused(self):
+        with self.assertRaises(ValueError):
+            Metric(
+                key="k",
+                measurement="a measurement, stated at length so it is real",
+                means="What this number means.",
+                unit=rec.METRIC_UNIT_RATIO,
+                worse_when=WORSE_WHEN_HIGHER,
+                ranges=(),
+            )
+
+
 class NoMoneyAnywhereTest(unittest.TestCase):
     """#30. The multipliers here are token multipliers and stay that way."""
 
@@ -1501,6 +1765,10 @@ class NoMoneyAnywhereTest(unittest.TestCase):
         ]
         for metric in METRICS.values():
             out.append(metric.measurement)
+            # The reader sentence is the string most likely to reach for a
+            # currency, because it is the one written in plain English about
+            # what something is worth. It goes through the same guard.
+            out.append(metric.means)
             for entry in metric.ranges:
                 out.append(entry.recommendation.text)
                 for edge in (entry.lower, entry.upper):

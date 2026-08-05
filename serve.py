@@ -42,7 +42,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path, PurePath
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -57,12 +57,14 @@ from context_window import (
 )
 from ingest import (
     INGEST_RUNS_TABLE,
+    SHAPE_TABLE,
     SOURCE_MAIN,
     SOURCE_SUBAGENT,
     STATUS_INGESTED,
     STATUS_UNAVAILABLE,
     SUBAGENTS_DIR,
     TASKS_DIR,
+    census_coverage,
 )
 from recommendations import (
     METRIC_CACHE_READS_PER_WRITE,
@@ -74,12 +76,20 @@ from recommendations import (
     RANKING_PROVENANCE,
     RECOMMENDATION_PROVENANCE,
     RECOMMENDATIONS_AS_OF,
+    SEVERITY_ACT,
+    SEVERITY_OK,
+    SEVERITY_RANK,
+    SEVERITY_WATCH,
     UNMEASURED_NOTE,
+    WORSE_WHEN_HIGHER,
     Assessment,
+    Assessments,
     Lever,
+    Metric,
     Provenance,
     assess_all,
     cache_write_repayment,
+    depth_in_band,
 )
 EASTERN = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
@@ -143,6 +153,106 @@ def _refuse_unwired_metrics(declared: frozenset[str], table: frozenset[str]) -> 
 
 
 _refuse_unwired_metrics(RECOMMENDED_METRICS, frozenset(METRICS))
+
+# --------------------------------------------------------------------------
+# #89: the summary level -- the four-dot status strip and the knob rows.
+#
+# Three levels over ONE payload: the summary (what do I do?), the four question
+# cards (why?), and the raw data (show me everything). Everything this block
+# adds is a READING of something already computed for the other two levels --
+# `health`, `context`, and the `recommendations` table -- never a second
+# derivation of it. That is why `_status()` takes those three blocks as
+# arguments, exactly as `_health()` and `_recommendations()` take `context`: a
+# strip that ran its own queries would be a second opinion on the numbers it
+# summarises, and a summary that disagreed with the level below it is the one
+# defect a three-level page makes easy.
+#
+# NO THRESHOLD IS AUTHORED HERE OR IN THE PAGE. Every number a gauge draws --
+# where an arc starts and stops, where a tick sits, what the reader should aim
+# for -- is a boundary in `recommendations.METRICS`, carried across with the
+# provenance that boundary already has. The one thing added is GEOMETRY: which
+# fraction of a semicircular sweep a value sits at, which is arithmetic over
+# the table's own ordered ranges.
+# --------------------------------------------------------------------------
+
+# Which metrics the summary's cache dot ranges over. A SECOND enumeration of a
+# subset of one set, so it gets `RECOMMENDED_METRICS`' treatment rather than
+# its own habits: checked against the wired set AT IMPORT, because a cache
+# metric added to the table and not named here would leave the dot reporting
+# "working" over a reading it never looked at -- the milder of two true
+# statements, chosen by an omission.
+#
+# It carries NO number. Which metrics measure the cache is a statement about
+# what was divided by what; where a cache reading stops being healthy is the
+# table's, and this set never decides it.
+CACHE_METRICS = frozenset(
+    {
+        METRIC_CACHE_READS_PER_WRITE,
+        METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+        METRIC_CACHE_WRITE_ONLY_SHARE,
+    }
+)
+
+
+def _refuse_ungrouped_cache_metrics(
+    cache: frozenset[str], wired: frozenset[str]
+) -> None:
+    """Refuse to import if the cache group names a metric nothing computes."""
+    stray = sorted(cache - wired)
+    if stray:
+        raise RuntimeError(
+            f"serve.CACHE_METRICS names {stray}, which serve.RECOMMENDED_METRICS "
+            "does not: a dot cannot report on a reading nothing measures."
+        )
+
+
+_refuse_ungrouped_cache_metrics(CACHE_METRICS, RECOMMENDED_METRICS)
+
+# WHAT KIND OF NUMBER EACH READING IS -- `30.3%` rather than `0.3034`, `3.20x`
+# rather than `3.195` -- IS NOT DECLARED HERE ANY MORE. It shipped as a
+# `METRIC_UNITS` mapping in this file, under an import-time totality guard,
+# because the branch that added it could not edit `recommendations.py`. The
+# unit is a property of the metric, so it now sits on `recommendations.Metric`
+# beside `measurement`, and the guard's property survives in a stronger form: a
+# metric with no unit, or one outside `METRIC_UNIT_KINDS`, cannot be
+# CONSTRUCTED. Everything below reads `METRICS[key].unit`; a second mapping
+# here would be one enumeration of the metric set too many, which is the defect
+# `RECOMMENDED_METRICS` exists to prevent.
+
+
+def _refuse_unhandled_states(
+    what: str, handled: Iterable[str], declared: Iterable[str]
+) -> None:
+    """Refuse to import unless a state table covers its vocabulary exactly.
+
+    Both directions. A state with no entry is the one a `.get()` default would
+    render as whichever verdict was convenient; an entry for a state that no
+    longer exists is a translation nothing can reach, and it makes the table
+    look more complete than it is.
+    """
+    handled, declared = frozenset(handled), frozenset(declared)
+    if handled != declared:
+        raise RuntimeError(
+            f"{what} does not cover its states exactly: unhandled "
+            f"{sorted(declared - handled)}, unknown {sorted(handled - declared)}"
+        )
+
+
+# What the model-mix observation ranges over, named ONCE and carried in the
+# payload -- `CONTEXT_SAMPLE`'s rule for a figure that is not a recommendation.
+#
+# IT IS AN OBSERVATION AND NOT ADVICE, and the distinction is an owner
+# decision rather than a presentation choice: routing work to a weaker model to
+# save tokens can cost more in rework than it saves, and CPB measures tokens,
+# not rework. So this block carries no severity, no lever, no target and no
+# direction -- there is nothing here that could be turned into a knob by a
+# later change without somebody deciding to -- and it is deliberately NOT a
+# member of `recommendations.METRICS`, whose entries all carry exactly those
+# things.
+MODEL_MIX_SAMPLE = (
+    "API calls in this window, both scopes, grouped by the model each one "
+    "names -- one row per model, not per model and scope"
+)
 
 # What the "top dispatches" ranking orders by, named ONCE (#30). The panel
 # was headed "by spend" for its whole life while `agents()` ordered by
@@ -284,6 +394,400 @@ UTIL_NO_SAMPLE_NO_DOCUMENTED_WINDOW = (
     "every measured call in this scope ran on a model with no documented "
     "context window, so none of them has a utilisation"
 )
+
+# ---------------------------------------------------------------------------
+# #64: the health VERDICT -- the reassurance the report never stated.
+# ---------------------------------------------------------------------------
+#
+# The page reported 8,163 records parsed and 0 unparsed and then never said
+# "nothing is broken". A reader scanning for alarm had to infer reassurance
+# from the ABSENCE OF A WARNING -- which is exactly the inference this
+# repository refuses to let a number make. The reassuring answer is a real
+# measurement, so it is stated as one.
+#
+# THREE STATES, NOT TWO, and the third is the whole point. "Nothing is broken"
+# and "we could not check" are different claims with different remedies, and a
+# verdict that collapsed them would report health over a corpus nobody has
+# looked at -- `source_shape`'s own rule (a source with no rows has not been
+# CENSUSED rather than been found CLEAN) applied to the report as a whole.
+HEALTH_OK = "ok"
+HEALTH_UNCHECKED = "unchecked"
+HEALTH_FAILED = "failed"
+# WORST FIRST. The verdict is the worst state any check reached, so a genuine
+# failure outranks the reassurance and is never averaged with it. Named as an
+# ordered tuple rather than compared with `<`, because the ordering is a
+# judgment about which claim matters more and not a property of the strings.
+HEALTH_ORDER = (HEALTH_FAILED, HEALTH_UNCHECKED, HEALTH_OK)
+
+# The verdict's own sentence, one per state, spelled ONCE. The page renders
+# these rather than composing its own, for the reason `sample_is` exists: the
+# words that say what was and was not established belong with the code that
+# established it.
+#
+# EACH LEADS WITH ITS ANSWER (#88). The card's heading is the question "is
+# anything blowing up?", and a first line that opens with the evidence has made
+# the reader derive the answer from it. `ok` said "No." from the start; the
+# failed one led with the evidence until #88, which matters more now that
+# `failed` is the ONE verdict that expands its own detail.
+HEALTH_STATEMENTS = {
+    HEALTH_FAILED: (
+        "Yes. At least one check FAILED, and that is not softened by the "
+        "checks that passed -- read the failing line first, and treat every "
+        "figure it qualifies as suspect until it is fixed."
+    ),
+    HEALTH_UNCHECKED: (
+        "Nothing is proven broken, and at least one check COULD NOT BE MADE. "
+        "This is not a clean bill of health, it is an incomplete one: the "
+        "unchecked lines below name what was not established, and each of them "
+        "is unknown rather than fine."
+    ),
+    HEALTH_OK: (
+        "No. Every check this build can make passed: nothing unreadable, "
+        "nothing skipped, nothing guessed at, and nothing measured against a "
+        "limit this build does not know."
+    ),
+}
+
+# The checks, named ONCE each. A check is a QUESTION the database can answer,
+# so the set is enumerated here rather than inferred from whichever fields
+# happened to be non-null -- an enumeration is the only shape in which "every
+# state is handled" is a checkable statement.
+CHECK_RECORDS_PARSED = "records-parsed"
+CHECK_FORMAT_CENSUS = "transcript-format-census"
+CHECK_MODEL_WINDOW_KNOWN = "model-window-known"
+CHECK_WITHIN_WINDOW = "within-window"
+CHECK_CONTEXT_MEASURED = "context-measured"
+CHECK_INGEST_AGE = "ingest-age"
+# The order they are reported in: the corpus first (can these files be read at
+# all), then what was read (are the figures measurable), then how old the
+# reading is. Not a severity ranking -- `verdict` is the severity, and a list
+# re-sorted by state would move a check under the reader every time its answer
+# changed.
+HEALTH_CHECKS = (
+    CHECK_RECORDS_PARSED,
+    CHECK_FORMAT_CENSUS,
+    CHECK_MODEL_WINDOW_KNOWN,
+    CHECK_WITHIN_WINDOW,
+    CHECK_CONTEXT_MEASURED,
+    CHECK_INGEST_AGE,
+)
+
+# #61 gave the per-scope band tallies a name; #65 asks which of them is the
+# PROBLEM, which is a ranking -- so it names the key it orders by, in the one
+# place the ranking is computed, exactly as `RANKED_BY` does for the dispatch
+# panel. The phrase, the `max()` key and the sentence on the page are one
+# quantity in three places, asserted equal in tests/test_serve.py.
+SATURATION_RANKED_BY = (
+    "share of a scope's banded calls at or above half the model's documented "
+    "context window"
+)
+
+# #88: THE ANSWER TO "AM I WASTING CONTEXT?", and it is a measurement.
+#
+# The card shipped answering with a LOCATION -- "Most of it, of the scopes
+# measured, is in your main-thread" -- which names where the context is and
+# never says whether any of it is a problem. A reader wanting yes or no got
+# neither, and "most of it" had no antecedent on the resting page, because the
+# meters that would give "it" a referent are one expansion down.
+#
+# The previous wording was a correction of a worse one: "the pressure is in
+# your X" asserts that there IS pressure, which is false of a healthy corpus
+# and would be the page inventing a finding. That instinct was right. The fix
+# is not to soften further but to make the sentence CONDITIONAL ON THE
+# MEASUREMENT -- so it is decided here, beside the tallies it is decided from,
+# and the page renders the verdict and its sentence exactly as it renders the
+# health verdict's.
+#
+# FIVE STATES, BECAUSE THE QUESTION HAS FIVE TRUE ANSWERS over this data, and
+# collapsing any pair of them would be the milder-of-two-true-statements defect
+# `HEALTH_UNCHECKED` exists to prevent one card up:
+#
+#   * `yes`         -- calls sit at or above the judged boundary. Proven, and
+#                      the scope doing most of it is named beside the verdict.
+#   * `no`          -- a complete sample, banded, none of it at the boundary. A
+#                      POSITIVE finding, stated as one, exactly as an `ok`
+#                      health verdict is.
+#   * `inconclusive`-- nothing reached the boundary, but part of the period
+#                      could not be read against a window at all. Not a clean
+#                      no; the counts that say how much sit with the verdict.
+#   * `unknown`     -- calls were measured and NONE of them could be banded, so
+#                      there is nothing to compare against a window.
+#   * `no sample`   -- no call in the period carried a measured context size.
+#
+# AN UNKNOWN MAY WEAKEN A `no` AND NEVER A `yes`: a proven saturation is not
+# softened by the calls that could not be measured beside it. Same direction as
+# every other fallback in this repository.
+CONTEXT_ANSWER_YES = "yes"
+CONTEXT_ANSWER_NO = "no"
+CONTEXT_ANSWER_INCONCLUSIVE = "inconclusive"
+CONTEXT_ANSWER_UNKNOWN = "unknown"
+CONTEXT_ANSWER_NO_SAMPLE = "no sample"
+# Enumerated, in the order "worst known" to "least established", so "every
+# state is handled" is a checkable statement rather than a habit.
+CONTEXT_ANSWER_STATES = (
+    CONTEXT_ANSWER_YES,
+    CONTEXT_ANSWER_NO,
+    CONTEXT_ANSWER_INCONCLUSIVE,
+    CONTEXT_ANSWER_UNKNOWN,
+    CONTEXT_ANSWER_NO_SAMPLE,
+)
+# One sentence per state, spelled ONCE and here rather than in the page, for
+# the reason `HEALTH_STATEMENTS` and `shape_statement` are: this branch shipped
+# a heading ("And it only ever grows.") that the same database contradicted
+# three hours later, because nothing guards prose written in a template. Each
+# of these LEADS WITH THE ANSWER WORD -- the question is a yes/no question, and
+# a first line that opens with a caveat has not answered it.
+CONTEXT_ANSWER_STATEMENTS = {
+    CONTEXT_ANSWER_YES: (
+        "Yes. Calls are running at or above half the context window their "
+        "model documents -- the judged boundary dated below -- and the scope "
+        "doing most of it is named beside this line."
+    ),
+    CONTEXT_ANSWER_NO: (
+        "No. Every scope's banded calls sat below half the context window "
+        "their models document, and every call in this period was measured, "
+        "banded and inside its window. That is a measured no over a complete "
+        "sample, not an absence of evidence."
+    ),
+    CONTEXT_ANSWER_INCONCLUSIVE: (
+        "Not established. No scope reached half its models' documented "
+        "window, but part of this period could not be read against one, so "
+        "this is not a clean no. The counts beside this line say how much, "
+        "and each of them is UNKNOWN rather than low."
+    ),
+    CONTEXT_ANSWER_UNKNOWN: (
+        "Unknown. Contexts were measured in this period and not one of them "
+        "could be compared with a documented window, so there is no "
+        "utilisation to answer with -- unknown, not none."
+    ),
+    CONTEXT_ANSWER_NO_SAMPLE: (
+        "No sample. No call in this period carried a measured context size, "
+        "so there is no median and no utilisation to report. None of that is "
+        "a zero."
+    ),
+}
+
+
+# The strip's own four states. THREE vocabularies reach this line -- the health
+# verdict's, the context answer's and the table's severities -- and each is
+# translated into these rather than rendered raw, so the four dots can be read
+# in one glance without the reader learning three sets of words.
+#
+# `STRIP_UNKNOWN` is the load-bearing member and is NOT a fourth shade of
+# `STRIP_WATCH`: "we could not check" and "we checked and it is middling" are
+# different claims, and collapsing them is the substitution this repository
+# refuses everywhere else. A dot with no measurement behind it must never wear
+# the colour of one that has.
+STRIP_GOOD = "good"
+STRIP_WATCH = "watch"
+STRIP_BAD = "bad"
+STRIP_UNKNOWN = "unknown"
+# Worst first, so "the worst state any reading reached" is a lookup rather than
+# a comparison somebody writes out. `STRIP_UNKNOWN` sits between `watch` and
+# `good` for the same reason `HEALTH_ORDER` puts `unchecked` there: an
+# unestablished answer may weaken a clean one and may never soften a bad one.
+STRIP_ORDER = (STRIP_BAD, STRIP_WATCH, STRIP_UNKNOWN, STRIP_GOOD)
+
+# One entry per state of each vocabulary, checked EXHAUSTIVE at import. A state
+# added upstream with no entry here would otherwise reach `KeyError` at request
+# time -- a 500 over the whole payload -- or, worse, a `.get(..., default)`
+# that quietly rendered a new failure state as a clean dot.
+STRIP_FROM_HEALTH: dict[str, tuple[str, str]] = {
+    HEALTH_OK: (STRIP_GOOD, "Nothing broken"),
+    HEALTH_UNCHECKED: (STRIP_UNKNOWN, "Not fully checked"),
+    HEALTH_FAILED: (STRIP_BAD, "Something is broken"),
+}
+STRIP_FROM_CONTEXT: dict[str, tuple[str, str]] = {
+    CONTEXT_ANSWER_YES: (STRIP_BAD, "Yes"),
+    CONTEXT_ANSWER_NO: (STRIP_GOOD, "No"),
+    CONTEXT_ANSWER_INCONCLUSIVE: (STRIP_UNKNOWN, "Not established"),
+    CONTEXT_ANSWER_UNKNOWN: (STRIP_UNKNOWN, "Unknown"),
+    CONTEXT_ANSWER_NO_SAMPLE: (STRIP_UNKNOWN, "No sample"),
+}
+STRIP_FROM_SEVERITY: dict[str, tuple[str, str]] = {
+    SEVERITY_OK: (STRIP_GOOD, "Repaying"),
+    SEVERITY_WATCH: (STRIP_WATCH, "Watch"),
+    SEVERITY_ACT: (STRIP_BAD, "Not repaying"),
+}
+# What the cache dot says when not one of its metrics has a sample. Named
+# rather than defaulted, because "no cache reading in this window" is a
+# statement and an empty dot is not.
+STRIP_CACHE_UNMEASURED = "Not measured"
+
+# The four questions, in the order they are read. Chosen so the strip runs from
+# "is it broken" to "is the discount working": a reader who stops after one dot
+# has stopped on the one that would invalidate the rest.
+STRIP_DOT_BROKEN = "broken"
+STRIP_DOT_CONTEXT = "context"
+STRIP_DOT_KNOBS = "knobs"
+STRIP_DOT_CACHE = "cache"
+STRIP_QUESTIONS: dict[str, str] = {
+    STRIP_DOT_BROKEN: "Anything broken?",
+    STRIP_DOT_CONTEXT: "Wasting context?",
+    STRIP_DOT_KNOBS: "Knobs worth turning",
+    STRIP_DOT_CACHE: "Cache health",
+}
+STRIP_DOTS = (
+    STRIP_DOT_BROKEN,
+    STRIP_DOT_CONTEXT,
+    STRIP_DOT_KNOBS,
+    STRIP_DOT_CACHE,
+)
+_refuse_unhandled_states("STRIP_FROM_HEALTH", STRIP_FROM_HEALTH, HEALTH_ORDER)
+_refuse_unhandled_states(
+    "STRIP_FROM_CONTEXT", STRIP_FROM_CONTEXT, CONTEXT_ANSWER_STATES
+)
+_refuse_unhandled_states("STRIP_FROM_SEVERITY", STRIP_FROM_SEVERITY, SEVERITY_RANK)
+_refuse_unhandled_states("STRIP_QUESTIONS", STRIP_QUESTIONS, STRIP_DOTS)
+_refuse_unhandled_states(
+    "STRIP_ORDER",
+    STRIP_ORDER,
+    {STRIP_GOOD, STRIP_WATCH, STRIP_BAD, STRIP_UNKNOWN},
+)
+
+# #65: the growth curve. THE finding that makes the context figures actionable
+# -- typical main-session context across the four quarters of its own life,
+# measured 2026-08-05 over this project's own transcripts:
+#
+#     97,436 -> 333,610 -> 514,413 -> 906,301
+#
+# By the last quarter the TYPICAL reply sat at 90.6% of the window. "Your
+# context is large" and "your context only ever grows" are different findings
+# with different remedies, and nothing in the report showed the second.
+GROWTH_QUARTERS = 4
+# WHICH SCOPE. Main-thread only, and it says so in the payload: the subagents
+# are short-lived by construction and their contexts do not accumulate, so a
+# curve pooled across both would average the mechanism away -- #61's dilution
+# defect on a second axis.
+GROWTH_SCOPE = SOURCE_MAIN
+GROWTH_SAMPLE = (
+    "main-thread calls with a measured context size, split into four equal "
+    "spans of the period between the first and the last of them"
+)
+# THE FLOOR, and it is DERIVED rather than judged. Each quarter's figure is a
+# nearest-rank median, and the smallest sample on which that median is
+# STRICTLY INTERIOR -- neither the smallest nor the largest call in the quarter
+# -- is 3: `nearest_rank` takes index `ceil(p*n/100) - 1`, which for p=50 is
+# index 0 (the minimum) at n<=2 and index 1 at n=3. A "typical" context that is
+# in fact the quarter's smallest call is not a typical anything, so a curve
+# drawn from such quarters would be four bars from three points.
+GROWTH_MIN_CALLS_PER_QUARTER = 3
+GROWTH_MIN_CALLS = GROWTH_QUARTERS * GROWTH_MIN_CALLS_PER_QUARTER  # 12
+# Why the curve is refused, non-null exactly when it is -- the same
+# tri-state-with-a-reason shape as `no_sample_reason` and
+# `stale_unknown_reason`. A refused curve still publishes its quarters' COUNTS,
+# which are true; what it withholds is the claim that they describe a trend.
+GROWTH_REFUSED_TOO_FEW = (
+    "too few measured main-thread calls in this period to quarter meaningfully "
+    "-- a quarter of fewer than three calls has no median that is not simply "
+    "its smallest or largest call"
+)
+GROWTH_REFUSED_NO_SPAN = (
+    "every measured main-thread call in this period carries the same "
+    "timestamp, so the period has no span to divide into quarters"
+)
+# A quarter nobody measured. NOT a zero: no call fell in it, so it has no
+# median, and a plotted 0 would draw the context COLLAPSING in a quarter that
+# was simply idle.
+GROWTH_QUARTER_NO_CALLS = (
+    "no measured main-thread call fell in this quarter of the period"
+)
+
+# ---------------------------------------------------------------------------
+# THE SHAPE OF THE CURVE, DERIVED -- because the sentence over it was AUTHORED.
+# ---------------------------------------------------------------------------
+#
+# The panel shipped in review headed "And it only ever grows." That sentence was
+# true of the corpus it was written against and false three hours later, and the
+# defect is worth stating plainly because it is this repository's own rule
+# arriving by a route none of its guards watch:
+#
+#   * measured 2026-08-05 in the morning, main thread: 97,436 -> 333,610 ->
+#     514,413 -> 906,301, monotonic;
+#   * measured 2026-08-05 in the afternoon over the same database, 559 calls:
+#     277,945 -> 837,645 -> 297,343 -> 430,832. It climbs, drops by two thirds,
+#     and rises again. The session compacted in between.
+#
+# A HEADING THAT STATES A TREND THE NUMBERS DO NOT HAVE IS A WRONG FIGURE MADE
+# OF WORDS, and it is worse than a wrong number: `Optional[int]` guards a
+# number, and nothing whatever guards prose. So the sentence is derived from the
+# quarters, every time, like every other figure here.
+#
+# The taxonomy is EXHAUSTIVE over the sequence, and its default is refusal:
+# where the movement fits none of the named shapes the panel says so rather than
+# picking the reading that sounds most like a finding.
+GROWTH_SHAPE_UNMEASURABLE = "unmeasurable"
+GROWTH_SHAPE_FLAT = "flat"
+GROWTH_SHAPE_RISING = "rising"
+GROWTH_SHAPE_FALLING = "falling"
+GROWTH_SHAPE_ROSE_THEN_FELL = "rose-then-fell"
+GROWTH_SHAPE_MIXED = "no-discernible-trend"
+GROWTH_SHAPES = (
+    GROWTH_SHAPE_UNMEASURABLE,
+    GROWTH_SHAPE_FLAT,
+    GROWTH_SHAPE_RISING,
+    GROWTH_SHAPE_FALLING,
+    GROWTH_SHAPE_ROSE_THEN_FELL,
+    GROWTH_SHAPE_MIXED,
+)
+
+# What counts as a CHANGE, as a fraction of the earlier quarter. This is the
+# one JUDGED number in the block and it carries its own provenance below --
+# every other figure here is a median of measured calls.
+GROWTH_MATERIAL_CHANGE = 0.25
+GROWTH_SHAPE_AS_OF = "2026-08-05"
+GROWTH_SHAPE_PROVENANCE = (
+    "Product-owner judgment: a quarter counts as having moved only if the "
+    "typical reply changed by at least "
+    f"{GROWTH_MATERIAL_CHANGE:.0%} of the previous quarter's. Anthropic "
+    "publishes nothing about this and it is derived from no measurement -- it "
+    "is where this project judged a change worth a sentence. Set higher, every "
+    "period reads as flat; set lower, ordinary variation reads as a trend. It "
+    "is stated with its date so the verdict can be weighed against it rather "
+    "than taken on trust."
+)
+
+# One sentence per shape, spelled ONCE and carried in the payload -- so the
+# claim and the arithmetic that produced it live in the same file, and the page
+# cannot author a seventh reading. No sentence here interpolates a figure: the
+# four quarters are rendered directly under it, and a sentence quoting numbers
+# would be a second copy of them.
+GROWTH_SHAPE_STATEMENTS = {
+    GROWTH_SHAPE_UNMEASURABLE: (
+        "No shape is claimed. This period does not carry two quarters that can "
+        "be compared, so whether the typical reply grew, shrank or held is "
+        "UNKNOWN -- not flat, and not none."
+    ),
+    GROWTH_SHAPE_FLAT: (
+        "The typical reply HELD STEADY across this period: no quarter differs "
+        "from the one before it by enough to count as a change. Nothing here "
+        "is accumulating, and nothing here needs acting on."
+    ),
+    GROWTH_SHAPE_RISING: (
+        "The typical reply GREW across this period: every change large enough "
+        "to count was upward. This is context accumulating -- the session is "
+        "re-reading more of its own history each time and never shedding it."
+    ),
+    GROWTH_SHAPE_FALLING: (
+        "The typical reply SHRANK across this period: every change large "
+        "enough to count was downward. There is nothing to act on here -- "
+        "whatever was keeping the context down was working."
+    ),
+    GROWTH_SHAPE_ROSE_THEN_FELL: (
+        "The typical reply CLIMBED AND THEN DROPPED: it peaked in the quarter "
+        "named below, and the last measured quarter sits well under that peak. "
+        "A fall this size is what a context RESET looks like -- a compaction, "
+        "a new session, or a change of subject -- but this report measures the "
+        "drop and never its cause, so which of those it was is not something "
+        "these figures can say."
+    ),
+    GROWTH_SHAPE_MIXED: (
+        "NO TREND IS CLAIMED: the typical reply moved materially in BOTH "
+        "directions across this period and settles into none of the shapes "
+        "this build can name. Read the four quarters themselves rather than a "
+        "summary of them."
+    ),
+}
 
 # #78: half the window, as a FRACTION of it -- the point
 # `METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW` counts from. Named rather than
@@ -664,6 +1168,340 @@ class Api:
             "stale_unknown_reason": stale_unknown_reason,
         }
 
+    def _has_source_shape_table(self) -> bool:
+        """Can this database record a transcript-format census AT ALL? (#15)
+
+        Asked for the same reason `_has_ingest_runs_table()` is: `serve.py`
+        never migrates, it reads the database as the ingester left it, so a
+        pre-v9 database simply has no `source_shape`. "This build cannot ask
+        the question" and "the question was asked and nothing was censused" are
+        different states of knowledge, and a bare `OperationalError` handler
+        would report the second for the first -- and would swallow a corrupt or
+        locked database as a merely old schema besides.
+        """
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+                (SHAPE_TABLE,),
+            ).fetchone()
+            is not None
+        )
+
+    def _health(
+        self, ingest: dict[str, Any], context: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Is anything broken? -- the verdict the report never gave (#64).
+
+        **DERIVED, never hardcoded optimistic.** Every check below reads a
+        figure this response already computed: `unparsed_records` and the
+        staleness tri-state off `_ingest_health()`, the census off
+        `source_shape`, and the three utilisation absences off the `context`
+        block that is PASSED IN rather than recomputed. A second query here
+        would be a second definition of what was measured, free to disagree
+        with the bands the reader is looking at -- the reason
+        `_recommendations()` takes the same argument.
+
+        **THE THIRD STATE IS THE POINT.** `HEALTH_OK` says the checks passed;
+        `HEALTH_UNCHECKED` says at least one could not be made. Collapsing them
+        would let a corpus nobody has censused report health -- and
+        `source_shape`'s whole design is that a source with NO rows has not been
+        censused rather than been found clean, which is this rule stated one
+        layer down. An uncensused corpus is the case that forced the three
+        states: every other check can pass over it while the one thing that
+        would notice a transcript-format change has never run.
+
+        **A FAILURE OUTRANKS THE REASSURANCE.** `verdict` is the worst state any
+        check reached, by `HEALTH_ORDER`, so no number of passing checks can
+        soften a failing one. And it cannot LOWER a staleness verdict: the
+        `ingest-age` check reads `ingest.stale` and maps true to `failed`, null
+        to `unchecked` and false to `ok`, which is the tri-state it was handed
+        -- the banner's own warning is untouched by anything here (PR #60).
+
+        Every check publishes `count` and `of` in ONE unit, or null where the
+        database does not hold that quantity. `records-parsed` has a null `of`
+        on purpose: `ingest_state` records how many records FAILED to parse and
+        not how many were read, so there is no total to state and inventing one
+        would be the defect this whole block exists to report.
+        """
+        util = context["utilisation"]
+        checks = [
+            self._check_records_parsed(ingest),
+            self._check_format_census(),
+            self._check_model_window_known(context, util),
+            self._check_within_window(util),
+            self._check_context_measured(context, util),
+            self._check_ingest_age(ingest),
+        ]
+        # Enumerated, and asserted to BE the enumeration: a check added to
+        # `HEALTH_CHECKS` and computed nowhere, or computed here and declared
+        # nowhere, is the wiring gap `_refuse_unwired_metrics()` exists for one
+        # module over. Here the set is small enough to state inline, and
+        # tests/test_serve.py pins the two equal.
+        states = {c["state"] for c in checks}
+        verdict = next(state for state in HEALTH_ORDER if state in states)
+        return {
+            "verdict": verdict,
+            "statement": HEALTH_STATEMENTS[verdict],
+            "checks": checks,
+        }
+
+    @staticmethod
+    def _health_check(
+        check: str,
+        state: str,
+        statement: str,
+        count: Optional[int] = None,
+        of: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """One check's row, spelled once so every check carries every field."""
+        return {
+            "check": check,
+            "state": state,
+            "statement": statement,
+            "count": count,
+            "of": of,
+        }
+
+    @classmethod
+    def _check_records_parsed(cls, ingest: dict[str, Any]) -> dict[str, Any]:
+        """Did every record in every ingested transcript parse? (#64)"""
+        files = ingest["files"]
+        unparsed = ingest["unparsed_records"]
+        if not files:
+            return cls._health_check(
+                CHECK_RECORDS_PARSED,
+                HEALTH_UNCHECKED,
+                "No transcript has been ingested, so nothing has been read and "
+                "nothing can be said about it. Run ingest.py.",
+                count=0,
+                of=None,
+            )
+        if unparsed is None:
+            # SUM over a non-empty table cannot be NULL today; if it ever is,
+            # "the ledger holds files and reports no parse count" is an unknown
+            # and must not read as a clean zero.
+            return cls._health_check(
+                CHECK_RECORDS_PARSED,
+                HEALTH_UNCHECKED,
+                "The ingest ledger holds files but reports no parse count for "
+                "them, so whether anything failed to parse is UNKNOWN, not no.",
+                count=None,
+                of=None,
+            )
+        if unparsed:
+            return cls._health_check(
+                CHECK_RECORDS_PARSED,
+                HEALTH_FAILED,
+                "Record(s) in the ingested transcripts could not be parsed, so "
+                "every total in this report undercounts by an unknown amount. "
+                "This is a real gap, not a rounding one.",
+                count=unparsed,
+                of=None,
+            )
+        return cls._health_check(
+            CHECK_RECORDS_PARSED,
+            HEALTH_OK,
+            "Every record in every ingested transcript parsed cleanly -- "
+            "nothing unreadable, nothing skipped, nothing guessed at.",
+            count=0,
+            of=None,
+        )
+
+    def _check_format_census(self) -> dict[str, Any]:
+        """Has the transcript format been censused at all? (#15/#64)
+
+        THE check that makes "nothing is broken" different from "we could not
+        check". The census is what would notice Claude Code renaming a token
+        key or emitting a record type CPB has never seen -- and a source with
+        no `source_shape` row has not been censused rather than been found
+        clean. A corpus that has never been censused therefore CANNOT report
+        health, however clean every other check is.
+        """
+        if not self._has_source_shape_table():
+            return self._health_check(
+                CHECK_FORMAT_CENSUS,
+                HEALTH_UNCHECKED,
+                "This database predates the transcript-format census, so the "
+                "shape of the records behind these figures has never been "
+                "checked -- UNCENSUSED, not clean. Re-run ingest.py.",
+                count=None,
+                of=None,
+            )
+        censused, tracked = census_coverage(self.conn)
+        if not tracked:
+            return self._health_check(
+                CHECK_FORMAT_CENSUS,
+                HEALTH_UNCHECKED,
+                "No transcript is tracked, so there is no format to census. "
+                "Nothing here has been found clean; nothing has been looked at.",
+                count=censused,
+                of=tracked,
+            )
+        if censused < tracked:
+            return self._health_check(
+                CHECK_FORMAT_CENSUS,
+                HEALTH_UNCHECKED,
+                "Some tracked transcripts carry no format census: they were "
+                "ingested before the census existed and are unchanged, so they "
+                "will be censused when they next change. They are UNCENSUSED, "
+                "not clean -- a format change in them would not have been seen.",
+                count=censused,
+                of=tracked,
+            )
+        return self._health_check(
+            CHECK_FORMAT_CENSUS,
+            HEALTH_OK,
+            "Every tracked transcript has been censused for its record shape, "
+            "so a Claude Code release that renamed a token key or emitted an "
+            "unknown record type would have been counted rather than absorbed.",
+            count=censused,
+            of=tracked,
+        )
+
+    @classmethod
+    def _check_model_window_known(
+        cls, context: dict[str, Any], util: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Did every measured call run on a model this build has a window for?"""
+        sample_calls = context["sample_calls"]
+        unknown = util["unknown_model_calls"]
+        if not sample_calls:
+            return cls._health_check(
+                CHECK_MODEL_WINDOW_KNOWN,
+                HEALTH_UNCHECKED,
+                "No call in this period carried a context measurement, so "
+                "there is no call whose model window could be looked up.",
+                count=unknown,
+                of=sample_calls,
+            )
+        if unknown:
+            return cls._health_check(
+                CHECK_MODEL_WINDOW_KNOWN,
+                HEALTH_UNCHECKED,
+                "Call(s) ran on a model this build has no documented context "
+                "window for, so their utilisation is UNKNOWN, not low. The "
+                "models are named beside the bands below.",
+                count=unknown,
+                of=sample_calls,
+            )
+        return cls._health_check(
+            CHECK_MODEL_WINDOW_KNOWN,
+            HEALTH_OK,
+            "Every measured call ran on a model whose context window this "
+            "build has documented, so none of them was banded against a guess.",
+            count=0,
+            of=sample_calls,
+        )
+
+    @classmethod
+    def _check_within_window(cls, util: dict[str, Any]) -> dict[str, Any]:
+        """Did any reply measure ABOVE 100% of the window it had? (#31)
+
+        A FAILURE rather than a caveat. A call cannot exceed its own context
+        window, so a measurement that says one did means this build's window
+        table has gone stale -- the loud half of `context_window.py`'s safety
+        story, and it is only a safety story if something states the verdict.
+        """
+        banded = util["banded_calls"]
+        over = util["over_window_calls"]
+        if not banded:
+            return cls._health_check(
+                CHECK_WITHIN_WINDOW,
+                HEALTH_UNCHECKED,
+                "No call in this period was banded against a documented "
+                "window, so no call could be compared to one.",
+                count=over,
+                of=banded,
+            )
+        if over:
+            return cls._health_check(
+                CHECK_WITHIN_WINDOW,
+                HEALTH_FAILED,
+                "Call(s) measure ABOVE 100% of their model's documented "
+                "window. That is impossible unless this build's window table "
+                "has gone stale, so treat the bands as suspect rather than the "
+                "calls as extraordinary.",
+                count=over,
+                of=banded,
+            )
+        return cls._health_check(
+            CHECK_WITHIN_WINDOW,
+            HEALTH_OK,
+            "No reply exceeded the context window it had, so this build's "
+            "window table is not contradicted by anything in this period.",
+            count=0,
+            of=banded,
+        )
+
+    @classmethod
+    def _check_context_measured(
+        cls, context: dict[str, Any], util: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Did every call in the window carry prompt accounting? (#25)"""
+        calls = util["calls"]
+        unmeasured = context["unmeasured_calls"]
+        if not calls:
+            return cls._health_check(
+                CHECK_CONTEXT_MEASURED,
+                HEALTH_UNCHECKED,
+                "No API call falls in this period, so there is nothing here "
+                "whose context could have been measured.",
+                count=unmeasured,
+                of=calls,
+            )
+        if unmeasured:
+            return cls._health_check(
+                CHECK_CONTEXT_MEASURED,
+                HEALTH_UNCHECKED,
+                "Call(s) carry no prompt accounting at all -- every token "
+                "class reported zero -- so their context is UNMEASURED, not "
+                "small. They are counted and kept out of every context figure.",
+                count=unmeasured,
+                of=calls,
+            )
+        return cls._health_check(
+            CHECK_CONTEXT_MEASURED,
+            HEALTH_OK,
+            "Every call in this period carried a context measurement, so no "
+            "context figure below ranges over a smaller set than the calls "
+            "beside it.",
+            count=0,
+            of=calls,
+        )
+
+    @classmethod
+    def _check_ingest_age(cls, ingest: dict[str, Any]) -> dict[str, Any]:
+        """How current the database is -- read, never re-derived (#20/#34).
+
+        This check may not LOWER the staleness verdict, and structurally
+        cannot: it maps the tri-state it was handed rather than comparing
+        timestamps itself. The banner's own warning is composed from the same
+        field and is untouched.
+        """
+        stale = ingest["stale"]
+        if stale is None:
+            return cls._health_check(
+                CHECK_INGEST_AGE,
+                HEALTH_UNCHECKED,
+                "The age of this database cannot be measured "
+                f"({ingest['stale_unknown_reason']}), so nothing below is "
+                "qualified as fresh or stale. Unknown, not fresh.",
+            )
+        if stale:
+            return cls._health_check(
+                CHECK_INGEST_AGE,
+                HEALTH_FAILED,
+                "The last ingest run is older than this build's staleness "
+                "threshold, so every figure here describes the transcripts as "
+                "of THEN, not as of now. Re-run ingest.py.",
+            )
+        return cls._health_check(
+            CHECK_INGEST_AGE,
+            HEALTH_OK,
+            "ingest.py has run within this build's staleness threshold, so "
+            "these figures describe the transcripts as they are now.",
+        )
+
     def _durability(self, start: float, end: float) -> dict[str, Any]:
         """Can the numbers in this window be recomputed, or only read here? (#14)
 
@@ -829,9 +1667,17 @@ class Api:
 
         def bucket(kind: str) -> dict[str, Any]:
             row = rows.get(kind)
-            if row is None:
-                return dict(empty)
-            row.pop("source_kind")
+            row = dict(empty) if row is None else row
+            row.pop("source_kind", None)
+            # #82: the bucket NAMES ITSELF, in `SCOPE_LABELS`' vocabulary. The
+            # key it sits under (`main_thread`) is the payload's spelling of
+            # the ingester's `source_kind`; the label is the one every other
+            # scoped figure in this API crosses the boundary as, and the page
+            # renders these means beside `context.utilisation.by_scope`, which
+            # is keyed on the label. Without this the page would have to map
+            # one to the other itself -- an equivalence the API never stated,
+            # which is the class of invention `SCOPE_LABELS` exists to prevent.
+            row["scope"] = SCOPE_LABELS.get(kind, kind)
             return row
 
         window_sessions = (
@@ -1017,8 +1863,14 @@ class Api:
         # is the single largest cost in the block at corpus scale.
         cursor = self.conn.cursor()
         cursor.row_factory = None
-        for kind, model, size in cursor.execute(
-            "SELECT source_kind, model, context_size FROM api_calls"
+        # #65: the growth curve's sample, collected in THIS pass rather than by
+        # a second query. A second read of the same rows would be a second
+        # definition of "a measured main-thread call", free to drift from the
+        # one the bands above are drawn from -- the defect `_recommendations()`
+        # takes `context` as an argument to avoid, one block down.
+        growth_points: list[tuple[float, int, Optional[float]]] = []
+        for kind, model, size, ts in cursor.execute(
+            "SELECT source_kind, model, context_size, ts FROM api_calls"
             " WHERE ts >= ? AND ts < ?",
             (start, end),
         ):
@@ -1042,8 +1894,17 @@ class Api:
             if window is None:
                 scope["unknown_model_calls"] += 1
                 scope["unknown_models"].add(model)
+                # The size WAS measured, so this call is part of the growth
+                # curve's context median; its utilisation is not known, so it
+                # is not part of that quarter's utilisation median. Two
+                # samples, counted separately (rule #12), never one figure
+                # standing in for the other.
+                if kind == GROWTH_SCOPE:
+                    growth_points.append((ts, size, None))
                 continue
             fraction = size / window
+            if kind == GROWTH_SCOPE:
+                growth_points.append((ts, size, fraction))
             if fraction > 1.0:
                 # The loud half of this feature's safety story: a window this
                 # table has let go stale shows up as calls over 100% of it,
@@ -1079,7 +1940,15 @@ class Api:
         # which is the exact failure this block exists to prevent.
         kinds = list(SCOPE_ORDER) + sorted(k for k in scopes if k not in SCOPE_ORDER)
         by_scope = [self._scoped_utilisation(k, scopes.get(k)) for k in kinds]
+        pooled_scoped = self._scoped_utilisation(None, pooled)
+        # ONE row wins the ranking, and the winner's own figures travel with
+        # its name: `worst_scope` alone names a scope without saying what makes
+        # it the worst, and the reader would have to open the meters to find
+        # out. Read off the winning row rather than re-derived, so the answer
+        # and the meter behind it cannot disagree.
+        worst = self._worst_saturated_scope(by_scope)
         sizes.sort()
+        growth = self._growth_curve(growth_points)
         percentiles = {f"p{p}": nearest_rank(sizes, p) for p in PERCENTILES}
         median = percentiles[f"p{MEDIAN_PERCENTILE}"]
         mean = (sum(sizes) / len(sizes)) if sizes else None
@@ -1118,12 +1987,295 @@ class Api:
                 # share of a set the reader cannot see, and the reader's own
                 # scope is diluted in it 6:1.
                 "includes": SCOPE_INCLUDES_BOTH,
-                **self._scoped_utilisation(None, pooled),
+                **pooled_scoped,
                 # The SCOPED tallies -- one entry per scope, always both known
                 # kinds, in `SCOPE_ORDER`.
                 "by_scope": by_scope,
+                # #65: WHICH SCOPE IS THE PROBLEM, answered here rather than
+                # left to the page to work out from the tallies. A ranking must
+                # name the key it orders by and the name must BE the key
+                # (`RANKED_BY`'s rule), so the phrase below is the one
+                # `_worst_saturated_scope()` maximises and the one the page
+                # puts in the sentence.
+                "worst_scope": worst["scope"] if worst else None,
+                "worst_scope_ranked_by": SATURATION_RANKED_BY,
+                # #88: the VALUE of the key the ranking ordered by, published
+                # beside the winner it produced. Null when no scope ranked --
+                # never 0, which would report the scope that measured nothing
+                # as the most frugal one.
+                "worst_scope_over_half_window_calls": (
+                    worst["over_half_window_calls"] if worst else None
+                ),
+                "worst_scope_over_half_window_share": (
+                    worst["over_half_window_share"] if worst else None
+                ),
+                # #88: and whether any of that is a problem, which is the
+                # question the card's heading asks and the one nothing answered.
+                "answer": self._context_answer(worst, pooled_scoped, len(sizes)),
             },
+            # #65: the mechanism behind the bands. Its own block rather than a
+            # field on `utilisation`, because it ranges over ONE scope and over
+            # four spans of time, which is neither of the two sets `utilisation`
+            # describes.
+            "growth": growth,
         }
+
+    @staticmethod
+    def _worst_saturated_scope(
+        by_scope: list[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """The scope ROW with the largest `over_half_window_share` (#65).
+
+        None when NO scope has a share at all -- every one of them has an empty
+        banded sample, so there is no ranking rather than a ranking whose
+        winner is a scope that measured nothing. A share of 0.0 is a real
+        reading and DOES rank: "the pressure is in your main session, and it is
+        currently none" is a true and useful sentence, while "the worst scope
+        is the one we never measured" is not.
+
+        Ties go to the FIRST scope in `SCOPE_ORDER`, which `max()` gives
+        without a tiebreaker because it returns the first maximal element. That
+        is the main thread, which is the scope a reader can act on.
+
+        **The whole ROW, not the name** (#88). The card states the share and
+        the count that make this scope the winner, and taking them off the row
+        the ranking returned is what stops the answer and the meter below it
+        from being two derivations of one figure.
+        """
+        ranked = [s for s in by_scope if s["over_half_window_share"] is not None]
+        if not ranked:
+            return None
+        return max(ranked, key=lambda s: s["over_half_window_share"])
+
+    @staticmethod
+    def _context_answer(
+        worst: Optional[dict[str, Any]],
+        pooled: dict[str, Any],
+        sample_calls: int,
+    ) -> dict[str, Any]:
+        """Whether this period is wasting context, as one of five states (#88).
+
+        The card's heading is a question, so its first line must answer that
+        question -- and the answer has to be DERIVED, because a sentence
+        written into the template is a claim nothing can check. This branch
+        already shipped one of those ("And it only ever grows.") and the same
+        database contradicted it three hours later.
+
+        **The order of the branches is the judgment.** A proven reading is
+        reported before an absent one: `yes` is decided from the POOLED count
+        at or above the judged boundary, so it holds however the unmeasured,
+        unwindowed and over-window calls fall around it. Only where nothing
+        reached the boundary can an unknown weaken the answer -- and there it
+        must, because "no scope reached it, and a third of the period could not
+        be looked at" is not the same claim as "no scope reached it".
+
+        `no` is therefore the ONE state that asserts a complete clean sample,
+        which is what makes it safe to say plainly. Every other state names
+        what it could not establish.
+        """
+        if not sample_calls:
+            verdict = CONTEXT_ANSWER_NO_SAMPLE
+        elif worst is None:
+            verdict = CONTEXT_ANSWER_UNKNOWN
+        elif pooled["over_half_window_calls"]:
+            verdict = CONTEXT_ANSWER_YES
+        elif (
+            pooled["unmeasured_calls"]
+            or pooled["unknown_model_calls"]
+            or pooled["over_window_calls"]
+        ):
+            verdict = CONTEXT_ANSWER_INCONCLUSIVE
+        else:
+            verdict = CONTEXT_ANSWER_NO
+        return {
+            "verdict": verdict,
+            "statement": CONTEXT_ANSWER_STATEMENTS[verdict],
+        }
+
+    @classmethod
+    def _growth_curve(
+        cls, points: list[tuple[float, int, Optional[float]]]
+    ) -> dict[str, Any]:
+        """Typical main-thread context across four spans of the period (#65).
+
+        `points` is `(ts, context_size, utilisation or None)` for every
+        main-thread call in the window whose context was MEASURED -- the same
+        predicate the bands are drawn through, collected in the same pass.
+
+        **The quarters are equal spans of TIME, not equal counts of calls.**
+        Equal counts can never leave a quarter empty, which would make "a
+        quarter with no measured call is a named absence" unreachable code and
+        would quietly redefine the finding: the claim is about a session's
+        LIFE, and a session that ran 900 calls in one hour and 30 over the next
+        week did not spend half its life on either.
+
+        **A quarter with no call has no median.** It is emitted with `calls: 0`
+        and a `no_sample_reason`, and every median beside it is null -- a
+        plotted 0 would draw the context collapsing in a quarter that was
+        merely idle, which is the same defect `timeseries()`'s null
+        `avg_context` fixed for the daily chart.
+
+        **Two medians, two samples, two counts.** `median_context` ranges over
+        the quarter's measured calls; `median_utilisation` ranges over the
+        subset of those whose model has a documented window, which is a
+        strictly smaller set whenever an unknown model ran. `banded_calls`
+        beside it is what keeps them from being read as one figure.
+
+        **The curve can be REFUSED, and says so.** `refused_reason` is non-null
+        exactly when the sample cannot support a trend -- see
+        `GROWTH_MIN_CALLS`, whose floor is derived from `nearest_rank`'s own
+        arithmetic rather than judged. The quarters are still published when it
+        is refused: their counts are true, and withholding them would replace
+        one over-claim with an absence nobody asked for. What the page must not
+        do is draw a trend through them.
+        """
+        points = sorted(points, key=lambda p: p[0])
+        calls = len(points)
+        first_ts = points[0][0] if points else None
+        last_ts = points[-1][0] if points else None
+        span = (last_ts - first_ts) if points else None
+        refused: Optional[str] = None
+        if calls < GROWTH_MIN_CALLS:
+            refused = GROWTH_REFUSED_TOO_FEW
+        elif not span:
+            refused = GROWTH_REFUSED_NO_SPAN
+        buckets: list[list[tuple[int, Optional[float]]]] = [
+            [] for _ in range(GROWTH_QUARTERS)
+        ]
+        for ts, size, fraction in points:
+            # The LAST quarter is closed at the top, so the final call -- which
+            # sits exactly on `last_ts` -- lands in quarter 4 rather than in a
+            # fifth bucket that does not exist. With no span at all every call
+            # shares one instant and they all land there, which is true: the
+            # period is a point and its end is that point.
+            index = GROWTH_QUARTERS - 1
+            if span:
+                index = min(
+                    GROWTH_QUARTERS - 1,
+                    int((ts - first_ts) / span * GROWTH_QUARTERS),
+                )
+            buckets[index].append((size, fraction))
+        quarters = []
+        for i, bucket in enumerate(buckets):
+            sizes = sorted(size for size, _ in bucket)
+            fractions = sorted(f for _, f in bucket if f is not None)
+            quarters.append({
+                "quarter": i + 1,
+                # Null rather than the window's own edges when there is no
+                # sample to derive them from: an empty scope has no period.
+                "from_ts": (first_ts + span * i / GROWTH_QUARTERS)
+                if span else first_ts,
+                "to_ts": (first_ts + span * (i + 1) / GROWTH_QUARTERS)
+                if span else last_ts,
+                "calls": len(bucket),
+                "median_context": nearest_rank(sizes, MEDIAN_PERCENTILE),
+                "banded_calls": len(fractions),
+                # `nearest_rank` returns an element of the list it is given, so
+                # it reports a utilisation some call actually carried -- the
+                # same reason the context percentiles use it.
+                "median_utilisation": nearest_rank(fractions, MEDIAN_PERCENTILE),
+                "no_sample_reason": None if bucket else GROWTH_QUARTER_NO_CALLS,
+            })
+        shape, peak_quarter = cls._growth_shape(quarters, refused)
+        return {
+            # WHICH SCOPE, HOW MANY REPLIES, OVER WHAT PERIOD -- the three
+            # things an aggregate owes the reader about the set it ranges over.
+            "scope": SCOPE_LABELS.get(GROWTH_SCOPE, GROWTH_SCOPE),
+            "sample_is": GROWTH_SAMPLE,
+            "calls": calls,
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "minimum_calls": GROWTH_MIN_CALLS,
+            "refused_reason": refused,
+            # The SENTENCE over the curve, derived from the curve. See
+            # `_growth_shape()` for why this is a field rather than a heading.
+            "shape": shape,
+            "shape_statement": GROWTH_SHAPE_STATEMENTS[shape],
+            # The judged half, with its own date, in the shape `band_provenance`
+            # established: the medians are measurements and this threshold is
+            # not, so they cross the API as separate fields and the page marks
+            # them as separate voices.
+            "shape_as_of": GROWTH_SHAPE_AS_OF,
+            "shape_provenance": GROWTH_SHAPE_PROVENANCE,
+            "peak_quarter": peak_quarter,
+            "quarters": quarters,
+        }
+
+    @staticmethod
+    def _growth_shape(
+        quarters: list[dict[str, Any]], refused: Optional[str]
+    ) -> tuple[str, Optional[int]]:
+        """Which of `GROWTH_SHAPES` this curve is, and where its peak sits.
+
+        **A QUARTER WITH NO SAMPLE DOES NOT PARTICIPATE.** The sequence is the
+        quarters that have a median, in order, and an empty one is SKIPPED
+        rather than carried in as a 0 -- which would turn every idle fortnight
+        into a collapse and then into a "rose then fell". This is the same rule
+        the null median beside it already follows, one level up: absence is not
+        a value, including when it is a value in a trend.
+
+        **A REFUSED CURVE HAS NO SHAPE.** If the sample cannot support a trend
+        (`refused_reason`), claiming one from it is exactly the over-claim the
+        refusal exists to prevent, so it reports `unmeasurable` and says so.
+
+        **THE DEFAULT IS REFUSAL.** Movement that fits none of the named shapes
+        is `no-discernible-trend`, never the nearest-sounding finding: this
+        block's whole reason for existing is that "it only ever grows" was
+        picked because it read well and stopped being true the same afternoon.
+
+        The branches are exhaustive over `(any material rise, any material
+        fall)`:
+
+          * neither -- `flat`;
+          * rises only -- `rising`. Not "monotonic": a dip too small to count
+            is allowed, which is why the sentence says "every change large
+            enough to count" rather than "every change";
+          * falls only -- `falling`;
+          * both -- the interesting one. It is `rose-then-fell` only if the
+            peak is genuinely between the ends, i.e. the climb from the first
+            sampled quarter to the peak AND the drop from the peak to the last
+            are both material. That test excludes a peak at either end by
+            construction (the change to itself is 0), so a curve that sagged in
+            the middle and recovered is `no-discernible-trend`, not a fall.
+
+        `peak_quarter` is the quarter NUMBER holding the largest median, or
+        None where no quarter has one. It is published for every shape because
+        it is true for every shape, and it is the evidence a reader checks
+        `rose-then-fell` against.
+        """
+        sampled = [
+            (q["quarter"], q["median_context"])
+            for q in quarters
+            if q["median_context"] is not None
+        ]
+        peak_quarter = (
+            max(sampled, key=lambda pair: pair[1])[0] if sampled else None
+        )
+        if refused is not None or len(sampled) < 2:
+            return GROWTH_SHAPE_UNMEASURABLE, peak_quarter
+        medians = [median for _quarter, median in sampled]
+        # `median_context` is at least `MEASURED_CONTEXT_MIN`, so the
+        # denominator cannot be zero; the guard states that rather than relying
+        # on it, because a future change to what counts as measured would
+        # otherwise turn this into a ZeroDivisionError inside a summary.
+        steps = [
+            (later - earlier) / earlier if earlier else 0.0
+            for earlier, later in zip(medians, medians[1:])
+        ]
+        rose = any(step >= GROWTH_MATERIAL_CHANGE for step in steps)
+        fell = any(step <= -GROWTH_MATERIAL_CHANGE for step in steps)
+        if not rose and not fell:
+            return GROWTH_SHAPE_FLAT, peak_quarter
+        if rose and not fell:
+            return GROWTH_SHAPE_RISING, peak_quarter
+        if fell and not rose:
+            return GROWTH_SHAPE_FALLING, peak_quarter
+        peak = max(medians)
+        climb = (peak - medians[0]) / medians[0] if medians[0] else 0.0
+        drop = (medians[-1] - peak) / peak if peak else 0.0
+        if climb >= GROWTH_MATERIAL_CHANGE and drop <= -GROWTH_MATERIAL_CHANGE:
+            return GROWTH_SHAPE_ROSE_THEN_FELL, peak_quarter
+        return GROWTH_SHAPE_MIXED, peak_quarter
 
     @staticmethod
     def _utilisation_bands(
@@ -1175,10 +2327,25 @@ class Api:
         sample_calls = tally["sample_calls"]
         banded_calls = sum(tally["banded"].values())
         named = {"scope": SCOPE_LABELS.get(kind, kind)} if kind is not None else {}
+        # #65: the saturation reading, DERIVED from this tally's own bands
+        # rather than counted a second time -- and derived from
+        # `OVER_HALF_WINDOW_BANDS`, which is itself derived from `BANDS`, so a
+        # band table that grew a cut at 0.6 joins the numerator instead of
+        # being silently dropped out of it. Null share on an empty banded
+        # sample: a share of an empty set is not 0%.
+        over_half = sum(
+            count
+            for key, count in tally["banded"].items()
+            if key in OVER_HALF_WINDOW_BANDS
+        )
         return {
             **named,
             "calls": calls,
             "sample_calls": sample_calls,
+            "over_half_window_calls": over_half,
+            "over_half_window_share": (
+                (over_half / banded_calls) if banded_calls else None
+            ),
             # The REMAINDER, as in `context_aggregate_sql()`: the two counts
             # partition `calls` by construction rather than by a second
             # predicate free to drift from the first.
@@ -1268,6 +2435,12 @@ class Api:
             "ranking_provenance": RANKING_PROVENANCE,
             "unmeasured_note": UNMEASURED_NOTE,
             "ranked": [self._assessment_payload(a) for a in assessed.ranked],
+            # #89's summary level, in the SAME order and off the SAME
+            # `Assessment` objects the diagnosis one level down reads. One row
+            # per metric, measured or not, so "four knobs exist and two are
+            # already fine" is a thing the page can show rather than infer from
+            # a list that dropped the healthy ones.
+            "knobs": self._knobs(assessed),
             # A MAPPING, metric -> what would have been measured, not a list of
             # rows: an unmeasured metric has no reading, no severity and no
             # advice, so there are no columns to tabulate. `UNMEASURED_NOTE`
@@ -1293,19 +2466,18 @@ class Api:
 
         None when that denominator is 0, which is three different absences
         (`no_sample_reason` says which) and no share at all.
+
+        **The share is READ, not recomputed.** #65 made it a published field of
+        the scope's own tally, because the page states which scope is worst by
+        ranking on it; a second summation here would be a second definition of
+        "over half the window", free to drift from the one the reader is
+        looking at and from the one the ranking used. That is the same reason
+        `context` is passed into `_recommendations()` rather than rebuilt.
         """
         for scope in context["utilisation"]["by_scope"]:
             if scope["scope"] != SCOPE_MAIN:
                 continue
-            banded_calls = scope["banded_calls"]
-            if not banded_calls:
-                return None
-            over_half = sum(
-                band["calls"]
-                for band in scope["bands"]
-                if band["band"] in OVER_HALF_WINDOW_BANDS
-            )
-            return over_half / banded_calls
+            return scope["over_half_window_share"]
         # Unreachable while `_context()` emits every scope in `SCOPE_ORDER`,
         # and None rather than 0.0 if that ever changes: a main-thread share
         # this function could not find is not a main-thread share of nothing.
@@ -1430,6 +2602,343 @@ class Api:
             return None
         return main / subagent
 
+    # ----------------------------------------------------------------------
+    # #89: the same table, drawn -- the summary level's knobs and gauges
+    # ----------------------------------------------------------------------
+
+    @classmethod
+    def _knobs(cls, assessed: Assessments) -> list[dict[str, Any]]:
+        """One row per metric, worst first, then the ones with no sample.
+
+        THE ORDER IS THE TABLE'S. `assessed.ranked` is already sorted by
+        `recommendations.rank()` -- severity, then depth into the severity
+        band, then key -- and nothing here re-sorts it. A second ordering in
+        this file would be a second judgment about which lever matters most,
+        undated and with no provenance, which is `RANKING_PROVENANCE`'s whole
+        subject.
+
+        THE UNMEASURED ONES ARE ROWS, not an omission. A knob whose reading has
+        no sample still exists, and the summary shows it dimmed with an empty
+        gauge: seeing that four knobs exist and two are already fine is what
+        stops the page becoming a list of complaints, and a metric that simply
+        vanished would be indistinguishable from a healthy one -- the defect
+        the table's explicit healthy entry exists to prevent, at the level
+        where it is hardest to see.
+
+        EVERY FIGURE IS READ OFF THE SAME `Assessment` THE LEVEL BELOW READS.
+        Not recomputed, not re-derived: `_assessment_payload()` and this method
+        are two renderings of one object, so the summary and the diagnosis
+        cannot disagree about a value, a severity or a directive. That is the
+        `RANKED_BY` discipline applied to a page split into levels, and
+        tests/test_serve.py asserts the two agree field by field.
+        """
+        rows = [
+            {
+                "metric": a.metric,
+                "measurement": a.measurement,
+                # WHAT THE NUMBER MEANS TO THE READER, beside the
+                # specification and never instead of it (#89 review). The
+                # summary row printed `measurement` because nothing else
+                # existed, and `measurement` is a definition -- exactly right
+                # under "Measures:" one level down, two lines of jargon on a
+                # row of advice. Both are the table's own words: a sentence
+                # composed here would be a claim with no date and no owner,
+                # which is what `RECOMMENDATION_PROVENANCE` is about.
+                "means": METRICS[a.metric].means,
+                "value": a.value,
+                "unit": METRICS[a.metric].unit,
+                "severity": a.severity,
+                # The module's own action-oriented phrase, composed from a
+                # closed registry inside `Lever`. Never assembled here: a
+                # directive built in this file from `action` and `target` would
+                # route around the guard that makes "reduce your cache reads"
+                # unrepresentable rather than merely absent.
+                "directive": None if a.lever is None else a.lever.directive,
+                "gauge": cls._gauge(METRICS[a.metric], a.value),
+            }
+            for a in assessed.ranked
+        ]
+        rows.extend(
+            {
+                "metric": key,
+                "measurement": METRICS[key].measurement,
+                # A metric with no sample still MEANS what it means and still
+                # HAS a unit: neither depends on whether this window measured
+                # one, and the boundaries drawn on an empty dial are in that
+                # unit whether or not a needle joins them. A row that lost its
+                # sentence when the sample went missing would say less about
+                # the absence than about the reading.
+                "means": METRICS[key].means,
+                "unit": METRICS[key].unit,
+                # THREE NULLS, and none of them a zero. No reading, no
+                # severity, nothing to do -- the gauge below carries no needle
+                # for the same reason, and `unmeasured_note` beside it says so
+                # in words.
+                "value": None,
+                "severity": None,
+                "directive": None,
+                "gauge": cls._gauge(METRICS[key], None),
+            }
+            for key in assessed.unmeasured
+        )
+        return rows
+
+    @classmethod
+    def _gauge(cls, metric: Metric, value: Optional[float]) -> dict[str, Any]:
+        """A metric's ranges as a drawable sweep. NO NUMBER ORIGINATES HERE.
+
+        The gauge is a VISUALISATION OF THE TABLE and needs no new judgment:
+        the coloured arcs are the metric's own ranges with their own
+        severities, the ticks are its own boundaries carrying their own
+        per-boundary provenance, the target is the edge of its own healthy
+        range, and the needle is this window's measured value. A boundary
+        authored in this method, or in `index.html`, would be a threshold with
+        no date, no provenance and nothing to redline -- the alternative
+        `recommendations.py` was written to replace, reappearing in the layer
+        that draws it.
+
+        WHAT IS ADDED IS GEOMETRY, WHICH IS NOT A JUDGMENT. Each range gets an
+        equal share of the sweep -- `1 / len(ranges)` -- and a value sits at
+        the fraction of the way through its own range. Equal shares rather than
+        a linear value axis because a linear one would need a maximum, and no
+        metric here has one: the top range of every metric is unbounded on
+        purpose, and inventing a ceiling to draw against is exactly the
+        `depth_in_band()` refusal one module over.
+
+        POSITION IS ALONG THE VALUE AXIS, NEVER ALONG HARM. `depth_in_band()`
+        is called with `WORSE_WHEN_HIGHER` for every metric, which here means
+        "further right", not "worse" -- it is the function's own left-to-right
+        reading, and it carries the rule that an unbounded band is measured by
+        the reciprocal of its entry boundary rather than against a made-up
+        ceiling. Which end is the good one is a separate published field,
+        `worse_when`, read straight off the metric.
+
+        `needle` is None -- never 0.0 -- for a metric with no sample. A needle
+        resting at the left of the dial is a reading of zero, which for four of
+        the five metrics here is the WORST possible one; drawing absence there
+        would be this repository's central rule failing in a new visual form.
+        """
+        ranges = metric.ranges
+        span = len(ranges)
+        target = cls._healthy_edge_index(metric)
+        return {
+            # Which direction the reader should want to move, from the table.
+            "worse_when": metric.worse_when,
+            "segments": [
+                {
+                    "severity": entry.recommendation.severity,
+                    "start": i / span,
+                    "end": (i + 1) / span,
+                }
+                for i, entry in enumerate(ranges)
+            ],
+            # The CUT POINTS, one per internal boundary. The first range's
+            # lower edge is not one of them: it is the domain floor -- a share
+            # cannot be negative -- so it is where the dial starts rather than
+            # a line anybody drew. Each carries the KIND and the STATEMENT of
+            # its own provenance, so a judged cut point and a documented one
+            # are distinguishable on the dial itself and not only in a table
+            # one level down (#31's `band_provenance` rule, at #78's grain).
+            "boundaries": [
+                {
+                    "value": entry.lower.value,
+                    "position": i / span,
+                    "kind": entry.lower.provenance.kind,
+                    "statement": entry.lower.provenance.statement,
+                    # The one the reader is aiming for: the edge of the healthy
+                    # range, which already exists and is already provenanced.
+                    "is_target": i == target,
+                }
+                for i, entry in enumerate(ranges)
+                if i > 0
+            ],
+            "needle": None if value is None else cls._gauge_position(metric, value),
+        }
+
+    @staticmethod
+    def _healthy_edge_index(metric: Metric) -> Optional[int]:
+        """Which boundary the healthy range ends at, by index into `ranges`.
+
+        Derived from the table, twice over: which ranges are healthy is the
+        entries' own severity, and which of the healthy run's two edges faces
+        the harm is the metric's own `worse_when`. Nothing here decides where
+        the number is.
+
+        None when no range is healthy at all. No metric is shaped that way
+        today, and the honest answer if one ever is would be that there is
+        nothing to aim for -- not a target picked from whichever end came
+        first.
+        """
+        healthy = [
+            i
+            for i, entry in enumerate(metric.ranges)
+            if entry.recommendation.severity == SEVERITY_OK
+        ]
+        if not healthy:
+            return None
+        # `ranges` is ordered low to high, so the boundary between the healthy
+        # run and its neighbour is above the run where higher is worse and
+        # below it where lower is. Boundary `i` IS `ranges[i].lower`, and
+        # adjacent ranges share one `Boundary` object, so either spelling names
+        # the same number with the same provenance.
+        if metric.worse_when == WORSE_WHEN_HIGHER:
+            return healthy[-1] + 1
+        return healthy[0]
+
+    @staticmethod
+    def _gauge_position(metric: Metric, value: float) -> float:
+        """Where `value` sits along the sweep, in [0, 1].
+
+        `range_for()` decides which range, so the drawing and the advice agree
+        by construction: the needle cannot land under an arc the table would
+        not have put it under.
+        """
+        span = len(metric.ranges)
+        entry = metric.range_for(value)
+        index = next(i for i, r in enumerate(metric.ranges) if r is entry)
+        within = depth_in_band(
+            value,
+            entry.lower.value,
+            None if entry.upper is None else entry.upper.value,
+            WORSE_WHEN_HIGHER,
+        )
+        return (index + within) / span
+
+    # ----------------------------------------------------------------------
+    # #89: the four-dot status strip
+    # ----------------------------------------------------------------------
+
+    @classmethod
+    def _status(
+        cls,
+        health: dict[str, Any],
+        context: dict[str, Any],
+        recommendations: dict[str, Any],
+    ) -> dict[str, Any]:
+        """The summary's one-line strip: four questions, four states.
+
+        STATUS, NOT CONTENT. Each dot says which of four states its question is
+        in and answers it in two or three words; everything that makes the
+        answer true is one level down, on the card that already states it.
+
+        EVERY ANSWER IS READ, NEVER RE-DERIVED. The three blocks arrive as
+        arguments -- the same objects the rest of the payload carries -- so a
+        dot cannot disagree with the card it summarises. A strip that ran its
+        own queries would be a fifth opinion in a payload that has spent this
+        much effort having one.
+        """
+        health_state, health_answer = STRIP_FROM_HEALTH[health["verdict"]]
+        utilisation = context["utilisation"]
+        context_verdict = utilisation["answer"]["verdict"]
+        context_state, context_answer = STRIP_FROM_CONTEXT[context_verdict]
+        # WHICH SCOPE, where there is a proven one and only there. The worst
+        # scope is the ranking's own winner, off the same tally question 2
+        # ranks on; where the answer is not a proven yes there is no winner to
+        # name and the verdict already says so.
+        if context_verdict == CONTEXT_ANSWER_YES and utilisation["worst_scope"]:
+            context_answer = f"{context_answer} — {utilisation['worst_scope']}"
+        knobs = recommendations["knobs"]
+        turnable = [k for k in knobs if k["directive"]]
+        knob_state, _ = cls._worst_strip_state(
+            [k["severity"] for k in knobs if k["severity"] is not None]
+        )
+        cache = [k["severity"] for k in knobs if k["metric"] in CACHE_METRICS]
+        cache_state, cache_answer = cls._worst_strip_state(
+            [severity for severity in cache if severity is not None]
+        )
+        answers = {
+            STRIP_DOT_BROKEN: (health_state, health_answer),
+            STRIP_DOT_CONTEXT: (context_state, context_answer),
+            # A COUNT, not a verdict in words: "2 of 5" says both how many
+            # knobs are worth turning and how many exist, and the second half
+            # is what stops a page of two rows reading as a page of two
+            # problems.
+            STRIP_DOT_KNOBS: (
+                knob_state,
+                f"{len(turnable)} of {len(knobs)}",
+            ),
+            STRIP_DOT_CACHE: (
+                cache_state,
+                cache_answer if cache_state != STRIP_UNKNOWN
+                else STRIP_CACHE_UNMEASURED,
+            ),
+        }
+        return {
+            "dots": [
+                {
+                    "key": key,
+                    "question": STRIP_QUESTIONS[key],
+                    "state": answers[key][0],
+                    "answer": answers[key][1],
+                }
+                for key in STRIP_DOTS
+            ]
+        }
+
+    @staticmethod
+    def _worst_strip_state(severities: list[str]) -> tuple[str, str]:
+        """The worst of a run of table severities, as a strip state.
+
+        NO SEVERITY ORDERING IS SPELLED HERE. `SEVERITY_RANK` is the module's
+        own explicit ordering -- not alphabetical and not declaration order --
+        and this reads it.
+
+        An EMPTY run is `STRIP_UNKNOWN`, never `STRIP_GOOD`. No reading is not
+        a clean reading, and a dot that went green because nothing was measured
+        is the exact failure this project is arranged against.
+        """
+        if not severities:
+            return STRIP_UNKNOWN, STRIP_CACHE_UNMEASURED
+        worst = max(severities, key=lambda s: SEVERITY_RANK[s])
+        return STRIP_FROM_SEVERITY[worst]
+
+    # ----------------------------------------------------------------------
+    # #89: the model mix -- an observation, and deliberately not advice
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _model_mix(models: list[dict[str, Any]]) -> dict[str, Any]:
+        """Which model this window's calls actually ran on.
+
+        WHY THIS IS NOT A RECOMMENDATION, and why it is not in the table. It is
+        a real measurement and plausibly the largest single lever on the page:
+        measured 2026-08-05 on this project's own corpus, 3,489 subagent
+        replies ran on Opus against 5 on Haiku. It is nonetheless NOT advice,
+        by owner decision -- routing work to a weaker model to save tokens can
+        cost more in rework than it saves, and CPB measures tokens and cannot
+        see rework. There is therefore no severity to give it, no lever to pull
+        and no direction to move, and `recommendations.assess_all()` would
+        rightly refuse a metric with none of those. So it is stated, never
+        prescribed, and it is read off `models` -- the breakdown the payload
+        already carries -- rather than measured again.
+
+        It names no tier and ranks no model against another. "The top tier" is
+        a claim about Anthropic's line-up that this project has not checked and
+        would have to date; the busiest model's own NAME is a measurement, and
+        the reader knows what they asked for.
+
+        `busiest` is None -- never a row of zeroes -- when the window holds no
+        call. `model` inside it may itself be None, which is a call whose model
+        the transcript never recorded: unmeasured, and rendered as such.
+        """
+        by_model: dict[Optional[str], int] = defaultdict(int)
+        for row in models:
+            by_model[row["model"]] += row["calls"]
+        busiest = None
+        if by_model:
+            # Deterministic beyond the count, so two models tied on calls do
+            # not swap places between requests over one unchanged database.
+            model, calls = sorted(
+                by_model.items(), key=lambda kv: (-kv[1], kv[0] or "")
+            )[0]
+            busiest = {"model": model, "calls": calls}
+        return {
+            "sample_is": MODEL_MIX_SAMPLE,
+            "sample_calls": sum(by_model.values()),
+            "models": len(by_model),
+            "busiest": busiest,
+        }
+
     @classmethod
     def _assessment_payload(cls, assessment: Assessment) -> dict[str, Any]:
         """One `Assessment`, flattened for JSON with its provenances intact.
@@ -1445,6 +2954,13 @@ class Api:
             "metric": assessment.metric,
             "measurement": assessment.measurement,
             "value": assessment.value,
+            # WHAT KIND OF NUMBER THIS IS (#89 review). Carried on BOTH
+            # renderings of a reading -- here and on the knob -- so the summary
+            # and the diagnosis show one figure one way. Two levels formatting
+            # `0.3034` as `30.3%` and as `0.3034` would be the same number in
+            # two voices, which is the drift a levelled page makes easy even
+            # when the value itself cannot move.
+            "unit": METRICS[assessment.metric].unit,
             "severity": assessment.severity,
             "recommendation": assessment.recommendation,
             "lever": cls._lever_payload(assessment.lever),
@@ -1670,6 +3186,10 @@ class Api:
         the same number as `context.mean`, over the same sample -- one
         definition of "measured", used by both.
 
+        `ingest` and `context` are each computed ONCE and handed to `_health()`
+        as well (#64), so the verdict at the top of the page and the figures it
+        qualifies are one reading rather than two.
+
         `context` is computed ONCE and handed to `_recommendations()`, which
         reads the main-thread saturation share off the same per-scope tally the
         page renders. Recomputing it there would put two definitions of "over
@@ -1685,14 +3205,33 @@ class Api:
             (start, end),
         ).fetchone()
         context = self._context(start, end)
+        ingest = self._ingest_health()
+        health = self._health(ingest, context)
+        models = self.models(start, end)
+        recommendations = self._recommendations(start, end, context)
         return {
             **dict(row),
-            "ingest": self._ingest_health(),
+            "ingest": ingest,
+            # #64: the VERDICT over the figures below, derived from the two
+            # blocks either side of it and from the census -- never computed a
+            # second time. It is built from `ingest` and `context` as ARGUMENTS
+            # for the same reason `_recommendations()` takes `context`: a
+            # verdict that ran its own queries would be a second opinion on the
+            # very numbers it qualifies.
+            "health": health,
             "context": context,
             "scope": self._scope(start, end),
             "durability": self._durability(start, end),
-            "models": self.models(start, end),
-            "recommendations": self._recommendations(start, end, context),
+            "models": models,
+            "recommendations": recommendations,
+            # #89's summary level. Both blocks are READINGS of what is already
+            # in this dict -- the strip of `health`, `context` and the table's
+            # own knobs; the mix of `models` -- so the level that says what to
+            # do and the levels that say why cannot report different numbers.
+            # `models` and `recommendations` are computed into locals above for
+            # exactly that reason: calling them twice would be two samples.
+            "status": self._status(health, context, recommendations),
+            "model_mix": self._model_mix(models),
         }
 
     def timeseries(self, start: float, end: float, by: str) -> dict[str, Any]:

@@ -11,7 +11,10 @@
 <script src="/vendor/chart.umd.min.js"></script>
 <script defer src="/vendor/alpine.min.js"></script>
 <style>
-  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2430; --muted:#67707c; --line:#e3e6ea; --accent:#2563eb; }
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2430; --muted:#67707c; --line:#e3e6ea; --accent:#2563eb;
+          --red:#b91c1c; --red-bg:#f7a8a8; --amber:#b45309; --amber-bg:#fbcf6b;
+          --neutral:#64748b; --neutral-bg:#cbd5e1; --ok:#15803d; --ok-bg:#a7d8b8;
+          --extra-bg:#a5b4fc; }
   * { box-sizing: border-box; }
   /* Alpine strips x-cloak once it boots; until then it hides the elements
      whose visibility x-show owns, so a panel cannot flash open empty. */
@@ -62,7 +65,226 @@
   .advice-cited { border-left:3px solid #0f766e; padding-left:8px; margin-left:6px; }
   .advice-structural { border-left:3px solid #9ca3af; padding-left:8px; margin-left:6px; }
   .util-band { display:inline-block; margin:0 16px 0 0; }
-  /* #70's two views, and the affordance between them. Named classes, never an
+  /* #64's verdict tones. THREE tones for three states, because the reader must
+     be able to tell "nothing is broken" from "we could not check" before
+     reading a word -- and an unchecked corpus that looked like a clean one
+     would be this whole feature failing at the last inch. #88 moved them onto
+     the question card, where they colour the ANSWER and the card's edge; the
+     card itself is the `.q` every other question uses, so no panel is added. */
+  .health-ok { border-left:4px solid var(--ok); }
+  .health-unchecked { border-left:4px solid var(--amber); }
+  .health-failed { border-left:4px solid var(--red); }
+  .health-ok > div > .answer .tag { background:#ecfdf5; color:var(--ok); }
+  .health-unchecked > div > .answer .tag { background:#fef3c7; color:var(--amber); }
+  .health-failed > div > .answer .tag { background:#fee2e2; color:var(--red); }
+  .health-count { color:var(--muted); }
+  .check-line { display:block; margin-top:5px; font-size:12.5px; color:var(--muted); }
+  .check-line strong { color:var(--ink); }
+  /* #65: the method and the two provenances, moved behind a disclosure rather
+     than deleted. At the same weight as the finding they buried it; deleted,
+     the judged boundaries would lose their date and their separate voice.
+
+     #88 GENERALISED IT TO THE WHOLE OVERVIEW. Every question card keeps its
+     ANSWER at rest and puts its evidence in one of these, and the element is
+     native `<details>` on purpose: it needs no state, no binding and no
+     JavaScript, it is keyboard-reachable for free, and it survives a page
+     whose vendored Alpine bundle failed to load -- which is the fallback the
+     reader lands on if it ever does. The `:open` binding below only ever
+     DECIDES THE DEFAULT; the control itself works without it. */
+  .disclosure { display:block; margin-top:9px; border-top:1px solid var(--line); padding-top:8px; }
+  .disclosure > summary { cursor:pointer; font-weight:600; font-size:12px; color:var(--muted);
+                          list-style:none; user-select:none; }
+  .disclosure > summary::-webkit-details-marker { display:none; }
+  .disclosure > summary::before { content:"\25B8\00a0"; }
+  .disclosure[open] > summary::before { content:"\25BE\00a0"; }
+  .disclosure > summary:hover { color:var(--accent); }
+  /* #88: THE QUESTION CARD. The overview's whole idiom, and the reason the
+     `note-band` prose it replaces was unreadable: four numbered questions, the
+     question as a heading, the ANSWER stated large and first, and the evidence
+     one expansion down. `.panel` is still the DETAIL view's surface and is
+     untouched, so the two levels stay visibly different. */
+  .q { background:var(--card); border:1px solid var(--line); border-radius:11px;
+       padding:15px 18px 14px; margin-bottom:12px; }
+  /* #89: the one-line form of a card, used by the health verdict on the
+     summary level only. It is the same surface with the same tone and the same
+     verdict text -- what it loses is the padding a heading and a disclosure
+     needed, and nothing else. Never applied to a verdict that expands its own
+     evidence: see `healthOneLine`. */
+  .q.compact { padding:9px 18px; margin-bottom:10px; }
+  .q > h2 { font-size:15px; margin:0 0 9px; letter-spacing:-.01em; display:flex;
+            align-items:center; gap:8px; }
+  .q > h2 .num { width:20px; height:20px; line-height:20px; text-align:center; border-radius:50%;
+                 background:#eef2ff; color:#3730a3; font-size:11px; font-weight:700; flex:0 0 auto; }
+  /* THE ANSWER, and it is a size rather than a colour: the verdict must be the
+     first thing read on the card whatever tone it wears. */
+  .answer { font-size:15px; font-weight:600; letter-spacing:-.01em; line-height:1.4; }
+  .answer .tag { display:inline-block; border-radius:5px; padding:1px 7px; margin-right:6px;
+                 font-size:11px; font-weight:700; letter-spacing:.03em; background:#eef2ff; color:#3730a3; }
+  /* The three KINDS of claim an answer can be, as named classes rather than a
+     colour spelled at the binding: a measured problem, a measured all-clear,
+     and something not established. The health band colours its tag from the
+     card's own edge class; a question card has no edge, so the tone rides on
+     the tag -- and the state's own word is rendered inside it either way, so
+     the colour is never the only thing carrying the verdict. */
+  .answer .tag-alarm { background:#fee2e2; color:var(--red); }
+  .answer .tag-clear { background:#ecfdf5; color:var(--ok); }
+  .answer .tag-incomplete { background:#fef3c7; color:var(--amber); }
+  /* The KEY a ranking is ordered by, and the DATE a lookup table was decided:
+     small, but never hidden. A ranking whose key is one click away has not
+     named its key (serve.RANKED_BY's rule), and a judged table whose date is
+     one click away is a judgment presented as a fact. */
+  .answer-key { font-size:12px; color:var(--muted); margin-top:4px; }
+  .body { font-size:13px; color:var(--muted); margin-top:8px; }
+  .body strong { color:var(--ink); }
+  /* #88's SEGMENTED PROPORTIONAL METER -- the utilisation bands as pixels
+     rather than as a comma-separated sentence.
+     THE CENTRAL RULE IS IN `min-width` AND IN `barWidth()` TOGETHER: a nonzero
+     band keeps a visible minimum, and a TRUE ZERO GETS NO SEGMENT AT ALL, so
+     "rare" and "never" can never render as the same picture. `flex:0 1 X%`
+     rather than `0 0`, so the minimum widths shrink the others instead of
+     overflowing the track. */
+  .scope-row { margin-top:11px; }
+  .scope-head { display:flex; align-items:baseline; justify-content:space-between; gap:12px;
+                margin-bottom:5px; flex-wrap:wrap; }
+  .scope-n { color:var(--muted); font-size:12px; font-weight:400; }
+  .scope-share { font-size:12px; font-weight:600; }
+  .meter { display:flex; height:22px; border-radius:6px; overflow:hidden; background:var(--line); }
+  .seg { min-width:5px; }
+  .seg-hot { background:var(--red-bg); }
+  .seg-warm { background:var(--amber-bg); }
+  .seg-mid { background:var(--neutral-bg); }
+  .seg-cool { background:var(--ok-bg); }
+  /* A band the API sent that this page has no tone for still gets a VISIBLE
+     one, never the track's own colour: an uncoloured segment would be a band
+     rendered as an absence. Same direction as HEALTH_TONE_UNRECOGNISED. */
+  .seg-extra { background:var(--extra-bg); }
+  .legend { display:flex; flex-wrap:wrap; gap:2px 14px; margin-top:5px; font-size:11.5px; color:var(--muted); }
+  .legend strong { color:var(--ink); }
+  /* A REAL ZERO, rendered as a real zero and demoted rather than dropped: the
+     band is still listed, with its count of 0, in a weight that says nothing
+     happened there. Dropping the row would make it indistinguishable from a
+     band the API never sent. */
+  .legend .zero, .legend .zero strong { color:var(--muted); font-weight:400; }
+  .sw { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; }
+  /* #65's growth curve, as LABELLED BARS. A quarter with no sample gets NO bar
+     at all -- an absence has no height -- while a nonzero one keeps a visible
+     minimum through the same `barWidth()` the meter segments use. */
+  .growth { display:flex; align-items:flex-end; gap:6px; height:76px; margin:10px 0 4px; }
+  .gcol { flex:1; height:100%; display:flex; align-items:flex-end; }
+  .gbar { width:100%; background:linear-gradient(180deg,#818cf8,#4338ca); border-radius:4px 4px 0 0;
+          display:flex; align-items:flex-start; justify-content:center; }
+  .gbar span { font-size:10px; font-weight:600; color:#fff; margin-top:3px; }
+  .glabels { display:flex; gap:6px; font-size:11px; color:var(--muted); }
+  .glabels > div { flex:1; text-align:center; }
+  /* #88's RANKED OPPORTUNITY ROWS: rank, what it is, the figure at the right.
+     The same readings that were four stacked paragraphs each. */
+  .opp { display:flex; gap:12px; align-items:flex-start; padding:10px 0; border-top:1px solid var(--line); }
+  .opp .rank { flex:0 0 22px; height:22px; line-height:22px; text-align:center; border-radius:50%;
+               background:#f1f3f5; color:var(--muted); font-size:11px; font-weight:700; }
+  .opp .txt { flex:1; font-size:13px; min-width:0; }
+  .opp .txt .h { font-weight:600; margin-bottom:2px; }
+  .opp .txt .d { color:var(--muted); font-size:12.5px; margin-top:2px; }
+  .opp .fig { flex:0 0 auto; text-align:right; }
+  .opp .fig .n { font-size:17px; font-weight:600; letter-spacing:-.01em; }
+  .opp .fig .u { font-size:11px; color:var(--muted); }
+  /* #88's NEXT STEPS: a numbered list, each item naming the figure that
+     justifies it. */
+  ol.next { margin:8px 0 0; padding-left:20px; font-size:13px; }
+  ol.next li { margin-bottom:8px; }
+  ol.next li:last-child { margin-bottom:0; }
+  ol.next .why { color:var(--muted); font-size:12.5px; display:block; }
+  /* #89's SUMMARY LEVEL. Two idioms, both named, neither an inline style
+     string: the four-dot status strip, and the knob row.
+
+     THE STRIP IS STATUS, NOT CONTENT -- one line, four questions, a coloured
+     dot and two or three words each. The four states come from the API
+     (`serve.STRIP_*`) and only the colours are this page's; `dot-unknown` is a
+     colour of its own rather than a paler `dot-watch`, because "we could not
+     check" and "we checked and it is middling" are different claims and a dot
+     is read before any word beside it. */
+  /* THE SUMMARY LEVEL'S OWN SURFACE. Not `.panel`, which is the raw-data
+     view's, and not `.q`, which is the question card: three levels that looked
+     alike would be three levels the reader cannot tell apart, and the level
+     distinction is the whole of #70 and #89. */
+  .board { background:var(--card); border:1px solid var(--line); border-radius:11px;
+           padding:15px 17px 8px; margin-bottom:14px; }
+  .board > h2 { font-size:15px; margin:0 0 3px; letter-spacing:-.01em; }
+  .strip { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line);
+           border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-bottom:16px; }
+  .st { background:var(--card); padding:11px 13px; display:flex; align-items:center; gap:9px; }
+  .dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
+  .dot-good { background:var(--ok); }
+  .dot-watch { background:var(--amber); }
+  .dot-bad { background:var(--red); }
+  /* Neither green nor amber: an unestablished answer must not borrow either
+     verdict's look. Same direction as `HEALTH_TONE_UNRECOGNISED`. */
+  .dot-unknown { background:var(--neutral); }
+  .stq { font-size:11px; color:var(--muted); }
+  .sta { font-size:13px; font-weight:650; margin-top:1px; }
+
+  /* THE KNOB ROW: gauge, imperative, why, figure. A knob that does not apply
+     is DIMMED, not hidden -- seeing that five knobs exist and three are
+     already fine is information, and it is what stops this page becoming a
+     list of complaints. `.off` is opacity alone, so every word stays on
+     screen and selectable. */
+  /* Tight on purpose: the summary is the one level with a hard height budget,
+     and a knob row is one gauge, one imperative, one why and one figure. The
+     padding is the only thing here that can be spent without hiding a
+     measurement, so it is spent. */
+  .knob { display:grid; grid-template-columns:60px 1fr 150px; gap:14px; align-items:center;
+          padding:10px 0; border-top:1px solid var(--line); }
+  .knob:first-of-type { border-top:0; }
+  .knob.off { opacity:.55; }
+  .gauge { width:60px; height:40px; flex:0 0 auto; }
+  /* The dial's parts, coloured by CLASS so no severity, provenance kind or
+     colour is spelled at a binding. `gauge-track` is the sweep the arcs are
+     drawn over -- it is the DIAL, never a reading, so it is the same neutral
+     whether or not anything was measured. */
+  .gauge path { fill:none; stroke-linecap:round; }
+  .gauge-track { stroke:var(--line); stroke-width:7; }
+  .arc-ok { stroke:var(--ok-bg); stroke-width:7; }
+  .arc-watch { stroke:var(--amber-bg); stroke-width:7; }
+  .arc-act { stroke:var(--red-bg); stroke-width:7; }
+  /* An arc whose severity this build has no colour for is still VISIBLE, never
+     the track's own colour: an uncoloured segment would be a range rendered as
+     an absence. Same direction as `BAND_TONE_UNRECOGNISED`. */
+  .arc-extra { stroke:var(--extra-bg); stroke-width:7; }
+  /* One tick per cut point, in the voice of the boundary's own provenance. A
+     judged line and a documented one must not look alike on the dial for the
+     same reason they must not read alike in the table. */
+     Each sets `color` as well as `stroke`, because the same class marks the
+     tick on the dial AND the words beside it: one voice, one place. */
+  .tick-cited { stroke:#0f766e; color:#0f766e; stroke-width:2; }
+  .tick-judged { stroke:#818cf8; color:#4338ca; stroke-width:2; font-style:italic; }
+  .tick-structural { stroke:#9ca3af; color:#6b7280; stroke-width:2; }
+  /* The needle starts at the pivot and its round cap IS the hub, so a dial
+     with no reading has no pivot either -- a lone hub at the centre of an
+     empty dial still reads as an instrument pointing at something. */
+  .needle { stroke:var(--ink); stroke-width:3; }
+  .kh { font-size:14px; font-weight:650; letter-spacing:-.01em; }
+  .kh .tag { font-size:10px; font-weight:700; letter-spacing:.05em; padding:1px 5px;
+             border-radius:3px; margin-right:7px; vertical-align:1px; }
+  .tag-now { background:#fee2e2; color:var(--red); }
+  .tag-soon { background:#fef3c7; color:var(--amber); }
+  .tag-fine { background:#ecfdf5; color:var(--ok); }
+  /* An unmeasured knob's tag: neither an urgency nor a clean bill of health. */
+  .tag-none { background:#eef2ff; color:var(--neutral); }
+  .kw { font-size:12px; color:var(--muted); margin-top:3px; }
+  /* Every cut point of one dial, one click down. The metric key heads the
+     group because it is what ties a gauge to its whole reading at the details
+     level; on the row itself it was a debugging aid. */
+  .kcuts { margin-top:9px; }
+  .kcuts-h { font-size:11.5px; color:var(--muted); }
+  .kfig { text-align:right; }
+  .kfig .n { font-size:20px; font-weight:650; letter-spacing:-.02em; line-height:1.15; }
+  .kfig .aim { font-size:11px; margin-top:3px; }
+  .kfig .none { font-size:11px; color:var(--muted); margin-top:3px; }
+  /* An OBSERVATION, and visibly not a knob: no tag, no gauge, no target and no
+     arrow. The owner's decision is that model tier is a real measurement and
+     not advice, so it must not be able to be mistaken for a row above it. */
+  .observation { font-size:13px; }
+  .obs-note { display:block; color:var(--muted); font-size:12px; margin-top:4px; }
+  /* #70's views, and the affordance between them. Named classes, never an
      inline style string: the tab, the period line, the drill-down and the
      filter notice are each a repeated pattern, and this page's rule is that a
      repeated pattern gets a name. */
@@ -137,15 +359,27 @@
        ONCE below, in neither section; no summary path may be bound in both
        sections; and the one figure they genuinely share, the period, is a
        single getter. tests/test_serve.py's ReportViewSplitTest is the check. -->
+  <!-- #89 MADE IT THREE, and the tabs are ITERATED rather than written out.
+       One button per member of `VIEWS`, labelled from `VIEW_LABELS`, so a
+       fourth level could not be added without a tab appearing for it and a
+       level cannot lose its way in or its way back.
+
+       WHY THE URL KEY AND THE LABEL DIFFER FOR TWO OF THE THREE. `#view=
+       overview` and `#view=details` are what #70 shipped and what anyone who
+       bookmarked this report has. Re-using `details` for the middle level
+       would leave those links resolving to a DIFFERENT page from the one they
+       named -- a stable name over a changed meaning, which `docs/
+       versioning.md` calls the worst kind of break because nothing fails
+       loudly. So the keys stay put and the labels say what the levels are;
+       `VIEW_LABELS` is the one place the two are joined. -->
   <nav class="tabs" id="view-tabs">
-    <button type="button" :class="{ on: view === 'overview' }"
-            :aria-current="view === 'overview' ? 'page' : false"
-            @click="setView('overview')">Overview</button>
-    <button type="button" :class="{ on: view === 'details' }"
-            :aria-current="view === 'details' ? 'page' : false"
-            @click="setView('details')">Details &amp; raw data</button>
-    <span class="hint">Same numbers, two levels &mdash; the detail view holds every
-      panel this report has ever had.</span>
+    <template x-for="v in views" :key="v">
+      <button type="button" :class="{ on: view === v }"
+              :aria-current="view === v ? 'page' : false"
+              @click="setView(v)" x-text="viewLabel(v)"></button>
+    </template>
+    <span class="hint">Same numbers, three levels &mdash; what to do, why, and
+      every panel this report has ever had.</span>
   </nav>
 
   <!-- ONE banner element, three things that can want it: a failed load, the
@@ -239,16 +473,432 @@
     <template x-if="elapsedNote"><span x-text="elapsedNote"></span></template>
   </div>
 
-  <!-- ===================================================================
-       THE OVERVIEW. The landing view: what these numbers are, at what scale,
-       and what the dated recommendation table says about them.
+  <!-- #64: IS ANYTHING BLOWING UP? The first of #62's four questions, and the
+       one the report computed everything for and never answered.
 
-       The four questions #62 asks -- is anything blowing up, am I wasting
-       context, where can I optimise, what do I do next -- are #63 through #68
-       and are NOT here. This change is the container they fill; what it holds
-       today is what the report already had at this level, moved rather than
-       rewritten.
+       The page said "8,163 records parsed, 0 unparsed" and then stopped. A
+       reader scanning for alarm had to infer reassurance from the ABSENCE OF A
+       WARNING -- the exact inference this repository refuses to let a number
+       make. So the reassuring answer is stated, as the measurement it is.
+
+       IN THE CHROME, NOT IN A VIEW, and that placement is the substance rather
+       than the layout. A verdict on every figure in the report cannot be one
+       the reader navigates away from: it sits with the banner and the data-age
+       line, above both views, so there is one rendering and no way past it.
+       It also earns its space -- the banner's "No files ingested yet" notice
+       is gone, subsumed by the `records-parsed` check below, which says the
+       same thing and says which of "clean" and "unchecked" it is.
+
+       THREE STATES, NEVER TWO. `ok` is a positive statement; `unchecked` is
+       not a weaker `ok` but a different claim, and the tone class changes with
+       it so the difference is visible before a word is read. A corpus with no
+       `source_shape` rows has not been censused rather than been found clean,
+       and this band is where that distinction reaches a person.
+
+       THE PAGE DERIVES NOTHING. Every state, every count and every sentence is
+       read off `/api/summary`, which computes them from the same `ingest` and
+       `context` blocks the rest of this page renders -- so the verdict and the
+       figures it qualifies cannot disagree. The ONE thing the page adds is its
+       own load failure, and it may only ever RAISE the verdict: a response
+       that never arrived cannot be reassured about.
+
+       #88 GAVE IT THE SHAPE THE OTHER THREE QUESTIONS HAVE. It is #62's first
+       question, so it is the first question CARD -- numbered, with the question
+       as its heading and the verdict stated large. It stays chrome for the
+       reason above; the only thing that changed is that it now looks like what
+       it always was.
+
+       SIX LINES OF `OK -- check-name: full sentence` WAS THE DENSITY PROBLEM IN
+       MINIATURE, so the checks moved one expansion down and the verdict did
+       not. `healthOpen` decides the DEFAULT only, and only a FAILED verdict
+       opens itself: a problem must never sit behind a click the reader has to
+       know to make, and an `unchecked` one is not that problem. Measured on
+       this project's own database, `unchecked` is the PERMANENT state -- 58 of
+       59 sources were ingested before the census existed and are censused only
+       when they next change -- so a card that opened on it was a card open for
+       ever. The verdict line still says UNCHECKED, in its own tone, and says
+       the bill of health is incomplete. See `HEALTH_OPEN`.
+
+       #89 SHORTENS IT ON THE SUMMARY LEVEL ONLY, AND ONLY WHERE IT WAS ALREADY
+       COLLAPSED. The summary has a hard height budget and this card spends the
+       height of a heading and a disclosure control on it; at that level it
+       renders as one line -- the verdict tag and its statement, which is the
+       part that must survive -- with the numbered heading and the checks
+       control dropped. The checks themselves are one CLICK away, at the two
+       levels below, and the tabs to reach them are on screen throughout.
+
+       THE CONDITION IS `healthOpen` ITSELF, NOT A SECOND RULE. A verdict that
+       expands its own evidence -- `failed`, an unrecognised state, or a load
+       failure -- keeps the full card at EVERY level, so a proven failure can
+       never be the thing that got shortened. That is the hard constraint on
+       this change, and it is met by composition rather than by remembering:
+       one-lining is `view is the summary AND the verdict did not open itself`,
+       so `HEALTH_OPEN` decides both. See `healthOneLine` and `HEALTH_COMPACT`. -->
+  <section class="q" id="health-note" x-cloak x-show="summary"
+           :class="healthTone + (healthOneLine ? ' compact' : '')">
+    <!-- The numbered heading is question 1's, and it is what a level that is
+         not the four question cards can do without: the summary is not a list
+         of questions, and the verdict below states itself in words. -->
+    <template x-if="!healthOneLine"><h2><span class="num">1</span>Is anything blowing up?</h2></template>
+    <template x-if="summary && banner.loadFailure"><div>
+      <div class="answer"><span class="tag">CANNOT SAY</span>
+        This page's last load FAILED, so the figures below are not this
+        response's figures and no verdict over them would be about what you are
+        looking at. The banner above has the error; reload to re-measure.</div>
+    </div></template>
+    <template x-if="summary && !banner.loadFailure"><div>
+      <div class="answer"><span class="tag"
+             x-text="summary.health.verdict.toUpperCase()"></span>
+        <span x-text="summary.health.statement"></span></div>
+      <!-- One line per check, in the API's own order -- corpus first, then
+           what was read, then how old the reading is. NOT re-sorted by state
+           here: `verdict` above is the severity, and a list that reordered
+           itself would move a check under the reader every time its answer
+           changed. Consumed by iteration, so a check added server-side reaches
+           this card by construction.
+
+           Absent on the summary level, and only where the verdict collapsed
+           itself anyway: `healthOneLine` is false for every verdict that opens
+           its own evidence, so what is dropped here is a CLOSED control and
+           never the six lines of a proven failure. -->
+      <template x-if="!healthOneLine">
+      <details class="disclosure" id="health-detail" :open="healthOpen">
+        <summary>The checks behind that verdict, one line each</summary>
+        <template x-for="c in summary.health.checks" :key="c.check">
+          <span class="check-line">
+            <strong x-text="c.state.toUpperCase()"></strong> &mdash;
+            <strong x-text="c.check"></strong>:
+            <span x-text="c.statement"></span>
+            <!-- `count` and `of` are one unit or both null; `fmtCount` renders
+                 a null as the em-dash, never as 0, so "this database does not
+                 hold that total" cannot read as "the total is nothing". -->
+            <span class="health-count">[<span x-text="fmtCount(c.count)"></span>
+              of <span x-text="fmtCount(c.of)"></span>]</span>
+          </span>
+        </template>
+      </details>
+      </template>
+    </div></template>
+  </section>
+
+  <!-- ===================================================================
+       THE OVERVIEW (#88). #62's four questions, as four numbered cards.
+
+       WHAT THIS REPLACED, AND WHY THE REPLACEMENT IS STRUCTURAL. #63 through
+       #68 answered every one of those questions correctly and poured all four
+       answers into the `note-band` idiom this page already had: counted on the
+       built page, `context-line` x20 and `advice-line` x8 inside four bands.
+       Every figure was right and nothing was readable. The cause was not the
+       content but the brief -- each of those issues carried constraint 4 as
+       "displace or annotate, do not append", which is the right rule for
+       adding a detector to a dashboard and the WRONG rule for building a
+       landing page. #88 corrected it: the overview is a different LEVEL, not
+       another panel on a dashboard, and it is explicitly permitted to be
+       restructured. #70's argument, one level up.
+
+       CONSTRAINT 4 IS STILL SATISFIED, BY THE COUNT. The register in
+       tests/test_serve.py holds the same number of surfaces it held before:
+       the raw token deck and the scope band moved DOWN to the detail view --
+       they are inputs to these answers, not answers -- and the recommendation
+       band split into questions 3 and 4. Nothing was added net, and the detail
+       view kept every panel it had.
+
+       DENSITY SCALES WITH HOW MUCH IS WRONG. Each card states its ANSWER and
+       stops; its evidence -- meters, quarter medians, ranked rows, counts,
+       provenance -- sits in exactly one `<details>` below it. The `:open`
+       binding decides only the DEFAULT, and it decides it from the payload: a
+       card opens ITSELF when the API has PROVEN something to act on -- a
+       failed check, a scope at or above the judged boundary, a lever -- because
+       a problem must never be hidden behind a click the reader has to know to
+       make. Everything else collapses, and that INCLUDES the states that
+       merely could not be established.
+
+       WHY AN UNKNOWN COLLAPSES RATHER THAN OPENS, which is the correction #88
+       needed twice. The states that say "could not be checked" are the
+       PERMANENT ones: a corpus censused only when its files next change, a
+       metric with no sample because this project dispatches no subagents, a
+       model this build has no window for. Opened by those, a card is open on
+       every load for ever, by a condition the reader cannot clear and need not
+       act on -- and a density rule that never collapses anything is not one.
+       So each of those states states ITSELF at rest, in the API's own words
+       and with its own counts, and puts only the EVIDENCE one click down. A
+       healthy corpus is therefore a short quiet page, which is itself the
+       finding.
+
+       WHAT COLLAPSING MAY NOT COST. Collapsed is still rendered -- no field
+       lost a reader and `NOT_RENDERED` did not grow by one. A real 0 and a
+       missing sample still render differently, expanded or not. Both
+       provenances stay separate and dated. And a judged threshold whose
+       conclusion is a VISIBLE heading stays visible with it: the growth
+       shape's verdict and the judgment behind it are in the same region as
+       each other, so no card can assert a shape at rest while the judgment
+       that produced it sits behind a click.
        =================================================================== -->
+  <!-- ===================================================================
+       LEVEL 1: THE SUMMARY (#89). Gauges and knobs, one screen, minimal text.
+
+       THREE LEVELS OVER ONE PAYLOAD. #70 split the report into an overview and
+       the raw data; #89 puts a level above both, because the overview answers
+       "why?" and the question most readers arrive with is "what do I do?".
+       The four question cards are still there, one click down, with every
+       figure they had; nothing was removed at any level.
+
+       THE GAUGE NEEDS NO NEW JUDGMENT, AND THIS IS THE WHOLE POINT. A
+       prototype of this screen invented its targets ("aim under 1.5x"). This
+       one cannot: `recommendations.py` already carries, per metric, an ordered
+       set of ranges with severities and PER-BOUNDARY provenance, and the gauge
+       is a drawing of that table. The coloured arcs are its ranges, the ticks
+       are its boundaries in their own voices, the target is the edge of its
+       healthy range, and the needle is this window's reading. NO THRESHOLD IS
+       AUTHORED IN THIS FILE -- `serve.py` sends the positions and
+       tests/test_serve.py fails if any of the table's numbers appears in this
+       page as a literal. A threshold typed here would be a threshold with no
+       date, no provenance and nothing to redline, and the page and the advice
+       would become two enumerations free to disagree.
+
+       AN UNMEASURED METRIC GETS NO NEEDLE. Not a needle at zero: for four of
+       the five metrics zero is the WORST reading there is, so absence drawn at
+       rest would be this repository's central rule failing in a new visual
+       form. The dial is still drawn -- the table's shape exists whether or not
+       this window has a sample -- and the row says in the API's own words that
+       there is no reading.
+
+       A KNOB THAT DOES NOT APPLY IS DIMMED, NOT HIDDEN. Seeing that five knobs
+       exist and three are already fine is itself the finding, and it is what
+       keeps a page of advice from becoming a page of complaints.
+       =================================================================== -->
+  <section id="view-summary" x-cloak x-show="view === 'summary'">
+
+    <!-- The window every figure below covers, through the one getter that
+         composes it. A caption, not a panel -- the same decision `#overview-
+         period` and `#details-period` record. -->
+    <div class="period" id="summary-period">Covering <strong x-text="periodLabel"></strong>.
+      <button type="button" class="drill" @click="setView('overview')">Why? The four
+        questions behind this &rarr;</button>
+    </div>
+
+    <!-- THE STATUS STRIP: four questions, one line, status rather than
+         content. Every dot's state, question and answer is the API's
+         (`serve.STRIP_*`), composed there off the SAME `health`, `context` and
+         table readings the cards below and one level down render -- so a dot
+         cannot disagree with the card it summarises. Iterated, so a fifth
+         question added server-side reaches this strip by construction.
+
+         The colours are this page's, keyed on the API's four states through
+         `STRIP_DOT_TONE`; the state's own answer is rendered in words beside
+         it, so no verdict here is carried by colour alone. -->
+    <div class="strip" id="status-strip" x-cloak x-show="summary">
+      <template x-for="d in (summary ? summary.status.dots : [])" :key="d.key">
+        <div class="st">
+          <span class="dot" :class="dotTone(d.state)"></span>
+          <div>
+            <div class="stq" x-text="d.question"></div>
+            <div class="sta" x-text="d.answer"></div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- THE KNOBS. One row per metric in the dated table, in the table's own
+         ranked order -- worst first, then the ones with no sample. The page
+         does not rank, filter or threshold anything: `knobs` is the API's own
+         list and this template iterates it whole, so a healthy reading and an
+         unmeasured one both reach the screen and are told apart by what they
+         say rather than by one of them being absent. -->
+    <section class="board" id="knobs-note">
+      <h2>What you can change today</h2>
+      <div class="body">Worst first, in the dated table's own order. A row with
+        nothing to turn is dimmed, not hidden.</div>
+
+      <template x-for="k in (summary ? summary.recommendations.knobs : [])" :key="k.metric">
+        <div class="knob" :class="{ off: !k.directive }">
+          <!-- THE DIAL. Every `d` here is composed by `arcPathsFor`,
+               `tickPathsFor` and `needlePath` from POSITIONS the API sent; the
+               only numbers in this file are the viewBox's own geometry.
+
+               ONE PATH PER TONE, NOT ONE PER SEGMENT, and that is a parser
+               constraint rather than a preference: inside `<svg>` the HTML
+               parser is in foreign content, where `<template>` is an
+               SVG-namespaced element with no `.content` -- so an `x-for` here
+               would be a loop Alpine cannot run. Each `<path>` therefore
+               carries every subpath of its own tone at once, which SVG's `d`
+               takes natively. The `arc-extra` path is the load-bearing one: a
+               severity this build has no colour for still lands on a VISIBLE
+               path rather than being filtered off the dial, which is
+               `BAND_TONE_UNRECOGNISED`'s rule in a second drawing.
+
+               NO NEEDLE WHERE THERE IS NO READING. `needlePath(null)` is the
+               empty string, which draws nothing at all -- not a needle resting
+               at the left of the dial, which for four of these five metrics is
+               the worst reading there is. -->
+          <svg class="gauge" viewBox="0 0 60 40" aria-hidden="true">
+            <path class="gauge-track" :d="arcPath(0, 1)"></path>
+            <path class="arc-ok" :d="arcPathsFor(k.gauge.segments, 'arc-ok')"></path>
+            <path class="arc-watch" :d="arcPathsFor(k.gauge.segments, 'arc-watch')"></path>
+            <path class="arc-act" :d="arcPathsFor(k.gauge.segments, 'arc-act')"></path>
+            <path class="arc-extra" :d="arcPathsFor(k.gauge.segments, 'arc-extra')"></path>
+            <!-- THE CUT POINTS, AND THEIR VOICES. Each tone's ticks carry an
+                 SVG `<title>`, so the value of every boundary and the kind of
+                 claim it is are on the dial itself rather than in a caption
+                 reading "at 0.1 judged   at 0.25 judged", which was a debug
+                 dump of the table (#89 review). The same boundaries are stated
+                 in full, with their statements, in the disclosure below --
+                 which is where a reader goes looking. -->
+            <path class="tick-cited" :d="tickPathsFor(k.gauge.boundaries, 'tick-cited')">
+              <title x-text="tickTitleFor(k.gauge.boundaries, 'tick-cited', k.unit)"></title></path>
+            <path class="tick-judged" :d="tickPathsFor(k.gauge.boundaries, 'tick-judged')">
+              <title x-text="tickTitleFor(k.gauge.boundaries, 'tick-judged', k.unit)"></title></path>
+            <path class="tick-structural" :d="tickPathsFor(k.gauge.boundaries, 'tick-structural')">
+              <title x-text="tickTitleFor(k.gauge.boundaries, 'tick-structural', k.unit)"></title></path>
+            <path class="needle" :d="needlePath(k.gauge.needle)"></path>
+          </svg>
+
+          <div>
+            <!-- THE IMPERATIVE. `lever.directive` is the module's own
+                 action-oriented phrase, built from a closed registry, so this
+                 page can state a move that does not exist in the table only by
+                 the module inventing it first. A row with no lever says what
+                 it is instead of leaving a gap where the others have a verb. -->
+            <div class="kh">
+              <span class="tag" :class="urgencyClass(k.severity)"
+                    x-text="urgencyTag(k.severity)"></span>
+              <template x-if="k.directive"><span x-text="k.directive"></span></template>
+              <template x-if="!k.directive && k.severity"><span>Nothing to turn here</span></template>
+              <template x-if="!k.severity"><span>No reading in this period</span></template>
+            </div>
+            <!-- WHY, in the table's own words. This line used to print the
+                 metric's `measurement`, which is a precise DEFINITION -- "share
+                 of main-thread API calls whose context reaches at least half
+                 the model's documented window (context_window bands 50-to-90
+                 and at-least-90), over main-thread calls with a known window"
+                 -- exactly right one level down and two lines of jargon on a
+                 row of advice. It was the page's last density problem.
+
+                 `means` IS THAT SENTENCE, AND IT IS STILL THE TABLE'S. It sits
+                 on `recommendations.Metric` beside `measurement`, which is
+                 where prose about what a metric means belongs: written here it
+                 would be a claim with no date, no owner and nothing to check
+                 it against, which is why no advice on this page is authored in
+                 this file. `Metric.__post_init__` refuses a metric without
+                 one, so a metric added later cannot arrive here with nothing
+                 to say.
+
+                 `measurement` DID NOT GO ANYWHERE. It states itself in full in
+                 the disclosure at the foot of this panel, and under "Measures:"
+                 on the diagnosis card one level down. Moving a figure behind a
+                 disclosure is not dropping it. -->
+            <div class="kw" x-text="k.means"></div>
+          </div>
+
+          <!-- THE FIGURE, AND THE DIRECTION TO MOVE, both in the metric's own
+               unit (#89 review): a share prints as a percentage and a ratio as
+               a multiple, because that is how a reader holds them. `fmtUnit`
+               dispatches on the unit the API sent and never on a metric key,
+               and every formatter behind it renders a null as the em-dash this
+               page reserves for "nobody measured" -- so a missing reading can
+               never print like a measured zero, in any unit. -->
+          <div class="kfig">
+            <div class="n" x-text="fmtUnit(k.value, k.unit)"></div>
+            <template x-for="(b, i) in targetsOf(k.gauge)" :key="i">
+              <div class="aim" :class="tickVoice(b.kind)"
+                   :title="b.kind + ': ' + b.statement">
+                <span x-text="aimWord(k.gauge.worse_when)"></span>
+                <strong x-text="fmtUnit(b.value, k.unit)"></strong></div>
+            </template>
+            <template x-if="k.value === null">
+              <div class="none" x-text="summary.recommendations.unmeasured_note"></div>
+            </template>
+          </div>
+        </div>
+      </template>
+
+      <!-- WHERE THE BOUNDARIES ARE STATED IN FULL (#89 review). Every cut
+           point on every dial, with its value, the KIND of claim it is and the
+           sentence behind it -- and the metric key each dial belongs to, which
+           is the string that ties a gauge to its whole reading one level down.
+           None of that is a caption on a summary row; all of it is one click
+           away, marked in its own voice, which is where a reader who wants to
+           audit a line goes looking.
+
+           THE JUDGED THRESHOLD STAYS REACHABLE FROM ITS CONCLUSION. The
+           target IS the visible conclusion, it wears the voice class of the
+           boundary it names, it carries that boundary's kind and statement in
+           its own tooltip, and this list sits directly beneath it. -->
+      <details class="disclosure" id="knobs-provenance">
+        <summary>What each row measures, where its lines are drawn, and what
+          they are not</summary>
+        <span class="context-line">Every arc, tick and target above is a range in
+          one dated table, decided
+          <strong x-text="summary ? summary.recommendations.as_of : ''"></strong>.
+          Each range gets an equal share of the dial, the needle sits where this
+          window's reading falls, and a dial with no needle is a reading nobody
+          took. Nothing on this page decides where a line goes.</span>
+        <span class="context-line context-judged">Table:
+          <span x-text="summary ? summary.recommendations.provenance : ''"></span></span>
+        <template x-for="k in (summary ? summary.recommendations.knobs : [])" :key="k.metric">
+          <div class="kcuts">
+            <div class="kcuts-h"><span class="mono" x-text="k.metric"></span></div>
+            <!-- WHAT WAS DIVIDED BY WHAT. The row above says what the number
+                 MEANS; this says what it IS, in the table's own `measurement`
+                 -- the string a reader checks the figure against. It moved
+                 here from the row and was not dropped: a summary row cannot
+                 carry two lines of specification, and a specification nobody
+                 can reach is a figure nobody can audit. -->
+            <div class="kw" x-text="k.measurement"></div>
+            <template x-for="(b, i) in k.gauge.boundaries" :key="i">
+              <span class="advice-line" :class="provenanceVoice({ kind: b.kind })">
+                at <strong x-text="fmtUnit(b.value, k.unit)"></strong> &mdash;
+                <strong x-text="b.kind"></strong>:
+                <span x-text="b.statement"></span></span>
+            </template>
+          </div>
+        </template>
+      </details>
+    </section>
+
+    <!-- WORTH KNOWING, AND DELIBERATELY NOT A KNOB (#89, owner decision).
+
+         Model tier is a real measurement and plausibly the largest lever here.
+         It is NOT advice: routing work to a weaker model to save tokens can
+         cost more in rework than it saves, and CPB measures tokens and cannot
+         see rework. So this panel has no urgency tag, no gauge, no target and
+         no arrow -- there is nothing on it that says which way is better --
+         and it is a separate panel with a heading that says so, rather than a
+         dimmed row among things the reader IS being told to change. -->
+    <section class="board" id="observations-note">
+      <h2>Worth knowing &mdash; not something to change</h2>
+      <!-- THE FINDING STAYS AT REST; THE EXPLANATION MOVES (#89 review). The
+           observation itself -- which model ran how much of this window's work
+           -- is one line and is the whole point of the panel, so it is the
+           thing on screen. What sits behind the disclosure is the set it
+           ranges over and the REASON it is not advice: both are explanation of
+           a finding already stated, which is exactly the rule level 2 already
+           runs on. The heading says "not something to change" at rest, so the
+           owner's decision is never one click away; only its argument is. -->
+      <template x-if="summary && summary.model_mix.busiest"><div class="observation">
+        <strong x-text="fmtCount(summary.model_mix.busiest.calls)"></strong> of
+        <strong x-text="fmtCount(summary.model_mix.sample_calls)"></strong> API calls
+        ran on <span class="mono" x-text="orDash(summary.model_mix.busiest.model)"></span>,
+        with <span x-text="fmtCount(summary.model_mix.models)"></span> model(s) named
+        in all.
+        <details class="disclosure" id="observation-detail">
+          <summary>What this counts, and why it is not a knob</summary>
+          <span class="obs-note">Over <span x-text="summary.model_mix.sample_is"></span>.
+            Stated, not recommended: this report counts tokens and cannot see whether
+            a cheaper model would have needed more attempts, so there is no target
+            here and no direction to move.</span>
+        </details>
+      </div></template>
+      <template x-if="summary && !summary.model_mix.busiest"><div class="observation">
+        No call in this period named a model, so there is no mix to report &mdash;
+        unmeasured, not zero.
+        <span class="obs-note">Over <span x-text="summary.model_mix.sample_is"></span>,
+          of which this window holds
+          <span x-text="fmtCount(summary.model_mix.sample_calls)"></span>.</span>
+      </div></template>
+    </section>
+  </section>
+
   <section id="view-overview" x-cloak x-show="view === 'overview'">
 
     <!-- The period every figure below covers, NAMED. The time picker lives in
@@ -256,12 +906,795 @@
          rather than leave the reader to assume one -- and it says it through
          the same `periodLabel` the detail view's picker reports, because a
          period stated twice from two compositions is the drift this split
-         exists to prevent. -->
+         exists to prevent.
+
+         A CAPTION, NOT A PANEL, and the register says so: its twin
+         `#details-period` was never counted as one either, and #88 removed the
+         asymmetry rather than exploiting it. -->
     <div class="period" id="overview-period">Covering <strong x-text="periodLabel"></strong>.
+      <button type="button" class="drill" @click="setView('summary')">&larr; Back to
+        the summary</button>
       <button type="button" class="drill" @click="setView('details')">Change the
         period, or see every number behind this &rarr;</button>
     </div>
 
+  <!-- =====================================================================
+       QUESTION 2: AM I WASTING CONTEXT? (#31, #61, #65, #88)
+
+       THE FIRST LINE ANSWERS THE HEADING, and until #88's second pass it did
+       not. The card read "Most of it, of the scopes measured, is in your
+       main-thread", which is a LOCATION: a reader wanting yes or no got
+       neither, and "most of it" had no antecedent on the resting page, because
+       the meters that would give "it" a referent are one expansion down.
+
+       THE ANSWER IS CONDITIONAL ON THE MEASUREMENT, and it is the API that
+       decides it. A scope at or above the judged boundary answers YES and
+       names the scope with the share and the count that make it so; nothing
+       above the boundary answers NO, as a finding, exactly as an `ok` health
+       verdict is a positive statement rather than an absence. Where part of
+       the period could not be read against a window at all the answer says
+       that instead, because "no scope reached it" and "no scope reached it,
+       and a third of the calls could not be looked at" are different claims.
+       Five states, five sentences, all five in `serve.CONTEXT_ANSWER_*` --
+       none of them written here. A sentence typed into this template is a
+       claim nothing can check, which is how this branch once shipped the
+       heading "And it only ever grows." over a database that had sawtoothed.
+
+       THE KEY STAYS ON THE CARD. A ranking whose ordering key is one click
+       away has not named its key, so `worst_scope_ranked_by` sits with the
+       answer even though it is the longest string here -- and since #88 the
+       VALUE of that key sits there too. The evidence it is a ranking OVER --
+       the per-scope meters -- is what moved down.
+
+       TWO PROVENANCES, NEVER MERGED, and neither is deleted by the collapse.
+       The denominator is Anthropic's DOCUMENTED context window. Where the band
+       boundaries sit is a dated PRODUCT-OWNER JUDGMENT Anthropic publishes
+       nothing about. They are two statements, each led by what kind of claim
+       it is and the judged one visually marked, because presenting the second
+       in the first's voice would borrow an authority this project has not
+       earned -- which is the whole reason the API carries them as two fields
+       with two dates. The judged one also PRODUCES the verdict above it, so it
+       stays on the resting card with the claim it produced.
+       ===================================================================== -->
+  <section class="q" id="context-note">
+    <h2><span class="num">2</span>Am I wasting context?</h2>
+    <template x-if="!summary"><div class="answer">Loading&hellip;</div></template>
+    <!-- A window with no measured context at all keeps its own branch, because
+         what follows it is a screen of meters over a sample that does not
+         exist -- but the SENTENCE is the API's, like every other state's. -->
+    <template x-if="summary && !summary.context.sample_calls"><div>
+      <div class="answer"><span class="tag" :class="contextTone"
+             x-text="summary.context.utilisation.answer.verdict.toUpperCase()"></span>
+        <span x-text="summary.context.utilisation.answer.statement"></span></div>
+      <div class="answer-key"><span x-text="fmtCount(summary.context.unmeasured_calls)"></span>
+        call(s) carry no context accounting at all &mdash; UNMEASURED, not zero.</div>
+    </div></template>
+    <template x-if="summary && summary.context.sample_calls"><div>
+      <!-- #89 TRIMMED THIS CARD TO ONE SENTENCE. The answer is now the API's
+           statement and nothing else; the scope that makes it so, and the
+           three counts that qualify it, moved into the disclosure below -- one
+           expansion down, not deleted. What did NOT move is the ranking key
+           and the two dates: a ranking whose key is one click away has not
+           named its key, and a judged boundary whose conclusion is visible has
+           to be visible with it. -->
+      <div class="answer"><span class="tag" :class="contextTone"
+             x-text="summary.context.utilisation.answer.verdict.toUpperCase()"></span>
+        <span x-text="summary.context.utilisation.answer.statement"></span>
+      </div>
+      <div class="answer-key">Ranked by
+        <span x-text="summary.context.utilisation.worst_scope_ranked_by"></span>.
+        Measured against each model's own documented window (table checked
+        <span x-text="summary.context.utilisation.windows_as_of"></span>), cut at
+        boundaries this project judges
+        (<span x-text="summary.context.utilisation.bands_as_of"></span>).</div>
+
+      <!-- WHAT THE ANSWER COULD NOT RANGE OVER, at rest and only when there is
+           some: the verdict above collapses its evidence unless it is a proven
+           yes, so a period that could not be fully read must say so on the
+           resting card rather than one click down. Counted three ways because
+           they are three different absences with three different remedies --
+           and each is a health check of its own one card up, which is where a
+           call measuring past its own window is reported as the FAILURE it is.
+           Silent on a clean corpus: a notice that never varies is one nobody
+           reads.
+
+           #89 LEFT THIS WHERE IT IS. The trim moves supporting prose, not the
+           statement that part of the period could not be read at all: an
+           absence behind a click is an absence the reader can act on the
+           figures without ever seeing. -->
+      <template x-if="summary.context.utilisation.unmeasured_calls
+                      || summary.context.utilisation.unknown_model_calls
+                      || summary.context.utilisation.over_window_calls"><div class="answer-key">
+        Not fully banded:
+        <span x-text="fmtCount(summary.context.utilisation.unmeasured_calls)"></span>
+        call(s) with no context accounting,
+        <span x-text="fmtCount(summary.context.utilisation.unknown_model_calls)"></span>
+        on a model with no documented window,
+        <span x-text="fmtCount(summary.context.utilisation.over_window_calls)"></span>
+        measuring above 100% of theirs.</div></template>
+
+      <!-- THE EVIDENCE. One disclosure, and `contextOpen` decides only its
+           DEFAULT: a proven YES opens the meters, because a problem must never
+           sit behind a click the reader has to know to make, and every other
+           state collapses because it has already stated itself above -- with
+           its counts -- and none of them is a thing to act on. An absence that
+           forced this open would hold it open for ever on any corpus that
+           carries one, which is the defect `HEALTH_OPEN` records.
+
+           #89 MOVED TWO THINGS IN HERE, both of them supporting prose rather
+           than the answer: the scope the ranking won on, and the three counts
+           the answer could not range over. Neither was deleted, and neither
+           lost a figure -- a proven YES opens this by default, so on the one
+           state where they matter most they are on screen without a click. -->
+      <details class="disclosure" id="context-detail" :open="contextOpen">
+        <summary>The meters, the growth curve, and how all of it is computed</summary>
+
+        <!-- WHAT MAKES THE ANSWER SO, and it is the ranking's own winner with
+             the VALUE of the key it was ranked by. Both figures come off the
+             winning row server-side, so this line and the meters below it
+             cannot be two derivations of one number. Absent when no scope
+             ranked -- there is no winner to name, and the verdict above
+             already says so. -->
+        <template x-if="summary.context.utilisation.worst_scope !== null">
+          <span class="context-line">Highest scope:
+            <strong x-text="summary.context.utilisation.worst_scope"></strong>,
+            <strong x-text="fmtPct(summary.context.utilisation.worst_scope_over_half_window_share)"></strong>
+            (<span x-text="fmtCount(summary.context.utilisation.worst_scope_over_half_window_calls)"></span>)
+            of its banded calls at or above half the window.</span>
+        </template>
+
+        <!-- The prose that qualified those three counts, one expansion down
+             rather than three lines into the resting card. The COUNTS stay
+             above; what moved is the sentence explaining what they mean. -->
+        <span class="context-line">Of the counts above, the first two are
+          UNKNOWN rather than low; the third is impossible, so treat the bands
+          as suspect rather than those calls as extraordinary.</span>
+
+        <!-- #61: SCOPED FIRST, POOLED SECOND.
+
+             Measured 2026-08-05 over this project's own transcripts (44
+             sources, 8,163 records, 0 unparsed), 2,722 banded calls:
+
+                 scope        banded   >=90% of the window
+                 main-thread     390   52 (13.3%)
+                 subagent      2,332    0  (0.0%)
+                 pooled        2,722   52  (1.9%)
+
+             Every red-band call was main-thread; not one was a subagent. 2,332
+             healthy subagent calls dilute 390 main-thread ones 6:1, so the
+             pooled share erases the one scope the reader can act on -- and it
+             moves the WRONG WAY under the condition it exists to detect,
+             because a saturated orchestrator dispatches MORE subagents, which
+             pushes the pooled share down.
+
+             #88 DREW IT. The four shares were a comma-separated sentence per
+             scope; they are now one proportional meter per scope, and the
+             central rule of this whole change lives in `barWidth()` and in
+             `.seg`'s `min-width` together: a NONZERO band keeps a visible
+             minimum, and a TRUE ZERO GETS NO SEGMENT AT ALL. The band is still
+             listed in the legend beside it, with its count of 0 in a muted
+             weight, so "rare" and "never" differ in the picture AND the zero
+             is still stated as the measurement it is. -->
+        <template x-for="s in summary.context.utilisation.by_scope" :key="s.scope">
+          <div class="scope-row">
+            <div class="scope-head">
+              <!-- THE LEAD names the scope, and it is the FIRST thing on the
+                   row rather than merely somewhere on it. `scope-lead` exists
+                   so a test can assert THIS rendering: the drill button at the
+                   foot of the row also spells `s.scope`, so an assertion that
+                   the name appears "in the loop" was satisfiable by the button
+                   alone and would have survived deleting the lead -- a figure
+                   whose set is named only in a link to somewhere else. -->
+              <div><strong class="scope-lead" x-text="s.scope"></strong>
+                <span class="scope-n"><span x-text="fmtCount(s.banded_calls)"></span>
+                  banded call(s) of <span x-text="fmtCount(s.calls)"></span>,
+                  <span x-text="fmtCount(s.sample_calls)"></span> measured</span></div>
+              <!-- #65: the reading the ANSWER above is ranked on, shown per
+                   scope so the ranking can be audited against the thing it
+                   ranked. Both the count and the share, because a share with
+                   no count cannot be checked against the denominator. -->
+              <div class="scope-share"><span x-text="fmtPct(s.over_half_window_share)"></span>
+                (<span x-text="fmtCount(s.over_half_window_calls)"></span>) at or
+                above half the window</div>
+            </div>
+            <!-- A scope with no banded sample is a NAMED ABSENCE, not four
+                 bands of 0.0%. Four zero bands is a true statement three
+                 different ways -- the scope ran nothing, it ran calls that
+                 carried no context measurement, it ran measured calls on
+                 models with no documented window -- with three different
+                 remedies, and every `share` beside them is null rather than
+                 0.0. The API says which; the page says it instead of drawing
+                 a meter. -->
+            <template x-if="s.no_sample_reason"><div class="body">
+              <strong>No banded sample</strong> &mdash;
+              <span x-text="s.no_sample_reason"></span>
+              (<span x-text="fmtCount(s.calls)"></span> call(s),
+              <span x-text="fmtCount(s.sample_calls)"></span> with a measured
+              context). A share of an empty set is not 0%, so no meter is drawn.
+            </div></template>
+            <template x-if="!s.no_sample_reason"><div>
+              <!-- Ordered high to low by the API, so the template neither
+                   sorts nor labels: the verdicts on the top two bands are the
+                   data layer's words, and only those two carry one because
+                   only those two were judged. Keyed on the band rather than on
+                   the loop index, because the band IS the row's identity. The
+                   TONE is keyed on position, because the page may not spell a
+                   band's name -- `bandTone` falls back to a visible colour, so
+                   a band this build has no tone for is never drawn as the
+                   track's own background, which would be an absence. -->
+              <div class="meter">
+                <template x-for="(b, i) in s.bands" :key="b.band">
+                  <template x-if="barWidth(b.share) !== null">
+                    <span class="seg" :class="bandTone(i)" :title="bandRange(b)"
+                          :style="'flex:0 1 ' + barWidth(b.share) + '%'"></span>
+                  </template>
+                </template>
+              </div>
+              <div class="legend">
+                <template x-for="(b, i) in s.bands" :key="b.band">
+                  <span :class="b.calls ? '' : 'zero'" :title="bandRange(b)">
+                    <i class="sw" :class="bandTone(i)"></i>
+                    <strong x-text="fmtCount(b.calls)"></strong>
+                    <span x-text="b.label"></span>
+                    (<span x-text="fmtPct(b.share)"></span>)</span>
+                </template>
+              </div>
+            </div></template>
+            <!-- The three caveats, per scope, as TALLIES. The prose that
+                 explains what each one means is stated ONCE with the pooled
+                 figures below. -->
+            <div class="body">
+              <template x-if="s.unmeasured_calls"><span>
+                <span x-text="fmtCount(s.unmeasured_calls)"></span> carried no
+                context accounting. </span></template>
+              <template x-if="s.unknown_model_calls"><span>
+                <span x-text="fmtCount(s.unknown_model_calls)"></span> on a model
+                with no documented window
+                (<span x-text="s.unknown_models.join(', ')"></span>). </span></template>
+              <template x-if="s.over_window_calls"><span>
+                <strong>INCONCLUSIVE:</strong>
+                <span x-text="fmtCount(s.over_window_calls)"></span> above 100% of
+                the window. </span></template>
+              <!-- #70: this scope's counterpart in the detail view, NAMED and
+                   FILTERED. Utilisation is measured against each model's OWN
+                   documented window, so "which models did this scope's calls
+                   run on, and what did they cost" is the row set behind this
+                   line. The filter is `s.scope` compared against
+                   `models[].scope`: BOTH ends are the payload's own
+                   `SCOPE_LABELS` string, so the page invents no equivalence.
+                   That is why the link is not into the outlier table, which
+                   would look like the sharper drill-down: an outlier row
+                   carries `is_sidechain`, the record's own flag, and NOT the
+                   `source_kind` every scoped figure here is derived from. -->
+              <button type="button" class="drill"
+                      @click="showPanel('models', { scope: s.scope })">See the models
+                <span x-text="s.scope"></span> calls ran on &rarr;</button>
+            </div>
+          </div>
+        </template>
+
+        <!-- #82 GROUP 1, CONSUMED RATHER THAN DELETED. `serve.py` has always
+             computed a mean context and its two sample counts PER SCOPE, and
+             the page showed none of them. They are the per-scope companions of
+             the pooled mean below, and they belong beside the meters: the
+             bands say how many calls were near the limit, and these say how
+             big a typical call in that scope was at all. Each scope names
+             ITSELF from the payload, so the page invents no mapping between
+             the bucket key and the label the meters are keyed on.
+
+             Absence survives both numbers: a scope whose calls all measured
+             nothing has a null mean, rendered as the em-dash by
+             `fmtTokRounded`, with `unmeasured_calls` beside it saying so. -->
+        <div class="body">Typical size, by scope &mdash; each mean over that
+          scope's OWN measured calls, never the pooled sample:
+          <span class="util-band"><strong x-text="summary.scope.main_thread.scope"></strong>
+            <span x-text="fmtTokRounded(summary.scope.main_thread.avg_context)"></span>
+            over <span x-text="fmtCount(summary.scope.main_thread.context_calls)"></span>
+            measured call(s),
+            <span x-text="fmtCount(summary.scope.main_thread.unmeasured_calls)"></span>
+            carrying none</span>
+          <span class="util-band"><strong x-text="summary.scope.subagent.scope"></strong>
+            <span x-text="fmtTokRounded(summary.scope.subagent.avg_context)"></span>
+            over <span x-text="fmtCount(summary.scope.subagent.context_calls)"></span>
+            measured call(s),
+            <span x-text="fmtCount(summary.scope.subagent.unmeasured_calls)"></span>
+            carrying none</span>
+        </div>
+
+        <!-- #65: THE GROWTH CURVE -- the mechanism behind the meters above.
+
+             Measured 2026-08-05 over this project's own transcripts, typical
+             main-session context by quarter of its own life:
+
+                 97,436 -> 333,610 -> 514,413 -> 906,301
+
+             By the last quarter the TYPICAL reply sat at 90.6% of the window.
+             "Your context is large" and "your context only ever grows" are
+             different findings with different remedies.
+
+             THE SENTENCE OVER IT IS DERIVED, NOT WRITTEN HERE. This band
+             shipped in review with the heading "And it only ever grows.",
+             which was true of the figures above and false of the SAME DATABASE
+             three hours later: 277,945 -> 837,645 -> 297,343 -> 430,832, a
+             sawtooth, because the session compacted in between. A heading that
+             states a trend the numbers do not have is a wrong figure made of
+             words -- and worse than a wrong number, because nothing here
+             guards prose. So the verdict is `shape`, the sentence is
+             `shape_statement`, and both come off `/api/summary`.
+
+             THE JUDGED THRESHOLD SITS WITH THE VERDICT IT PRODUCED, in its own
+             voice and with its own date. #88 collapsed this whole block behind
+             a disclosure, which makes that rule BITE HARDER rather than
+             release it: the shape claim and the judgment behind it are in the
+             same region as each other, so no resting card can assert a shape
+             while the judgment sits one click further down.
+
+             NOT A SECOND CHART. Four points do not earn a canvas, and a canvas
+             would be a panel (constraint 4) -- so the curve is four labelled
+             bars drawn from the payload's own medians. A QUARTER WITH NO
+             SAMPLE IS A NAMED ABSENCE and gets NO BAR AT ALL: a bar of zero
+             height is indistinguishable from a bar this page decided not to
+             draw, and a bar drawn AT zero would show the context COLLAPSING in
+             a quarter that was merely idle. -->
+        <div class="body"><strong x-text="summary.context.growth.shape.toUpperCase()"></strong>
+          &mdash; <strong x-text="summary.context.growth.shape_statement"></strong>
+          Typical context in your
+          <strong x-text="summary.context.growth.scope"></strong>, over
+          <span x-text="fmtCount(summary.context.growth.calls)"></span> reply/replies
+          from <span x-text="fmtTs(summary.context.growth.first_ts)"></span> to
+          <span x-text="fmtTs(summary.context.growth.last_ts)"></span>. The sample is
+          <span x-text="summary.context.growth.sample_is"></span>.
+          <!-- The evidence the verdict is checked against, and the reason it is
+               rendered for every shape rather than only for `rose-then-fell`:
+               it is a true statement about any curve that has a sample at all,
+               and a reader auditing "it peaked in the quarter named below"
+               needs the quarter named. Null when no quarter carries a median
+               -- an absence, never Q0. -->
+          <template x-if="summary.context.growth.peak_quarter !== null"><span>
+            The largest typical quarter is
+            <strong>Q<span x-text="fmtCount(summary.context.growth.peak_quarter)"></span></strong>.
+          </span></template>
+          <!-- A corpus too small to quarter says so rather than drawing four
+               bars from three points. The floor is DERIVED (see
+               `GROWTH_MIN_CALLS`), and it is stated so the reader can see how
+               far short they are. The quarter counts are still shown: they are
+               true, and what is withheld is only the claim that they trend. -->
+          <template x-if="summary.context.growth.refused_reason"><span>
+            <strong>No trend is claimed here</strong> &mdash;
+            <span x-text="summary.context.growth.refused_reason"></span>. That
+            needs at least
+            <span x-text="fmtCount(summary.context.growth.minimum_calls)"></span>
+            measured replies in this period; the quarters below are true counts,
+            not a curve.
+          </span></template>
+        </div>
+        <span class="context-line context-judged">Shape threshold
+          (<span x-text="summary.context.growth.shape_as_of"></span>):
+          <span x-text="summary.context.growth.shape_provenance"></span></span>
+        <div class="growth">
+          <template x-for="q in summary.context.growth.quarters" :key="q.quarter">
+            <div class="gcol">
+              <template x-if="barWidth(q.median_utilisation) !== null">
+                <div class="gbar" :style="'height:' + barWidth(q.median_utilisation) + '%'"
+                     :title="fmtPct(q.median_utilisation)"><span
+                     x-text="fmtTok(q.median_context)"></span></div>
+              </template>
+            </div>
+          </template>
+        </div>
+        <div class="glabels">
+          <template x-for="q in summary.context.growth.quarters" :key="q.quarter">
+            <div>Q<span x-text="q.quarter"></span>
+              <template x-if="q.no_sample_reason"><span> &mdash;
+                <strong>no sample</strong>:
+                <span x-text="q.no_sample_reason"></span>. No bar is drawn,
+                because an absence has no height.</span></template>
+              <template x-if="!q.no_sample_reason"><span>
+                &middot; <span x-text="fmtPct(q.median_utilisation)"></span>
+                of the window over
+                <span x-text="fmtCount(q.banded_calls)"></span> banded,
+                <span x-text="fmtCount(q.calls)"></span> measured
+                (<span x-text="fmtTs(q.from_ts)"></span> &ndash;
+                <span x-text="fmtTs(q.to_ts)"></span>)</span></template>
+            </div>
+          </template>
+        </div>
+
+        <!-- The POOLED tally, DEMOTED below the scoped ones and carrying the
+             name of the set it spans. Kept rather than deleted: it is still the
+             honest answer to "of every call in this window, how many were red",
+             and it is the denominator the bands + unknown + unmeasured
+             partition is checked against. What was wrong with it was never the
+             arithmetic -- it was that it did not name its set. It gets the same
+             meter as the scopes, so the dilution is VISIBLE as a shape rather
+             than only stated. -->
+        <div class="scope-row">
+          <div class="scope-head">
+            <div><strong>Pooled across
+              <span x-text="summary.context.utilisation.includes"></span></strong>
+              <span class="scope-n">the same calls under one denominator, which is
+                where the split above disappears &mdash;
+                <span x-text="fmtCount(summary.context.utilisation.banded_calls)"></span>
+                banded of <span x-text="fmtCount(summary.context.utilisation.calls)"></span>
+                (<span x-text="fmtCount(summary.context.utilisation.sample_calls)"></span>
+                measured,
+                <span x-text="fmtCount(summary.context.utilisation.unmeasured_calls)"></span>
+                not)</span></div>
+            <div class="scope-share"><span
+                x-text="fmtPct(summary.context.utilisation.over_half_window_share)"></span>
+              (<span x-text="fmtCount(summary.context.utilisation.over_half_window_calls)"></span>)
+              at or above half the window</div>
+          </div>
+          <template x-if="summary.context.utilisation.no_sample_reason"><div class="body">
+            <strong>No banded sample:</strong>
+            <span x-text="summary.context.utilisation.no_sample_reason"></span>.
+          </div></template>
+          <template x-if="!summary.context.utilisation.no_sample_reason"><div>
+            <div class="meter">
+              <template x-for="(b, i) in summary.context.utilisation.bands" :key="b.band">
+                <template x-if="barWidth(b.share) !== null">
+                  <span class="seg" :class="bandTone(i)" :title="bandRange(b)"
+                        :style="'flex:0 1 ' + barWidth(b.share) + '%'"></span>
+                </template>
+              </template>
+            </div>
+            <div class="legend">
+              <template x-for="(b, i) in summary.context.utilisation.bands" :key="b.band">
+                <span :class="b.calls ? '' : 'zero'" :title="bandRange(b)">
+                  <i class="sw" :class="bandTone(i)"></i>
+                  <strong x-text="fmtCount(b.calls)"></strong>
+                  <span x-text="b.label"></span>
+                  (<span x-text="fmtPct(b.share)"></span>)</span>
+              </template>
+            </div>
+          </div></template>
+        </div>
+
+        <template x-if="summary.context.utilisation.unknown_model_calls"><div class="body">
+          <strong><span x-text="fmtCount(summary.context.utilisation.unknown_model_calls)"></span>
+          call(s)</strong> ran on a model this build has no documented window for
+          (<span x-text="summary.context.utilisation.unknown_models.join(', ')"></span>), so
+          their utilisation is <strong>UNKNOWN, not low</strong> &mdash; their context is
+          counted in the spread below and they are banded nowhere.
+          <!-- The second deep link, and the same rule: `unknown_models` and
+               `outliers[].model` are both the API's own model strings, so the
+               filter is one payload string matched against another. -->
+          <button type="button" class="drill"
+                  @click="showPanel('outliers', { models: summary.context.utilisation.unknown_models })">See
+            the heaviest calls on those models &rarr;</button>
+        </div></template>
+        <template x-if="summary.context.utilisation.over_window_calls"><div class="body">
+          <strong>INCONCLUSIVE:</strong>
+          <span x-text="fmtCount(summary.context.utilisation.over_window_calls)"></span> call(s)
+          measure ABOVE 100% of their model's window. That is impossible unless this
+          build's window table has gone stale, so treat the bands as suspect rather
+          than the calls as extraordinary.
+        </div></template>
+        <template x-if="summary.context.unmeasured_calls"><div class="body">
+          <span x-text="fmtCount(summary.context.unmeasured_calls)"></span> call(s) in this
+          period carry no context accounting at all. They are counted here and kept out
+          of the median, the mean and the bands &mdash; 0 is not a measurement of a
+          context, and banded it would file as the most frugal call on the report.
+        </div></template>
+
+        <!-- THE METHOD AND THE TWO PROVENANCES. Not deleted, and the
+             distinction matters: the judged band boundaries must stay dated
+             and stay in their own voice, or this card would present a
+             product-owner judgment in a documented fact's voice -- the failure
+             `band_provenance` exists as a separate field to prevent. What was
+             wrong was the WEIGHT. -->
+        <div class="body"><strong>Median, not mean.</strong> The mean over the
+          same sample is <span x-text="fmtTok(summary.context.mean)"></span>,
+          <span x-text="fmtRatio(summary.context.mean_over_median)"></span> the
+          median, and only
+          <span x-text="fmtPct(summary.context.share_above_mean)"></span> of
+          measured calls
+          (<span x-text="fmtCount(summary.context.calls_above_mean)"></span> of
+          <span x-text="fmtCount(summary.context.sample_calls)"></span>) sit
+          above it, so it describes the tail rather than a typical call.</div>
+
+        <!-- #25 CHANGED WHAT THIS SENTENCE COULD SAY. It used to read that the
+             window's `avg_context` was "a different figure over a different
+             set" from this block's `mean` -- true then, because `avg_context`
+             divided the same tokens across EVERY row including those that
+             reported no prompt accounting. The defect is fixed: both now run
+             through one predicate for what counts as a measurement, so they
+             are the same number over the same sample. Saying they differ would
+             now be the page asserting a discrepancy that no longer exists. -->
+        <div class="body"><strong>One sample, one definition.</strong>
+          The window's <em>avg_context</em> reads
+          <span x-text="fmtTokRounded(summary.avg_context)"></span> &mdash; the
+          same figure as the mean above rather than a second opinion on it,
+          because since #25 both are computed through one definition of what
+          counts as a measurement. A call that reported no prompt accounting is
+          excluded from both instead of being averaged in as a zero.</div>
+
+        <div class="body">Spread: <span x-text="contextSpread"></span></div>
+
+        <span class="context-line">Denominator:
+          <span x-text="summary.context.utilisation.window_provenance"></span></span>
+        <span class="context-line context-judged">Boundaries:
+          <span x-text="summary.context.utilisation.band_provenance"></span></span>
+      </details>
+    </div></template>
+  </section>
+
+  <!-- =====================================================================
+       QUESTION 3: WHERE CAN I OPTIMIZE? (#78, #79, #84, #88)
+
+       THE PAGE PERFORMS NO LOOKUP AND HOLDS NO THRESHOLD. Every boundary,
+       every severity, every word of advice and both provenances are read off
+       `/api/summary`. `tests/test_serve.py` asserts that none of the table's
+       prose appears in this file: advice that could be edited here would be
+       advice with no date, no provenance and no redline.
+
+       THE ANSWER IS THE BIGGEST LEVER, NAMED BY ITS FIGURE. `topOpportunity`
+       takes the FIRST ranked reading that carries a lever -- it does not rank,
+       it reads the order the API already published, and `recommendations.py`
+       guarantees the correspondence it relies on (a reading the table calls
+       healthy has no lever; one it does not, always has one). So "is there
+       anything to do" is the API's own answer, not a severity ordering this
+       page invented.
+
+       AN `ok` IS A POSITIVE STATEMENT and is rendered as one. Healthy entries
+       are shown, not omitted -- if "nothing to change here" were represented
+       by absence, healthy and unmeasured would render identically, which is
+       the rule this repository is built on. Unmeasured metrics get the API's
+       own `unmeasured_note` for the same reason, never a dash and never a 0.
+
+       THE FIFTH ENTRY NEEDED NO MARKUP (#84), and that is the structure
+       working rather than an oversight. `ranked` is iterated and `unmeasured`
+       is consumed whole, so a metric added to the table reaches this card by
+       construction, in whichever of the two it lands.
+
+       TWO VOICES, PER BOUNDARY. `#context-note` keeps the documented window
+       and the judged band boundaries in two separately marked voices. Here the
+       same rule runs one level down: a single range can have a CITED lower
+       edge and a JUDGED upper edge, so the marking is on the edge.
+       ===================================================================== -->
+  <section class="q" id="advice-note">
+    <h2><span class="num">3</span>Where can I optimize?</h2>
+    <template x-if="!summary"><div class="answer">Loading&hellip;</div></template>
+    <template x-if="summary"><div>
+      <template x-if="topOpportunity === null"><div class="answer">
+        <span class="tag">NOTHING</span> No reading in the dated table is
+        outside its healthy range, so there is no lever to pull.
+      </div></template>
+      <template x-if="topOpportunity !== null"><div class="answer">
+        Biggest first: <span class="mono" x-text="topOpportunity.metric"></span>
+        reads <strong x-text="fmtUnit(topOpportunity.value, topOpportunity.unit)"></strong> &mdash;
+        <strong x-text="topOpportunity.severity.toUpperCase()"></strong>.
+      </div></template>
+      <div class="answer-key">Each reading is looked up in a dated table of
+        ranges (decided <span x-text="summary.recommendations.as_of"></span>).
+        <!-- THE UNMEASURED COUNT IS THE PRICE OF COLLAPSING ON IT. This card
+             no longer opens itself for a metric with no sample -- a project
+             that dispatches no subagent has no main-to-subagent ratio and
+             never will, and a card held open by that is a card never collapsed
+             at all -- so the count stays at rest, beside the answer, saying in
+             the same breath that unmeasured is not healthy. WHICH metrics they
+             are is evidence, and evidence is what the disclosure holds. -->
+        <template x-if="Object.keys(summary.recommendations.unmeasured).length"><span>
+          <span x-text="Object.keys(summary.recommendations.unmeasured).length"></span>
+          of them could not be measured in this period, which is not the same as
+          healthy.</span></template></div>
+
+      <details class="disclosure" id="optimize-detail" :open="opportunitiesOpen">
+        <summary>Every reading, worst first &mdash; and where each range comes from</summary>
+        <span class="context-line context-judged">Table:
+          <span x-text="summary.recommendations.provenance"></span></span>
+        <span class="context-line context-judged">Order:
+          <span x-text="summary.recommendations.ranking_provenance"></span></span>
+
+        <template x-for="(a, i) in summary.recommendations.ranked" :key="a.metric">
+          <div class="opp">
+            <div class="rank" x-text="i + 1"></div>
+            <div class="txt">
+              <div class="h"><span class="mono" x-text="a.metric"></span></div>
+              <div class="d">Measures: <span x-text="a.measurement"></span></div>
+              <div class="d" x-text="a.recommendation"></div>
+              <!-- The lever is the machine-readable half, shown beside the
+                   prose so a reader can see WHAT is being changed and WHICH
+                   WAY without parsing the sentence. `directive` is composed in
+                   the module from a closed registry -- never here -- which is
+                   what makes "reduce your cache-read" unrepresentable rather
+                   than merely absent. -->
+              <template x-if="a.lever"><div class="d">Lever:
+                <strong x-text="a.lever.directive"></strong>
+                (<span x-text="a.lever.action"></span>
+                <span class="mono" x-text="a.lever.target"></span>).</div></template>
+              <!-- A healthy entry carries NO lever by construction, and says so
+                   rather than showing an empty space where the other rows have
+                   one. Absence with no explanation is the thing this page
+                   refuses to render. -->
+              <template x-if="!a.lever"><div class="d">No lever: this is a
+                healthy reading, so there is nothing here to change.</div></template>
+              <details class="disclosure">
+                <summary>Where this range comes from</summary>
+                <span class="advice-line">Range
+                  <strong x-text="fmtUnit(a.range_lower, a.unit)"></strong> to
+                  <strong x-text="a.range_upper === null ? 'no ceiling' : fmtUnit(a.range_upper, a.unit)"></strong>,
+                  <!-- The key the order was derived from, published beside the
+                       order it produced: `RANKED_BY`'s rule, and the reason
+                       `ranking_provenance` above is a field rather than a
+                       comment. -->
+                  ranked <span x-text="fmtMetric(a.depth_in_severity)"></span> into the
+                  <span x-text="a.severity"></span> band.</span>
+                <!-- The two edges, each in its own voice. Written out twice
+                     rather than looped, because a helper that reshaped them
+                     would spell the field names in JavaScript where the wiring
+                     guard cannot follow them to the payload. `covers` rides in
+                     the tooltip: it is a paragraph qualifying exactly what the
+                     citation does and does not cover. -->
+                <span class="advice-line" :class="provenanceVoice(a.lower_provenance)">
+                  Lower edge <span x-text="fmtUnit(a.range_lower, a.unit)"></span> &mdash;
+                  <strong x-text="a.lower_provenance.kind"></strong>:
+                  <span x-text="a.lower_provenance.statement"></span>
+                  <template x-if="a.lower_provenance.checked"><span>(<span
+                    x-text="a.lower_provenance.checked"></span>)</span></template>
+                  <template x-if="a.lower_provenance.source"><span>Source:
+                    <span class="mono" :title="a.lower_provenance.covers"
+                          x-text="a.lower_provenance.source"></span>
+                    &mdash; hover for what it covers.</span></template>
+                </span>
+                <template x-if="a.upper_provenance">
+                  <span class="advice-line" :class="provenanceVoice(a.upper_provenance)">
+                    Upper edge <span x-text="fmtUnit(a.range_upper, a.unit)"></span> &mdash;
+                    <strong x-text="a.upper_provenance.kind"></strong>:
+                    <span x-text="a.upper_provenance.statement"></span>
+                    <template x-if="a.upper_provenance.checked"><span>(<span
+                      x-text="a.upper_provenance.checked"></span>)</span></template>
+                    <template x-if="a.upper_provenance.source"><span>Source:
+                      <span class="mono" :title="a.upper_provenance.covers"
+                            x-text="a.upper_provenance.source"></span>
+                      &mdash; hover for what it covers.</span></template>
+                  </span>
+                </template>
+              </details>
+            </div>
+            <div class="fig">
+              <div class="n" x-text="fmtUnit(a.value, a.unit)"></div>
+              <div class="u" x-text="a.severity"></div>
+            </div>
+          </div>
+        </template>
+
+        <!-- UNMEASURED IS NAMED, NEVER DROPPED. A metric with no sample that
+             simply vanished would be indistinguishable from a healthy one,
+             which is the defect the whole table exists to avoid -- so the
+             API's own note is rendered against each, and never a dash or a 0.
+
+             Consumed WHOLE, like `context.percentiles`: the keys are metric
+             names the server decides, so the page cannot name them in advance
+             and does not try. `e[0]` is the metric, `e[1]` what would have been
+             measured. -->
+        <template x-if="Object.keys(summary.recommendations.unmeasured).length"><div>
+          <div class="body"><strong>Not measured in this period.</strong></div>
+          <template x-for="e in Object.entries(summary.recommendations.unmeasured)" :key="e[0]">
+            <div class="opp">
+              <div class="rank">&mdash;</div>
+              <div class="txt">
+                <div class="h"><span class="mono" x-text="e[0]"></span></div>
+                <div class="d" x-text="summary.recommendations.unmeasured_note"></div>
+                <div class="d">Would measure: <span x-text="e[1]"></span>.</div>
+              </div>
+              <div class="fig"><div class="n">&mdash;</div>
+                <div class="u">no sample</div></div>
+            </div>
+          </template>
+        </div></template>
+      </details>
+    </div></template>
+  </section>
+
+  <!-- =====================================================================
+       QUESTION 4: WHAT DO I DO NEXT? (#67, #88)
+
+       THE SAME READINGS, AS MOVES. Question 3 is the diagnosis -- which figure
+       is out of range and by how much; this is the prescription, in the
+       table's own order, each move naming the figure that justifies it. Both
+       read `recommendations.ranked`, which is one payload path bound twice
+       within ONE view: they cannot disagree, because there is nothing between
+       them to drift.
+
+       THE PAGE COMPOSES NO ADVICE. `lever.directive` is the module's own
+       action-oriented phrase, built from a closed registry, so this list can
+       state a move that does not exist in the table only by the module
+       inventing it first.
+
+       A LIST WITH NO ITEMS IS A NAMED ABSENCE. Every reading being healthy is
+       a finding, not an empty `<ol>`: it is stated in words, in the same
+       branch that would otherwise carry the first move.
+       ===================================================================== -->
+  <section class="q" id="next-note">
+    <h2><span class="num">4</span>What do I do next?</h2>
+    <template x-if="!summary"><div class="answer">Loading&hellip;</div></template>
+    <template x-if="summary"><div>
+      <template x-if="topOpportunity === null"><div class="answer">
+        <span class="tag">NOTHING</span> No reading carries a lever, so there is
+        no move to make first. That is a measured verdict over the table, not an
+        empty list.
+      </div></template>
+      <template x-if="topOpportunity !== null"><div class="answer">
+        First: <strong x-text="topOpportunity.lever.directive"></strong>.
+      </div></template>
+      <div class="answer-key">In the order the dated table ranks them, each move
+        named by the figure that justifies it.
+        <!-- The same count as question 3's, for the same reason and on the
+             same card-by-card rule: a metric with no sample might have been
+             the first move, so a list that collapses on "no lever" must state
+             at rest how many readings never got one. -->
+        <template x-if="Object.keys(summary.recommendations.unmeasured).length"><span>
+          <span x-text="Object.keys(summary.recommendations.unmeasured).length"></span>
+          reading(s) could not be measured in this period, so no move is offered
+          for them &mdash; unmeasured, not healthy.</span></template></div>
+
+      <details class="disclosure" id="next-detail" :open="opportunitiesOpen">
+        <summary>Every move, in order</summary>
+        <ol class="next">
+          <template x-for="a in summary.recommendations.ranked" :key="a.metric">
+            <template x-if="a.lever">
+              <li><strong x-text="a.lever.directive"></strong>
+                <span class="why">Because
+                  <span class="mono" x-text="a.metric"></span> reads
+                  <strong x-text="fmtUnit(a.value, a.unit)"></strong>, which the dated
+                  table calls <strong x-text="a.severity"></strong>.
+                  <span x-text="a.recommendation"></span></span></li>
+            </template>
+          </template>
+        </ol>
+        <template x-if="topOpportunity === null"><div class="body">Nothing to
+          list: every measured reading sits inside its healthy range, so no
+          lever is offered. This is a positive statement about the table, not a
+          gap in it.</div></template>
+      </details>
+    </div></template>
+  </section>
+  </section>
+
+  <!-- ===================================================================
+       DETAILS & RAW DATA. Every panel this report has ever had, with its
+       behaviour intact: the time picker still filters, the chart still
+       switches groupings, every table still sorts by the key its heading
+       names. Nothing was removed by the split -- the panels below are the
+       page as it stood, moved one level down and reachable in one click.
+       =================================================================== -->
+  <section id="view-details" x-cloak x-show="view === 'details'">
+
+    <!-- The same `periodLabel` the overview names, so the two views cannot
+         state different periods: one getter, two bindings. The picker below
+         is the only thing on this page that OWNS `from`/`to`. -->
+    <div class="period" id="details-period">Showing <strong x-text="periodLabel"></strong>.
+      <button type="button" class="drill" @click="setView('overview')">&larr; Back to
+        the overview</button>
+    </div>
+
+  <div class="filters" id="filters">
+    <button :class="{ active: range === '1' }" @click="setRange(1)">24h</button>
+    <button :class="{ active: range === '7' }" @click="setRange(7)">7d</button>
+    <button :class="{ active: range === '30' }" @click="setRange(30)">30d</button>
+    <button :class="{ active: range === 'all' }" @click="setRange('all')">All</button>
+    <span>Custom:</span>
+    <input type="date" id="from" :value="from ?? ''" @input="from = $event.target.value || null">
+    <input type="date" id="to" :value="to ?? ''" @input="to = $event.target.value || null">
+    <button id="apply" @click="applyCustomRange()">Apply</button>
+  </div>
+
+  <!-- #88: THE RAW TOKEN DECK AND THE SCOPE BAND, MOVED DOWN A LEVEL.
+
+       They were the first two things a reader met on the landing page, and
+       they are INPUTS TO the four answers rather than answers: "Input tokens
+       32.1k / Cache-read 443.47M / Cache-write 8.07M" is three raw token
+       classes with no verdict, and the reader's own reaction to it -- "what do
+       I do with this?" -- is what #62 was filed over. They are not deleted and
+       not one figure poorer; they moved to the level where raw data belongs,
+       and the overview answers the questions they used to raise.
+
+       The scope band travels WITH the deck because it is the deck's own
+       caveat: "every figure below is a main-thread figure, not a session
+       total" names the scope of exactly these cards. Split from them it would
+       be a warning about numbers on another page.
+       -->
   <!-- #4966: every figure on this page names the SCOPE it ranges over. Subagent
        API calls live in separate `<session>/subagents/agent-*.jsonl`
        transcripts; when none were ingested the numbers are main-thread-only and
@@ -357,396 +1790,6 @@
         <template x-if="c.note"><div class="note" x-text="c.note"></div></template>
       </div>
     </template>
-  </div>
-
-  <!-- #31: the REFERENT for the context card above. "Avg context/call 266.6k"
-       is a fact with no scale: nothing said whether that is a lot. This band
-       annotates the card it sits under rather than adding a panel (CLAUDE.md
-       constraint 4) -- the median displaced the mean in the card itself, and
-       what is left here is the evidence for that displacement, the spread, and
-       the utilisation the median is measured against.
-
-       TWO PROVENANCES, NEVER MERGED. The denominator is Anthropic's DOCUMENTED
-       context window. Where the band boundaries sit is a dated PRODUCT-OWNER
-       JUDGMENT that Anthropic publishes nothing about. They are rendered as two
-       separate statements, each led by what kind of claim it is and the judged
-       one visually marked, because presenting the second in the first's voice
-       would borrow an authority this project has not earned -- which is the
-       whole reason the API carries them as two fields with two dates. -->
-  <div class="note-band" id="context-note">
-    <template x-if="!summary"><span>Loading context&hellip;</span></template>
-    <template x-if="summary && !summary.context.sample_calls"><span>
-      <strong>Context: no measured sample.</strong> No call in this period carried a
-      measured context size, so there is no median and no utilisation to report.
-      <span x-text="fmtCount(summary.context.unmeasured_calls)"></span> call(s) carry no
-      context accounting at all &mdash; UNMEASURED, not zero.
-    </span></template>
-    <template x-if="summary && summary.context.sample_calls"><span>
-      <!-- Why the card leads with a median. The mean is kept because it is
-           EVIDENCE OF THE SKEW and nothing else: a figure most calls fall below
-           is not describing them. -->
-      <strong>Median, not mean.</strong> The mean over the same sample is
-      <span x-text="fmtTok(summary.context.mean)"></span>,
-      <span x-text="fmtRatio(summary.context.mean_over_median)"></span> the median, and only
-      <span x-text="fmtPct(summary.context.share_above_mean)"></span> of measured calls
-      (<span x-text="fmtCount(summary.context.calls_above_mean)"></span> of
-      <span x-text="fmtCount(summary.context.sample_calls)"></span>) sit above it, so it
-      describes the tail rather than a typical call.
-
-      <!-- #25 CHANGED WHAT THIS SENTENCE COULD SAY. It used to read that the
-           window's `avg_context` was "a different figure over a different set"
-           from this block's `mean` -- true then, because `avg_context` divided
-           the same tokens across EVERY row including those that reported no
-           prompt accounting, and the gap between the two WAS that defect made
-           visible. The defect is fixed: both now run through one predicate for
-           what counts as a measurement, so they are the same number over the
-           same sample. Saying they differ would now be the page asserting a
-           discrepancy that no longer exists. -->
-      <span class="context-line"><strong>One sample, one definition.</strong> The
-        window's <em>avg_context</em> reads
-        <span x-text="fmtTokRounded(summary.avg_context)"></span> &mdash; the same
-        figure as the mean above rather than a second opinion on it, because
-        since #25 both are computed through one definition of what counts as a
-        measurement. A call that reported no prompt accounting is excluded from
-        both instead of being averaged in as a zero, so the card and this band
-        cannot disagree about the set they describe.</span>
-
-      <span class="context-line">Spread: <span x-text="contextSpread"></span></span>
-
-      <!-- #61: SCOPED FIRST, POOLED SECOND.
-
-           Measured 2026-08-05 over this project's own transcripts (44 sources,
-           8,163 records, 0 unparsed), 2,722 banded calls:
-
-               scope        banded   >=90% of the window
-               main-thread     390   52 (13.3%)
-               subagent      2,332    0  (0.0%)
-               pooled        2,722   52  (1.9%)
-
-           Every red-band call was main-thread; not one was a subagent. 2,332
-           healthy subagent calls dilute 390 main-thread ones 6:1, so the pooled
-           share erases the one scope the reader can act on -- and it moves the
-           WRONG WAY under the condition it exists to detect, because a saturated
-           orchestrator dispatches MORE subagents, which pushes the pooled share
-           down. "13.3% of your main-thread calls ran at 90%+ of the window"
-           prompts an action; "1.9% probably wrong" prompts none.
-
-           The two DATES ride with the figures, so the reader can see how old
-           both inputs are without hunting; the two provenance SENTENCES stay at
-           the foot of this band, in their two separately marked voices, and
-           never inside this loop -- which window a model has and where the
-           boundaries sit are properties of context_window.py, not of a scope. -->
-      <span class="context-line">Against each model's own documented window
-        (table checked <span x-text="summary.context.utilisation.windows_as_of"></span>),
-        cut at boundaries this project judges
-        (<span x-text="summary.context.utilisation.bands_as_of"></span>),
-        <strong>by scope</strong>:</span>
-      <template x-for="s in summary.context.utilisation.by_scope" :key="s.scope">
-        <span class="context-line">
-          <strong x-text="s.scope"></strong>:
-          <!-- A scope with no banded sample is a NAMED ABSENCE, not four bands
-               of 0.0%. Four zero bands is a true statement three different ways
-               -- the scope ran nothing, it ran calls that carried no context
-               measurement, it ran measured calls on models with no documented
-               window -- with three different remedies, and every `share` beside
-               them is null rather than 0.0. The API says which; the page says
-               it instead of drawing the bands. -->
-          <template x-if="s.no_sample_reason"><span><strong>no banded sample</strong>
-            &mdash; <span x-text="s.no_sample_reason"></span>
-            (<span x-text="fmtCount(s.calls)"></span> call(s),
-            <span x-text="fmtCount(s.sample_calls)"></span> with a measured
-            context). A share of an empty set is not 0%, so no band is drawn.
-          </span></template>
-          <template x-if="!s.no_sample_reason"><span>
-            <span x-text="fmtCount(s.banded_calls)"></span> banded call(s) of
-            <span x-text="fmtCount(s.calls)"></span>
-            (<span x-text="fmtCount(s.sample_calls)"></span> measured):
-            <!-- Ordered high to low by the API, so the template neither sorts
-                 nor labels: the verdicts on the top two bands are the data
-                 layer's words, and only those two carry one because only those
-                 two were judged. Keyed on the band rather than on the loop
-                 index, because the band IS the row's identity and an index says
-                 only where it happened to sit. -->
-            <template x-for="b in s.bands" :key="b.band">
-              <!-- The trailing space is load-bearing: the chips are
-                   inline-block, so they read correctly on screen either way,
-                   but without it the page's text -- copied, or read aloud --
-                   runs one band's share into the next band's label. -->
-              <span class="util-band" :title="bandRange(b)"><span x-text="b.label"></span>:
-                <strong x-text="fmtCount(b.calls)"></strong>
-                (<span x-text="fmtPct(b.share)"></span>) </span>
-            </template>
-          </span></template>
-          <!-- The three caveats, per scope, as TALLIES. The prose that explains
-               what each one means is stated ONCE with the pooled figures below:
-               a scope line repeating three paragraphs would bury the split it
-               exists to show (CLAUDE.md constraint 4). -->
-          <template x-if="s.unmeasured_calls"><span> &middot;
-            <span x-text="fmtCount(s.unmeasured_calls)"></span> carried no context
-            accounting</span></template>
-          <template x-if="s.unknown_model_calls"><span> &middot;
-            <span x-text="fmtCount(s.unknown_model_calls)"></span> on a model with no
-            documented window (<span x-text="s.unknown_models.join(', ')"></span>)</span></template>
-          <template x-if="s.over_window_calls"><span> &middot;
-            <strong>INCONCLUSIVE:</strong>
-            <span x-text="fmtCount(s.over_window_calls)"></span> above 100% of the
-            window</span></template>
-          <!-- #70: this scope's counterpart in the detail view, NAMED and
-               FILTERED. Utilisation is measured against each model's OWN
-               documented window, so "which models did this scope's calls run
-               on, and what did they cost" is the row set behind this line.
-
-               The filter is `s.scope` compared against `models[].scope`: BOTH
-               ends are the payload's own `SCOPE_LABELS` string, so the page
-               invents no equivalence between them. That is why the link is
-               not into the outlier table, which would look like the sharper
-               drill-down: an outlier row carries `is_sidechain`, the record's
-               own flag, and NOT the `source_kind` every scoped figure on this
-               page is derived from. They agree in practice and they are two
-               different measurements, and a page that quietly equated them
-               would be this issue's own defect -- two views of one figure,
-               free to disagree -- hidden one level further down. -->
-          <button type="button" class="drill"
-                  @click="showPanel('models', { scope: s.scope })">See the models
-            <span x-text="s.scope"></span> calls ran on &rarr;</button>
-        </span>
-      </template>
-
-      <!-- The POOLED tally, DEMOTED below the scoped ones and carrying the name
-           of the set it spans. Kept rather than deleted: it is still the honest
-           answer to "of every call in this window, how many were red", and it is
-           the denominator the bands + unknown + unmeasured partition is checked
-           against, so removing it would delete a true figure to prevent a
-           misreading. What was wrong with it was never the arithmetic -- it was
-           that it did not name its set. -->
-      <span class="context-line">Pooled across
-        <strong x-text="summary.context.utilisation.includes"></strong> &mdash; the same
-        calls under one denominator, which is where the split above disappears:
-        <span x-text="fmtCount(summary.context.utilisation.banded_calls)"></span>
-        banded call(s) of
-        <span x-text="fmtCount(summary.context.utilisation.calls)"></span>
-        (<span x-text="fmtCount(summary.context.utilisation.sample_calls)"></span> measured,
-        <span x-text="fmtCount(summary.context.utilisation.unmeasured_calls)"></span> not).
-        <template x-if="summary.context.utilisation.no_sample_reason"><span>
-          <strong>No banded sample:</strong>
-          <span x-text="summary.context.utilisation.no_sample_reason"></span>.
-        </span></template>
-        <template x-if="!summary.context.utilisation.no_sample_reason"><span>
-          <template x-for="b in summary.context.utilisation.bands" :key="b.band">
-            <span class="util-band" :title="bandRange(b)"><span x-text="b.label"></span>:
-              <strong x-text="fmtCount(b.calls)"></strong>
-              (<span x-text="fmtPct(b.share)"></span>) </span>
-          </template>
-        </span></template>
-      </span>
-
-      <template x-if="summary.context.utilisation.unknown_model_calls"><span class="context-line">
-        <strong><span x-text="fmtCount(summary.context.utilisation.unknown_model_calls)"></span>
-        call(s)</strong> ran on a model this build has no documented window for
-        (<span x-text="summary.context.utilisation.unknown_models.join(', ')"></span>), so
-        their utilisation is <strong>UNKNOWN, not low</strong> &mdash; their context is
-        counted in the spread above and they are banded nowhere.
-        <!-- The second deep link, and the same rule: `unknown_models` and
-             `outliers[].model` are both the API's own model strings, so the
-             filter is one payload string matched against another. Banded
-             nowhere is exactly the case where the reader has to look at the
-             calls themselves, and this takes them to the heaviest of them. -->
-        <button type="button" class="drill"
-                @click="showPanel('outliers', { models: summary.context.utilisation.unknown_models })">See
-          the heaviest calls on those models &rarr;</button>
-      </span></template>
-      <template x-if="summary.context.utilisation.over_window_calls"><span class="context-line">
-        <strong>INCONCLUSIVE:</strong>
-        <span x-text="fmtCount(summary.context.utilisation.over_window_calls)"></span> call(s)
-        measure ABOVE 100% of their model's window. That is impossible unless this
-        build's window table has gone stale, so treat the bands as suspect rather
-        than the calls as extraordinary.
-      </span></template>
-      <template x-if="summary.context.unmeasured_calls"><span class="context-line">
-        <span x-text="fmtCount(summary.context.unmeasured_calls)"></span> call(s) in this
-        period carry no context accounting at all. They are counted here and kept out
-        of the median, the mean and the bands &mdash; 0 is not a measurement of a
-        context, and banded it would file as the most frugal call on the report.
-      </span></template>
-
-      <span class="context-line">Denominator:
-        <span x-text="summary.context.utilisation.window_provenance"></span></span>
-      <span class="context-line context-judged">Boundaries:
-        <span x-text="summary.context.utilisation.band_provenance"></span></span>
-    </span></template>
-  </div>
-
-  <!-- #78/#79: the recommendation table's consumer.
-       ==============================================
-
-       CONSTRAINT 4 (do not overwhelm the UI). This is a note-band, not a
-       table, and it is the page's existing idiom for ANNOTATING the figures
-       above rather than restating them: `#scope-note` annotates the cards and
-       `#context-note` annotates the context card. Every one of the five
-       assessments is a lookup of a figure this page already carries the inputs
-       for -- the saturation share off the per-scope bands directly above, the
-       three cache figures off the cache-read and cache-write cards, the reply
-       ratio off the main-vs-subagent split -- so what earns the space is the
-       verdict on those numbers, not a second copy of them.
-
-       THE FIFTH ENTRY NEEDED NO MARKUP (#84), and that is the structure
-       working rather than an oversight. `ranked` is iterated and `unmeasured`
-       is consumed whole, so a metric added to the table reaches this band by
-       construction, in whichever of the two it lands -- which for
-       `cache_write_repayment_at_own_ttl` is `unmeasured` on every database not
-       re-ingested since the split was first read. A band that had spelled its
-       five entries out would have rendered four and looked complete.
-
-       THE RENDERING IS DELIBERATELY PROVISIONAL. #70 splits the report into an
-       overview and a details view; the ranked levers belong on the overview
-       under #66 (ranked opportunities) and #67 (next steps), which is where
-       their shape gets decided. This band exists so the assessments are
-       visible and auditable NOW, not as a layout anyone should preserve. Do
-       not mistake it for a decision.
-
-       THE PAGE PERFORMS NO LOOKUP AND HOLDS NO THRESHOLD (#78). Every
-       boundary, every severity, every word of advice and both provenances are
-       read off `/api/summary`. `tests/test_serve.py` asserts that none of the
-       table's prose appears in this file: advice that could be edited here
-       would be advice with no date, no provenance and no redline.
-
-       AN `ok` IS A POSITIVE STATEMENT and is rendered as one. Healthy entries
-       are shown, not omitted -- if "nothing to change here" were represented
-       by absence, healthy and unmeasured would render identically, which is
-       the rule this repository is built on. Unmeasured metrics get the API's
-       own `unmeasured_note` for the same reason, never a dash and never a 0.
-
-       TWO VOICES, PER BOUNDARY. `#context-note` keeps the documented window
-       and the judged band boundaries in two separately marked voices. Here the
-       same rule runs one level down: a single range can have a CITED lower
-       edge and a JUDGED upper edge, so the marking is on the edge. A judged
-       cut point rendered in a cited one's voice would borrow an authority
-       nobody earned -- which is why the API carries `kind` per boundary and
-       why a judged provenance structurally cannot carry a source. -->
-  <div class="note-band" id="advice-note">
-    <template x-if="!summary"><span>Loading recommendations&hellip;</span></template>
-    <template x-if="summary"><span>
-      <strong>What to change, worst first.</strong>
-      Each line looks one figure above up in a dated table of ranges
-      (decided <span x-text="summary.recommendations.as_of"></span>).
-      <span class="context-line context-judged">Table:
-        <span x-text="summary.recommendations.provenance"></span></span>
-      <span class="context-line context-judged">Order:
-        <span x-text="summary.recommendations.ranking_provenance"></span></span>
-
-      <template x-for="(a, i) in summary.recommendations.ranked" :key="a.metric">
-        <span class="context-line">
-          <strong x-text="'#' + (i + 1) + ' ' + a.severity.toUpperCase()"></strong>
-          &mdash; <strong x-text="a.metric"></strong> =
-          <strong x-text="fmtMetric(a.value)"></strong>
-          <span class="advice-line">Measures: <span x-text="a.measurement"></span>.</span>
-          <span class="advice-line" x-text="a.recommendation"></span>
-          <!-- The lever is the machine-readable half, shown beside the prose so
-               a reader can see WHAT is being changed and WHICH WAY without
-               parsing the sentence. `directive` is composed in the module from
-               a closed registry -- never here -- which is what makes "reduce
-               your cache-read" unrepresentable rather than merely absent. -->
-          <template x-if="a.lever"><span class="advice-line">Lever:
-            <strong x-text="a.lever.directive"></strong>
-            (<span x-text="a.lever.action"></span>
-            <span class="mono" x-text="a.lever.target"></span>).</span></template>
-          <!-- A healthy entry carries NO lever by construction, and says so
-               rather than showing an empty space where the other rows have
-               one. Absence with no explanation is the thing this page refuses
-               to render. -->
-          <template x-if="!a.lever"><span class="advice-line">No lever: this is a
-            healthy reading, so there is nothing here to change.</span></template>
-          <span class="advice-line">Range
-            <strong x-text="fmtMetric(a.range_lower)"></strong> to
-            <strong x-text="a.range_upper === null ? 'no ceiling' : fmtMetric(a.range_upper)"></strong>,
-            <!-- The key the order was derived from, published beside the order
-                 it produced: `RANKED_BY`'s rule, and the reason
-                 `ranking_provenance` above is a field rather than a comment. -->
-            ranked <span x-text="fmtMetric(a.depth_in_severity)"></span> into the
-            <span x-text="a.severity"></span> band.</span>
-          <!-- The two edges, each in its own voice. Written out twice rather
-               than looped, because a helper that reshaped them would spell the
-               field names in JavaScript where the wiring guard cannot follow
-               them to the payload. `covers` rides in the tooltip: it is a
-               paragraph qualifying exactly what the citation does and does not
-               cover, and it must be READABLE without displacing the verdict. -->
-          <span class="advice-line" :class="provenanceVoice(a.lower_provenance)">
-            Lower edge <span x-text="fmtMetric(a.range_lower)"></span> &mdash;
-            <strong x-text="a.lower_provenance.kind"></strong>:
-            <span x-text="a.lower_provenance.statement"></span>
-            <template x-if="a.lower_provenance.checked"><span>(<span
-              x-text="a.lower_provenance.checked"></span>)</span></template>
-            <template x-if="a.lower_provenance.source"><span>Source:
-              <span class="mono" :title="a.lower_provenance.covers"
-                    x-text="a.lower_provenance.source"></span>
-              &mdash; hover for what it covers.</span></template>
-          </span>
-          <template x-if="a.upper_provenance">
-            <span class="advice-line" :class="provenanceVoice(a.upper_provenance)">
-              Upper edge <span x-text="fmtMetric(a.range_upper)"></span> &mdash;
-              <strong x-text="a.upper_provenance.kind"></strong>:
-              <span x-text="a.upper_provenance.statement"></span>
-              <template x-if="a.upper_provenance.checked"><span>(<span
-                x-text="a.upper_provenance.checked"></span>)</span></template>
-              <template x-if="a.upper_provenance.source"><span>Source:
-                <span class="mono" :title="a.upper_provenance.covers"
-                      x-text="a.upper_provenance.source"></span>
-                &mdash; hover for what it covers.</span></template>
-            </span>
-          </template>
-        </span>
-      </template>
-
-      <!-- UNMEASURED IS NAMED, NEVER DROPPED. A metric with no sample that
-           simply vanished would be indistinguishable from a healthy one, which
-           is the defect the whole table exists to avoid -- so the API's own
-           note is rendered against each, and never a dash or a 0.
-
-           Consumed WHOLE, like `context.percentiles`: the keys are metric
-           names the server decides, so the page cannot name them in advance
-           and does not try. `e[0]` is the metric, `e[1]` what would have been
-           measured. -->
-      <template x-if="Object.keys(summary.recommendations.unmeasured).length"><span
-            class="context-line">
-        <strong>Not measured in this period.</strong>
-        <template x-for="e in Object.entries(summary.recommendations.unmeasured)" :key="e[0]">
-          <span class="advice-line">
-            <strong x-text="e[0]"></strong> &mdash;
-            <span x-text="summary.recommendations.unmeasured_note"></span>
-            Would measure: <span x-text="e[1]"></span>.
-          </span>
-        </template>
-      </span></template>
-    </span></template>
-  </div>
-  </section>
-
-  <!-- ===================================================================
-       DETAILS & RAW DATA. Every panel this report has ever had, with its
-       behaviour intact: the time picker still filters, the chart still
-       switches groupings, every table still sorts by the key its heading
-       names. Nothing was removed by the split -- the panels below are the
-       page as it stood, moved one level down and reachable in one click.
-       =================================================================== -->
-  <section id="view-details" x-cloak x-show="view === 'details'">
-
-    <!-- The same `periodLabel` the overview names, so the two views cannot
-         state different periods: one getter, two bindings. The picker below
-         is the only thing on this page that OWNS `from`/`to`. -->
-    <div class="period" id="details-period">Showing <strong x-text="periodLabel"></strong>.
-      <button type="button" class="drill" @click="setView('overview')">&larr; Back to
-        the overview</button>
-    </div>
-
-  <div class="filters" id="filters">
-    <button :class="{ active: range === '1' }" @click="setRange(1)">24h</button>
-    <button :class="{ active: range === '7' }" @click="setRange(7)">7d</button>
-    <button :class="{ active: range === '30' }" @click="setRange(30)">30d</button>
-    <button :class="{ active: range === 'all' }" @click="setRange('all')">All</button>
-    <span>Custom:</span>
-    <input type="date" id="from" :value="from ?? ''" @input="from = $event.target.value || null">
-    <input type="date" id="to" :value="to ?? ''" @input="to = $event.target.value || null">
-    <button id="apply" @click="applyCustomRange()">Apply</button>
   </div>
 
   <div class="panel" id="chart-panel" x-ref="panelChart">
@@ -1062,15 +2105,40 @@ function bandRange(b) {
   if (b.upper === null) return fmtPct(b.lower) + " of the window and above";
   return fmtPct(b.lower) + " to " + fmtPct(b.upper) + " of the window";
 }
+// #65/#88: how wide (or how tall) one reading is drawn, or null for "draw
+// nothing at all". ONE function for the growth bars AND the meter segments,
+// because it is ONE RULE and two copies of it would be free to drift -- the
+// same reason both views run every figure through one set of formatters.
+//
+// TWO absences collapse into that null and they are told apart in WORDS beside
+// the drawing, never in pixels: `fmtPct` prints "—" for an unmeasured reading
+// and "0.0%" for a measured zero, and the quarter's own `no_sample_reason` or
+// the band's own count names the first. What must never happen is the reverse
+// -- a nonzero reading drawn so thin it looks like nothing -- so anything above
+// zero keeps a visible minimum, and a TRUE ZERO GETS NO SEGMENT AT ALL rather
+// than a sliver. That minimum is enforced twice on purpose: here as a floor on
+// the percentage, and in `.seg { min-width }` as a floor in pixels, because a
+// 1% share of a 900px meter is 9px and a 1% share of a 200px one is 2.
+function barWidth(x) {
+  if (x === null || x === undefined) return null;
+  if (x <= 0) return null;
+  return Math.max(1, Math.min(100, x * 100));
+}
 function fmtRatio(x) {
   if (x === null || x === undefined) return "—";
   return x.toFixed(2) + "×";
 }
-// #78's readings are shares (0-1) and unbounded ratios in one list, so they get
-// one significant-figures formatter rather than a per-metric unit the payload
-// would have to carry. What each number IS, is stated beside it by the metric's
-// own `measurement` string, which is the field that names what was divided by
-// what -- so the page never has to guess whether it is holding a percentage.
+// A DIMENSIONLESS quantity, to four significant figures.
+//
+// #78's readings were all printed this way, on the argument that shares and
+// unbounded ratios in one list should share one formatter and let each
+// metric's `measurement` string say which it was holding. Looked at on a
+// summary row (#89 review) that reads as a debug view: `0.3034` is a share and
+// a reader holds it as `30.3%`, `3.195` is a multiple and reads as `3.20x`. So
+// the payload now carries the unit and `fmtUnit` below dispatches on it; what
+// is left here is the case that genuinely has no unit -- `depth_in_severity`,
+// which is a position inside a band -- and the fallback for a unit this build
+// has never seen.
 //
 // Absence first, as everywhere: `(0).toPrecision` is a real 0 and `null` is not
 // a reading at all, and a formatter that let the second print like the first
@@ -1078,6 +2146,32 @@ function fmtRatio(x) {
 function fmtMetric(x) {
   if (x === null || x === undefined) return "—";
   return String(Number(x.toPrecision(4)));
+}
+// #89 review: WHAT KIND OF NUMBER a reading is, and therefore how to print it.
+//
+// `fmtMetric` above is right for a dimensionless quantity and wrong for every
+// figure a reader is asked to act on: `0.3034` is a share and reads as `30.3%`,
+// `3.195` is a multiple and reads as `3.20x`. Which of those a metric is comes
+// from the payload (`serve.METRIC_UNITS`), never from a metric key spelled
+// here -- a `if (metric === ...)` in this file would be an enumeration of the
+// metric set in the one place no import guard can reach, which is exactly the
+// defect `RECOMMENDED_METRICS` exists to prevent one layer down.
+//
+// One entry per unit the API can send, and every one of them is a formatter
+// that already ANSWERS ABSENCE BEFORE IT COMPUTES -- a null reading prints the
+// em-dash at every level and in every unit, which is the property this table
+// must not be allowed to cost.
+const UNIT_FORMAT = {
+  share: fmtPct,
+  ratio: fmtRatio,
+  count: fmtCount,
+};
+// A unit this build has never seen falls back to the unitless formatter, which
+// is honest: the figure is still shown, still to four significant figures, and
+// still an em-dash when absent. Never a bare `String(x)`, which would print a
+// float's full tail, and never nothing.
+function fmtUnit(value, unit) {
+  return (UNIT_FORMAT[unit] ?? fmtMetric)(value);
 }
 // Which VOICE a boundary is stated in -- one class per provenance KIND, and
 // the three must stay visibly different. A judged cut point rendered like a
@@ -1097,6 +2191,154 @@ const PROVENANCE_VOICE = {
 function provenanceVoice(p) {
   return PROVENANCE_VOICE[p.kind] ?? PROVENANCE_VOICE.judged;
 }
+// ---------------------------------------------------------------------------
+// #89: THE GAUGE. Geometry only -- not one threshold, not one boundary.
+//
+// The dial's shape is the only thing decided here: where a semicircle starts,
+// how long the needle is, how far a tick pokes through the arc. Everything the
+// gauge MEANS -- which range an arc covers, where a cut point sits, what the
+// reader should aim for, where the needle points -- arrives on the payload as
+// a position in [0, 1], computed by `serve.Api._gauge()` from
+// `recommendations.METRICS`. A number from that table typed into this file
+// would be a threshold with no date and no provenance, and the page and the
+// advice would become two enumerations free to disagree; the suite fails on
+// any of the table's boundaries appearing here as a literal.
+// ---------------------------------------------------------------------------
+const GAUGE = { cx: 30, cy: 34, r: 24, needle: 18, tickInner: 20, tickOuter: 28 };
+
+// A point on the sweep: `t` runs 0 (left) to 1 (right) over a half turn.
+// CLAMPED, because a position outside the dial would silently draw a needle
+// somewhere the arithmetic never put it -- and the API's positions are
+// fractions of a range by construction, so a value outside [0, 1] is a bug to
+// pin against the edge and see, not one to extrapolate.
+function gaugePoint(t, radius) {
+  const angle = Math.PI * (1 + Math.min(1, Math.max(0, t)));
+  return [
+    (GAUGE.cx + radius * Math.cos(angle)).toFixed(2),
+    (GAUGE.cy + radius * Math.sin(angle)).toFixed(2),
+  ];
+}
+function arcPath(start, end) {
+  const from = gaugePoint(start, GAUGE.r);
+  const to = gaugePoint(end, GAUGE.r);
+  return `M${from[0]} ${from[1]} A${GAUGE.r} ${GAUGE.r} 0 0 1 ${to[0]} ${to[1]}`;
+}
+// ABSENCE FIRST, as everywhere on this page. A metric with no sample has no
+// needle at all -- never one resting at the left of the dial, which for four
+// of the five metrics is the WORST reading there is. The template guards this
+// too; the guard is here as well so the rule survives a second call site.
+function needlePath(t) {
+  if (t === null || t === undefined) return "";
+  const point = gaugePoint(t, GAUGE.needle);
+  return `M${GAUGE.cx} ${GAUGE.cy} L${point[0]} ${point[1]}`;
+}
+function tickPath(t) {
+  const inner = gaugePoint(t, GAUGE.tickInner);
+  const outer = gaugePoint(t, GAUGE.tickOuter);
+  return `M${inner[0]} ${inner[1]} L${outer[0]} ${outer[1]}`;
+}
+// EVERY SUBPATH OF ONE TONE, IN ONE `d`. The dial cannot hold an `x-for`: a
+// `<template>` inside `<svg>` is parsed as an SVG-namespaced element with no
+// `.content`, so Alpine has nothing to clone. One element per TONE instead,
+// each drawing whichever segments or boundaries resolve to it -- which keeps
+// the fallback tones real elements rather than filters, so a severity or a
+// provenance kind this build has never seen is still drawn.
+function arcPathsFor(segments, tone) {
+  return segments
+    .filter(s => arcTone(s.severity) === tone)
+    .map(s => arcPath(s.start, s.end))
+    .join(" ");
+}
+function tickPathsFor(boundaries, tone) {
+  return boundaries
+    .filter(b => tickVoice(b.kind) === tone)
+    .map(b => tickPath(b.position))
+    .join(" ");
+}
+// What those ticks SAY, as the dial's own `<title>`: the boundary's value in
+// the metric's unit and the kind of claim it is. On the dial rather than in a
+// caption, because "at 0.1 judged   at 0.25 judged" beside a row of advice is
+// a dump of the table and not a sentence -- and in full, with each statement,
+// in the disclosure at the foot of the panel.
+function tickTitleFor(boundaries, tone, unit) {
+  return boundaries
+    .filter(b => tickVoice(b.kind) === tone)
+    .map(b => `${fmtUnit(b.value, unit)} — ${b.kind}: ${b.statement}`)
+    .join("\n");
+}
+// The boundary the reader is aiming for, as a list of NOUGHT OR ONE. A list so
+// the template can bind it without inventing a variable, and nought when the
+// table has no healthy range for this metric: there is then nothing to aim
+// for, and the row says nothing rather than pointing at whichever edge came
+// first.
+function targetsOf(gauge) {
+  return gauge.boundaries.filter(b => b.is_target);
+}
+
+// One colour per SEVERITY, one label per severity, one voice per PROVENANCE
+// KIND, and one tone per strip STATE -- four tables, for the reason
+// `HEALTH_TONE` and `PROVENANCE_VOICE` are tables: a chain of ifs could quietly
+// return the same class for two states, and a test can assert these cover the
+// API's vocabularies exactly.
+//
+// Every fallback runs the same direction as the rest of this page: an
+// unrecognised value takes the LOUDEST treatment, never the reassuring one and
+// never no treatment at all. A severity this build has never seen is exactly
+// the one that must not draw as a healthy arc.
+const SEVERITY_ARC = { ok: "arc-ok", watch: "arc-watch", act: "arc-act" };
+const SEVERITY_ARC_UNRECOGNISED = "arc-extra";
+function arcTone(severity) {
+  return SEVERITY_ARC[severity] ?? SEVERITY_ARC_UNRECOGNISED;
+}
+// The urgency tag: the severity as something to DO about it, which is what a
+// summary is for. `null` is not an unrecognised severity -- it is the API
+// saying this metric has no reading -- so it gets its own label and its own
+// neutral tone rather than the loud fallback, and the row says the same thing
+// in the API's own words beside the figure.
+const URGENCY_TAG = { ok: "FINE", watch: "WATCH", act: "DO NOW" };
+const URGENCY_TAG_UNRECOGNISED = "DO NOW";
+const URGENCY_TAG_UNMEASURED = "NO READING";
+const URGENCY_CLASS = { ok: "tag-fine", watch: "tag-soon", act: "tag-now" };
+const URGENCY_CLASS_UNRECOGNISED = "tag-now";
+const URGENCY_CLASS_UNMEASURED = "tag-none";
+function urgencyTag(severity) {
+  if (severity === null || severity === undefined) return URGENCY_TAG_UNMEASURED;
+  return URGENCY_TAG[severity] ?? URGENCY_TAG_UNRECOGNISED;
+}
+function urgencyClass(severity) {
+  if (severity === null || severity === undefined) return URGENCY_CLASS_UNMEASURED;
+  return URGENCY_CLASS[severity] ?? URGENCY_CLASS_UNRECOGNISED;
+}
+// WHICH WAY IS BETTER, read off the metric's own `worse_when`. The page never
+// decides it: two of these five metrics are worse when LOWER, and a page that
+// assumed one direction would draw an arrow pointing away from the advice.
+const AIM_WORDS = { higher: "↓ aim under", lower: "↑ aim above" };
+const AIM_WORD_UNRECOGNISED = "target";
+function aimWord(worseWhen) {
+  return AIM_WORDS[worseWhen] ?? AIM_WORD_UNRECOGNISED;
+}
+// The dial's own copy of `PROVENANCE_VOICE`, in stroke rather than in a border,
+// falling back to JUDGED for the same reason: a boundary this page cannot
+// classify is exactly the one that must not read as documented.
+const TICK_VOICE = {
+  cited: "tick-cited",
+  judged: "tick-judged",
+  structural: "tick-structural",
+};
+function tickVoice(kind) {
+  return TICK_VOICE[kind] ?? TICK_VOICE.judged;
+}
+const STRIP_DOT_TONE = {
+  good: "dot-good",
+  watch: "dot-watch",
+  bad: "dot-bad",
+  unknown: "dot-unknown",
+};
+const STRIP_DOT_TONE_UNRECOGNISED = "dot-bad";
+function dotTone(state) {
+  return STRIP_DOT_TONE[state] ?? STRIP_DOT_TONE_UNRECOGNISED;
+}
+
 function fmtTokRounded(n) {
   // The guard comes BEFORE the rounding on purpose: `Math.round(null)` is 0,
   // so rounding first turns a window that measured nothing into a measured 0.
@@ -1229,6 +2471,133 @@ const AGENT_STATUS = {
     "The transcript was reaped before it was ever measured, so this dispatch's usage is UNKNOWN — never 0."],
 };
 
+// #64: one tone per health state, carried as a TABLE for the reason
+// `PROVENANCE_VOICE` is -- a chain of ifs could quietly return the same class
+// for two states, and a test can assert three distinct values here. The states
+// are the API's (`serve.HEALTH_*`); the colours are this page's.
+const HEALTH_TONE = {
+  ok: "health-ok",
+  unchecked: "health-unchecked",
+  failed: "health-failed",
+};
+// A verdict this build cannot classify falls back to the LOUDEST tone, never
+// to the reassuring one and never to no tone at all: a state added server-side
+// that this page has never seen is exactly the one that must not render as a
+// clean bill of health. Same direction as `provenanceVoice`'s fallback.
+const HEALTH_TONE_UNRECOGNISED = HEALTH_TONE.failed;
+
+// #88: whether the verdict's evidence is OPEN when the page lands, one entry
+// per state, and a table for exactly the reason `HEALTH_TONE` is one.
+//
+// ONLY A PROVEN PROBLEM EXPANDS ITSELF. A problem must never sit behind a
+// click the reader has to know to make, so `failed` opens its own six lines.
+// Everything else collapses, INCLUDING `unchecked` -- and that correction is
+// the whole of this rule.
+//
+// WHY `unchecked` COLLAPSES, measured 2026-08-05 on this project's own
+// database: the corpus was clean, every check passed but one, and the card
+// still opened all six lines. The `transcript-format-census` check read 58 of
+// 59 sources uncensused -- they were ingested before the census existed and
+// are unchanged, so they are censused only when they next change, which for
+// most of them is never. That verdict is PERMANENT AND BENIGN, so the card was
+// permanently open: the one page state nobody can design for is the one every
+// reader sees every time, and a density rule that never collapses anything is
+// not a density rule.
+//
+// NOTHING IS HIDDEN BY IT. The verdict line still renders UNCHECKED, in its
+// own tone, saying the bill of health is incomplete -- the reader is told and
+// can open the detail. What they must not get is six dense lines forced open
+// for ever by a condition they cannot clear and need not act on.
+//
+// A state added server-side that this build has never seen falls to OPEN,
+// never to collapsed: an unrecognised verdict might be a new FAILURE, and the
+// fallback runs the same direction as `HEALTH_TONE_UNRECOGNISED`.
+const HEALTH_OPEN = {
+  ok: false,
+  unchecked: false,
+  failed: true,
+};
+const HEALTH_OPEN_UNRECOGNISED = true;
+
+// #89: which LEVEL renders the verdict as one line, one entry per view, and a
+// table for exactly the reason `HEALTH_OPEN` is one.
+//
+// The card is chrome -- it qualifies every figure at every level, so it is
+// rendered once, above all three, and cannot be navigated away from. What it
+// may do is spend less height where height is the binding constraint: the
+// summary is the one level with a stated budget, and there the heading and the
+// closed disclosure control are furniture around a verdict that states itself.
+//
+// WHAT IT MAY NEVER COST IS THE VERDICT. The tag and its statement are outside
+// this rule entirely -- they are rendered by one binding in every form of the
+// card -- and `healthOneLine` refuses to shorten any verdict that opens its
+// own evidence, so a `failed` one keeps its heading, its tone and its six open
+// lines on every level including this one.
+//
+// A view this build has never seen gets the FULL card, never the short one:
+// the fallback runs the same direction as every other on this page.
+const HEALTH_COMPACT = { summary: true, overview: false, details: false };
+const HEALTH_COMPACT_UNRECOGNISED = false;
+
+// #88: the same rule on question 2, over the API's own five answers.
+//
+// `yes` is the only PROVEN one -- calls measured at or above the judged
+// boundary -- so it is the only one that opens the meters. `no` is a clean
+// finding and collapses; `inconclusive`, `unknown` and `no sample` are
+// absences, and an absence forced permanently open is the `unchecked` defect
+// again: a corpus that always carries a few calls with no context accounting,
+// or one model this build has no window for, would open this card for ever.
+//
+// COLLAPSED IS NOT SILENT. Each of those states states ITSELF at rest, in the
+// API's own sentence, with the counts that qualify it beside the verdict --
+// which is what makes collapsing the evidence a density decision rather than a
+// suppression. Where a call cannot be banded at all, the health card one level
+// up reports it as a check of its own and, if it is a failure rather than an
+// unknown, opens itself there.
+const CONTEXT_OPEN = {
+  "yes": true,
+  "no": false,
+  "inconclusive": false,
+  "unknown": false,
+  "no sample": false,
+};
+const CONTEXT_OPEN_UNRECOGNISED = true;
+
+// The tone the ANSWER's tag wears, one entry per state, on the tag rather than
+// on the card: the question cards are the overview's own idiom and only the
+// health band carries a coloured edge. Three tones for five states, because
+// the three KINDS of claim are what a reader tells apart at a glance -- a
+// measured problem, a measured all-clear, and something not established -- and
+// the state's own word is rendered beside it for which of them it is.
+//
+// An unrecognised state takes the loudest tone, never the reassuring one, for
+// the reason `HEALTH_TONE_UNRECOGNISED` does.
+const CONTEXT_TONE = {
+  "yes": "tag-alarm",
+  "no": "tag-clear",
+  "inconclusive": "tag-incomplete",
+  "unknown": "tag-incomplete",
+  "no sample": "tag-incomplete",
+};
+const CONTEXT_TONE_UNRECOGNISED = "tag-alarm";
+
+// #88: one tone per SEGMENT of a utilisation meter, keyed on the band's
+// POSITION in the API's own high-to-low order rather than on its name --
+// `context_window.py` owns the band keys, the labels and the boundaries, and
+// the page may not spell any of them (`test_the_page_invents_no_band_of_its_own`).
+//
+// The fallback is the load-bearing half. A band this build has no tone for
+// must still be VISIBLE, or it would be drawn in the meter track's own colour
+// and a real measurement would render as an absence -- which is the one
+// substitution this repository refuses. Same direction as
+// `HEALTH_TONE_UNRECOGNISED`, and the count is asserted against `BANDS` so a
+// fifth band added upstream cannot quietly land on the fallback either.
+const BAND_TONES = ["seg-hot", "seg-warm", "seg-mid", "seg-cool"];
+const BAND_TONE_UNRECOGNISED = "seg-extra";
+function bandTone(i) {
+  return BAND_TONES[i] ?? BAND_TONE_UNRECOGNISED;
+}
+
 const SUBAGENT_STATUS = {
   "measured": ["", "Subagent transcripts were read for this session."],
   "unavailable": [" !", "INCOMPLETE: a dispatch dated into this period had its transcript reaped, so this count is a LOWER BOUND -- not zero."],
@@ -1247,11 +2616,20 @@ const SUBAGENT_STATUS = {
 // it, so this adds no handler, no parameter to validate and no request.
 // ---------------------------------------------------------------------------
 
-const VIEWS = ["overview", "details"];
+// #89 made it THREE, in altitude order: what to do, why, and everything.
+const VIEWS = ["summary", "overview", "details"];
+// The LABEL each one wears. It is a TABLE and not a string in the markup
+// because the key and the label deliberately differ for two of the three: the
+// keys are the ones #70 shipped, which is what a bookmark carries, and giving
+// `details` a new meaning would resolve an existing link to a page it never
+// named -- `docs/versioning.md`'s worst kind of break, because nothing about
+// it fails loudly. So the URL keeps its names and the reader gets theirs.
+const VIEW_LABELS = { summary: "Summary", overview: "Details", details: "Raw data" };
 // The LANDING view. The owner's decision, and the one thing about this split
-// that is not a preference: the overview answers the question most people
-// arrive with, and the reader who wants raw data knows that they do.
-const DEFAULT_VIEW = "overview";
+// that is not a preference: the summary answers the question most people
+// arrive with -- what do I do? -- and the reader who wants the reasoning or
+// the raw data knows that they do.
+const DEFAULT_VIEW = "summary";
 const DEFAULT_RANGE_DAYS = 7;
 // The range presets the picker offers, as the URL spells them. Anything else
 // in `range=` is not a preset and is ignored in favour of an explicit
@@ -1394,6 +2772,18 @@ function report() {
       if (this.filters.scope) p.set("scope", this.filters.scope);
       if (this.filters.models) p.set("models", this.filters.models.join(","));
       history.replaceState(null, "", "#" + p.toString());
+    },
+
+    // #89: the tabs are ITERATED over these, so every view this page can show
+    // has a way in and a way back, and a fourth could not be added without
+    // one. A label this build has no entry for falls back to the view's own
+    // key -- the honest thing a page can say about a state it has.
+    get views() {
+      return VIEWS;
+    },
+
+    viewLabel(view) {
+      return VIEW_LABELS[view] ?? view;
     },
 
     setView(view) {
@@ -1603,6 +2993,105 @@ function report() {
         this.banner.stale ?? this.localStaleMessage,
         ...this.banner.notices,
       ].filter(Boolean);
+    },
+
+    // --- health ----------------------------------------------------------
+    // #64: which tone the verdict band wears.
+    //
+    // A LOAD FAILURE OUTRANKS THE SERVER'S VERDICT and can only ever raise it.
+    // The band renders its own branch in that case rather than comparing two
+    // verdicts, which is what keeps this page from holding a severity ordering
+    // of its own: elapsed evidence that a response never arrived says nothing
+    // about the database, only that the figures on screen are not this
+    // response's. Same asymmetry as `bannerMessages`' staleness slot.
+    get healthTone() {
+      if (!this.summary || this.banner.loadFailure) {
+        return HEALTH_TONE_UNRECOGNISED;
+      }
+      return HEALTH_TONE[this.summary.health.verdict] ?? HEALTH_TONE_UNRECOGNISED;
+    },
+
+    // #88: whether the checks behind the verdict are open when the page lands.
+    // Same shape and same asymmetry as `healthTone` above -- a load failure
+    // outranks the server's verdict and can only ever OPEN this, never close
+    // it, because a response that never arrived cannot be reassured about.
+    get healthOpen() {
+      if (!this.summary || this.banner.loadFailure) {
+        return HEALTH_OPEN_UNRECOGNISED;
+      }
+      return HEALTH_OPEN[this.summary.health.verdict] ?? HEALTH_OPEN_UNRECOGNISED;
+    },
+
+    // #89: whether the verdict renders as ONE LINE -- tag, statement, nothing
+    // else. True only on the summary level, and only for a verdict that had
+    // already collapsed its own evidence.
+    //
+    // THE ORDER OF THE TWO GUARDS IS THE WHOLE SAFETY PROPERTY. `healthOpen`
+    // is consulted FIRST, so anything that expands itself -- a `failed`
+    // verdict, a state this build has never seen, a load failure -- keeps the
+    // full card at every level. A proven failure therefore cannot be the thing
+    // that got shortened, and that is guaranteed by composition rather than by
+    // a second table somebody would have to keep in step with the first.
+    //
+    // A null summary is not a level decision either: the card renders its own
+    // branches then, and `healthOpen` has already answered for it.
+    get healthOneLine() {
+      if (this.healthOpen) return false;
+      return HEALTH_COMPACT[this.view] ?? HEALTH_COMPACT_UNRECOGNISED;
+    },
+
+    // --- which question card expands its own evidence (#88) ---------------
+    //
+    // ONE RULE ACROSS ALL FOUR: a card expands itself when, and only when, the
+    // API has PROVEN something to act on. A clean finding collapses because a
+    // healthy report should be short and that brevity is itself the finding;
+    // an absence collapses because an absence is not a problem and the states
+    // that produce one are effectively permanent -- a corpus uncensused before
+    // the census existed, a metric with no sample because this project
+    // dispatches no subagents. A card held open by a condition the reader
+    // cannot clear is a card that is never collapsed at all.
+    //
+    // WHAT COLLAPSING MAY NOT COST: every one of those states says ITSELF at
+    // rest, in the API's own words, with the count that qualifies it. The
+    // evidence moves; the claim does not.
+    //
+    // NO GETTER HERE RANKS OR THRESHOLDS ANYTHING. Both read a state the API
+    // decided against a boundary the API dates; a cut point spelled here would
+    // be a second undated threshold, which is `band_provenance`'s failure mode
+    // in the layout layer.
+    get contextOpen() {
+      const verdict = this.summary.context.utilisation.answer.verdict;
+      return CONTEXT_OPEN[verdict] ?? CONTEXT_OPEN_UNRECOGNISED;
+    },
+
+    get contextTone() {
+      const verdict = this.summary.context.utilisation.answer.verdict;
+      return CONTEXT_TONE[verdict] ?? CONTEXT_TONE_UNRECOGNISED;
+    },
+
+    // The FIRST ranked reading that carries a lever, or null when none does.
+    //
+    // This is a READ of the order `/api/summary` already published, not a
+    // second ranking -- `.find` walks the list the API sorted, and
+    // `recommendations.py` refuses to build an `ok` reading WITH a lever or a
+    // non-`ok` reading WITHOUT one. So "is there anything to do, and what is
+    // it" is the module's own answer; the page holds no severity ordering it
+    // could get wrong.
+    get topOpportunity() {
+      return this.summary.recommendations.ranked.find(a => a.lever) ?? null;
+    },
+
+    // A LEVER IS THE PROVEN THING HERE, so a lever is what opens these two
+    // cards. An unmeasured metric used to open them as well, and that was the
+    // `unchecked` defect one card over: a project that dispatches no subagent
+    // has no ratio of main to subagent tokens and never will, so both cards
+    // stood permanently open over a reading nobody can act on. It is not
+    // hidden -- each card states HOW MANY readings could not be measured at
+    // rest, beside the answer, and says in the same breath that unmeasured is
+    // not healthy. Which ones they are is the evidence, and evidence is what
+    // the disclosure holds.
+    get opportunitiesOpen() {
+      return this.topOpportunity !== null;
     },
 
     // --- summary ---------------------------------------------------------
@@ -1872,7 +3361,17 @@ function report() {
         + `is unknown and may be unbounded — a run that raises never stamps, so a `
         + `failing ingest looks exactly like this. Re-run ingest.py and check it `
         + `exits cleanly.`);
-      if (this.summary.ingest.files === 0) msgs.push("No files ingested yet — run ingest.py.");
+      // "No files ingested yet — run ingest.py." USED TO BE HERE and is gone
+      // (#64). The health band's `records-parsed` check states it, and states
+      // more: an empty ledger is UNCHECKED rather than clean, which a banner
+      // line phrased as an instruction never said. Net banner messages fall by
+      // one, which is what "displace, do not append" means here.
+      //
+      // The unparsed-record notice STAYS. It is a load-bearing warning about
+      // every total on the page, the health band is a second rendering of the
+      // same `ingest.unparsed_records` rather than a replacement for it, and a
+      // warning the reader could navigate away from would be a warning this
+      // page had quietly weakened.
       if (this.summary.ingest.unparsed_records > 0) msgs.push(`INCONCLUSIVE: ${this.summary.ingest.unparsed_records} unparsed record(s) across ingested files — totals may undercount.`);
       // Totals here are COMPLETE — the archived calls are counted. What they
       // are not is reproducible: those transcripts are gone, so this database
