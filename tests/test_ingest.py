@@ -3054,21 +3054,27 @@ class SchemaVersionSetsAreDecidedTest(unittest.TestCase):
     difference between its shape and the CURRENT one can be applied without
     losing a measurement. This test cannot judge that for a future version --
     what it pins is that the set was re-read at the bump, by tying it to the
-    four hops (#20's added table, #30's dropped column, #15's added census
-    table, #36's uniqueness) that were actually reasoned about.
+    five hops (#20's added table, #30's dropped column, #15's added census
+    table, #36's uniqueness, #5's added diagnostics columns) that were actually
+    reasoned about.
     """
 
-    def test_schema_version_is_10(self) -> None:
-        self.assertEqual(ingest_mod.SCHEMA_VERSION, 10)
+    def test_schema_version_is_11(self) -> None:
+        self.assertEqual(ingest_mod.SCHEMA_VERSION, 11)
 
-    def test_only_the_four_reasoned_hops_upgrade_in_place(self) -> None:
-        # v9 was re-checked against the CURRENT shape at this bump, not
+    def test_only_the_five_reasoned_hops_upgrade_in_place(self) -> None:
+        # v9 was re-checked against the CURRENT shape at the v10 bump, not
         # inherited: v9 -> v10 adds the UNIQUE index over `task_id`, which
         # needs the duplicates already stored resolved first. That deletes
-        # rows, so the bar this set applies had to be RESTATED at the bump --
-        # what the hop preserves is every DISPATCH, not every row, and the
-        # reasoning is written out above the constant.
-        self.assertEqual(ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7, 8, 9}))
+        # rows, so the bar this set applies had to be RESTATED at that bump --
+        # what the hop preserves is every DISPATCH, not every row.
+        #
+        # v10 was decided at THIS bump against the same restated bar: v10 -> v11
+        # adds three nullable `api_calls` columns and deletes nothing, and NULL
+        # in them is a true statement about a row written before CPB ever read
+        # `message.diagnostics` -- it means unmeasured, which is what those rows
+        # are. The reasoning is written out above the constant.
+        self.assertEqual(ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7, 8, 9, 10}))
 
     def test_the_current_version_is_not_in_the_upgrade_set(self) -> None:
         # A no-op hop is not an upgrade; listing it would make the branch
@@ -3699,16 +3705,27 @@ class InPlaceRepairSetsAreDecidedTest(unittest.TestCase):
             frozenset({ingest_mod.INGEST_RUNS_TABLE, ingest_mod.SHAPE_TABLE}),
         )
 
-    def test_only_archived_at_may_be_added_to_rows_that_already_exist(
+    def test_only_these_columns_may_be_added_to_rows_that_already_exist(
         self,
     ) -> None:
-        # NULL means "still on disk", which is true of every row written before
-        # the column existed, and the next run recomputes it from the
-        # filesystem. A NOT NULL column, or one whose NULL would be read as a
-        # measurement, cannot be added this way at all.
+        # `archived_at`: NULL means "still on disk", which is true of every row
+        # written before the column existed, and the next run recomputes it from
+        # the filesystem.
+        #
+        # The three cache-miss columns (#5): NULL means "this row was written
+        # before CPB read `message.diagnostics`", i.e. UNMEASURED -- true of
+        # every v10 row by construction, and distinct from every value the
+        # reader can write (`CacheMissDiagnosticsUpgradeTest`). A NOT NULL
+        # column, or one whose NULL would be read as a measurement, cannot be
+        # added this way at all.
         self.assertEqual(
             dict(ingest_mod.IN_PLACE_ADDABLE_COLUMNS),
-            {("ingest_state", "archived_at"): "REAL"},
+            {
+                ("ingest_state", "archived_at"): "REAL",
+                ("api_calls", "cache_miss_outcome"): "TEXT",
+                ("api_calls", "cache_miss_reason"): "TEXT",
+                ("api_calls", "cache_missed_input_tokens"): "INTEGER",
+            },
         )
 
     def test_every_addable_column_is_in_the_shipped_schema(self) -> None:
@@ -4842,6 +4859,54 @@ class RealTranscriptShapeSmokeTest(unittest.TestCase):
             "every real API call measured a context of 0 tokens.",
         )
 
+    def test_real_records_still_carry_the_cache_miss_diagnostics_field(self) -> None:
+        # #5 reads Anthropic's own classification off `message.diagnostics`
+        # instead of re-deriving it, which is only possible while Claude Code
+        # keeps persisting it -- a documented-as-internal field, so this is
+        # exactly the #15 exposure. Measured 2026-08-05 on this machine: present
+        # on 341,489 of 341,597 assistant records, the 108 exceptions being the
+        # `<synthetic>` local-error placeholders.
+        #
+        # Asserted over OUTCOMES, never over reasons: whether a sampled session
+        # happened to miss the cache is chance, but whether the field was there
+        # at all is the format.
+        outcomes = [
+            call.cache_miss_outcome
+            for parsed in self.parsed
+            for call in parsed.calls
+        ]
+        self.assertTrue(outcomes, "no calls in the sample")
+        self.assertTrue(
+            any(o != ingest_mod.CACHE_DIAG_ABSENT for o in outcomes),
+            "no record in the sampled real transcripts carries a `diagnostics`"
+            " field at all. Either Claude Code stopped sending the"
+            " cache-diagnosis beta header or the field moved -- and CPB's"
+            " cache-miss reporting then reads as a corpus that never missed the"
+            " cache, rather than as one nobody measured.",
+        )
+
+    def test_no_real_record_carries_a_cache_miss_type_this_tool_cannot_place(
+        self,
+    ) -> None:
+        # A seventh member of the taxonomy is stored by name and placed in
+        # NEITHER family, so it can never be counted as a cause. This is where
+        # it becomes visible instead of merely harmless.
+        unplaced = {
+            call.cache_miss_reason
+            for parsed in self.parsed
+            for call in parsed.calls
+            if call.cache_miss_outcome
+            in (ingest_mod.CACHE_DIAG_UNRECOGNISED, ingest_mod.CACHE_DIAG_UNREADABLE)
+        }
+        self.assertEqual(
+            unplaced,
+            set(),
+            "a real transcript carries a `cache_miss_reason` this tool cannot"
+            " place (name above, or None where the shape itself defeated the"
+            " read). Decide which family it belongs to -- divergence, or no"
+            " comparison produced -- before anything counts it.",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Duplicate-dispatch fixtures (#36)
@@ -5434,6 +5499,630 @@ class DispatchDedupeMigrationTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             ingest_mod._prepare_schema(self._conn())
         self.assertEqual(out.getvalue(), "")
+
+
+# ---------------------------------------------------------------------------
+# Cache-miss diagnostics fixtures (#5)
+# ---------------------------------------------------------------------------
+#
+# Claude Code sends the `cache-diagnosis-2026-04-07` beta header and persists
+# Anthropic's OWN classification at `message.diagnostics`. CPB reads it; it does
+# not re-derive it (a re-derivation is impossible anyway -- 0 assistant records
+# on this machine carry a `system` or `tools` field, measured 2026-08-05 over
+# 3,012 transcripts; the corpus is live, so treat every count here as a dated
+# sample).
+#
+# Every value below is deliberately UNEQUAL to every other one, in two
+# directions at once, because two different defects hide behind sameness:
+#
+#   * the six `cache_miss_reason.type`s each get their own `input_tokens` and
+#     their own `cache_missed_input_tokens`, so a mapping that collapsed two
+#     types into one bucket, or wrote the magnitude into the wrong column,
+#     cannot pass;
+#   * the magnitudes live in a range (1000+) no token value in this fixture
+#     reaches, so an estimate landing in a token column is visible as itself.
+#
+# `MISSED_HUGE` is the no-clamping case: 99,991 against 11 `input_tokens`.
+# Anthropic derives the figure from byte lengths BEFORE tokenization and says it
+# "can differ from (and occasionally exceed) `usage.input_tokens`" -- measured
+# here, it exceeded it on 1,144 of 1,144 records that carried it (2026-08-05),
+# so a clamp or a validation would corrupt every single one of them.
+
+_NO_DIAGNOSTICS = object()
+
+MISSED_MODEL = 1031
+MISSED_SYSTEM = 1037
+MISSED_TOOLS = 1041
+MISSED_HUGE = 99991
+MISSED_UNKNOWN_TYPE = 1053
+MISSED_STREAMED = 1059
+MISSED_UNTYPED = 1061
+
+# A seventh type, which the API does not currently define. It stands for the
+# release that adds one: CPB must store the name it was given and refuse to
+# place it in either family, rather than guess which.
+UNKNOWN_MISS_TYPE = "quantum_changed"
+
+
+def diagnostics_line(
+    message_id: str,
+    input_tokens: int,
+    diagnostics=_NO_DIAGNOSTICS,
+    output_tokens: int = 2,
+    ts: str = "2026-08-05T12:00:00.000Z",
+) -> str:
+    """One assistant record, with `message.diagnostics` present or ABSENT.
+
+    The default omits the key ENTIRELY, which is a different fact from
+    `"diagnostics": null` and the whole reason this fixture exists.
+    """
+    message = {
+        "id": message_id,
+        "model": "claude-sonnet-5-20260115",
+        "usage": {
+            "input_tokens": input_tokens,
+            "cache_creation_input_tokens": input_tokens * 2,
+            "cache_read_input_tokens": input_tokens * 3,
+            "output_tokens": output_tokens,
+        },
+        "content": [{"type": "text", "text": "reply"}],
+    }
+    if diagnostics is not _NO_DIAGNOSTICS:
+        message["diagnostics"] = diagnostics
+    return json.dumps(
+        {
+            "type": "assistant",
+            "sessionId": "cache-miss-fixture",
+            "timestamp": ts,
+            "message": message,
+        }
+    ) + "\n"
+
+
+def miss_reason(reason_type, missed=None) -> dict:
+    """A `diagnostics` object carrying one `cache_miss_reason`."""
+    reason = {}
+    if reason_type is not _NO_DIAGNOSTICS:
+        reason["type"] = reason_type
+    if missed is not None:
+        reason["cache_missed_input_tokens"] = missed
+    return {"cache_miss_reason": reason}
+
+
+CACHE_MISS_TRANSCRIPT = "".join(
+    [
+        # 1. no `diagnostics` key at all -- the `<synthetic>` local-error
+        #    placeholders are shaped like this (108 of 341,597 records).
+        diagnostics_line("msg_absent", 1),
+        # 2. `diagnostics: null` -- "first turn, or no divergence found". The
+        #    common case by four orders of magnitude (338,692 records).
+        diagnostics_line("msg_null", 2, diagnostics=None),
+        # 2b. the same statement written the other way: an object that names no
+        #     reason. Not observed on this corpus; read identically because it
+        #     says the same thing.
+        diagnostics_line(
+            "msg_reason_null", 37, diagnostics={"cache_miss_reason": None}
+        ),
+        # 3. the four DIVERGENCES, each carrying a magnitude.
+        diagnostics_line(
+            "msg_model", 3, diagnostics=miss_reason("model_changed", MISSED_MODEL)
+        ),
+        diagnostics_line(
+            "msg_system", 5, diagnostics=miss_reason("system_changed", MISSED_SYSTEM)
+        ),
+        diagnostics_line(
+            "msg_tools", 7, diagnostics=miss_reason("tools_changed", MISSED_TOOLS)
+        ),
+        diagnostics_line(
+            "msg_messages", 11, diagnostics=miss_reason("messages_changed", MISSED_HUGE)
+        ),
+        # 4. the two NON-divergences. Neither carries a magnitude on the real
+        #    corpus (0 of 1,653 records) and neither is evidence that anything
+        #    changed.
+        diagnostics_line(
+            "msg_prev", 13, diagnostics=miss_reason("previous_message_not_found")
+        ),
+        diagnostics_line(
+            "msg_unavailable", 17, diagnostics=miss_reason("unavailable")
+        ),
+        # 5. a type from a future release.
+        diagnostics_line(
+            "msg_unknown_type",
+            19,
+            diagnostics=miss_reason(UNKNOWN_MISS_TYPE, MISSED_UNKNOWN_TYPE),
+        ),
+        # 6. shapes the reader cannot trust: `diagnostics` that is not an object,
+        #    and a reason object with no `type`. Both must leave the CALL's token
+        #    measurement intact -- the usage was fine.
+        diagnostics_line("msg_diag_not_an_object", 23, diagnostics=7),
+        diagnostics_line(
+            "msg_reason_untyped",
+            29,
+            diagnostics=miss_reason(_NO_DIAGNOSTICS, MISSED_UNTYPED),
+        ),
+        # 7. a real classification with an unreadable magnitude: the type is
+        #    kept (it is independently valid), the magnitude is not invented.
+        diagnostics_line(
+            "msg_bad_magnitude", 31, diagnostics=miss_reason("tools_changed", "lots")
+        ),
+        # 8. two STREAMED records of one call (#2): the classification is a
+        #    property of the call, so it must survive dedupe exactly once.
+        diagnostics_line(
+            "msg_streamed",
+            41,
+            diagnostics=miss_reason("system_changed", MISSED_STREAMED),
+            output_tokens=5,
+        ),
+        diagnostics_line(
+            "msg_streamed",
+            41,
+            diagnostics=miss_reason("system_changed", MISSED_STREAMED),
+            output_tokens=9,
+        ),
+    ]
+)
+
+
+class CacheMissVocabularyTest(unittest.TestCase):
+    """The taxonomy has six members and TWO families, not one list (#5).
+
+    `previous_message_not_found` and `unavailable` are not divergences: the
+    first means no fingerprint was stored for that id, the second that no
+    comparison was produced at all (and is also where a `thinking`, `effort`,
+    `tool_choice` or beta-header change lands -- TA-6/TA-7). Counting either as
+    a cause of a cache miss invents a cause, which is the exact failure the
+    absence rule exists to prevent, committed by the detector written to avoid
+    it.
+
+    The names are pinned as LITERALS: they are Anthropic's wire vocabulary, so
+    a "tidy-up" rename here would silently stop matching the transcripts.
+    """
+
+    def test_all_six_documented_types_are_named(self) -> None:
+        self.assertEqual(
+            set(ingest_mod.CACHE_MISS_TYPES),
+            {
+                "model_changed",
+                "system_changed",
+                "tools_changed",
+                "messages_changed",
+                "previous_message_not_found",
+                "unavailable",
+            },
+        )
+
+    def test_the_two_families_partition_the_taxonomy(self) -> None:
+        divergence = ingest_mod.CACHE_MISS_DIVERGENCE_TYPES
+        no_comparison = ingest_mod.CACHE_MISS_NO_COMPARISON_TYPES
+        self.assertEqual(divergence | no_comparison, ingest_mod.CACHE_MISS_TYPES)
+        self.assertEqual(divergence & no_comparison, frozenset())
+
+    def test_the_absence_states_are_not_divergences(self) -> None:
+        for absent in ("previous_message_not_found", "unavailable"):
+            with self.subTest(type=absent):
+                self.assertIn(absent, ingest_mod.CACHE_MISS_NO_COMPARISON_TYPES)
+                self.assertNotIn(absent, ingest_mod.CACHE_MISS_DIVERGENCE_TYPES)
+
+    def test_only_a_changed_thing_is_a_divergence(self) -> None:
+        self.assertEqual(
+            set(ingest_mod.CACHE_MISS_DIVERGENCE_TYPES),
+            {"model_changed", "system_changed", "tools_changed", "messages_changed"},
+        )
+
+    def test_the_stored_outcomes_are_named_and_none_of_them_is_a_reason(self) -> None:
+        # The outcome column answers "what KIND of sample is this call", the
+        # reason column answers "which member of the taxonomy". If a value
+        # appeared in both vocabularies a reader grouping by one would be
+        # silently reading the other.
+        self.assertEqual(
+            set(ingest_mod.CACHE_DIAG_OUTCOMES),
+            {
+                ingest_mod.CACHE_DIAG_ABSENT,
+                ingest_mod.CACHE_DIAG_UNREADABLE,
+                ingest_mod.CACHE_DIAG_NO_DIVERGENCE,
+                ingest_mod.CACHE_DIAG_DIVERGENCE,
+                ingest_mod.CACHE_DIAG_NO_COMPARISON,
+                ingest_mod.CACHE_DIAG_UNRECOGNISED,
+            },
+        )
+        self.assertEqual(
+            set(ingest_mod.CACHE_DIAG_OUTCOMES) & set(ingest_mod.CACHE_MISS_TYPES),
+            set(),
+        )
+
+
+class CacheMissDiagnosticsIngestTest(unittest.TestCase):
+    """`message.diagnostics`, read onto the call at the `message.id` grain (#5).
+
+    THREE sample states have to stay apart, and one nullable column cannot
+    hold them:
+
+      1. no `diagnostics` key at all -> INCONCLUSIVE. Claude Code persisting
+         the field is a Claude Code behaviour, not an API guarantee (#15), so
+         its absence is "not sampled", never "no divergence".
+      2. `diagnostics` present and naming no reason -> a real ZERO-divergence
+         sample: first turn, or nothing diverged.
+      3. `diagnostics` naming a type -> classified, in one of two families.
+
+    So the schema carries an OUTCOME column (which of those states, and which
+    family) beside the REASON column (which member of the taxonomy). A fourth
+    state, NULL, belongs to neither of the three: it means this row was written
+    before CPB read diagnostics at all -- see `CacheMissDiagnosticsUpgradeTest`.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-cache-miss-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "cache-miss-fixture.jsonl"
+        self.transcript.write_text(CACHE_MISS_TRANSCRIPT)
+        self.db = self.tmp / "usage.db"
+        self.summary = ingest(self.projects, self.db)
+        self.conn = sqlite3.connect(self.db)
+        self.addCleanup(self.conn.close)
+
+    def _rows(self) -> dict:
+        return {
+            row[0]: row[1:]
+            for row in self.conn.execute(
+                "SELECT message_id, cache_miss_outcome, cache_miss_reason,"
+                " cache_missed_input_tokens FROM api_calls"
+            )
+        }
+
+    def _count(self, where: str, *params) -> int:
+        return self.conn.execute(
+            f"SELECT COUNT(*) FROM api_calls WHERE {where}", params
+        ).fetchone()[0]
+
+    def test_every_record_parsed_and_one_row_survives_per_call(self) -> None:
+        # 15 records, 14 calls: the two streamed records of `msg_streamed` are
+        # ONE call. Nothing in this fixture is malformed as a RECORD -- an
+        # unreadable `diagnostics` is a refusal to classify, not a parse
+        # failure, and must never cost the call its token measurement.
+        self.assertEqual(self.summary["unparsed_records"], 0)
+        self.assertEqual(self.summary["records_parsed"], 15)
+        self.assertEqual(self._count("1=1"), 14)
+
+    def test_each_type_lands_on_its_call_with_its_own_magnitude(self) -> None:
+        absent = ingest_mod.CACHE_DIAG_ABSENT
+        none = ingest_mod.CACHE_DIAG_NO_DIVERGENCE
+        div = ingest_mod.CACHE_DIAG_DIVERGENCE
+        nocmp = ingest_mod.CACHE_DIAG_NO_COMPARISON
+        unrec = ingest_mod.CACHE_DIAG_UNRECOGNISED
+        unread = ingest_mod.CACHE_DIAG_UNREADABLE
+        self.assertEqual(
+            self._rows(),
+            {
+                "msg_absent": (absent, None, None),
+                "msg_null": (none, None, None),
+                "msg_reason_null": (none, None, None),
+                "msg_model": (div, "model_changed", MISSED_MODEL),
+                "msg_system": (div, "system_changed", MISSED_SYSTEM),
+                "msg_tools": (div, "tools_changed", MISSED_TOOLS),
+                "msg_messages": (div, "messages_changed", MISSED_HUGE),
+                "msg_prev": (nocmp, "previous_message_not_found", None),
+                "msg_unavailable": (nocmp, "unavailable", None),
+                "msg_unknown_type": (unrec, UNKNOWN_MISS_TYPE, MISSED_UNKNOWN_TYPE),
+                "msg_diag_not_an_object": (unread, None, None),
+                "msg_reason_untyped": (unread, None, None),
+                "msg_bad_magnitude": (div, "tools_changed", None),
+                "msg_streamed": (div, "system_changed", MISSED_STREAMED),
+            },
+        )
+
+    def test_no_sample_is_never_stored_as_a_zero_divergence_sample(self) -> None:
+        # The rule this whole design exists for. The record with NO
+        # `diagnostics` key and the records that carry one naming no reason are
+        # DIFFERENT facts, and a reader asking for either gets only that one.
+        self.assertEqual(
+            self._count("cache_miss_outcome = ?", ingest_mod.CACHE_DIAG_ABSENT), 1
+        )
+        self.assertEqual(
+            self._count("cache_miss_outcome = ?", ingest_mod.CACHE_DIAG_NO_DIVERGENCE),
+            2,
+        )
+        # ...and neither state is reachable by asking for the other.
+        self.assertEqual(
+            self._count(
+                "cache_miss_outcome = ? AND message_id = 'msg_absent'",
+                ingest_mod.CACHE_DIAG_NO_DIVERGENCE,
+            ),
+            0,
+        )
+
+    def test_the_two_absence_states_are_not_counted_as_divergences(self) -> None:
+        # A reader ranking "why did the cache miss" ranges over the divergence
+        # outcome. `unavailable` and `previous_message_not_found` must not be
+        # in it -- they are not causes, and 549 + 206 of the 1,219 classified
+        # calls on this machine are exactly those two (2026-08-05).
+        diverged = {
+            row[0]
+            for row in self.conn.execute(
+                "SELECT cache_miss_reason FROM api_calls WHERE cache_miss_outcome = ?",
+                (ingest_mod.CACHE_DIAG_DIVERGENCE,),
+            )
+        }
+        self.assertEqual(
+            diverged,
+            {"model_changed", "system_changed", "tools_changed", "messages_changed"},
+        )
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.conn.execute(
+                    "SELECT cache_miss_reason FROM api_calls"
+                    " WHERE cache_miss_outcome = ?",
+                    (ingest_mod.CACHE_DIAG_NO_COMPARISON,),
+                )
+            },
+            {"previous_message_not_found", "unavailable"},
+        )
+
+    def test_an_unknown_type_is_stored_by_name_and_placed_in_no_family(self) -> None:
+        # The seventh type a release adds. Guessing its family would be
+        # inventing the answer; dropping it would hide the release.
+        row = self.conn.execute(
+            "SELECT cache_miss_outcome, cache_miss_reason FROM api_calls"
+            " WHERE message_id = 'msg_unknown_type'"
+        ).fetchone()
+        self.assertEqual(row, (ingest_mod.CACHE_DIAG_UNRECOGNISED, UNKNOWN_MISS_TYPE))
+        self.assertEqual(
+            self._count(
+                "cache_miss_outcome IN (?, ?) AND cache_miss_reason = ?",
+                ingest_mod.CACHE_DIAG_DIVERGENCE,
+                ingest_mod.CACHE_DIAG_NO_COMPARISON,
+                UNKNOWN_MISS_TYPE,
+            ),
+            0,
+        )
+
+    def test_the_magnitude_is_stored_verbatim_and_never_clamped(self) -> None:
+        # Anthropic derives it from byte lengths BEFORE tokenization and says it
+        # can exceed `usage.input_tokens`; measured, it exceeded it on 1,144 of
+        # 1,144 records carrying it (2026-08-05). Clamping it to the input, or
+        # rejecting it for being larger, would corrupt every one of them.
+        row = self.conn.execute(
+            "SELECT input_tokens, cache_missed_input_tokens FROM api_calls"
+            " WHERE message_id = 'msg_messages'"
+        ).fetchone()
+        self.assertEqual(row, (11, MISSED_HUGE))
+        self.assertGreater(row[1], row[0])
+
+    def test_an_unreadable_diagnostics_costs_the_call_nothing_measured(self) -> None:
+        # The usage object was fine; only the classification was not. A
+        # refusal to classify must not throw away a real token measurement.
+        rows = {
+            row[0]: row[1:]
+            for row in self.conn.execute(
+                "SELECT message_id, input_tokens, cache_read, cache_write,"
+                " output_tokens FROM api_calls WHERE message_id IN"
+                " ('msg_diag_not_an_object', 'msg_reason_untyped')"
+            )
+        }
+        self.assertEqual(
+            rows,
+            {
+                "msg_diag_not_an_object": (23, 69, 46, 2),
+                "msg_reason_untyped": (29, 87, 58, 2),
+            },
+        )
+
+    def test_a_magnitude_that_cannot_be_read_is_not_invented(self) -> None:
+        # A valid type beside an unreadable magnitude: the type stands, the
+        # magnitude is NULL rather than 0. A 0 there would say "this miss cost
+        # nothing", which is the opposite of not knowing.
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT cache_miss_reason, cache_missed_input_tokens FROM api_calls"
+                " WHERE message_id = 'msg_bad_magnitude'"
+            ).fetchone(),
+            ("tools_changed", None),
+        )
+
+    def test_the_classification_survives_dedupe_exactly_once(self) -> None:
+        # #2: one API call is many transcript records, each repeating the same
+        # `message`. The surviving WHOLE record brings its own classification --
+        # measured, records of one id disagreed on `diagnostics` in 0 of 169,331
+        # cases (2026-08-05), and a per-field synthesis would describe a
+        # response that never happened.
+        self.assertEqual(self._count("message_id = 'msg_streamed'"), 1)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT output_tokens, cache_miss_reason FROM api_calls"
+                " WHERE message_id = 'msg_streamed'"
+            ).fetchone(),
+            (9, "system_changed"),
+        )
+
+    def test_records_with_no_diagnostics_are_counted_separately(self) -> None:
+        # Counted as their own fact, not folded into a bucket: a corpus where
+        # Claude Code stopped writing the field would otherwise read as a
+        # corpus with no cache misses.
+        self.assertEqual(self.summary["calls_without_diagnostics"], 1)
+        self.assertEqual(self.summary["calls_with_unreadable_diagnostics"], 3)
+
+    def test_single_file_mode_reports_the_same_two_counts(self) -> None:
+        # The hook path measures the same file and must not report a quieter
+        # corpus than the directory path does.
+        db = self.tmp / "hook.db"
+        summary = ingest_mod.ingest_transcript(self.transcript, db)
+        self.assertEqual(summary["calls_without_diagnostics"], 1)
+        self.assertEqual(summary["calls_with_unreadable_diagnostics"], 3)
+
+    def test_the_counts_are_said_out_loud(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ingest_mod.print_cache_diagnostics_note(self.summary)
+        note = out.getvalue()
+        self.assertIn("no `diagnostics` field: 1", note)
+        self.assertIn("unreadable: 3", note)
+
+    def test_a_corpus_with_nothing_to_report_says_nothing(self) -> None:
+        # So that the note above MEANS something when it appears.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ingest_mod.print_cache_diagnostics_note(
+                {"calls_without_diagnostics": 0, "calls_with_unreadable_diagnostics": 0}
+            )
+        self.assertEqual(out.getvalue(), "")
+
+
+class CacheMissDiagnosticsUpgradeTest(unittest.TestCase):
+    """v10 -> v11 adds the three columns without re-parsing anything (#5).
+
+    The rows a v10 database holds were written by a build that never looked at
+    `message.diagnostics`. They upgrade to NULL, which is the fourth state:
+    UNMEASURED. Upgrading them to "no divergence" would manufacture a
+    zero-divergence sample for every call ever ingested -- a whole corpus of
+    confident findings nobody measured.
+
+    Why NULL rather than the `absent` outcome: `absent` is a POSITIVE
+    observation ("CPB read this record and it carried no `diagnostics`"), and no
+    such observation exists for a row written before the read existed. Same
+    distinction `source_shape` draws between an absent row and a measured zero
+    (#15), and it resolves the same way: those rows are re-read when their
+    source file next changes, not back-filled with a guess.
+    """
+
+    # The v10 shape of `api_calls`, STATED rather than reached by DROP COLUMN.
+    # Same reasoning as `SchemaShapeProbeTest.INGEST_STATE_WITHOUT_ARCHIVED_AT`:
+    # the DROP COLUMN statement is itself version-sensitive, and a fixture that
+    # differs across CI legs tests the fixture rather than the code.
+    API_CALLS_AT_V10 = """
+        CREATE TABLE api_calls_v10 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            agent_id TEXT,
+            turn_id INTEGER,
+            ts REAL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            cache_read INTEGER NOT NULL,
+            cache_write INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            context_size INTEGER NOT NULL,
+            is_sidechain INTEGER NOT NULL DEFAULT 0,
+            message_id TEXT
+        )
+    """
+    V10_COLUMNS = (
+        "id, session_id, source_path, source_kind, agent_id, turn_id, ts, model,"
+        " input_tokens, cache_read, cache_write, output_tokens, context_size,"
+        " is_sidechain, message_id"
+    )
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-cache-miss-upgrade-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "cache-miss-fixture.jsonl"
+        self.transcript.write_text(CACHE_MISS_TRANSCRIPT)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        return conn
+
+    def _snapshot(self) -> list:
+        conn = self._conn()
+        return conn.execute(
+            f"SELECT {self.V10_COLUMNS} FROM api_calls ORDER BY id"
+        ).fetchall()
+
+    def _outcomes(self) -> dict:
+        conn = self._conn()
+        return {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT COALESCE(cache_miss_outcome, '(null)') o, COUNT(*)"
+                " FROM api_calls GROUP BY o"
+            )
+        }
+
+    def _downgrade_to_v10(self) -> None:
+        conn = self._conn()
+        conn.execute(self.API_CALLS_AT_V10)
+        conn.execute(
+            f"INSERT INTO api_calls_v10 SELECT {self.V10_COLUMNS} FROM api_calls"
+        )
+        conn.execute("DROP TABLE api_calls")
+        conn.execute("ALTER TABLE api_calls_v10 RENAME TO api_calls")
+        conn.execute("PRAGMA user_version = 10")
+        conn.commit()
+        self.assertNotIn(
+            "cache_miss_outcome", ingest_mod._table_columns(conn, "api_calls")
+        )
+
+    def test_a_fresh_ingest_records_an_observation_on_every_row(self) -> None:
+        # The baseline the upgrade must NOT reproduce: a row CPB actually read
+        # never has a NULL outcome, whatever the transcript said.
+        self.assertNotIn("(null)", self._outcomes())
+
+    def test_the_upgrade_carries_the_rows_and_leaves_them_unmeasured(self) -> None:
+        self._downgrade_to_v10()
+        before = self._snapshot()
+        self.assertTrue(before, "the fixture must hold rows for this to mean anything")
+
+        summary = ingest(self.projects, self.db)
+
+        self.assertFalse(summary["schema_rebuilt"])
+        # A rebuild empties `ingest_state`, so every file would be re-parsed.
+        # Skipping them all is the observable proof the rows were carried.
+        self.assertEqual(summary["files_ingested"], 0)
+        self.assertEqual(summary["files_skipped"], summary["files_scanned"])
+        self.assertEqual(self._snapshot(), before)
+        conn = self._conn()
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            ingest_mod.SCHEMA_VERSION,
+        )
+        # EVERY carried row reads unmeasured -- not "no divergence", not
+        # "absent", not 0 missed tokens.
+        self.assertEqual(self._outcomes(), {"(null)": len(before)})
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM api_calls WHERE cache_miss_reason IS NOT NULL"
+                " OR cache_missed_input_tokens IS NOT NULL"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_the_upgrade_is_not_refused_over_a_reaped_source(self) -> None:
+        # Past Claude Code's retention window the database is the only copy of
+        # its measurements, and a rebuild would be REFUSED. Three added nullable
+        # columns must not be the change that strands those databases at v10.
+        self.transcript.unlink()
+        ingest(self.projects, self.db)  # archives it; rows retained
+        self._downgrade_to_v10()
+        before = self._snapshot()
+
+        ingest(self.projects, self.db)  # must not raise SystemExit
+
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self._outcomes(), {"(null)": len(before)})
+
+    def test_re_ingesting_the_source_replaces_unmeasured_with_a_reading(self) -> None:
+        # The other half of "not back-filled with a guess": the answer arrives
+        # when the file is read again, which is exactly when it can be known.
+        self._downgrade_to_v10()
+        ingest(self.projects, self.db)
+        self.assertEqual(self._outcomes().get("(null)"), 14)
+
+        self.transcript.write_text(CACHE_MISS_TRANSCRIPT)  # changes mtime/size
+        os.utime(self.transcript, (time.time() + 2, time.time() + 2))
+        ingest(self.projects, self.db)
+
+        self.assertNotIn("(null)", self._outcomes())
+        self.assertEqual(
+            self._outcomes()[ingest_mod.CACHE_DIAG_DIVERGENCE], 6
+        )
 
 
 if __name__ == "__main__":
