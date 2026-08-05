@@ -170,6 +170,18 @@ deliberately unequal values per token class so a swapped column mapping cannot
 pass, and include a deliberately malformed line asserting that parse failures
 are counted rather than swallowed.
 
+## Documentation
+
+Longer-form reference lives in [`docs/`](docs/), indexed by
+[`docs/README.md`](docs/README.md). The one to know about:
+
+- [Claude API token accounting](docs/claude-api-token-accounting.md) — the API
+  accounting facts the analysis rests on, each with its source URL and the date
+  it was checked. Thinking is billed as output and is invisible in transcript
+  content; whether it is re-billed as input on later turns depends on the
+  model; cache writes carry a markup and the cacheable minimum is a per-model
+  lookup, not a constant.
+
 ## Provenance
 
 CPB was extracted in August 2026 from a private monorepo, where it began as an
