@@ -15,6 +15,13 @@ sessions, files) and SQL NULL sums stay null in the JSON -- an empty period
 renders as "no data", never as a fabricated zero. `unparsed_records` is
 surfaced on every summary response.
 
+That rule reaches inside a non-empty period too (#25). A call whose `usage`
+reports every token class as zero measured NOTHING, so it is counted as a
+call and kept out of every CONTEXT mean, which publishes `context_calls` and
+`unmeasured_calls` beside it -- see `MEASURED_CONTEXT_MIN`. A window whose
+only calls are those reports no average at all rather than 0, which is what a
+day with one such call used to draw as a context collapse.
+
 No route emits a dollar figure (#30). Every quantity here is MEASURED --
 tokens, calls, sessions, timestamps -- and the list-rate estimate that used to
 sit beside them is gone rather than qualified: it was arithmetic over a
@@ -93,6 +100,82 @@ PERCENTILES = (10, 25, 50, 75, 90, 99)
 # once and published in both places, so the card and the spread beside it
 # cannot disagree.
 MEDIAN_PERCENTILE = 50
+
+# #25: the threshold that separates A MEASUREMENT from NO MEASUREMENT, spelled
+# ONCE for every figure that averages, medians or bands a context.
+#
+# `context_size` is `input_tokens + cache_write + cache_read` -- the whole
+# prompt side of a call. Zero of all three is not a small prompt; it is no
+# prompt accounting at all, and no request to the Messages API can consist of
+# nothing. Measured 2026-08-05 over a local corpus of 38,381 distinct API
+# calls: 82 rows report every token class as 0, and every one of them carries
+# a COMPLETE `usage` object whose token keys are PRESENT and valued zero. The
+# parser is faithful -- it stores exactly what is on disk -- so the defect is
+# entirely in what the aggregates then do with those rows.
+#
+# The threshold is a MINIMUM rather than a `> 0` comparison so that the SQL
+# and the Python spellings below share one literal. It is 1, not 0, and the
+# distinction is the whole issue: one token is the smallest quantity that can
+# be measured, and it IS a measurement. A GENUINE measured zero -- a call that
+# really produced 0 output tokens, or read 0 from cache -- is a healthy sample
+# in its own dimension and is untouched by this: it is counted, summed and
+# averaged like any other row. Only the prompt side going entirely unrecorded
+# takes the call out of a CONTEXT mean.
+MEASURED_CONTEXT_MIN = 1
+
+
+def has_context_measurement(context_size: int) -> bool:
+    """Whether this row's `context_size` is a measurement at all (#25).
+
+    False for 0 -- no prompt accounting -- and false for a negative, which
+    summed token counts cannot produce: a row carrying one is broken, and the
+    one thing it must not do is join the sample as the most frugal call on the
+    report. The SQL twin is `measured_context_sql()`.
+    """
+    return context_size >= MEASURED_CONTEXT_MIN
+
+
+def measured_context_sql(column: str = "context_size") -> str:
+    """`has_context_measurement()` as a SQL predicate over `column`.
+
+    Takes the column expression so a joined query can alias it
+    (`a.context_size`) without re-spelling the comparison. Two definitions of
+    "has a measurement", free to drift apart, is how this class of defect
+    recurs; `tests/test_serve.py` asserts the two select the same rows.
+    """
+    return f"{column} >= {MEASURED_CONTEXT_MIN}"
+
+
+def context_aggregate_sql(column: str = "context_size") -> str:
+    """The three columns a context mean must publish TOGETHER (#25).
+
+    An average, and beside it the size of the sample it ranged over and the
+    count of calls it refused -- CLAUDE.md's "count samples separately from
+    the aggregate", as SQL. `AVG` skips the NULLs the CASE produces, so a
+    window whose every call measured nothing yields NULL rather than 0: that
+    window is INCONCLUSIVE for context, and the call counts beside it say
+    which of "nothing happened" and "nothing was measured" it was.
+
+    The counts are `COUNT(...)` rather than `SUM(...)`, so an empty window
+    gives 0 -- a count over an empty set is a real zero, corroborated by the
+    `calls` count beside it -- instead of a NULL that would have to be
+    coalesced back into one. And `unmeasured_calls` is the REMAINDER rather
+    than the complementary predicate, so the two counts partition the group by
+    construction: `context_calls + unmeasured_calls == COUNT(*)` holds for any
+    value the column can hold, including a NULL that no predicate would match
+    either way.
+
+    `column` is an internal literal chosen by the caller (`context_size` or an
+    alias of it), never a request parameter -- nothing here interpolates user
+    input into SQL.
+    """
+    measured = measured_context_sql(column)
+    return (
+        f"AVG(CASE WHEN {measured} THEN {column} END) avg_context,"
+        f" COUNT(CASE WHEN {measured} THEN 1 END) context_calls,"
+        f" COUNT(*) - COUNT(CASE WHEN {measured} THEN 1 END) unmeasured_calls"
+    )
+
 
 # #4966: an aggregate must NAME the set it ranges over. `source_kind` in the
 # DB is the ingester's vocabulary ('main'/'subagent'); these are the labels
@@ -619,14 +702,18 @@ class Api:
             for r in self.conn.execute(
                 "SELECT source_kind, COUNT(*) calls, SUM(input_tokens) input,"
                 " SUM(cache_read) cache_read, SUM(cache_write) cache_write,"
-                " SUM(output_tokens) output, AVG(context_size) avg_context"
+                " SUM(output_tokens) output, " + context_aggregate_sql() +
                 " FROM api_calls WHERE ts >= ? AND ts < ? GROUP BY source_kind",
                 (start, end),
             )
         }
+        # A scope with no rows at all: every COUNT is a real zero (nothing
+        # happened, corroborated by `calls`), and the average is null because
+        # there is no sample -- not 0, which would be a context measurement.
         empty = {
             "calls": 0, "input": 0, "cache_read": 0, "cache_write": 0,
-            "output": 0, "avg_context": None,
+            "output": 0, "avg_context": None, "context_calls": 0,
+            "unmeasured_calls": 0,
         }
 
         def bucket(kind: str) -> dict[str, Any]:
@@ -711,16 +798,18 @@ class Api:
 
         **Zero-context rows are counted, never sampled or banded.** A row whose
         `input + cache_write + cache_read` is 0 carries no prompt accounting at
-        all -- the population #25 is about, and whether those are genuinely
-        zero-usage records or a lost `usage` block is still unanswered. Either
-        way 0 is not a measurement of a context, so it stays out of the median,
-        out of the mean and out of the bands, and is counted in
+        all -- the population #25 is about. Measured 2026-08-05 over 38,381
+        distinct calls, all 82 such rows carry a complete `usage` object whose
+        token keys are present and zero, so they are faithfully stored records
+        of a call that reported nothing, not a `usage` block the parser lost.
+        Nothing is a measurement of a context, so the row stays out of the
+        median, out of the mean and out of the bands, and is counted in
         `unmeasured_calls` instead. Banded, it would file as the most frugal
         call in the corpus; averaged in, it drags the figure down by exactly
         the proportion of rows nobody measured. `summary()`'s `avg_context`
-        still ranges over every row and is left alone here -- #25 owns those
-        four call sites; the difference between it and `mean` is that defect,
-        visible.
+        now ranges over the SAME sample, through the same predicate
+        (`has_context_measurement()`), so the card and this block cannot
+        disagree about what was measured.
 
         **An unknown model keeps its context and loses its utilisation.** Its
         size was measured, so it belongs in the distribution; its window is not
@@ -761,11 +850,15 @@ class Api:
             "SELECT model, context_size FROM api_calls WHERE ts >= ? AND ts < ?",
             (start, end),
         ):
-            if size <= 0:
-                # <= rather than == on purpose: a negative context is not
-                # reachable from summed token counts, so if one ever appears it
-                # is a broken row, and the one thing it must not do is band as
-                # the most frugal call on the report.
+            if not has_context_measurement(size):
+                # The SAME predicate the four SQL means use (#25), not a
+                # second spelling of it: this block and `summary()`'s
+                # `avg_context` describe one sample, and two definitions free
+                # to drift apart is how this defect recurs. It excludes a
+                # negative as well as a zero -- a negative context is not
+                # reachable from summed token counts, so a row carrying one is
+                # broken, and the one thing it must not do is band as the most
+                # frugal call on the report.
                 unmeasured_calls += 1
                 continue
             sizes.append(size)
@@ -972,11 +1065,19 @@ class Api:
         return out
 
     def summary(self, start: float, end: float) -> dict[str, Any]:
+        """The window's headline figures.
+
+        `avg_context` ranges over the calls that CARRY a context measurement,
+        which is a strictly smaller set than `calls` and says so through
+        `context_calls` / `unmeasured_calls` beside it (#25). It is therefore
+        the same number as `context.mean`, over the same sample -- one
+        definition of "measured", used by both.
+        """
         row = self.conn.execute(
             "SELECT COUNT(*) calls, COUNT(DISTINCT session_id) sessions,"
             " SUM(input_tokens) input, SUM(cache_read) cache_read,"
             " SUM(cache_write) cache_write, SUM(output_tokens) output,"
-            " AVG(context_size) avg_context"
+            " " + context_aggregate_sql() +
             " FROM api_calls WHERE ts >= ? AND ts < ?",
             (start, end),
         ).fetchone()
@@ -990,6 +1091,17 @@ class Api:
         }
 
     def timeseries(self, start: float, end: float, by: str) -> dict[str, Any]:
+        """One point per day, in the window's own order.
+
+        The fifth context mean, and the one whose failure was VISIBLE (#25):
+        it is computed in Python rather than by `AVG`, so it shared none of
+        the other four's SQL but all of their defect. On the reference corpus
+        two days held exactly one call each, both of them rows carrying no
+        measurement, and this series reported `calls: 1, avg_context: 0` --
+        which the chart drew as a context collapse. A day with no measured
+        call now yields null, which Chart.js leaves as a GAP in the line, and
+        `context_calls` / `unmeasured_calls` say per point which it was.
+        """
         rows = self.conn.execute(
             "SELECT a.ts, a.input_tokens, a.cache_read, a.cache_write,"
             " a.output_tokens, a.context_size, a.source_kind, t.turn_type"
@@ -999,13 +1111,22 @@ class Api:
         ).fetchall()
         days: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         meta: dict[str, dict[str, int]] = defaultdict(
-            lambda: {"calls": 0, "context": 0, "main": 0, "subagent": 0}
+            lambda: {
+                "calls": 0, "context": 0, "context_calls": 0,
+                "unmeasured": 0, "main": 0, "subagent": 0,
+            }
         )
         for r in rows:
             day = eastern_day(r["ts"])
             scope = SCOPE_LABELS.get(r["source_kind"], r["source_kind"])
             meta[day]["calls"] += 1
-            meta[day]["context"] += r["context_size"]
+            # The call is counted either way -- it happened. Only the mean's
+            # numerator and denominator are restricted to measured rows.
+            if has_context_measurement(r["context_size"]):
+                meta[day]["context"] += r["context_size"]
+                meta[day]["context_calls"] += 1
+            else:
+                meta[day]["unmeasured"] += 1
             meta[day]["subagent" if scope == SCOPE_SUBAGENT else "main"] += 1
             tokens = (
                 r["input_tokens"] + r["cache_read"] + r["cache_write"] + r["output_tokens"]
@@ -1038,9 +1159,17 @@ class Api:
             "main_thread_calls": [meta[d]["main"] for d in ordered],
             "subagent_calls": [meta[d]["subagent"] for d in ordered],
             "avg_context": [
-                (meta[d]["context"] / meta[d]["calls"]) if meta[d]["calls"] else None
+                (meta[d]["context"] / meta[d]["context_calls"])
+                if meta[d]["context_calls"]
+                else None
                 for d in ordered
             ],
+            # The mean's own sample size, per point, beside the call count it
+            # is NOT the same as -- CLAUDE.md's "count samples separately from
+            # the aggregate", and the only way a reader can tell a gap that
+            # means "no calls" from one that means "no measurement".
+            "context_calls": [meta[d]["context_calls"] for d in ordered],
+            "unmeasured_calls": [meta[d]["unmeasured"] for d in ordered],
         }
 
     def sessions(self, start: float, end: float) -> list[dict[str, Any]]:
@@ -1051,6 +1180,10 @@ class Api:
         it. Its gap is not lost -- `_scope()`'s coverage reports the reaped
         runs for this window (dated by `subagent_runs.dispatched_at`) plus any
         that carry no timestamp at all.
+
+        `avg_context` is the session's mean over its MEASURED calls only, with
+        `context_calls` / `unmeasured_calls` beside it (#25): a session whose
+        in-window calls all measured nothing gets null, not 0.
 
         `subagent_status` is what keeps the subagent-call COUNT honest, and it
         is five-valued on purpose: `measured`, `unavailable` (a reaped dispatch
@@ -1065,7 +1198,7 @@ class Api:
             " SUM(a.cache_write) cache_write, SUM(a.output_tokens) output,"
             " SUM(a.source_kind = ?) subagent_calls,"
             " SUM(a.source_kind <> ?) main_thread_calls,"
-            " AVG(a.context_size) avg_context"
+            " " + context_aggregate_sql("a.context_size") +
             " FROM api_calls a WHERE a.ts >= ? AND a.ts < ?"
             " GROUP BY a.session_id ORDER BY last_ts DESC",
             (SOURCE_SUBAGENT, SOURCE_SUBAGENT, start, end),
@@ -1235,7 +1368,7 @@ class Api:
             for r in self.conn.execute(
                 "SELECT source_kind, COUNT(*) calls, SUM(input_tokens) input,"
                 " SUM(cache_read) cache_read, SUM(cache_write) cache_write,"
-                " SUM(output_tokens) output, AVG(context_size) avg_context"
+                " SUM(output_tokens) output, " + context_aggregate_sql() +
                 " FROM api_calls WHERE session_id = ?"
                 " GROUP BY source_kind ORDER BY source_kind",
                 (session_id,),

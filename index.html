@@ -266,11 +266,25 @@
       <span x-text="fmtPct(summary.context.share_above_mean)"></span> of measured calls
       (<span x-text="fmtCount(summary.context.calls_above_mean)"></span> of
       <span x-text="fmtCount(summary.context.sample_calls)"></span>) sit above it, so it
-      describes the tail rather than a typical call. The legacy
-      <em>Avg context/call</em> divides the same tokens across EVERY row, including
-      those with no context accounting, and reads
-      <span x-text="fmtTokRounded(summary.avg_context)"></span>: a different figure over a
-      different set, not a rounding difference.
+      describes the tail rather than a typical call.
+
+      <!-- #25 CHANGED WHAT THIS SENTENCE COULD SAY. It used to read that the
+           window's `avg_context` was "a different figure over a different set"
+           from this block's `mean` -- true then, because `avg_context` divided
+           the same tokens across EVERY row including those that reported no
+           prompt accounting, and the gap between the two WAS that defect made
+           visible. The defect is fixed: both now run through one predicate for
+           what counts as a measurement, so they are the same number over the
+           same sample. Saying they differ would now be the page asserting a
+           discrepancy that no longer exists. -->
+      <span class="context-line"><strong>One sample, one definition.</strong> The
+        window's <em>avg_context</em> reads
+        <span x-text="fmtTokRounded(summary.avg_context)"></span> &mdash; the same
+        figure as the mean above rather than a second opinion on it, because
+        since #25 both are computed through one definition of what counts as a
+        measurement. A call that reported no prompt accounting is excluded from
+        both instead of being averaged in as a zero, so the card and this band
+        cannot disagree about the set they describe.</span>
 
       <span class="context-line">Spread: <span x-text="contextSpread"></span></span>
 
@@ -448,7 +462,8 @@
       <th>Session</th><th>Last activity</th><th>API calls</th>
       <th title="Of the API calls, how many came from subagent (sidechain) transcripts.">Subagent calls</th>
       <th>Input</th><th>Cache read</th>
-      <th>Cache write</th><th>Output</th><th>Avg ctx/call</th>
+      <th>Cache write</th><th>Output</th>
+      <th title="Mean context per call over this session's calls that CARRY a context measurement (#25). A call that reported none is excluded, never averaged in as a zero — so this mean can range over fewer calls than the count on the left. '—' = no call in this session carried one, which is UNMEASURED, not 0. Hover a figure for its own sample.">Avg ctx/call</th>
       <th title="Task-tool dispatches within the selected from/to period.">Dispatches</th>
     </tr></thead><tbody>
       <template x-for="(r, i) in (sessions ?? [])" :key="i">
@@ -467,7 +482,13 @@
                always carries its own provenance. -->
           <td><span :title="subagentStatus(r)[1]"><span x-text="fmtCount(r.subagent_calls)"></span><template x-if="subagentStatus(r)[0]"><strong x-text="subagentStatus(r)[0]"></strong></template></span></td>
           <template x-for="(v, j) in tokenCols(r)" :key="j"><td x-text="fmtTok(v)"></td></template>
-          <td x-text="fmtTok(Math.round(r.avg_context))"></td>
+          <!-- #25: this mean ranges over a SMALLER set than the call count two
+               columns of tokens to the left, whenever a call reported no
+               context accounting. `Math.round(null)` is 0, so the old binding
+               drew a measured zero for a session that measured nothing at all
+               -- the same substitution the API stopped making. The count rides
+               with the figure, in the same shape as the subagent cell above. -->
+          <td><span :title="contextSample(r)[1]"><span x-text="fmtTokRounded(r.avg_context)"></span><template x-if="contextSample(r)[0]"><strong x-text="contextSample(r)[0]"></strong></template></span></td>
           <td x-text="r.dispatches"></td>
         </tr>
       </template>
@@ -625,6 +646,29 @@ async function getJSON(url) {
 // construction. `x-html` is not used anywhere and would reintroduce exactly
 // that surface.
 
+// A chart point's label, and for the avg-context series its SAMPLE (#25).
+// A stacked token series is a sum over every call on the day, so it names no
+// sample; the context line is a mean over only the calls that carried a
+// measurement, and a gap in it means "nobody measured", never "zero".
+function chartTooltipLabel(c) {
+  const base = `${c.dataset.label}: ${fmtTok(c.raw)}`;
+  const measured = c.dataset.contextCalls;
+  if (!measured) return base;
+  const n = measured[c.dataIndex];
+  const unmeasured = c.dataset.unmeasuredCalls[c.dataIndex];
+  const total = c.dataset.totalCalls[c.dataIndex];
+  // Parenthesised rather than dash-separated: `fmtTok(null)` is already "—",
+  // and "avg context/call: — — no call this day..." reads as a typo.
+  if (!n) {
+    return `${base} (no call this day carried a context measurement; `
+      + `${fmtCount(total)} call(s), all unmeasured)`;
+  }
+  return unmeasured
+    ? `${base} (over ${fmtCount(n)} of ${fmtCount(total)} call(s); `
+      + `${fmtCount(unmeasured)} measured nothing)`
+    : `${base} (over all ${fmtCount(total)} call(s))`;
+}
+
 const CLASS_COLORS = { input: "#2563eb", cache_read: "#059669", cache_write: "#d97706", output: "#dc2626" };
 // One colour per turn-type series, cycled. Must stay >= the number of keys the
 // "by turn type" chart can produce, or two series share a colour and the stack
@@ -716,10 +760,23 @@ function report() {
         {
           label: "Median context/call",
           value: fmtTok(this.summary.context.median),
-          note: `${fmtCount(this.summary.context.sample_calls)} `
-            + `${this.summary.context.sample_is}`,
+          note: this.contextSampleLine,
         },
       ];
+    },
+
+    // #25: the card's sample line. Read off `/api/summary`'s TOP-LEVEL pair
+    // rather than the identical pair inside `context`, because these are the
+    // two the card's own `avg_context` is partitioned against -- the API
+    // guarantees `context_calls + unmeasured_calls == calls`, and stating them
+    // here is what stops the headline being read as a mean over every call.
+    get contextSampleLine() {
+      const line = `${fmtCount(this.summary.context_calls)} `
+        + `${this.summary.context.sample_is}`;
+      return this.summary.unmeasured_calls
+        ? `${line}; ${fmtCount(this.summary.unmeasured_calls)} measured nothing `
+          + `and are excluded`
+        : line;
     },
 
     // Ordered by the percentile IN THE KEY rather than by the payload's key
@@ -762,6 +819,31 @@ function report() {
       return SUBAGENT_STATUS[r.subagent_status] || [" ?", "Unrecognized subagent status."];
     },
 
+    // #25: the sample a row's context mean ranges over, in the same
+    // mark-plus-tooltip shape as `subagentStatus`. An aggregate must name the
+    // set it ranges over, and this one no longer ranges over `calls`: a call
+    // that reported no prompt accounting is excluded rather than averaged in
+    // as a zero, so the mean and the call count beside it describe different
+    // sets whenever `unmeasured_calls` is non-zero.
+    contextSample(r) {
+      const measured = fmtCount(r.context_calls);
+      const total = fmtCount(r.calls);
+      if (!r.context_calls) {
+        return [" ?", `No call in this session carried a context measurement, `
+          + `so there is no mean to report. UNMEASURED, never 0 -- all ${total} `
+          + `call(s) reported no prompt accounting.`];
+      }
+      if (r.unmeasured_calls) {
+        return [" !", `Mean over the ${measured} call(s) that carried a context `
+          + `measurement, of ${total} in this session. The other `
+          + `${fmtCount(r.unmeasured_calls)} reported none and are excluded -- `
+          + `averaged in, they would drag this figure down by exactly the `
+          + `proportion nobody measured.`];
+      }
+      return ["", `Mean over all ${total} of this session's calls; every one `
+        + `carried a context measurement.`];
+    },
+
     agentStatus(r) {
       return AGENT_STATUS[r.status] ?? [r.status, ""];
     },
@@ -800,6 +882,16 @@ function report() {
         type: "line",
         label: "avg context/call",
         data: ts.avg_context,
+        // #25: this series is where the defect was SEEN -- the line plunged to
+        // zero on days whose calls carried no context accounting, because a
+        // mean over nothing was published as 0. The API now publishes null,
+        // which Chart.js draws as a gap, and these two arrays say per point
+        // which of "no calls" and "no measurement" opened it. Carried on the
+        // dataset so the tooltip can name the sample without the callback
+        // closing over the whole response.
+        contextCalls: ts.context_calls,
+        unmeasuredCalls: ts.unmeasured_calls,
+        totalCalls: ts.calls,
         borderColor: "#111827",
         backgroundColor: "#111827",
         yAxisID: "y2",
@@ -817,7 +909,7 @@ function report() {
             y: { stacked: true, ticks: { callback: v => fmtTok(v) }, title: { display: true, text: "tokens/day" } },
             y2: { position: "right", grid: { drawOnChartArea: false }, ticks: { callback: v => fmtTok(v) }, title: { display: true, text: "avg context/call" } },
           },
-          plugins: { tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmtTok(c.raw)}` } } },
+          plugins: { tooltip: { callbacks: { label: c => chartTooltipLabel(c) } } },
         },
       });
     },
