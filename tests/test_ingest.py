@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ingest as ingest_mod  # noqa: E402
 from ingest import (  # noqa: E402
     available_projects,
+    classify_turn,
     default_projects_dir,
     ingest,
     parse_file,
@@ -1462,6 +1463,233 @@ class MissingMessageIdTest(unittest.TestCase):
 
     def test_the_count_is_surfaced(self) -> None:
         self.assertEqual(self.summary["calls_without_message_id"], 2)
+
+
+class ClassifyTurnProvenanceTest(unittest.TestCase):
+    """`turn_type` is PROVENANCE -- who submitted the turn -- not topic (#4).
+
+    The old classifier searched topic vocabulary (`cron`, `wakeup`, `PR-cycle`)
+    anywhere in the first 600 chars, so it answered "what is this turn ABOUT",
+    which is a different question with a different answer. Measured over one
+    developer machine's local transcript corpus (48 session files,
+    6,643 user turns, checked 2026-08-04) it was wrong in both directions: 117
+    of 117 `wakeup` turns merely contained the word mid-prompt (the literal
+    never once appeared at offset 0), while 259 genuine `PIPELINE TICK` ticks
+    were filed as `human` because the pattern did not list that prefix.
+
+    Every fixture below is synthetic and hand-written; CLAUDE.md forbids
+    committing captured session content. The SHAPES are real -- each was
+    verified against the corpus -- but the words are invented.
+    """
+
+    # -- the filed false positive: topic word, human provenance -------------
+    def test_human_turn_ABOUT_cron_is_human(self) -> None:
+        text = (
+            "this is consuming way too much context (likely because of our "
+            "cron addition) - can we look at whether the PR-cycle tick is "
+            "worth keeping at all?"
+        )
+        self.assertEqual(classify_turn(text), "human")
+
+    def test_human_turn_ABOUT_wakeups_is_human(self) -> None:
+        # Shape of the real false positives: a long operator prompt whose body
+        # says "THIS WAKEUP:". The word sat at offset >= 40 in 117 of 117
+        # corpus matches, never at 0, so provenance was never what was matched.
+        text = (
+            "Drive the open reviews and keep the queue moving forward. "
+            "THIS WAKEUP: (1) re-check the build, (2) report back."
+        )
+        self.assertEqual(classify_turn(text), "human")
+        self.assertNotEqual(classify_turn(text), "wakeup")
+
+    def test_human_turn_QUOTING_a_marker_is_not_stolen_by_it(self) -> None:
+        # A marker deeper in the text is quoted content, not provenance.
+        # Anchoring is what stops a human turn with an appended
+        # <system-reminder> from being filed as harness-injected.
+        text = (
+            "why does this turn classify the way it does?\n"
+            "<system-reminder>the reminder body</system-reminder>"
+        )
+        self.assertEqual(classify_turn(text), "human")
+
+    def test_typed_slash_text_without_harness_tags_is_human(self) -> None:
+        # The harness REWRITES a real invocation into <command-*> tags, so bare
+        # "/wizard:" prose in the transcript was typed by the operator.
+        self.assertEqual(classify_turn("/wizard: resume the queue please"), "human")
+
+    # -- the filed false negative: real ticks that fell through -------------
+    def test_genuine_pr_cycle_tick_is_cron_tick(self) -> None:
+        text = (
+            "PR-CYCLE TICK. Drive every open PR to merge-ready, then report "
+            "the queue depth."
+        )
+        self.assertEqual(classify_turn(text), "cron-tick")
+
+    def test_genuine_pipeline_tick_is_cron_tick(self) -> None:
+        # 259 of these were classified `human` before this fix -- a bucket
+        # larger than the entire `cron-tick` bucket it was missing from (145).
+        text = "PIPELINE TICK — drive open reviews and keep the queue moving."
+        self.assertEqual(classify_turn(text), "cron-tick")
+
+    def test_other_measured_tick_sentinels_are_cron_tick(self) -> None:
+        # Two more shapes measured in the corpus (18 and 2 turns). The rule is
+        # the ALL-CAPS sentinel, not an enumeration that ages out silently.
+        self.assertEqual(
+            classify_turn("SOME-COHORT TICK — act, do not report.\n\nfirst:"),
+            "cron-tick",
+        )
+        self.assertEqual(
+            classify_turn("RESOURCE-MANAGER TICK. Measure host capacity."),
+            "cron-tick",
+        )
+
+    def test_tick_sentinel_must_be_a_whole_word_at_the_start(self) -> None:
+        # Guards the sentinel against the obvious over-matches. A human
+        # SHOUTING about a ticket is not a scheduler.
+        self.assertEqual(classify_turn("TICKET #12 IS STILL OPEN."), "human")
+        self.assertEqual(
+            classify_turn("please check every TICK. of the pipeline"), "human"
+        )
+        # TICK must be its OWN word: without the word boundary this shouted
+        # sentence matches on the tail of "STICK" and becomes a scheduler.
+        self.assertEqual(classify_turn("MAKE IT STICK."), "human")
+        # ... and the sentinel must CLOSE with punctuation, not merely lead a
+        # shouted sentence that happens to use the word.
+        self.assertEqual(classify_turn("ALL TICK BOXES MUST BE CHECKED"), "human")
+
+    def test_human_turn_QUOTING_a_tick_sentinel_is_still_human(self) -> None:
+        # The anchor is what separates this from the filed defect: discussing
+        # a tick must not be charged to the tick. This is the exact shape that
+        # made issue #11's attribution detector unsafe to build on.
+        text = (
+            "the scheduler keeps firing 'PIPELINE TICK — drive open reviews' "
+            "every ten minutes and it is burning context. can we stop it?"
+        )
+        self.assertEqual(classify_turn(text), "human")
+
+    # -- the slash-command arm -----------------------------------------------
+    def test_slash_command_with_no_stdout_is_local_command(self) -> None:
+        # The filed defect: a command that emits no stdout writes only
+        # <command-message>/<command-name>, so `"<local-command" in head` missed
+        # it and the topic search then filed /wizard as a cron tick.
+        text = (
+            "<command-message>wizard</command-message>\n"
+            "<command-name>/wizard</command-name>\n"
+            "<command-args>resume the PR-cycle queue</command-args>"
+        )
+        self.assertEqual(classify_turn(text), "local-command")
+
+    def test_slash_command_written_name_first_is_local_command(self) -> None:
+        # 29 of the 340 corpus command turns lead with <command-name>; both
+        # orders occur and both are the harness.
+        text = (
+            "<command-name>/self-learning</command-name>\n"
+            "<command-message>self-learning</command-message>"
+        )
+        self.assertEqual(classify_turn(text), "local-command")
+
+    def test_local_command_stdout_and_caveat_still_classify(self) -> None:
+        self.assertEqual(
+            classify_turn("<local-command-stdout>ok</local-command-stdout>"),
+            "local-command",
+        )
+        self.assertEqual(
+            classify_turn("<local-command-caveat>Caveat: ...</local-command-caveat>"),
+            "local-command",
+        )
+
+    # -- the tag arms, now anchored ------------------------------------------
+    def test_task_notification_and_system_reminder_anchor_at_start(self) -> None:
+        self.assertEqual(
+            classify_turn("<task-notification><task-id>t-1</task-id>"),
+            "task-notification",
+        )
+        self.assertEqual(
+            classify_turn("<system-reminder>ctx</system-reminder>"), "system-reminder"
+        )
+
+    def test_leading_whitespace_does_not_defeat_the_anchor(self) -> None:
+        self.assertEqual(
+            classify_turn("\n  <task-notification><task-id>t-1</task-id>"),
+            "task-notification",
+        )
+        self.assertEqual(
+            classify_turn("\nPR-CYCLE TICK. Drive every open PR."), "cron-tick"
+        )
+
+    def test_empty_text_is_not_a_provenance_claim(self) -> None:
+        self.assertEqual(classify_turn(""), "human")
+
+
+class ClassifyTurnEndToEndTest(unittest.TestCase):
+    """The reclassification survives the write path into `turns.turn_type`.
+
+    Asserts the STATE CHANGE, not that classify_turn returned a string: the
+    consumer (issue #11's wakeup/heartbeat attribution) reads the column, not
+    the function. Fixture is built inline and is entirely synthetic.
+    """
+
+    def _record(self, uuid: str, text: str, ts: str) -> str:
+        return json.dumps(
+            {
+                "type": "user",
+                "uuid": uuid,
+                "sessionId": "sess-classify",
+                "timestamp": ts,
+                "message": {"role": "user", "content": text},
+            }
+        )
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-classify-test-"))
+        projects = self.tmp / "projects"
+        projects.mkdir(parents=True)
+        lines = [
+            self._record(
+                "u1",
+                "<command-message>wizard</command-message>\n"
+                "<command-name>/wizard</command-name>",
+                "2026-08-04T10:00:00.000Z",
+            ),
+            self._record(
+                "u2",
+                "PR-CYCLE TICK. Drive every open PR to merge-ready.",
+                "2026-08-04T10:01:00.000Z",
+            ),
+            self._record(
+                "u3",
+                "PIPELINE TICK — drive open reviews and keep the queue moving.",
+                "2026-08-04T10:02:00.000Z",
+            ),
+            self._record(
+                "u4",
+                "can we drop the cron tick? it eats context on every wakeup.",
+                "2026-08-04T10:03:00.000Z",
+            ),
+        ]
+        (projects / "sess-classify.jsonl").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+        self.db = self.tmp / "usage.db"
+        self.summary = ingest(projects, self.db)
+        self.conn = sqlite3.connect(self.db)
+        self.conn.row_factory = sqlite3.Row
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        shutil.rmtree(self.tmp)
+
+    def test_turn_types_written_to_the_db(self) -> None:
+        rows = self.conn.execute(
+            "SELECT turn_type, COUNT(*) n FROM turns GROUP BY turn_type"
+        ).fetchall()
+        self.assertEqual(
+            {r["turn_type"]: r["n"] for r in rows},
+            {"local-command": 1, "cron-tick": 2, "human": 1},
+        )
+
+    def test_no_record_was_dropped_as_unparsed(self) -> None:
+        self.assertEqual(self.summary["unparsed_records"], 0)
 
 
 if __name__ == "__main__":
