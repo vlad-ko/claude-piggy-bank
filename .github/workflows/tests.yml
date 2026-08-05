@@ -102,18 +102,110 @@ jobs:
                 f"({len(local)} local modules).")
           PY
 
-      - name: No dependency manifests
-        # The rule is about the whole build, not only imports: a requirements
-        # file or a package.json means someone intends an install step.
+      - name: No manifest may declare a dependency
+        # NARROWED from "no manifest may exist" (#21). The rule being enforced
+        # is a property -- CPB installs nothing into the user's environment but
+        # CPB -- and the step above already tests that property directly, by
+        # resolving every import in every shipped module against
+        # `sys.stdlib_module_names` on an interpreter with nothing installed.
+        # Banning `pyproject.toml` by filename tested a proxy: it failed a file
+        # with `dependencies = []`, which declares exactly the thing the rule
+        # wants, and so foreclosed packaging options that satisfy it
+        # completely. This step is now the second, cheaper signal -- about
+        # INTENT, which the import scanner cannot see: a declared dependency is
+        # someone planning an install step, even before the import lands.
+        #
+        # Two tiers, both deliberate:
+        #
+        #   Rejected on sight. `requirements*.txt`, `Pipfile` and the lockfiles
+        #   exist only to drive an installer -- declaring nothing in one is a
+        #   file with no purpose -- and the npm manifests additionally imply a
+        #   Node runtime, which the project rules out outright rather than
+        #   conditionally. `setup.py` and `setup.cfg` are superseded by
+        #   `pyproject.toml`, so permitting a dependency-free variant of them
+        #   buys nothing and adds an executable manifest to audit.
+        #
+        #   Inspected. `pyproject.toml` passes iff it declares no runtime,
+        #   optional or grouped dependency. `build-system.requires` is NOT
+        #   counted: a build frontend provisions it in an isolated environment
+        #   that is discarded, so nothing reaches the environment the user
+        #   installs into -- and anything it smuggled in would still have to
+        #   be imported to matter, where the step above catches it.
+        #
+        # `dynamic = ["dependencies"]` fails: it moves the declaration
+        # somewhere this cannot read, and a check that cannot see its answer
+        # must refuse rather than report a clean one.
+        #
+        # Adding such a file is still a reviewed decision -- this step only
+        # stops it from being an automatic build break. Needs tomllib (3.11+);
+        # on an older interpreter this step fails loudly rather than passing.
         run: |
           set -euo pipefail
-          found=$(ls requirements*.txt pyproject.toml setup.py package.json Pipfile 2>/dev/null || true)
-          if [ -n "$found" ]; then
-            echo "Dependency manifest(s) present, contradicting stdlib-only:"
-            echo "$found"
-            exit 1
-          fi
-          echo "No dependency manifests."
+          python - <<'PY'
+          import pathlib, sys, tomllib
+
+          REJECTED_ON_SIGHT = {
+              "Pipfile", "Pipfile.lock", "poetry.lock", "uv.lock",
+              "package.json", "package-lock.json", "yarn.lock",
+              "pnpm-lock.yaml", "setup.py", "setup.cfg",
+          }
+
+          def declared_dependencies(data):
+              """Every dependency `pyproject.toml` declares, as "where: what"."""
+              found = []
+              project = data.get("project", {})
+              found += [f"project.dependencies: {d}" for d in project.get("dependencies", [])]
+              for extra, deps in project.get("optional-dependencies", {}).items():
+                  found += [f"project.optional-dependencies.{extra}: {d}" for d in deps]
+              for group, deps in data.get("dependency-groups", {}).items():
+                  found += [f"dependency-groups.{group}: {d}" for d in deps]
+              poetry = data.get("tool", {}).get("poetry", {})
+              found += [
+                  f"tool.poetry.dependencies: {name}"
+                  for name in poetry.get("dependencies", {})
+                  if name != "python"
+              ]
+              for group, spec in poetry.get("group", {}).items():
+                  found += [
+                      f"tool.poetry.group.{group}.dependencies: {name}"
+                      for name in spec.get("dependencies", {})
+                      if name != "python"
+                  ]
+              if "dependencies" in project.get("dynamic", []):
+                  found.append("project.dynamic: dependencies are declared elsewhere")
+              return found
+
+          offenders = []
+          inspected = []
+          for path in sorted(pathlib.Path(".").rglob("*")):
+              if ".git" in path.parts or not path.is_file():
+                  continue
+              name = path.name
+              if name in REJECTED_ON_SIGHT or (
+                  name.startswith("requirements") and name.endswith(".txt")
+              ):
+                  offenders.append(f"{path}: rejected on sight -- it exists to drive an installer")
+                  continue
+              if name != "pyproject.toml":
+                  continue
+              inspected.append(str(path))
+              try:
+                  data = tomllib.loads(path.read_text(encoding="utf-8"))
+              except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+                  offenders.append(f"{path}: unreadable, so its dependencies are unknown ({exc})")
+                  continue
+              offenders += [f"{path} declares {d}" for d in declared_dependencies(data)]
+
+          if offenders:
+              print("Dependency declaration(s) found, contradicting stdlib-only:")
+              for line in offenders:
+                  print(f"  {line}")
+              sys.exit(1)
+          print(
+              "No manifest declares a dependency"
+              f" ({len(inspected)} inspected: {', '.join(inspected) or 'none present'})."
+          )
+          PY
 
   # Fan-in. Branch protection requires THIS one check, so the matrix can grow
   # or shrink without anyone editing the protection settings -- and a matrix
