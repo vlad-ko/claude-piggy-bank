@@ -4951,11 +4951,23 @@ class ContextReferentIsBoundTest(unittest.TestCase):
         # cannot show a band the API did not send, and cannot omit one it did.
         # TWO band loops since #61 -- one per scope and one pooled -- and both
         # iterate a list the API sent rather than a list the page assembled.
+        #
+        # FOUR loops since #88, not two: each of the two band lists is iterated
+        # once for its METER and once for its LEGEND, and the pair is the point
+        # rather than a duplication. A segment is drawn only for a band with a
+        # nonzero share, so a meter alone could not state a band that measured
+        # zero -- and "0 calls in this band" is a measurement, not an absence.
+        # The legend carries it, muted, beside the picture that omits it.
         loops = re.findall(r'<template x-for="([^"]+)"', self.band)
         self.assertEqual(
             [loop for loop in loops if "bands" in loop],
-            ["b in s.bands", "b in summary.context.utilisation.bands"],
-            "a band list is built some other way, or one of the two is gone",
+            [
+                "(b, i) in s.bands",
+                "(b, i) in s.bands",
+                "(b, i) in summary.context.utilisation.bands",
+                "(b, i) in summary.context.utilisation.bands",
+            ],
+            "a band list is built some other way, or one of the four is gone",
         )
 
     def test_the_bands_lead_with_the_scope_split(self) -> None:
@@ -5035,8 +5047,8 @@ class ContextReferentIsBoundTest(unittest.TestCase):
         self.assertIn('x-if="!s.no_sample_reason"', self.scope_loop)
         self.assertLess(
             self.scope_loop.index('x-if="!s.no_sample_reason"'),
-            self.scope_loop.index("b in s.bands"),
-            "the bands are drawn outside the branch that establishes a sample",
+            self.scope_loop.index("(b, i) in s.bands"),
+            "the meter is drawn outside the branch that establishes a sample",
         )
         self.assertIn('x-text="s.no_sample_reason"', self.scope_loop)
 
@@ -5192,10 +5204,15 @@ class ContextReferentIsBoundTest(unittest.TestCase):
         )
 
     def test_the_annotation_adds_no_panel(self) -> None:
-        # CLAUDE.md constraint 4. This earned its space by DISPLACING the mean
-        # in the card above it; it may not also append a surface. It reuses the
-        # `note-band` component the scope note already uses, and adds no table.
-        self.assertRegex(self.raw, r'<div class="note-band" id="context-note">')
+        # CLAUDE.md constraint 4. #88 turned this from a note-band annotating a
+        # card deck into question card TWO, which is a change of LEVEL and not
+        # an appended surface: the deck it used to annotate moved to the detail
+        # view in the same change, and `ReportViewSplitTest` pins that the net
+        # count did not rise. What must still hold is that the overview's idiom
+        # is not the detail view's -- `.panel` is what the tables and the chart
+        # wear, and its count is unchanged -- and that this card is still not a
+        # table.
+        self.assertRegex(self.raw, r'<section class="q" id="context-note">')
         self.assertNotIn("<table", self.band)
         self.assertEqual(self.html.count('class="panel"'), 6, "a panel was added")
 
@@ -7030,12 +7047,24 @@ class RecommendationRenderTest(unittest.TestCase):
         )
 
     def test_the_band_annotates_rather_than_adding_a_table(self) -> None:
-        # Constraint 4. `note-band` is this page's idiom for annotating the
-        # figures above it -- `#scope-note` and `#context-note` are the two that
-        # came first -- and a `<table>` here would be the appended surface the
-        # constraint names.
-        self.assertIn('class="note-band"', self.band)
+        # Constraint 4. #88 promoted this band to question card THREE, which is
+        # the level change that issue authorises rather than an appended
+        # surface -- the net count across both views is pinned unchanged in
+        # `ReportViewSplitTest`. The rendering itself is still ranked ROWS
+        # rather than a `<table>`: the detail view is where tables live.
+        self.assertIn('class="q"', self.band)
         self.assertNotIn("<table", self.band)
+
+    def test_the_readings_render_as_ranked_rows_rather_than_paragraphs(self) -> None:
+        # #88's complaint in its most literal form: each reading was four
+        # stacked `advice-line` paragraphs, which is why eight of them read as
+        # a wall. A row carries its RANK, what it is, and its figure at the
+        # right -- and the rank is the loop index rather than a number the page
+        # invents, so it cannot disagree with the order the API published.
+        self.assertIn('<div class="rank" x-text="i + 1"></div>', self.band)
+        self.assertIn('<div class="n" x-text="fmtMetric(a.value)"></div>', self.band)
+        self.assertRegex(self.raw, r"\.opp\s*\{[^}]+\}")
+        self.assertRegex(self.raw, r"\.opp \.fig\s*\{[^}]*text-align:right")
 
 
 class RecommendationWiringIsCompleteTest(unittest.TestCase):
@@ -7207,15 +7236,39 @@ CHROME_PANELS = {
     # #64's verdict, and it is chrome for the same reason the banner is: it
     # qualifies EVERY figure in either view, so a rendering the reader could
     # navigate away from would be a verdict they could leave behind unresolved.
-    # One element, no second copy to drift from.
+    # One element, no second copy to drift from. #88 made it question card ONE
+    # -- #62's first question is this verdict -- without moving it into a view:
+    # what changed is that it now looks like what it always was.
     "health-note",
     # The affordance itself: one click there, one click back, from either view.
     "view-tabs",
 }
-OVERVIEW_PANELS = {"overview-period", "cards", "scope-note", "context-note", "advice-note"}
+# #88: #62's four questions, as four cards. Question 1 is `health-note` above,
+# in the chrome; 2, 3 and 4 are here.
+#
+# `overview-period` LEFT THE REGISTER AND DID NOT LEAVE THE PAGE. It is a
+# caption naming the window the figures cover, and its twin `#details-period`
+# was never registered as a panel either -- so #88 removed the asymmetry rather
+# than exploiting it. `test_the_period_caption_is_not_counted_as_a_panel` pins
+# that it is still there and still bound.
+OVERVIEW_PANELS = {"context-note", "advice-note", "next-note"}
+# The raw token deck and the scope band MOVED DOWN, they were not dropped: they
+# are inputs to the four answers rather than answers, and "Input tokens 32.1k /
+# Cache-read 443.47M" with no verdict is the reaction #62 was filed over. The
+# scope band travels with the deck because it is the deck's own caveat -- "every
+# figure below is a main-thread figure, not a session total" names the scope of
+# exactly those cards, and split from them it would warn about numbers on
+# another page.
 DETAIL_PANELS = {
-    "filters", "chart-panel", "models", "detail", "sessions", "agents", "outliers",
+    "filters", "cards", "scope-note", "chart-panel", "models", "detail",
+    "sessions", "agents", "outliers",
 }
+# What "net panel count across both views must not rise" (#88) means as a
+# number. Sixteen before the redesign -- 4 chrome + 5 overview + 7 detail --
+# and sixteen after: the overview lost the deck, the scope band and the period
+# caption and gained a fourth question card, and the detail view took the two
+# panels the overview shed.
+EXPECTED_SURFACES = 16
 
 # Every JS member name that can sit on the tail of a payload read. Stripped
 # before two views' bindings are compared, so `summary.calls` in one view and
@@ -7344,6 +7397,63 @@ class ReportViewSplitTest(unittest.TestCase):
             with self.subTest(panel=panel, view="details"):
                 self.assertIn(f'id="{panel}"', self.details)
                 self.assertNotIn(f'id="{panel}"', self.overview)
+
+    def test_the_redesign_did_not_raise_the_net_surface_count(self) -> None:
+        # CLAUDE.md constraint 4, as the #88 brief states it: the overview is a
+        # different LEVEL and may be restructured, but the net panel count
+        # across both views must not rise. Asserted as EQUALITY rather than a
+        # ceiling, for `EXPECTED_NOT_RENDERED`'s reason -- a ceiling nobody
+        # restates is a budget to spend, and raising this literal has to be a
+        # deliberate line of code somebody argues for.
+        surfaces = CHROME_PANELS | OVERVIEW_PANELS | DETAIL_PANELS
+        self.assertEqual(len(surfaces), EXPECTED_SURFACES)
+        # And the halves, so a change that moved one panel down and added two
+        # up cannot pass on the total alone.
+        self.assertEqual(len(CHROME_PANELS), 4)
+        self.assertEqual(len(OVERVIEW_PANELS), 3)
+        self.assertEqual(len(DETAIL_PANELS), 9)
+
+    def test_the_four_questions_are_the_overviews_structure(self) -> None:
+        # #62's information architecture, as MARKUP rather than as prose: four
+        # cards, each numbered, each headed by the question it answers. The
+        # first is chrome (see CHROME_PANELS); the other three are the whole of
+        # the overview.
+        questions = [
+            ("health-note", "1", "Is anything blowing up?"),
+            ("context-note", "2", "Am I wasting context?"),
+            ("advice-note", "3", "Where can I optimize?"),
+            ("next-note", "4", "What do I do next?"),
+        ]
+        for panel, number, question in questions:
+            with self.subTest(question=question):
+                card = html_element(self.raw, f'id="{panel}"')
+                self.assertRegex(
+                    card,
+                    rf'<h2><span class="num">{number}</span>{re.escape(question)}</h2>',
+                    f"{panel} is not headed by question {number}",
+                )
+        # THE CARD IDIOM IS NOT THE DETAIL VIEW'S. `.panel` is what the tables
+        # and the chart wear, and the count of it is pinned elsewhere; a
+        # question card that reused it would erase the level distinction this
+        # whole split is built on.
+        for panel, _number, _question in questions:
+            with self.subTest(panel=panel, css="q"):
+                self.assertRegex(
+                    self.raw, rf'<section class="q" id="{panel}"'
+                )
+
+    def test_the_period_caption_is_not_counted_as_a_panel(self) -> None:
+        # It left the register and did not leave the page. Both views name the
+        # window their figures cover, through the one getter that composes it;
+        # neither naming is a panel, and the detail view's twin never was one.
+        for view, element in (
+            ("overview", "overview-period"), ("details", "details-period")
+        ):
+            with self.subTest(view=view):
+                caption = html_element(self.raw, f'id="{element}"')
+                self.assertIn('class="period"', caption)
+                self.assertIn("periodLabel", caption)
+                self.assertNotIn(element, OVERVIEW_PANELS | DETAIL_PANELS)
 
     def test_each_panel_exists_exactly_once_in_the_page(self) -> None:
         # A panel duplicated into both views is the disagreement this issue is
@@ -8574,15 +8684,37 @@ class HealthBandIsBoundTest(unittest.TestCase):
                 )
 
     def test_the_verdict_adds_no_panel(self) -> None:
-        # CLAUDE.md constraint 4. It reuses the `note-band` component the scope
-        # and context notes already use, and it DISPLACES a banner message: the
-        # "No files ingested yet" notice is gone, subsumed by the
-        # `records-parsed` check, which says the same thing and says which of
-        # "clean" and "unchecked" it is.
-        self.assertRegex(self.raw, r'<div class="note-band" id="health-note"')
+        # CLAUDE.md constraint 4. It wears the overview's own question-card
+        # idiom rather than the detail view's `.panel`, and it DISPLACES a
+        # banner message: the "No files ingested yet" notice is gone, subsumed
+        # by the `records-parsed` check, which says the same thing and says
+        # which of "clean" and "unchecked" it is. The net surface count across
+        # both views is pinned in `ReportViewSplitTest`.
+        self.assertRegex(self.raw, r'<section class="q" id="health-note"')
         self.assertNotIn("<table", self.band)
         self.assertNotIn("No files ingested yet", self.html)
         self.assertEqual(self.html.count('class="panel"'), 6, "a panel was added")
+
+    def test_the_checks_are_one_expansion_down_and_the_verdict_is_not(self) -> None:
+        # #88: six lines of `OK -- check-name: full sentence` was the density
+        # problem in miniature. The DETAIL moved; the verdict did not, and the
+        # order is asserted rather than assumed -- a verdict rendered below the
+        # evidence it summarises is the defect this whole issue is about.
+        detail = html_element(self.raw, 'id="health-detail"')
+        resting = self.band.replace(detail, "")
+        self.assertIn("summary.health.verdict", resting)
+        self.assertIn("summary.health.statement", resting)
+        self.assertIn("summary.health.checks", detail)
+        self.assertNotIn("summary.health.checks", resting)
+        self.assertLess(
+            self.band.index("summary.health.verdict"),
+            self.band.index('id="health-detail"'),
+            "the verdict is rendered after the checks it summarises",
+        )
+        # Native `<details>`, not an `x-show` toggle: it needs no state and no
+        # binding, it is keyboard-reachable for free, and it still opens if the
+        # vendored Alpine bundle ever fails to load.
+        self.assertRegex(detail, r"^<details\b")
 
     def test_the_unparsed_record_warning_is_not_removed_from_the_banner(self) -> None:
         # The health band is a SECOND rendering of `ingest.unparsed_records`,
@@ -8612,31 +8744,59 @@ class GrowthCurveIsBoundTest(unittest.TestCase):
                 self.assertIn(f"summary.context.growth.{field}", self.band)
 
     def test_the_quarters_are_iterated_from_the_payload(self) -> None:
-        loops = re.findall(r'<template x-for="([^"]+)"', self.band)
-        self.assertIn(
-            "q in summary.context.growth.quarters",
-            loops,
-            "the quarters are built some other way",
+        # TIGHTENED AFTER A SURVIVING MUTATION. `assertIn` over the whole card
+        # passed while the BAR loop iterated a literal `[]`, because the LABEL
+        # loop beside it still named the payload -- the curve rendered nothing
+        # and every field it mentions still looked wired. That is
+        # `DeclarativeRenderLayerTest`'s "iterating a literal []" defect, which
+        # is pinned per table there and was unpinned here.
+        #
+        # So both loops are asserted, and each is asserted INSIDE the element
+        # it fills: the bars and their labels are two renderings of one list
+        # and neither may be fed from somewhere else.
+        loop = 'x-for="q in summary.context.growth.quarters"'
+        self.assertEqual(
+            self.band.count(loop),
+            2,
+            "the quarters are built some other way, or one of the two loops "
+            "was pointed at something that is not the payload",
         )
+        for element in ('class="growth"', 'class="glabels"'):
+            with self.subTest(element=element):
+                self.assertIn(loop, html_element(self.raw, element))
 
     def test_a_quarter_with_no_sample_gets_the_apis_reason_and_no_bar(self) -> None:
-        # The central rule of this panel, in pixels: an absence has no width. A
-        # bar of zero width is indistinguishable from a bar the page decided
+        # The central rule of this panel, in pixels: an absence has no height.
+        # A bar of zero height is indistinguishable from a bar the page decided
         # not to draw, and a bar drawn AT zero would show the context
         # collapsing in a quarter that was merely idle.
+        #
+        # #88 turned the four proportional ROWS into four labelled BARS, so the
+        # gate moved from "inside the sampled branch" onto the bar element
+        # itself -- which is the stronger statement of the two, because it is
+        # the drawing that must not exist rather than a branch that happens to
+        # contain it. A quarter that ran calls but banded none has a null
+        # `median_utilisation` and a null `no_sample_reason`, and it must get no
+        # bar either; only the element's own guard covers that case.
+        self.assertRegex(
+            self.band,
+            r'x-if="barWidth\(q\.median_utilisation\) !== null">\s*'
+            r'<div class="gbar"',
+            "the bar is drawn outside the guard that establishes a reading",
+        )
+        self.assertEqual(
+            self.band.count('class="gbar"'), 1, "a second bar escapes the guard"
+        )
         self.assertIn('x-if="q.no_sample_reason"', self.band)
         self.assertIn('x-if="!q.no_sample_reason"', self.band)
         self.assertIn('x-text="q.no_sample_reason"', self.band)
-        self.assertLess(
-            self.band.index('x-if="!q.no_sample_reason"'),
-            self.band.index("growthBarWidth("),
-            "the track is drawn outside the branch that establishes a sample",
-        )
 
     def test_a_nonzero_reading_keeps_a_visible_minimum_width(self) -> None:
         # "Rare" and "never" must never render as the same picture, which is
-        # the acceptance criterion this issue states in pixels.
-        body = js_function_body(self.html, "function growthBarWidth(")
+        # the acceptance criterion this issue states in pixels -- and #88's
+        # central rule for the meters as well, which is why ONE function serves
+        # both. Two copies of this rule would be free to drift.
+        body = js_function_body(self.html, "function barWidth(")
         self.assertIn("Math.max(1,", body)
         self.assertLess(
             body.index("=== null"),
@@ -8644,6 +8804,9 @@ class GrowthCurveIsBoundTest(unittest.TestCase):
             "the width is computed before the absence is recognised",
         )
         self.assertRegex(body, r"if \(x <= 0\) return null;")
+        # The percentage floor alone is not enough: 1% of a 200px meter is 2px.
+        # The pixel floor lives in the stylesheet, and both are load-bearing.
+        self.assertRegex(self.html, r"\.seg\s*\{[^}]*min-width:\s*\d+px")
 
     def test_the_curve_refuses_rather_than_drawing_four_bars_from_three_points(
         self,
@@ -8685,9 +8848,7 @@ class GrowthCurveIsBoundTest(unittest.TestCase):
     def test_the_judged_threshold_keeps_its_own_voice_and_date(self) -> None:
         # The medians are measurements and the threshold is not, so the page
         # must not present the second in the first's voice -- `band_provenance`'s
-        # rule, one panel over. It sits WITH the verdict rather than behind the
-        # disclosure, because a judgment whose conclusion is the heading must
-        # not be further from the reader than the heading is.
+        # rule, one panel over.
         judged = re.search(
             r'<span class="([^"]*context-judged[^"]*)"[^>]*>\s*Shape threshold',
             self.band,
@@ -8697,8 +8858,29 @@ class GrowthCurveIsBoundTest(unittest.TestCase):
         )
         self.assertIn("summary.context.growth.shape_provenance", self.band)
         self.assertIn("summary.context.growth.shape_as_of", self.band)
-        disclosure = html_element(self.raw, 'class="disclosure"')
-        self.assertNotIn("shape_provenance", disclosure)
+
+    def test_the_shape_claim_and_its_judgment_are_never_separated(self) -> None:
+        # THE RULE #88 MADE BITE HARDER. It used to read "the threshold sits
+        # WITH the verdict rather than behind the disclosure", which was the
+        # right rule while the verdict was on the resting card. #88 collapsed
+        # this whole block, so the rule has to be stated as what it always
+        # meant: a judgment may not be further from the reader than the claim
+        # it produced. Both are now inside `#context-detail`, and the failure
+        # to catch is one of them moving without the other -- a card that
+        # asserted a SHAPE at rest while the judgment behind it stayed one
+        # click down would be a product-owner judgment presented as a
+        # measurement, which is exactly what `band_provenance` exists to stop.
+        detail = html_element(self.raw, 'id="context-detail"')
+        resting = self.band.replace(detail, "")
+        for field in ("shape", "shape_statement", "shape_as_of", "shape_provenance"):
+            path = f"summary.context.growth.{field}"
+            with self.subTest(field=field):
+                self.assertIn(path, detail, f"{field} left the region")
+                self.assertNotIn(
+                    path,
+                    resting,
+                    f"{field} is asserted at rest while its companions are not",
+                )
 
     def test_the_answer_sentence_precedes_the_meters_it_is_evidenced_by(self) -> None:
         # #65 asks for the ANSWER above the meters. Order is the whole
@@ -8726,7 +8908,7 @@ class GrowthCurveIsBoundTest(unittest.TestCase):
         # own voice, which is why `band_provenance` is a separate field at all.
         # What was wrong was the WEIGHT: at the same size as the finding they
         # buried it.
-        disclosure = html_element(self.raw, 'class="disclosure"')
+        disclosure = html_element(self.raw, 'id="context-detail"')
         for field in ("window_provenance", "band_provenance"):
             with self.subTest(field=field):
                 self.assertIn(field, disclosure)
@@ -8750,6 +8932,424 @@ class GrowthCurveIsBoundTest(unittest.TestCase):
                 self.assertIn(
                     f"fmtTokRounded(summary.scope.{kind}.avg_context)", self.band
                 )
+
+
+class UtilisationMeterTest(unittest.TestCase):
+    """#88: the bands are a picture, and a zero is not a thin sliver.
+
+    THE CENTRAL RULE OF THIS CHANGE, IN PIXELS. Four comma-separated shares
+    told the reader nothing at a glance; a proportional meter does. What a
+    meter can lose that a sentence cannot is the difference between RARE and
+    NEVER -- a 0.04% band and a 0% band are one pixel apart on any real width,
+    and this repository's whole posture is that a real 0 and no sample must not
+    render alike. So the rule is enforced in two directions at once: a nonzero
+    share keeps a visible minimum, and a TRUE ZERO GETS NO SEGMENT AT ALL,
+    while the legend beside it still states the zero as the measurement it is.
+
+    The limit these share with every other check in this file: the project
+    ships no JS runtime, so they pin the bindings and the stylesheet rather
+    than executing the render. What a person still has to look at is whether
+    the minimum width is wide enough to SEE -- a rule that is satisfied at one
+    pixel is satisfied and invisible.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+        cls.band = html_element(cls.raw, 'id="context-note"')
+
+    def test_a_true_zero_gets_no_segment_at_all(self) -> None:
+        # Not a segment of zero width -- NO SEGMENT. A zero-width flex item
+        # with a `min-width` is a segment of the minimum width, which is
+        # exactly the picture "rare" produces, so the guard has to remove the
+        # element rather than size it.
+        segments = re.findall(
+            r'x-if="barWidth\(b\.share\) !== null">\s*<span class="seg"', self.band
+        )
+        self.assertEqual(
+            len(segments), 2, "a meter draws a segment outside the zero guard"
+        )
+        self.assertEqual(
+            self.band.count('<span class="seg"'),
+            2,
+            "there is a segment element the guard does not cover",
+        )
+        body = js_function_body(self.html, "function barWidth(")
+        self.assertRegex(body, r"if \(x <= 0\) return null;")
+
+    def test_a_zero_band_is_still_stated_beside_the_picture_that_omits_it(
+        self,
+    ) -> None:
+        # The other half, and the one that keeps the omission honest: a band
+        # with no calls is dropped from the METER and kept in the LEGEND, with
+        # its count of 0 rendered through `fmtCount` and marked as the real
+        # zero it is. Dropped from both, it would be indistinguishable from a
+        # band the API never sent.
+        self.assertEqual(
+            self.band.count("""<span :class="b.calls ? '' : 'zero'\""""),
+            2,
+            "a legend does not mark its zero bands, or one legend is gone",
+        )
+        self.assertEqual(self.band.count("fmtCount(b.calls)"), 2)
+        self.assertRegex(self.html, r"\.legend \.zero[^{]*\{[^}]+\}")
+
+    def test_a_share_of_an_empty_set_is_not_drawn_as_a_zero(self) -> None:
+        # `share` is null -- never 0.0 -- for a band over an empty set, and
+        # `barWidth` refuses a null before it computes. A meter drawn from
+        # nulls would show four missing segments, which is the same picture as
+        # four measured zeroes.
+        body = js_function_body(self.html, "function barWidth(")
+        self.assertLess(
+            body.index("=== null"),
+            body.index("Math.max"),
+            "the width is computed before the absence is recognised",
+        )
+
+    def test_every_band_the_api_can_send_has_a_tone_of_its_own(self) -> None:
+        # `TurnTypeChartColourTest`'s rule, one widget over: a palette shorter
+        # than the series count gives two bands one colour, and a meter with
+        # two identically coloured segments does not look broken -- it looks
+        # like one segment. The tone is keyed on POSITION because the page may
+        # not spell a band's name (`test_the_page_invents_no_band_of_its_own`).
+        table = re.search(r"const BAND_TONES = \[(.*?)\];", self.html, re.S)
+        self.assertIsNotNone(table, "BAND_TONES is gone")
+        tones = re.findall(r'"([^"]+)"', table.group(1))
+        self.assertGreaterEqual(
+            len(tones), len(BANDS), "there are more bands than tones for them"
+        )
+        self.assertEqual(len(set(tones)), len(tones), "two bands share a tone")
+        for tone in tones:
+            with self.subTest(tone=tone):
+                self.assertRegex(self.html, rf"\.{re.escape(tone)}\s*\{{[^}}]+\}}")
+
+    def test_a_band_this_build_has_no_tone_for_is_still_visible(self) -> None:
+        # The fallback is the load-bearing half. An uncoloured segment inherits
+        # the meter TRACK's own background, so a band added upstream would
+        # render as the absence of a band -- the one substitution this
+        # repository refuses. Same direction as `HEALTH_TONE_UNRECOGNISED`.
+        self.assertIn('const BAND_TONE_UNRECOGNISED = "seg-extra";', self.html)
+        self.assertIn(
+            "return BAND_TONES[i] ?? BAND_TONE_UNRECOGNISED;",
+            js_function_body(self.html, "function bandTone("),
+        )
+        fallback = re.search(r"\.seg-extra\s*\{([^}]+)\}", self.html)
+        self.assertIsNotNone(fallback, "the fallback tone has no rule")
+        track = re.search(r"\.meter\s*\{([^}]+)\}", self.html)
+        self.assertNotEqual(
+            re.search(r"background:\s*([^;]+)", fallback.group(1)).group(1).strip(),
+            re.search(r"background:\s*([^;]+)", track.group(1)).group(1).strip(),
+            "an unrecognised band is drawn in the track's own colour, which is "
+            "a measurement rendered as an absence",
+        )
+
+    def test_the_pooled_tally_is_drawn_the_same_way_it_is_demoted(self) -> None:
+        # Kept, demoted, and drawn -- the dilution #61 is about is a SHAPE, and
+        # stating it in words under two meters that show the opposite would
+        # leave the reader to do the comparison themselves.
+        self.assertLess(
+            self.band.index(SCOPE_LOOP_EXPR),
+            self.band.index("summary.context.utilisation.includes"),
+            "the pooled meter is not demoted below the split it hides",
+        )
+        self.assertEqual(self.band.count('<div class="meter">'), 2)
+
+
+class OverviewRestingStateTest(unittest.TestCase):
+    """#88: what the overview says before anyone touches it.
+
+    THE OWNER'S SECOND CORRECTION, and it is about the DEFAULT STATE rather
+    than the layout: "let's start with the basics, and then expand, but not
+    with a wall of text." Four cards that each state an answer and stop, with
+    every figure behind them still rendered and one expansion away.
+
+    ONE RULE GOVERNS THE WHOLE THING: DENSITY SCALES WITH HOW MUCH IS WRONG. A
+    reading the API places inside a healthy range collapses to a line, because
+    a healthy report should be short and quiet and that brevity is itself the
+    finding. Anything that is not healthy -- including anything INCONCLUSIVE,
+    which is not the same as healthy -- opens ITSELF, because a problem behind
+    a click the reader has to know to make is a problem this page failed to
+    report.
+
+    THE LIMIT, STATED PLAINLY. These pin which bindings sit inside which
+    region and what decides the `open` attribute. They cannot see whether the
+    resting page fits on a screen, whether a segment is wide enough to notice,
+    or whether the answer reads as an answer. That is the defect #88 was filed
+    over and the reason it shipped green: only a person looking at the page can
+    judge it.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    # card -> the ONE disclosure that holds its evidence.
+    CARDS = (
+        ("health-note", "health-detail"),
+        ("context-note", "context-detail"),
+        ("advice-note", "optimize-detail"),
+        ("next-note", "next-detail"),
+    )
+
+    # What each card must ANSWER with, at rest, before any evidence. Every one
+    # of these is the API's own word or figure: the page states no verdict of
+    # its own anywhere on this level.
+    RESTING = {
+        "health-note": ("summary.health.verdict", "summary.health.statement"),
+        "context-note": (
+            "summary.context.utilisation.worst_scope",
+            # A ranking must name the key it orders by, and a key one click
+            # away has not been named -- `serve.RANKED_BY`'s rule survives the
+            # collapse.
+            "summary.context.utilisation.worst_scope_ranked_by",
+            # The two DATES ride with the answer for the same reason: a judged
+            # cut point whose date is hidden is a judgment presented as a fact.
+            "summary.context.utilisation.windows_as_of",
+            "summary.context.utilisation.bands_as_of",
+        ),
+        "advice-note": (
+            "topOpportunity.metric",
+            "topOpportunity.value",
+            "topOpportunity.severity",
+            "summary.recommendations.as_of",
+        ),
+        "next-note": ("topOpportunity.lever.directive",),
+    }
+
+    # What each card must NOT assert at rest -- the evidence, which is one
+    # expansion down. A path here that crept back up is a card rebuilding the
+    # wall this issue tore down.
+    COLLAPSED = {
+        "health-note": ("summary.health.checks",),
+        "context-note": (
+            "summary.context.utilisation.by_scope",
+            "summary.context.utilisation.bands",
+            "summary.context.growth",
+            "summary.context.utilisation.band_provenance",
+            "summary.context.utilisation.window_provenance",
+            "summary.context.mean",
+            "summary.scope.main_thread.avg_context",
+            "contextSpread",
+        ),
+        "advice-note": (
+            "summary.recommendations.ranked",
+            "summary.recommendations.provenance",
+            "summary.recommendations.ranking_provenance",
+            "summary.recommendations.unmeasured_note",
+        ),
+        "next-note": ("summary.recommendations.ranked",),
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+
+    def card(self, card_id: str) -> str:
+        return html_element(self.raw, f'id="{card_id}"')
+
+    def resting(self, card_id: str, detail_id: str) -> str:
+        """The card with its evidence disclosure removed."""
+        card = self.card(card_id)
+        return card.replace(html_element(self.raw, f'id="{detail_id}"'), "")
+
+    def test_every_card_answers_at_rest(self) -> None:
+        for card_id, detail_id in self.CARDS:
+            resting = self.resting(card_id, detail_id)
+            for path in self.RESTING[card_id]:
+                with self.subTest(card=card_id, path=path):
+                    self.assertIn(
+                        path, resting, f"{card_id} does not state {path} at rest"
+                    )
+
+    def test_no_card_states_its_evidence_at_rest(self) -> None:
+        for card_id, detail_id in self.CARDS:
+            resting = self.resting(card_id, detail_id)
+            for path in self.COLLAPSED[card_id]:
+                with self.subTest(card=card_id, path=path):
+                    # Matched to a path BOUNDARY, not as a substring:
+                    # `utilisation.bands_as_of` is a date the answer is
+                    # required to carry and `utilisation.bands` is evidence it
+                    # is required not to, and one is a prefix of the other.
+                    self.assertNotRegex(
+                        resting,
+                        re.escape(path) + r"(?!\w)",
+                        f"{card_id} still asserts {path} before anyone asks",
+                    )
+
+    def test_no_figure_was_deleted_rather_than_collapsed(self) -> None:
+        # THE mutation this class exists to catch, and the cheapest way to
+        # satisfy every test above: delete the evidence instead of collapsing
+        # it. Collapsed is still RENDERED, so every path the resting card
+        # refuses must be present in the disclosure below it. The wiring guard
+        # would see a field that lost its LAST reader; it cannot see one that
+        # merely lost the reader it was supposed to keep.
+        for card_id, detail_id in self.CARDS:
+            detail = html_element(self.raw, f'id="{detail_id}"')
+            for path in self.COLLAPSED[card_id]:
+                with self.subTest(card=card_id, path=path):
+                    self.assertIn(
+                        path,
+                        detail,
+                        f"{path} was dropped from {card_id} rather than collapsed",
+                    )
+
+    def test_every_answer_precedes_the_evidence_it_rests_on(self) -> None:
+        # Order, as structure. #88's first complaint was that every verdict was
+        # buried mid-paragraph; a card whose disclosure came first would satisfy
+        # every containment check above and still bury it.
+        for card_id, detail_id in self.CARDS:
+            with self.subTest(card=card_id):
+                card = self.card(card_id)
+                self.assertLess(
+                    card.index('class="answer"'),
+                    card.index(f'id="{detail_id}"'),
+                    f"{card_id} renders its evidence above its answer",
+                )
+
+    def test_each_card_holds_its_evidence_in_one_native_disclosure(self) -> None:
+        # ONE, so there is a single thing to open and a single default to
+        # decide. NATIVE, so it needs no state, no binding and no JavaScript,
+        # stays keyboard-reachable, and still works on a page whose vendored
+        # Alpine bundle failed to load -- the `:open` binding decides only the
+        # DEFAULT, never whether the control exists.
+        for card_id, detail_id in self.CARDS:
+            with self.subTest(card=card_id):
+                card = self.card(card_id)
+                self.assertEqual(
+                    card.count(f'id="{detail_id}"'), 1, "the card's disclosure moved"
+                )
+                detail = html_element(self.raw, f'id="{detail_id}"')
+                self.assertRegex(detail, r"^<details\b")
+                self.assertIn("<summary>", detail)
+                self.assertNotIn("x-show", detail[: detail.index(">")])
+
+    def test_a_clean_verdict_collapses_and_every_other_state_opens(self) -> None:
+        # THE asymmetry, as a table for the reason `HEALTH_TONE` is one: a
+        # chain of ifs could quietly return the same default for two states,
+        # and a test can assert this. `unchecked` is NOT a weaker `ok` -- it is
+        # a different claim, and it must not be the one the reader has to go
+        # looking for.
+        table = re.search(r"const HEALTH_OPEN = \{(.*?)\};", self.html, re.S)
+        self.assertIsNotNone(table, "HEALTH_OPEN is gone")
+        defaults = dict(re.findall(r"(\w+):\s*(true|false)", table.group(1)))
+        self.assertEqual(
+            defaults,
+            {HEALTH_OK: "false", HEALTH_UNCHECKED: "true", HEALTH_FAILED: "true"},
+            "a verdict collapses or expands against the rule",
+        )
+        self.assertIn("const HEALTH_OPEN_UNRECOGNISED = true;", self.html)
+        self.assertIn(
+            "?? HEALTH_OPEN_UNRECOGNISED", js_function_body(self.html, "get healthOpen(")
+        )
+
+    def test_a_failed_load_opens_the_verdict_it_cannot_reassure_about(self) -> None:
+        # Same asymmetry as `healthTone` and `bannerMessages`: elapsed evidence
+        # that a response never arrived may only ever RAISE the alarm.
+        body = js_function_body(self.html, "get healthOpen(")
+        self.assertRegex(
+            body,
+            r"if \(!this\.summary \|\| this\.banner\.loadFailure\) \{\s*"
+            r"return HEALTH_OPEN_UNRECOGNISED;",
+        )
+
+    def test_an_inconclusive_context_reading_is_not_a_quiet_one(self) -> None:
+        # Every way the context block can be less than a clean measured healthy
+        # reading, enumerated -- because "unknown" is not "fine", and a card
+        # that collapsed an INCONCLUSIVE reading would be hiding exactly the
+        # thing this repository refuses to soften.
+        body = js_function_body(self.html, "get contextIsQuiet(")
+        for refusal in (
+            "if (u.no_sample_reason !== null) return false;",
+            "if (u.over_half_window_calls) return false;",
+            "if (u.unmeasured_calls) return false;",
+            "if (u.unknown_model_calls) return false;",
+            "if (u.over_window_calls) return false;",
+        ):
+            with self.subTest(refusal=refusal):
+                self.assertIn(refusal, body)
+        self.assertIn("return true;", body)
+
+    def test_an_unmeasured_metric_opens_the_cards_that_rank_it(self) -> None:
+        # "No sample" and "nothing to change" must not render alike, which is
+        # the rule the table's explicit healthy entry exists for -- so an
+        # unmeasured metric opens the card exactly as a lever does.
+        body = js_function_body(self.html, "get opportunitiesAreQuiet(")
+        self.assertIn(
+            "if (Object.keys(this.summary.recommendations.unmeasured).length) "
+            "return false;",
+            body,
+        )
+        self.assertIn("return this.topOpportunity === null;", body)
+
+    def test_neither_quiet_getter_holds_a_threshold_of_its_own(self) -> None:
+        # What separates "counting" from "judging". Every boundary these
+        # getters consult was drawn, dated and published by the API; a numeric
+        # literal here would be a second cut point with no date and no
+        # provenance -- `band_provenance`'s failure mode, in the layout layer.
+        for decl in ("get contextIsQuiet(", "get opportunitiesAreQuiet("):
+            with self.subTest(decl=decl):
+                self.assertNotRegex(
+                    js_function_body(self.html, decl),
+                    r"\d",
+                    "a cut point is spelled in the page rather than read off "
+                    "the payload",
+                )
+
+    def test_the_top_opportunity_reads_the_apis_order_rather_than_ranking(
+        self,
+    ) -> None:
+        # `recommendations.py` refuses to build an `ok` reading WITH a lever or
+        # a non-`ok` reading WITHOUT one, so "is there anything to do, and what
+        # is it first" is the module's own answer. A comparison here would be a
+        # second ranking, free to disagree with the one the card below renders.
+        body = js_function_body(self.html, "get topOpportunity(")
+        self.assertIn(
+            "return this.summary.recommendations.ranked.find(a => a.lever) ?? null;",
+            body,
+        )
+        for forbidden in (".sort(", "Math.max(", "SEVERITY", "severity >"):
+            with self.subTest(expr=forbidden):
+                self.assertNotIn(forbidden, body)
+
+    def test_an_empty_list_of_moves_is_a_named_absence(self) -> None:
+        # A healthy table produces no moves, and an empty `<ol>` says nothing
+        # about why. Both cards state it in words, in the branch that would
+        # otherwise carry the first move.
+        for card_id in ("advice-note", "next-note"):
+            with self.subTest(card=card_id):
+                card = self.card(card_id)
+                self.assertIn('x-if="topOpportunity === null"', card)
+                self.assertIn('x-if="topOpportunity !== null"', card)
+
+    def test_the_moves_are_a_numbered_list_naming_their_figures(self) -> None:
+        # #88 asks for next steps as a numbered list, each naming the figure
+        # that justifies it -- so the move and its evidence cannot be read
+        # apart, and neither is prose this page composed.
+        detail = html_element(self.raw, 'id="next-detail"')
+        self.assertIn('<ol class="next">', detail)
+        self.assertIn('x-text="a.lever.directive"', detail)
+        for evidence in ('x-text="a.metric"', "fmtMetric(a.value)", 'x-text="a.severity"'):
+            with self.subTest(evidence=evidence):
+                self.assertIn(evidence, detail)
+        self.assertRegex(self.html, r"ol\.next\s*\{[^}]+\}")
+
+    def test_the_raw_token_deck_answers_nothing_and_sits_one_level_down(
+        self,
+    ) -> None:
+        # "Input tokens 32.1k / Cache-read 443.47M / Cache-write 8.07M -- what
+        # do I do with this?" is the reaction #62 was filed over. The deck is
+        # an INPUT to the four answers, so it moved to where raw data lives.
+        # Moved, not deleted: `SummaryPayloadIsWiredTest` still sees every one
+        # of its figures, and `ReportViewSplitTest` sees the panel.
+        details = view_section(self.raw, "details")
+        overview = view_section(self.raw, "overview")
+        self.assertIn('id="cards"', details)
+        self.assertNotIn('id="cards"', overview)
+        deck = js_function_body(self.html, "get cards(")
+        for figure in ("input", "cache_read", "cache_write", "output", "sessions"):
+            with self.subTest(figure=figure):
+                self.assertIn(f"this.summary.{figure}", deck)
 
 
 if __name__ == "__main__":
