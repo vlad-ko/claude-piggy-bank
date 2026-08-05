@@ -1931,27 +1931,9 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
 
     # Fields `/api/summary` computes that the page deliberately does not show.
     # An entry must name the reason. Empty is the healthy state.
-    NOT_RENDERED: dict[str, str] = {
-        # #25's sample counts, the pair that makes `avg_context` readable:
-        # `avg_context` is now null for a window whose every call carried no
-        # measurement, and these two say which of "no calls" and "no
-        # measurement" produced it. This commit is the data layer; it does not
-        # touch `index.html`, so the pair arrives here declared rather than
-        # drawn -- and the next commit is the one that owes it.
-        #
-        # NAMING THE EXPOSURE, because an allowlist that hides one is worse
-        # than no allowlist: the median card's sample line does not yet state
-        # either count, and the note band still renders the legacy
-        # `avg_context` through a formatter that predates this change. The API
-        # no longer says zero for an inconclusive window; until the view is
-        # bound, the page has not caught up. The timeseries chart, which is
-        # where the defect was observed, is already correct: Chart.js leaves a
-        # null as a gap in the line.
-        "context_calls": "sample count for #25; bound by the view in the follow-up",
-        "unmeasured_calls": (
-            "sample count for #25; bound by the view in the follow-up"
-        ),
-    }
+    # Fields `/api/summary` computes that the page deliberately does not show.
+    # An entry must name the reason. Empty is the healthy state.
+    NOT_RENDERED: dict[str, str] = {}
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -3684,6 +3666,7 @@ class ContextReferentIsBoundTest(unittest.TestCase):
         cls.html = strip_comments(cls.raw)
         cls.band = html_element(cls.raw, 'id="context-note"')
         cls.cards = js_function_body(cls.html, "get cards(")
+        cls.sample_line = js_function_body(cls.html, "get contextSampleLine(")
 
     # --- the median displaced the mean, rather than joining it ---
 
@@ -3699,16 +3682,26 @@ class ContextReferentIsBoundTest(unittest.TestCase):
         self.assertNotIn("context.mean", self.cards)
         self.assertIn("summary.context.mean", self.band)
 
-    def test_the_legacy_average_is_still_shown_and_still_disagrees(self) -> None:
-        # #25 made visible, and it must STAY visible: `avg_context` divides the
-        # same tokens across every row including those with no context
-        # accounting, so it is a different figure over a different set. The
-        # page says that rather than quietly picking one.
+    def test_the_window_average_is_shown_as_the_same_figure_not_a_rival(
+        self,
+    ) -> None:
+        # INVERTED BY #25, deliberately. This used to assert the page called
+        # `avg_context` "a different figure over a different set" -- true while
+        # it divided the same tokens across every row including those that
+        # reported no prompt accounting, and the gap between it and
+        # `context.mean` WAS that defect made visible.
+        #
+        # The defect is fixed: both run through `has_context_measurement()`, so
+        # they are the same number over the same sample and `serve.py` asserts
+        # it. A page still claiming they differ would be asserting a
+        # discrepancy that no longer exists -- which is the same failure as
+        # rendering a figure nobody measured, pointed the other way.
         self.assertIn("summary.avg_context", self.band)
         self.assertNotIn("summary.avg_context", self.cards)
-        for word in ("legacy", "different set"):
-            with self.subTest(word=word):
-                self.assertIn(word, self.band)
+        self.assertIn("the same", self.band)
+        for stale in ("different set", "divides the same tokens across EVERY row"):
+            with self.subTest(claim=stale):
+                self.assertNotIn(stale, self.band)
 
     def test_the_legacy_average_cannot_round_an_absence_into_a_zero(self) -> None:
         # `Math.round(null)` is 0. The card used to be guarded by a `noData`
@@ -3831,7 +3824,47 @@ class ContextReferentIsBoundTest(unittest.TestCase):
         # `sample_is` exists so the page does not invent its own words for what
         # was counted. An aggregate must name the set it ranges over, and the
         # set is named once, server-side.
-        self.assertIn("context.sample_is", self.cards)
+        #
+        # Read from the sample line rather than the card body: #25 gave the
+        # line two counts to state as well as a name, so it moved into a getter
+        # of its own. The property being asserted is that the WORDS come from
+        # the API, which is about where they originate, not where they are
+        # assembled.
+        self.assertIn("context.sample_is", self.sample_line)
+
+    def test_the_sample_line_states_the_measured_count_and_the_excluded_one(
+        self,
+    ) -> None:
+        # #25: `avg_context` and the median both range over a strictly smaller
+        # set than `calls`, and the card must say by how much. Bound to the
+        # TOP-LEVEL pair, which is the one partitioned against the card's own
+        # call count -- `context_calls + unmeasured_calls == calls`.
+        # The RENDERED form, not the bare property: `unmeasured_calls` also
+        # appears as the condition deciding whether to mention it at all, so
+        # matching the property name alone passed a mutation that kept the test
+        # and dropped the words.
+        for field in ("context_calls", "unmeasured_calls"):
+            with self.subTest(field=field):
+                self.assertIn(
+                    f"fmtCount(this.summary.{field})",
+                    self.sample_line,
+                    f"{field} is consulted but never stated",
+                )
+
+    def test_the_sample_line_actually_reaches_the_card(self) -> None:
+        # `SummaryPayloadIsWiredTest` greps the whole page for a reference, so a
+        # getter that nothing renders satisfies it -- the "computed but never
+        # rendered" shape, one level up from the one that test was built for.
+        # Mutation-checked: deleting the card's `note` leaves that test green.
+        self.assertIn("this.contextSampleLine", self.cards)
+
+    def test_the_excluded_count_is_stated_only_when_there_is_one(self) -> None:
+        # A window where every call was measured must not grow a permanent
+        # "0 measured nothing" clause: a notice that never varies is a notice
+        # nobody reads, and this one would be announcing a healthy state.
+        self.assertRegex(
+            self.sample_line, r"summary\.unmeasured_calls\s*\n?\s*\?"
+        )
 
     def test_the_annotation_adds_no_panel(self) -> None:
         # CLAUDE.md constraint 4. This earned its space by DISPLACING the mean
@@ -4269,6 +4302,117 @@ class NoMeasurementIsNotAMeasuredZeroTest(unittest.TestCase):
                     self.assertIsNone(row["avg_context"])
                 else:
                     self.assertIsNotNone(row["avg_context"])
+
+
+class NoMeasurementIsNotAZeroInTheViewTest(unittest.TestCase):
+    """#25's five means reach the reader as means over a NAMED sample.
+
+    The API stopped publishing 0 for a mean over nothing; the page had not
+    caught up. `Math.round(null)` is 0, so a binding that rounds before it
+    checks re-creates the defect one layer down -- the API says INCONCLUSIVE
+    and the cell still draws a measured zero, which is worse than the original
+    because the number now looks freshly corrected.
+
+    Every context mean on this page therefore has to answer two questions, and
+    these tests are one per question: what does it read when nothing was
+    measured, and over how many of the calls beside it was it taken.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+        cls.sessions = html_element(cls.raw, 'id="sessions"')
+
+    def test_no_context_mean_is_rounded_before_it_is_checked(self) -> None:
+        # THE defect, as an absence: `Math.round(null)` is 0, so every
+        # `avg_context` binding must go through the formatter that refuses
+        # first. Asserted over the whole page rather than the known sites, so a
+        # sixth mean added later cannot quietly reintroduce it.
+        for hit in re.findall(r"Math\.round\([^)]*\)", self.html):
+            with self.subTest(expr=hit):
+                self.assertNotIn("avg_context", hit)
+        self.assertNotIn("Math.round(r.avg_context)", self.html)
+
+    def test_every_rendered_context_mean_uses_the_refusing_formatter(self) -> None:
+        bindings = re.findall(r"\w+\(\s*\w+\.avg_context\s*\)", self.html)
+        self.assertTrue(bindings, "no context mean is rendered at all")
+        for binding in bindings:
+            with self.subTest(binding=binding):
+                self.assertTrue(
+                    binding.startswith("fmtTokRounded("),
+                    f"{binding} does not refuse a missing measurement first",
+                )
+
+    # --- the sessions table ---
+
+    def test_the_sessions_mean_carries_its_own_sample(self) -> None:
+        # An aggregate must name the set it ranges over, and this one no longer
+        # ranges over the call count in the same row.
+        self.assertIn("contextSample(r)", self.sessions)
+        body = js_function_body(self.html, "contextSample(r) {")
+        self.assertIn("r.context_calls", body)
+        self.assertIn("r.unmeasured_calls", body)
+        self.assertIn("r.calls", body)
+
+    def test_the_sessions_mean_distinguishes_none_measured_from_some(self) -> None:
+        # Three states, not two: every call measured, some measured, none
+        # measured. The third is the one that must never read as a small mean.
+        body = js_function_body(self.html, "contextSample(r) {")
+        self.assertRegex(body, r"if \(!r\.context_calls\) \{")
+        self.assertRegex(body, r"if \(r\.unmeasured_calls\) \{")
+        self.assertIn("UNMEASURED, never 0", body)
+
+    def test_the_partial_sample_is_marked_and_not_only_tooltipped(self) -> None:
+        # A caveat only in a `title` is a caveat nobody sees. This mirrors the
+        # subagent cell in the same table: value, mark, tooltip.
+        self.assertRegex(self.sessions, r'title="contextSample\(r\)\[1\]"')
+        self.assertRegex(self.sessions, r'x-text="contextSample\(r\)\[0\]"')
+
+    def test_the_column_heading_says_what_the_mean_ranges_over(self) -> None:
+        heading = re.search(r'<th title="([^"]*)">Avg ctx/call</th>', self.sessions)
+        self.assertIsNotNone(heading, "the column no longer names its sample")
+        for claim in ("context measurement", "never averaged in as a zero"):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, heading.group(1))
+
+    # --- the timeseries, which is where the defect was SEEN ---
+
+    def test_the_chart_point_names_the_sample_behind_it(self) -> None:
+        # The fifth site, and the only one whose failure was visible: the line
+        # plunged to zero on days nobody measured. A gap is the right drawing,
+        # but a gap alone does not say whether the day had no calls or no
+        # measurements -- these two arrays do, per point.
+        chart = js_function_body(self.html, "drawChart(ts)")
+        self.assertIn("ts.context_calls", chart)
+        self.assertIn("ts.unmeasured_calls", chart)
+        label = js_function_body(self.html, "function chartTooltipLabel(")
+        self.assertIn("dataset.contextCalls", label)
+        self.assertIn("dataset.unmeasuredCalls", label)
+
+    def test_a_point_with_no_measured_call_says_so_rather_than_nothing(self) -> None:
+        label = js_function_body(self.html, "function chartTooltipLabel(")
+        self.assertRegex(label, r"if \(!n\) \{")
+        self.assertIn("no call this day carried a context measurement", label)
+
+    def test_the_token_series_claim_no_sample_they_do_not_have(self) -> None:
+        # A stacked token series is a SUM over every call that day, so it has
+        # no sample to name; only the mean does. Attaching the counts to every
+        # dataset would put a sample size on a figure that has none.
+        label = js_function_body(self.html, "function chartTooltipLabel(")
+        self.assertRegex(
+            label, r"const measured = c\.dataset\.contextCalls;\s*\n\s*if \(!measured\) return base;"
+        )
+
+    def test_the_page_derives_no_total_the_api_already_publishes(self) -> None:
+        # `context_calls + unmeasured_calls == calls` is the API's invariant,
+        # published as `calls`. Re-adding the two here would be a second
+        # arithmetic free to disagree with it.
+        label = js_function_body(self.html, "function chartTooltipLabel(")
+        self.assertIn("dataset.totalCalls", label)
+        self.assertNotRegex(label, r"unmeasured\s*\+\s*n|n\s*\+\s*unmeasured")
 
 
 if __name__ == "__main__":
