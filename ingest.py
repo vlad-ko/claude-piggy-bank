@@ -75,7 +75,7 @@ import sqlite3
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Sequence
 
 SOURCE_MAIN = "main"
 SOURCE_SUBAGENT = "subagent"
@@ -144,6 +144,49 @@ SCHEMA_VERSION = 8
 # one is row-preserving, and that is not a property that accumulates.
 IN_PLACE_UPGRADE_FROM = frozenset({6, 7})
 
+# The two permissions an in-place upgrade needs, named and bounded, because
+# `CREATE TABLE IF NOT EXISTS` silently grants the first to EVERY table and
+# would have granted it to `turns` (#35).
+#
+# A table listed here may be CREATED FROM NOTHING by the in-place path. The
+# test is not "is it new in this version" but "is an empty one TRUE": the run
+# stamp holds no row derived from a transcript, so an empty `ingest_runs` says
+# "no run has been recorded", which is exactly a v6 database's state. An empty
+# `turns` says a session had no turns, next to an `ingest_state` that still
+# marks its source unchanged so it will never be re-read -- a confident empty
+# table beside a populated one, which is the failure this project exists to
+# prevent. Anything not listed here must be REFUSED, not conjured.
+IN_PLACE_CREATABLE_TABLES = frozenset({INGEST_RUNS_TABLE})
+
+# A column listed here may be ADDED to a table that already holds rows, with
+# its declared type. The bar is the same one: the value the existing rows get
+# (always NULL) has to be TRUE of them. `archived_at` clears it -- NULL means
+# "the source is still on disk", which is what every row written before the
+# column existed asserted implicitly, and the next run recomputes it from the
+# filesystem anyway. A NOT NULL column cannot be added this way at all, and a
+# nullable one whose NULL would read as a measurement must not be.
+IN_PLACE_ADDABLE_COLUMNS: dict[tuple[str, str], str] = {
+    ("ingest_state", "archived_at"): "REAL",
+}
+
+# The column the current shape has RETIRED (#30). Named once: the drop, the
+# "is there anything to drop" gate and the refusal all have to mean the same
+# column, and spelling it three times is how they stop meaning it.
+RETIRED_COLUMN_TABLE = "api_calls"
+RETIRED_COLUMN = "cost_usd"
+
+# The exits of `_prepare_schema`, in the ONE order that is correct. They are
+# named constants returned by `_schema_plan()` rather than the shape of an
+# if-chain, because the ordering between them used to live only in a comment:
+# a future edit that swapped two branches would have changed behaviour that no
+# test described. `SchemaPlanOrderingTest` is the precedence table.
+PLAN_CURRENT = "current"  # nothing to do but create what is absent
+PLAN_REFUSE_SHAPE = "refuse-shape"  # tables do not match the version claimed
+PLAN_IN_PLACE = "in-place"  # row-preserving hop from a listed version
+PLAN_REFUSE_REAPED = "refuse-reaped"  # a rebuild would delete the only copy
+PLAN_LEGACY_REPAIR = "legacy-repair"  # pre-v5 shape, past the guard
+PLAN_REBUILD = "rebuild"  # drop and re-derive from the transcripts
+
 # `ALTER TABLE ... DROP COLUMN` shipped in SQLite 3.35.0 (2021-03-12), well
 # after this project's Python floor (3.10, 2021-10) but not implied by it: the
 # SQLite a Python build links is the platform's business, and a distro or CI
@@ -154,6 +197,30 @@ IN_PLACE_UPGRADE_FROM = frozenset({6, 7})
 # exactly the machines we cannot see.
 DROP_COLUMN_MIN_SQLITE = (3, 35, 0)
 
+# AUTHORING RULE, enforced by `SchemaCommentPlacementTest`: no `--` comment may
+# appear BETWEEN a table's parentheses. Comment freely above `CREATE TABLE` --
+# SQLite stores the statement from `CREATE` onwards, so text above it is not
+# part of the stored schema and cannot affect anything.
+#
+# Why: `ALTER TABLE ... DROP COLUMN` makes SQLite RECONSTRUCT the stored CREATE
+# statement. On SQLite 3.45.1, dropping the LAST column of a table whose text
+# directly above it is a `--` comment re-appends the closing paren inside the
+# commented-out line, so the statement never closes:
+#
+#     OperationalError: error in table ingest_state after drop column:
+#     incomplete input
+#
+# Measured 2026-08-05: red on all four CI legs (Python 3.10-3.13, SQLite
+# 3.45.1), green on a 3.53.3 laptop, which discards the comment block instead.
+# The version boundary is measured; the mechanism is inferred from the error
+# string, as no 3.45.x was available to instrument.
+#
+# This is a rule about AUTHORING rather than a runtime fallback because the
+# obvious fallback is a dead end: catching the error and rebuilding meets the
+# reaped-source guard, which refuses a rebuild exactly when the database is the
+# only copy of its measurements, so an old corpus would get *drop refused ->
+# rebuild refused* and no upgrade path at all (#42). A comment that is not in
+# the stored statement cannot break its reconstruction on any version.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -170,6 +237,13 @@ CREATE TABLE IF NOT EXISTS turns (
     turn_type TEXT NOT NULL,
     preview TEXT NOT NULL
 );
+-- NO MONEY COLUMN. Tokens are MEASURED; dollars were derived from a
+-- hand-maintained list-rate table that went stale twice and diverged from real
+-- spend by >2.5x (#30). A precise-looking figure wrong by a factor of two is
+-- worse than no figure: the reader cannot see the error.
+--
+-- `message_id` is the API's own id for this response. NULL is legitimate and is
+-- NOT a shared key: two NULL-id records are two calls, never one.
 CREATE TABLE IF NOT EXISTS api_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -185,12 +259,6 @@ CREATE TABLE IF NOT EXISTS api_calls (
     output_tokens INTEGER NOT NULL,
     context_size INTEGER NOT NULL,
     is_sidechain INTEGER NOT NULL DEFAULT 0,
-    -- No money column. Tokens are MEASURED; dollars were derived from a
-    -- hand-maintained list-rate table that went stale twice and diverged from
-    -- real spend by >2.5x (#30). A precise-looking figure wrong by a factor of
-    -- two is worse than no figure: the reader cannot see the error.
-    -- The API's own id for this response. NULL is legitimate and is NOT a
-    -- shared key: two NULL-id records are two calls, never one.
     message_id TEXT
 );
 CREATE TABLE IF NOT EXISTS agent_dispatches (
@@ -207,6 +275,10 @@ CREATE TABLE IF NOT EXISTS agent_dispatches (
 -- 'unavailable' means the task index proves the dispatch happened but its
 -- transcript is gone from /private/tmp, so that session's subagent spend is
 -- UNMEASURED -- never to be rendered as a zero.
+--
+-- `dispatched_at` is epoch seconds from the task-index ENTRY's own mtime; NULL
+-- when it could not be read. It is the only timestamp a reaped run has, and it
+-- is what lets a window-scoped view ask whether THIS window is missing spend.
 CREATE TABLE IF NOT EXISTS subagent_runs (
     agent_id TEXT PRIMARY KEY,
     session_id TEXT,
@@ -218,9 +290,6 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
     spawn_depth INTEGER,
     status TEXT NOT NULL,
     source_path TEXT,
-    -- Epoch seconds from the task-index ENTRY's own mtime; NULL when it could
-    -- not be read. It is the only timestamp a reaped run has, and it is what
-    -- lets a window-scoped view ask whether THIS window is missing spend.
     dispatched_at REAL
 );
 -- Sessions whose tasks/ directory was actually scanned. Distinguishes
@@ -228,6 +297,10 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
 CREATE TABLE IF NOT EXISTS task_index_sessions (
     session_id TEXT PRIMARY KEY
 );
+-- `archived_at` is epoch seconds at which this source stopped being present on
+-- disk. NULL = the file is still there. NOT NULL = its measurements are now
+-- IRREPLACEABLE: Claude Code deletes transcripts after `cleanupPeriodDays`
+-- (default 30), so the rows derived from it can never be regenerated.
 CREATE TABLE IF NOT EXISTS ingest_state (
     path TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -237,10 +310,6 @@ CREATE TABLE IF NOT EXISTS ingest_state (
     unparsed_records INTEGER NOT NULL,
     first_ts REAL,
     last_ts REAL,
-    -- Epoch seconds at which this source stopped being present on disk.
-    -- NULL = the file is still there. NOT NULL = its measurements are now
-    -- IRREPLACEABLE: Claude Code deletes transcripts after `cleanupPeriodDays`
-    -- (default 30), so the rows derived from it can never be regenerated.
     archived_at REAL
 );
 -- WHEN this tool last ran (#20). One row, or NONE AT ALL -- an empty table is
@@ -1609,6 +1678,36 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
+def _needs_retired_column_drop(conn: sqlite3.Connection) -> bool:
+    """Does THIS database still carry the retired column? (#42)
+
+    A fact about the DATABASE, deliberately separate from
+    `_sqlite_supports_drop_column()`, which is a fact about the LIBRARY. The
+    upgrade gate needs both and they are not the same question: a database that
+    already lacks the column needs no DROP COLUMN at all, and refusing it for
+    want of a statement it will never execute pushed it onto the rebuild path,
+    where a reaped source refuses it forever (#42(a)).
+    """
+    return RETIRED_COLUMN in _table_columns(conn, RETIRED_COLUMN_TABLE)
+
+
+def _objects_referencing(conn: sqlite3.Connection, column: str) -> list[str]:
+    """Non-table schema objects whose SQL names `column`, as "type name".
+
+    Used only to say WHAT is blocking a drop. A textual match over
+    `sqlite_master.sql` over-reports (a comment or a like-named column in
+    another object counts), which is the right direction for a message whose
+    job is to give the operator somewhere to look.
+    """
+    rows = conn.execute(
+        "SELECT type, name FROM sqlite_master"
+        " WHERE type != 'table' AND sql IS NOT NULL AND sql LIKE ?"
+        " ORDER BY type, name",
+        (f"%{column}%",),
+    ).fetchall()
+    return [f"{kind} {name}" for kind, name in rows]
+
+
 def _drop_retired_cost_column(conn: sqlite3.Connection) -> None:
     """Remove `api_calls.cost_usd` where an older shape still carries it (#30).
 
@@ -1617,10 +1716,240 @@ def _drop_retired_cost_column(conn: sqlite3.Connection) -> None:
     must have established `_sqlite_supports_drop_column()` first -- this is a
     3.35+ statement, and attempting it on an older library raises rather than
     degrading. Idempotent: a database that never had the column is left alone.
+
+    SQLite can still REFUSE the drop structurally -- most plausibly because a
+    user's own index or view references the column, which this project's
+    durability design positively encourages people to create (#42(b)). That
+    refusal is caught and re-raised as an operator-visible one NAMING what to
+    remove, and deliberately NOT as a fall-through to the rebuild path: the
+    rebuild would meet the reaped-source guard, and on a corpus older than the
+    retention window the two correct refusals compose into no upgrade path at
+    all. A refusal with a next step in it is not a dead end; a fallback into a
+    second refusal is. `with conn:` rolls the failed statement back, so the
+    database is left exactly as it was found.
     """
-    if "cost_usd" in _table_columns(conn, "api_calls"):
+    if not _needs_retired_column_drop(conn):
+        return
+    try:
         with conn:
-            conn.execute("ALTER TABLE api_calls DROP COLUMN cost_usd")
+            conn.execute(
+                f"ALTER TABLE {RETIRED_COLUMN_TABLE} DROP COLUMN {RETIRED_COLUMN}"
+            )
+    except sqlite3.OperationalError as exc:
+        blockers = _objects_referencing(conn, RETIRED_COLUMN)
+        named = (
+            "\n\nThese schema objects name that column:\n  "
+            + "\n  ".join(blockers)
+            if blockers
+            else "\n\nNo index, view or trigger of this database names that "
+            "column, so this is SQLite's own reconstruction of the table's "
+            "CREATE statement failing -- please report it with the error above."
+        )
+        raise SystemExit(
+            f"REFUSING to upgrade the database.\n\n"
+            f"SQLite would not drop the retired `{RETIRED_COLUMN_TABLE}."
+            f"{RETIRED_COLUMN}` column (#30):\n\n"
+            f"  {exc}\n\n"
+            "SQLite refuses to drop a column that an index, view, trigger or "
+            "generated column references." + named + "\n\n"
+            "Nothing was changed: the statement was rolled back, and the "
+            "database still holds every row, the column, and its previous "
+            "schema version. Drop the object(s) above and re-run -- the "
+            "upgrade then completes in place, without deleting a row. The "
+            "rebuild path is NOT taken automatically here, because it would "
+            "refuse over any reaped source and leave no upgrade path at all."
+        ) from exc
+
+
+def _target_shape() -> dict[str, set[str]]:
+    """The column names the CURRENT schema requires, per table.
+
+    Read from `SCHEMA` itself by building it in memory rather than restated as
+    a constant: a hand-maintained copy of the shape is a second source of truth
+    that drifts silently, which is the same failure mode that once left
+    `subagent_runs` out of the rebuild's drop list.
+    """
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.executescript(SCHEMA)
+        return {table: _table_columns(probe, table) for table in DERIVED_TABLES}
+    finally:
+        probe.close()
+
+
+def _shape_problems(conn: sqlite3.Connection) -> list[str]:
+    """Ways this database's tables differ from `SCHEMA` that NO upgrade can fix.
+
+    `PRAGMA user_version` is a CLAIM about shape, and `CREATE TABLE IF NOT
+    EXISTS` verifies nothing: it accepts any pre-existing table of that name
+    and creates any absent one empty. So the number could be stamped onto a
+    database with a missing column (which raises on the next read) or a missing
+    TABLE (which does not raise at all -- it renders an empty "By turn type"
+    beside a populated "By model", with `ingest_state` still marking every
+    source unchanged so nothing is ever re-read). See #35.
+
+    What is NOT a problem here:
+
+      * a table in `IN_PLACE_CREATABLE_TABLES`, which an upgrade may create
+        empty because empty is TRUE of it;
+      * a column in `IN_PLACE_ADDABLE_COLUMNS`, which an upgrade may add
+        because NULL is TRUE of the rows that already exist;
+      * an EXTRA column. `cost_usd` on a v7 database is one, and is shed by its
+        own gate; anything else a user added is inert, since every query in
+        this project names its columns.
+
+    Returns one line per problem, naming the table and the columns, because an
+    operator who cannot see WHICH table is wrong cannot act on the refusal.
+    """
+    problems = []
+    for table, required in sorted(_target_shape().items()):
+        present = _table_columns(conn, table)
+        if not present:
+            if table not in IN_PLACE_CREATABLE_TABLES:
+                problems.append(f"{table}: the whole table is missing")
+            continue
+        missing = sorted(
+            column
+            for column in required - present
+            if (table, column) not in IN_PLACE_ADDABLE_COLUMNS
+        )
+        if missing:
+            problems.append(f"{table}: missing column(s) {', '.join(missing)}")
+    return problems
+
+
+def _pending_additions(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
+    """The `IN_PLACE_ADDABLE_COLUMNS` this database is missing, with their type.
+
+    An EXISTING table missing one of them only: a column cannot be added to a
+    table that is not there, and a table that is not there is either created by
+    `SCHEMA` complete or is a shape problem.
+    """
+    pending = []
+    for (table, column), decl in sorted(IN_PLACE_ADDABLE_COLUMNS.items()):
+        present = _table_columns(conn, table)
+        if present and column not in present:
+            pending.append((table, column, decl))
+    return pending
+
+
+def _apply_pending_additions(conn: sqlite3.Connection) -> None:
+    """Add every missing addable column. Row-preserving by construction."""
+    for table, column, decl in _pending_additions(conn):
+        with conn:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _unreadable_sources(conn: sqlite3.Connection) -> list[str]:
+    """Tracked source paths with no file behind them any more.
+
+    Is a rebuild LOSSY? The original justification -- "a re-ingest reproduces
+    the DB exactly" -- holds only while every source is still readable. Ask the
+    FILESYSTEM, not the schema: a tracked path with no file behind it can never
+    be re-read, so its rows are the only copy.
+
+    Keying on the filesystem rather than on `archived_at` is deliberate. The
+    column only exists AFTER the v5 upgrade, so a guard reading it can never
+    protect the upgrade that installs it -- and the real database this was
+    tested against turned out to be v0, older than the shape the first attempt
+    assumed. The filesystem check works for every version, including ones
+    written before any of this existed.
+    """
+    try:
+        tracked = conn.execute("SELECT path FROM ingest_state").fetchall()
+    except sqlite3.OperationalError:
+        return []  # no ingest_state at all: nothing tracked, nothing to lose
+    return [path for (path,) in tracked if not Path(path).exists()]
+
+
+def _indented_sample(lines: Sequence[str], limit: int = 5) -> str:
+    """Up to `limit` lines, indented one per line, with a count of the rest.
+
+    Truncated because a refusal an operator scrolls past is a refusal they did
+    not read; the count keeps the omission visible rather than silent.
+    """
+    shown = sorted(lines)[:limit]
+    more = f"\n  ...and {len(lines) - limit} more" if len(lines) > limit else ""
+    return "  " + "\n  ".join(shown) + more
+
+
+def _schema_plan(
+    *,
+    version: int,
+    has_tables: bool,
+    shape_problems: Sequence[str],
+    pending_additions: bool,
+    needs_column_drop: bool,
+    can_drop_column: bool,
+    any_source_unreadable: Callable[[], bool],
+) -> str:
+    """Decide WHICH exit `_prepare_schema` takes, from facts alone.
+
+    Pure, and separate from the work, because the order of these exits is the
+    load-bearing part and it used to live only in a comment. The order, and why
+    each step precedes the next:
+
+    1. A database with none of our tables is FRESH -- there is nothing to
+       verify and nothing to lose.
+    2. A database whose stamp is the CURRENT version, or one hop from it, is
+       claiming a shape. Where the tables contradict that claim the answer is
+       to REFUSE, ahead of every other exit: stamping would certify data that
+       is not there, and rebuilding would delete rows over a defect we cannot
+       attribute -- a crashed migration and a hand-edit look identical from
+       here. Refusing preserves both the rows and the operator's choice.
+
+       This is deliberately NOT applied to an older version. There, "the shape
+       differs from current" is not damage, it is what an old version MEANS,
+       and the rebuild below is the exit written for it. Refusing a v0 database
+       for having a v0 shape would strand exactly the users the in-place work
+       exists to serve.
+    3. A listed version upgrades IN PLACE, before the reaped-source guard is
+       even consulted. That guard protects a REBUILD; applied here it would
+       refuse a change that deletes nothing, telling exactly the users whose
+       database is the only copy of their history to stay on the old version.
+       Note `can_drop_column` is only consulted when there is something to drop
+       (#42(a)): asking whether the library CAN drop a column that is not there
+       refused a no-op, and refused it forever on a reaped corpus.
+    4. Only then the reaped-source guard, gating everything that follows --
+       both remaining exits can reach the rebuild.
+    5. The pre-v5 repair, past the guard. It does the same row-preserving work
+       as (3) and is NOT promoted above the guard, because matching COLUMNS is
+       not the same fact as a row-preserving DELTA: an unlisted version is
+       precisely one whose row semantics nobody has re-decided (#38), and the
+       shape probe cannot see that. It IS gated on the shape probe, for the
+       same reason (3) is: it stamps.
+    6. Otherwise the default: drop and re-derive from the transcripts.
+
+    `any_source_unreadable` is a CALLABLE so that "was the guard consulted?" is
+    observable in a test, and so the filesystem is not scanned on a path that
+    does not need it.
+    """
+    if not has_tables:
+        return PLAN_CURRENT
+    # Can an in-place route arrive at the CURRENT shape, or only at most of it?
+    # Stamping a version onto a table that is not that version is #35 by
+    # another door, so an unshedable retired column disqualifies the shortcut.
+    reaches_current_shape = can_drop_column or not needs_column_drop
+    if version == SCHEMA_VERSION:
+        if shape_problems:
+            return PLAN_REFUSE_SHAPE
+        # Stamped current and structurally sound -- but a database the
+        # unprobed path stamped can still be missing a repairable column, and
+        # at the current version no migration branch ever runs again (#35).
+        # Repair it here or nothing ever will.
+        if pending_additions or (needs_column_drop and can_drop_column):
+            return PLAN_IN_PLACE
+        return PLAN_CURRENT
+    if version in IN_PLACE_UPGRADE_FROM:
+        if shape_problems:
+            return PLAN_REFUSE_SHAPE
+        if reaches_current_shape:
+            return PLAN_IN_PLACE
+    if any_source_unreadable():
+        return PLAN_REFUSE_REAPED
+    if pending_additions and reaches_current_shape and not shape_problems:
+        return PLAN_LEGACY_REPAIR
+    return PLAN_REBUILD
 
 
 def _prepare_schema(conn: sqlite3.Connection) -> bool:
@@ -1632,16 +1961,14 @@ def _prepare_schema(conn: sqlite3.Connection) -> bool:
     rebuilt rather than migrated in place. This is CLAUDE.md rule #14 domain
     (4): a regenerable artifact, deleted through a legitimate capability.
 
-    Two exits from that default, both narrower than it: a shape listed in
-    `IN_PLACE_UPGRADE_FROM` is carried forward row for row (the delta to the
-    current shape deletes nothing), and a rebuild that would destroy rows whose
-    source file is gone is refused outright (it would not be regenerable at
-    all).
+    Which of the six exits is taken, and in what order they are considered, is
+    `_schema_plan()`'s decision and is documented there. This function only
+    executes it, so a future edit cannot reorder the exits by accident.
 
-    The probe and the drop loop BOTH range over `DERIVED_TABLES` -- the same
-    set, deliberately. When they were two hand-maintained lists, a table added
-    to the schema was silently absent from the rebuild, and `CREATE TABLE IF
-    NOT EXISTS` then preserved the stale column shape until the next INSERT
+    The shape probe and the drop loop BOTH range over `DERIVED_TABLES` -- the
+    same set, deliberately. When they were two hand-maintained lists, a table
+    added to the schema was silently absent from the rebuild, and `CREATE TABLE
+    IF NOT EXISTS` then preserved the stale column shape until the next INSERT
     failed with an `OperationalError`.
     """
     version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -1654,100 +1981,85 @@ def _prepare_schema(conn: sqlite3.Connection) -> bool:
         ).fetchone()[0]
         > 0
     )
-    rebuilt = False
-    if has_tables and version != SCHEMA_VERSION:
-        if version in IN_PLACE_UPGRADE_FROM and _sqlite_supports_drop_column():
-            # NO ROW IS DELETED on this path. Two statements, both of which
-            # leave every existing row where it is:
-            #
-            #   * `CREATE TABLE IF NOT EXISTS` supplies whatever tables the
-            #     older shape lacks (`ingest_runs`, for a v6 database);
-            #   * `ALTER TABLE api_calls DROP COLUMN cost_usd` removes the
-            #     retired list-rate estimate (#30). SQLite applies this to the
-            #     table's own storage -- it is not a rebuild and not a
-            #     DROP/re-CREATE, so no row is destroyed and none is
-            #     re-derived. Gated on `_sqlite_supports_drop_column()`
-            #     because the statement needs SQLite 3.35+; without it we fall
-            #     through to the rebuild path below, guard included.
-            #
-            # This runs BEFORE the reaped-source guard on purpose, and does not
-            # route around it. That guard gates the DROP loop -- it refuses a
-            # REBUILD because a rebuild deletes rows no re-ingest can
-            # reproduce. Applied here it would refuse a change that deletes
-            # nothing, telling exactly the users whose database is the only
-            # copy of their history to stay on the old version. The refusal's
-            # own sentence ("a schema rebuild would delete them permanently")
-            # would be untrue, and an untrue refusal is the same class of
-            # defect as an untrue number.
-            conn.executescript(SCHEMA)
-            _drop_retired_cost_column(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            return False
+    problems = _shape_problems(conn) if has_tables else []
+    plan = _schema_plan(
+        version=version,
+        has_tables=has_tables,
+        shape_problems=problems,
+        pending_additions=bool(_pending_additions(conn)),
+        needs_column_drop=_needs_retired_column_drop(conn),
+        can_drop_column=_sqlite_supports_drop_column(),
+        any_source_unreadable=lambda: bool(_unreadable_sources(conn)),
+    )
 
-        # Is a rebuild LOSSY? The original justification -- "a re-ingest
-        # reproduces the DB exactly" -- holds only while every source is still
-        # readable. Ask the FILESYSTEM, not the schema: a tracked path with no
-        # file behind it can never be re-read, so its rows are the only copy.
-        #
-        # Keying on the filesystem rather than on `archived_at` is deliberate.
-        # The column only exists AFTER the v5 upgrade, so a guard reading it
-        # can never protect the upgrade that installs it -- and the real
-        # database this was tested against turned out to be v0, older than the
-        # shape the first attempt assumed. The filesystem check works for every
-        # version, including ones written before any of this existed.
-        unreadable = []
-        try:
-            for (tracked,) in conn.execute("SELECT path FROM ingest_state").fetchall():
-                if not Path(tracked).exists():
-                    unreadable.append(tracked)
-        except sqlite3.OperationalError:
-            pass  # no ingest_state at all: nothing tracked, nothing to lose
+    if plan == PLAN_REFUSE_SHAPE:
+        # The reaped count is part of the ADVICE, not part of the decision:
+        # where every source is still on disk the operator can move the
+        # database aside and re-ingest, and where one has been reaped that
+        # same action destroys the only copy. A refusal that does not
+        # distinguish them invites the destructive reading.
+        unreadable = _unreadable_sources(conn)
+        loss = (
+            "\n\nEvery tracked source is still on disk, so a rebuild would "
+            "reproduce this database exactly."
+            if not unreadable
+            else f"\n\nWARNING: {len(unreadable)} tracked source(s) are already "
+            "GONE from disk, so a rebuild would NOT reproduce them -- this "
+            "database is their only copy:\n" + _indented_sample(unreadable)
+        )
+        raise SystemExit(
+            f"REFUSING to stamp this database as schema version "
+            f"{SCHEMA_VERSION}.\n\n"
+            f"Its `user_version` says {version}, which asserts a shape this "
+            f"tool can carry to version {SCHEMA_VERSION} without deleting a "
+            "row. The tables contradict that:\n\n"
+            + _indented_sample(problems, limit=len(problems))
+            + "\n\n`CREATE TABLE IF NOT EXISTS` cannot repair that -- it "
+            "accepts whatever table is already there, and creates a missing "
+            "one EMPTY. Stamping a version number over it would either raise "
+            "on the next read or, worse, report a confident empty table beside "
+            "a populated one (#35).\n\n"
+            "Nothing was changed: the version, the tables and every row are as "
+            "they were found." + loss + "\n\n"
+            "Restore the database from a backup, or move it aside and re-run "
+            "to build a new one from the transcripts still on disk."
+        )
 
-        if unreadable:
-            sample = "\n  ".join(sorted(unreadable)[:5])
-            more = f"\n  ...and {len(unreadable) - 5} more" if len(unreadable) > 5 else ""
-            raise SystemExit(
-                f"REFUSING to rebuild the database.\n\n"
-                f"{len(unreadable)} tracked source(s) no longer exist on disk, so "
-                "their measurements CANNOT be regenerated by re-ingesting -- this "
-                "database is their only copy. Claude Code deletes transcripts "
-                "after `cleanupPeriodDays` (default 30), so this is expected on "
-                "any corpus older than a month.\n\n"
-                f"  {sample}{more}\n\n"
-                "A schema rebuild would delete them permanently. Either back up "
-                "the database file and re-run, or keep using the version that "
-                "wrote it."
-            )
+    if plan == PLAN_REFUSE_REAPED:
+        unreadable = _unreadable_sources(conn)
+        raise SystemExit(
+            f"REFUSING to rebuild the database.\n\n"
+            f"{len(unreadable)} tracked source(s) no longer exist on disk, so "
+            "their measurements CANNOT be regenerated by re-ingesting -- this "
+            "database is their only copy. Claude Code deletes transcripts "
+            "after `cleanupPeriodDays` (default 30), so this is expected on "
+            "any corpus older than a month.\n\n"
+            f"{_indented_sample(unreadable)}\n\n"
+            "A schema rebuild would delete them permanently. Either back up "
+            "the database file and re-run, or keep using the version that "
+            "wrote it."
+        )
 
-        # Additive migrations, applied in place, for shapes we can carry
-        # forward without a rebuild. Reached only past the guard above, i.e.
-        # only when every tracked source is still re-readable.
-        #
-        # `_sqlite_supports_drop_column()` is part of the condition because a
-        # database that takes this shortcut must arrive at the CURRENT shape,
-        # not most of it: a pre-v5 database still carries `cost_usd`, and
-        # leaving it behind would stamp `user_version = 8` on a table that is
-        # not v8. Where the statement is unavailable the rebuild below reaches
-        # the same shape by re-parsing, which is safe here by construction.
-        columns = _table_columns(conn, "ingest_state")
-        if (
-            columns
-            and "archived_at" not in columns
-            and "source_kind" in columns
-            and _sqlite_supports_drop_column()
-        ):
-            with conn:
-                conn.execute("ALTER TABLE ingest_state ADD COLUMN archived_at REAL")
-            conn.executescript(SCHEMA)
-            _drop_retired_cost_column(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            return False
-
+    # NO ROW IS DELETED on the in-place routes. Every statement they run leaves
+    # each existing row where it is:
+    #
+    #   * `ALTER TABLE ... ADD COLUMN` for a column NULL is true of;
+    #   * `CREATE TABLE IF NOT EXISTS` for a table empty is true of
+    #     (`ingest_runs`, for a v6 database);
+    #   * `ALTER TABLE api_calls DROP COLUMN cost_usd`, which SQLite applies to
+    #     the table's own storage -- not a rebuild, not a DROP/re-CREATE, so no
+    #     row is destroyed and none is re-derived.
+    in_place = plan in (PLAN_IN_PLACE, PLAN_LEGACY_REPAIR)
+    if in_place:
+        _apply_pending_additions(conn)
+    rebuilt = plan == PLAN_REBUILD
+    if rebuilt:
         with conn:
             for table in DERIVED_TABLES:
                 conn.execute(f"DROP TABLE IF EXISTS {table}")
-        rebuilt = True
     conn.executescript(SCHEMA)
+    if in_place:
+        _drop_retired_cost_column(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return rebuilt
 

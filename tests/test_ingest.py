@@ -3065,5 +3065,828 @@ class PreV5ShortcutIsGatedOnDropColumnTest(unittest.TestCase):
         )
 
 
+class SchemaShapeProbeTest(unittest.TestCase):
+    """`user_version` is a CLAIM about shape; it must be verified before it is
+    stamped (#35).
+
+    Every statement in `SCHEMA` is `CREATE TABLE IF NOT EXISTS`, which accepts
+    ANY pre-existing table of that name. So the in-place upgrade -- which
+    decided it could stamp from the version NUMBER plus "at least one derived
+    table exists" -- would certify a table with the wrong columns, or a table
+    it had just created empty, as current. Three shapes were hand-built and
+    each was stamped with `rebuilt=False` and exit 0 (measured 2026-08-05).
+
+    The third is the one this project exists to prevent: no exception, no
+    banner, `turns` recreated empty while `ingest_state` still marks every
+    source unchanged, so the report renders a confident empty "By turn type"
+    beside a populated "By model".
+
+    It was also PERMANENT: once stamped, `version == SCHEMA_VERSION` means no
+    migration path ever runs again, so the repair the database still needed
+    became unreachable. Hence the probe runs at the current version too.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-shape-probe-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+
+    # -- helpers ---------------------------------------------------------
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        return conn
+
+    def _user_version(self) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _counts(self) -> dict[str, int]:
+        """Row count of every table that survives on disk, by name.
+
+        Counted per table rather than in total: the defect under test recreates
+        ONE table empty and leaves the others populated, which a grand total
+        would only show as a smaller number of an unnamed set.
+        """
+        conn = sqlite3.connect(self.db)
+        try:
+            names = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                    " AND name NOT LIKE 'sqlite_%'"
+                )
+            ]
+            return {
+                name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+                for name in sorted(names)
+            }
+        finally:
+            conn.close()
+
+    def _stamp(self, version: int) -> None:
+        conn = self._conn()
+        conn.execute(f"PRAGMA user_version = {version}")
+        conn.commit()
+
+    def _downgrade_to_v6(self) -> None:
+        """The shape v6 shipped: no run-stamp table, `cost_usd` still present."""
+        conn = self._conn()
+        conn.execute(f"DROP TABLE {ingest_mod.INGEST_RUNS_TABLE}")
+        conn.execute("ALTER TABLE api_calls ADD COLUMN cost_usd REAL")
+        conn.execute("PRAGMA user_version = 6")
+        conn.commit()
+
+    # The pre-v5 shape of `ingest_state`, STATED rather than derived from the
+    # current one by DROP COLUMN -- that statement is exactly what fails on
+    # SQLite 3.45.1 for a last column preceded by a comment (see
+    # `SchemaCommentPlacementTest`), which would make this fixture, not the
+    # code under test, the thing that differs across CI legs.
+    INGEST_STATE_WITHOUT_ARCHIVED_AT = """
+        CREATE TABLE ingest_state_old (
+            path TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            unparsed_records INTEGER NOT NULL,
+            first_ts REAL,
+            last_ts REAL
+        )
+    """
+
+    def _drop_archived_at_keeping_rows(self) -> None:
+        conn = self._conn()
+        conn.execute(self.INGEST_STATE_WITHOUT_ARCHIVED_AT)
+        conn.execute(
+            "INSERT INTO ingest_state_old SELECT path, session_id, source_kind,"
+            " size, mtime, unparsed_records, first_ts, last_ts FROM ingest_state"
+        )
+        conn.execute("DROP TABLE ingest_state")
+        conn.execute("ALTER TABLE ingest_state_old RENAME TO ingest_state")
+        conn.commit()
+        self.assertNotIn(
+            "archived_at", ingest_mod._table_columns(conn, "ingest_state")
+        )
+
+    # -- the three hand-built shapes -------------------------------------
+    def test_a_dropped_derived_table_is_refused_not_recreated_empty(self) -> None:
+        # The silent one. `turns` is gone; `ingest_state` still says every
+        # source is unchanged, so a re-ingest will never re-read them and
+        # `api_calls.turn_id` would point at rows that no longer exist.
+        self._downgrade_to_v6()
+        before = self._counts()
+        self.assertGreater(before["turns"], 0, "the fixture must have turns")
+        conn = self._conn()
+        conn.execute("DROP TABLE turns")
+        conn.commit()
+
+        with self.assertRaises(SystemExit) as caught:
+            ingest(self.projects, self.db)
+
+        message = str(caught.exception)
+        self.assertIn("REFUSING", message)
+        # The refusal must NAME the table, or the operator is told only that
+        # something is wrong somewhere.
+        self.assertIn("turns", message)
+        # Refused means REFUSED: no stamp, and nothing else touched.
+        self.assertEqual(self._user_version(), 6)
+        after = self._counts()
+        self.assertNotIn("turns", after)
+        self.assertEqual(after, {k: v for k, v in before.items() if k != "turns"})
+
+    def test_a_wrong_shaped_run_table_is_refused_before_it_reaches_serve(
+        self,
+    ) -> None:
+        # `ingest_runs(id, started_at)` satisfies `CREATE TABLE IF NOT EXISTS`
+        # and every "has tables" check, and 500s `/api/summary` on the next
+        # read with `no such column: finished_at`.
+        self._downgrade_to_v6()
+        conn = self._conn()
+        conn.execute(
+            f"CREATE TABLE {ingest_mod.INGEST_RUNS_TABLE}"
+            " (id INTEGER PRIMARY KEY, started_at TEXT)"
+        )
+        conn.commit()
+        before = self._counts()
+
+        with self.assertRaises(SystemExit) as caught:
+            ingest(self.projects, self.db)
+
+        message = str(caught.exception)
+        self.assertIn("REFUSING", message)
+        self.assertIn(ingest_mod.INGEST_RUNS_TABLE, message)
+        self.assertIn("finished_at", message)
+        self.assertEqual(self._user_version(), 6)
+        self.assertEqual(self._counts(), before)
+
+    def test_a_missing_archived_at_column_is_repaired_not_stamped_over(
+        self,
+    ) -> None:
+        # The only missing column an in-place upgrade may supply: adding a
+        # nullable `archived_at` states the truth about an old row (NULL = the
+        # source is still on disk), and the next run recomputes it. Stamping
+        # WITHOUT adding it raised `no such column: archived_at` on the next
+        # run and left the repair permanently unreachable.
+        self._downgrade_to_v6()
+        self._drop_archived_at_keeping_rows()
+        before = self._counts()
+
+        summary = ingest(self.projects, self.db)
+
+        self.assertFalse(summary["schema_rebuilt"])
+        self.assertEqual(summary["files_ingested"], 0, "no source was re-parsed")
+        self.assertEqual(self._user_version(), ingest_mod.SCHEMA_VERSION)
+        conn = self._conn()
+        self.assertIn("archived_at", ingest_mod._table_columns(conn, "ingest_state"))
+        after = self._counts()
+        # `ingest_runs` is created by the same hop, so compare the tables that
+        # existed before rather than the whole dict.
+        self.assertEqual({k: after[k] for k in before}, before)
+
+    def test_the_probe_still_catches_a_database_already_stamped_current(
+        self,
+    ) -> None:
+        # The permanence half of #35: a database the unprobed path stamped is
+        # now at `version == SCHEMA_VERSION`, where no migration branch runs at
+        # all. Without a probe here the damage is undetectable forever.
+        conn = self._conn()
+        conn.execute("DROP TABLE turns")
+        conn.commit()
+        self.assertEqual(self._user_version(), ingest_mod.SCHEMA_VERSION)
+
+        with self.assertRaises(SystemExit) as caught:
+            ingest(self.projects, self.db)
+
+        self.assertIn("turns", str(caught.exception))
+
+    def test_the_refusal_says_whether_a_rebuild_would_lose_measurements(
+        self,
+    ) -> None:
+        # The advice differs by corpus. Where every source is still on disk the
+        # operator can move the database aside and re-ingest; where one has been
+        # reaped, that same action destroys the only copy. A refusal that does
+        # not distinguish them invites the destructive reading.
+        self.transcript.unlink()
+        ingest(self.projects, self.db)  # archives it; rows retained
+        self._downgrade_to_v6()
+        conn = self._conn()
+        conn.execute("DROP TABLE turns")
+        conn.commit()
+
+        with self.assertRaises(SystemExit) as caught:
+            ingest(self.projects, self.db)
+
+        message = str(caught.exception)
+        self.assertIn(str(self.transcript), message)
+        self.assertEqual(self._user_version(), 6)
+
+    # An `api_calls` from before `message_id` existed (#2), STATED rather than
+    # derived from the current one, for the same reason as above.
+    API_CALLS_WITHOUT_MESSAGE_ID = """
+        CREATE TABLE api_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            agent_id TEXT,
+            turn_id INTEGER,
+            ts REAL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            cache_read INTEGER NOT NULL,
+            cache_write INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            context_size INTEGER NOT NULL,
+            is_sidechain INTEGER NOT NULL DEFAULT 0
+        )
+    """
+
+    def test_a_genuinely_old_shape_is_rebuilt_rather_than_refused(self) -> None:
+        # The boundary the probe must NOT cross. For a version nobody listed as
+        # row-preserving, "the tables differ from the current shape" is not
+        # damage -- it is what an old version means -- and the rebuild is the
+        # exit written for it. A probe that refused here would strand every
+        # genuinely old database in the field, which is a worse outcome than
+        # the defect it was added for.
+        conn = self._conn()
+        conn.execute("DROP TABLE api_calls")
+        conn.executescript(self.API_CALLS_WITHOUT_MESSAGE_ID)
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+
+        summary = ingest(self.projects, self.db)
+
+        self.assertTrue(summary["schema_rebuilt"])
+        self.assertEqual(summary["files_ingested"], summary["files_scanned"])
+        self.assertEqual(self._user_version(), ingest_mod.SCHEMA_VERSION)
+        conn = self._conn()
+        self.assertIn("message_id", ingest_mod._table_columns(conn, "api_calls"))
+        self.assertGreater(
+            self._counts()["api_calls"], 0, "the rebuild must re-derive the rows"
+        )
+
+    def test_the_shipped_shape_passes_its_own_probe(self) -> None:
+        # The control. Every refusal above is worthless if the probe also
+        # refuses the shape this tool writes.
+        conn = self._conn()
+        self.assertEqual(ingest_mod._shape_problems(conn), [])
+        summary = ingest(self.projects, self.db)
+        self.assertFalse(summary["schema_rebuilt"])
+
+
+class SchemaPlanOrderingTest(unittest.TestCase):
+    """The order of `_prepare_schema`'s exits is data, not prose (#35).
+
+    Four exits became six, and which one wins when several conditions hold at
+    once was explained in a comment and enforced nowhere -- so a future edit
+    that reordered the branches would change behaviour that no test describes.
+    The decision is now a pure function over the facts, and this is the
+    precedence table.
+
+    The reaped-source probe is passed as a CALLABLE so "was it consulted?" is
+    observable: the in-place path must reach its decision without asking,
+    because that guard protects a REBUILD and applies to nothing this path
+    does.
+    """
+
+    class _Probe:
+        """A reaped-source probe that records whether it was consulted."""
+
+        def __init__(self, unreadable: bool) -> None:
+            self.unreadable = unreadable
+            self.calls = 0
+
+        def __call__(self) -> bool:
+            self.calls += 1
+            return self.unreadable
+
+    def _plan(self, probe: "SchemaPlanOrderingTest._Probe", **facts: object) -> str:
+        defaults: dict[str, object] = {
+            "version": ingest_mod.SCHEMA_VERSION,
+            "has_tables": True,
+            "shape_problems": [],
+            "pending_additions": False,
+            "needs_column_drop": False,
+            "can_drop_column": True,
+        }
+        defaults.update(facts)
+        return ingest_mod._schema_plan(any_source_unreadable=probe, **defaults)
+
+    def test_a_fresh_database_is_simply_created(self) -> None:
+        probe = self._Probe(False)
+        self.assertEqual(
+            self._plan(probe, has_tables=False, version=0), ingest_mod.PLAN_CURRENT
+        )
+        self.assertEqual(probe.calls, 0)
+
+    def test_a_shape_mismatch_outranks_every_other_exit(self) -> None:
+        # Listed version, reaped source, a column to drop: the shape refusal
+        # wins over all of them, and reaches that verdict without touching the
+        # filesystem.
+        probe = self._Probe(True)
+        self.assertEqual(
+            self._plan(
+                probe,
+                version=6,
+                shape_problems=["turns: the whole table is missing"],
+                needs_column_drop=True,
+            ),
+            ingest_mod.PLAN_REFUSE_SHAPE,
+        )
+        self.assertEqual(probe.calls, 0)
+
+    def test_the_in_place_upgrade_is_decided_before_the_reaped_source_probe(
+        self,
+    ) -> None:
+        # The ordering the 12-line comment used to carry alone. Asking the
+        # guard here would refuse a change that deletes nothing, telling
+        # exactly the users whose database is the only copy of their history
+        # to stay on the old version.
+        probe = self._Probe(True)
+        self.assertEqual(
+            self._plan(probe, version=6, needs_column_drop=True),
+            ingest_mod.PLAN_IN_PLACE,
+        )
+        self.assertEqual(probe.calls, 0, "the guard must not gate a lossless hop")
+
+    def test_an_unlisted_version_meets_the_guard_before_the_legacy_repair(
+        self,
+    ) -> None:
+        # Matching COLUMNS is not the same fact as a row-preserving DELTA: an
+        # unlisted version is precisely one whose row semantics nobody has
+        # re-decided, so it does not get to jump the guard.
+        probe = self._Probe(True)
+        self.assertEqual(
+            self._plan(probe, version=4, pending_additions=True),
+            ingest_mod.PLAN_REFUSE_REAPED,
+        )
+        self.assertEqual(probe.calls, 1)
+
+        clear = self._Probe(False)
+        self.assertEqual(
+            self._plan(clear, version=4, pending_additions=True),
+            ingest_mod.PLAN_LEGACY_REPAIR,
+        )
+        self.assertEqual(clear.calls, 1)
+
+    def test_an_unlisted_version_with_nothing_repairable_rebuilds(self) -> None:
+        probe = self._Probe(False)
+        self.assertEqual(self._plan(probe, version=4), ingest_mod.PLAN_REBUILD)
+
+    def test_an_old_version_with_an_old_SHAPE_is_rebuilt_not_refused(self) -> None:
+        # The shape probe must not swallow the exit it was added in front of.
+        # For a version nobody listed, "the tables differ from current" is not
+        # damage -- it is what an old version MEANS, and the rebuild is the
+        # exit written for it. Refusing here would strand every genuinely old
+        # database, including the v0 one the reaped-source guard was built
+        # against.
+        probe = self._Probe(False)
+        self.assertEqual(
+            self._plan(
+                probe,
+                version=1,
+                shape_problems=["api_calls: missing column(s) message_id"],
+            ),
+            ingest_mod.PLAN_REBUILD,
+        )
+        # ...and it still meets the guard on the way, which is what makes
+        # rebuilding it safe rather than merely permitted.
+        reaped = self._Probe(True)
+        self.assertEqual(
+            self._plan(
+                reaped,
+                version=1,
+                shape_problems=["api_calls: missing column(s) message_id"],
+            ),
+            ingest_mod.PLAN_REFUSE_REAPED,
+        )
+
+    def test_an_unverified_shape_never_takes_the_legacy_repair(self) -> None:
+        # The pre-v5 repair stamps too, so #35 applies to it identically: it
+        # may only run over a shape that has been checked. The fall-through is
+        # a rebuild rather than a refusal because this exit is PAST the guard,
+        # which has already established that every source can be re-read.
+        probe = self._Probe(False)
+        self.assertEqual(
+            self._plan(
+                probe,
+                version=4,
+                pending_additions=True,
+                shape_problems=["turns: the whole table is missing"],
+            ),
+            ingest_mod.PLAN_REBUILD,
+        )
+
+    def test_an_old_sqlite_with_a_column_to_drop_declines_the_shortcuts(
+        self,
+    ) -> None:
+        # Without DROP COLUMN the in-place route cannot REACH the current
+        # shape, and stamping most of it is the #35 defect by another door.
+        probe = self._Probe(False)
+        self.assertEqual(
+            self._plan(
+                probe, version=7, needs_column_drop=True, can_drop_column=False
+            ),
+            ingest_mod.PLAN_REBUILD,
+        )
+        self.assertEqual(
+            self._plan(
+                probe,
+                version=4,
+                pending_additions=True,
+                needs_column_drop=True,
+                can_drop_column=False,
+            ),
+            ingest_mod.PLAN_REBUILD,
+        )
+
+    def test_capability_is_only_consulted_when_there_is_something_to_drop(
+        self,
+    ) -> None:
+        # #42(a): the gate asked whether this SQLite CAN drop a column, not
+        # whether anything needs dropping, so a database that already lacks
+        # `cost_usd` was pushed onto the rebuild path -- and refused there
+        # forever on a reaped corpus -- for work that was a no-op.
+        probe = self._Probe(True)
+        self.assertEqual(
+            self._plan(
+                probe, version=7, needs_column_drop=False, can_drop_column=False
+            ),
+            ingest_mod.PLAN_IN_PLACE,
+        )
+        self.assertEqual(probe.calls, 0)
+
+    def test_a_current_database_needing_no_work_is_left_alone(self) -> None:
+        probe = self._Probe(False)
+        self.assertEqual(self._plan(probe), ingest_mod.PLAN_CURRENT)
+        # ...but one the unprobed path stamped can still be missing a column
+        # it can supply, and at the current version nothing else ever will.
+        self.assertEqual(
+            self._plan(probe, pending_additions=True), ingest_mod.PLAN_IN_PLACE
+        )
+        self.assertEqual(probe.calls, 0)
+
+
+class InPlaceRepairSetsAreDecidedTest(unittest.TestCase):
+    """What an in-place upgrade may CREATE and may ADD, named and pinned.
+
+    Both sets are permissions to write something a transcript did not: a table
+    created from nothing, or a column with no measured value in it. Each entry
+    has to be true of the DATA, not just of the SQL -- so they are listed here
+    with the reason, and a new entry has to change this test.
+    """
+
+    def test_only_the_run_stamp_may_be_created_from_nothing(self) -> None:
+        # `ingest_runs` holds no row derived from a transcript, so creating it
+        # empty states the truth ("no run recorded yet"), which is exactly what
+        # a v6 database's state is. `turns` created empty is a lie about a
+        # source that `ingest_state` still marks unchanged.
+        self.assertEqual(
+            ingest_mod.IN_PLACE_CREATABLE_TABLES,
+            frozenset({ingest_mod.INGEST_RUNS_TABLE}),
+        )
+
+    def test_only_archived_at_may_be_added_to_rows_that_already_exist(
+        self,
+    ) -> None:
+        # NULL means "still on disk", which is true of every row written before
+        # the column existed, and the next run recomputes it from the
+        # filesystem. A NOT NULL column, or one whose NULL would be read as a
+        # measurement, cannot be added this way at all.
+        self.assertEqual(
+            dict(ingest_mod.IN_PLACE_ADDABLE_COLUMNS),
+            {("ingest_state", "archived_at"): "REAL"},
+        )
+
+    def test_every_addable_column_is_in_the_shipped_schema(self) -> None:
+        # A repair that adds a column the schema does not declare would leave
+        # the database permanently unable to pass its own shape probe.
+        shape = ingest_mod._target_shape()
+        for (table, column) in ingest_mod.IN_PLACE_ADDABLE_COLUMNS:
+            with self.subTest(table=table, column=column):
+                self.assertIn(column, shape[table])
+
+    def test_every_creatable_table_is_in_the_shipped_schema(self) -> None:
+        for table in ingest_mod.IN_PLACE_CREATABLE_TABLES:
+            with self.subTest(table=table):
+                self.assertIn(table, ingest_mod.DERIVED_TABLES)
+
+
+class CapabilityGateAsksAboutNeedTest(unittest.TestCase):
+    """A database with nothing to drop must not be refused for want of DROP
+    COLUMN (#42(a)).
+
+    The gate read `_sqlite_supports_drop_column()`, which is a fact about the
+    LIBRARY. What the in-place path needs is a fact about the DATABASE: whether
+    `api_calls` still carries `cost_usd`. A v6/v7-stamped database that already
+    lacks it -- reachable by crashing mid-upgrade on a new SQLite, or by moving
+    a file between machines -- failed a gate about work it did not need, fell
+    through to the rebuild path, and was refused there forever if any source
+    had been reaped. Measured before the fix, 2026-08-05:
+
+        before: version=7 rows=5 cost_usd=False
+        ->  SystemExit: REFUSING to rebuild the database.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-need-gate-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+
+    def _rows(self) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _state(self) -> tuple[int, bool]:
+        conn = sqlite3.connect(self.db)
+        try:
+            return (
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                "cost_usd" in ingest_mod._table_columns(conn, "api_calls"),
+            )
+        finally:
+            conn.close()
+
+    def test_a_v7_shape_with_nothing_to_drop_upgrades_on_an_old_sqlite(
+        self,
+    ) -> None:
+        self.transcript.unlink()
+        ingest(self.projects, self.db)  # archives it; rows retained
+        conn = sqlite3.connect(self.db)
+        conn.execute("PRAGMA user_version = 7")
+        conn.commit()
+        conn.close()
+        before = self._rows()
+        self.assertEqual(self._state(), (7, False))
+
+        with mock.patch.object(sqlite3, "sqlite_version", "3.34.1"):
+            summary = ingest(self.projects, self.db)  # must not raise SystemExit
+
+        self.assertFalse(summary["schema_rebuilt"])
+        self.assertEqual(summary["files_ingested"], 0)
+        self.assertEqual(self._rows(), before)
+        self.assertEqual(self._state(), (ingest_mod.SCHEMA_VERSION, False))
+
+    def test_a_pre_v5_shape_with_nothing_to_drop_repairs_on_an_old_sqlite(
+        self,
+    ) -> None:
+        # The same gate, second instance: the legacy `archived_at` repair asked
+        # the same capability question about the same absent work.
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        conn.execute(
+            "CREATE TABLE ingest_state_old (path TEXT PRIMARY KEY,"
+            " session_id TEXT NOT NULL, source_kind TEXT NOT NULL,"
+            " size INTEGER NOT NULL, mtime REAL NOT NULL,"
+            " unparsed_records INTEGER NOT NULL, first_ts REAL, last_ts REAL)"
+        )
+        conn.execute(
+            "INSERT INTO ingest_state_old SELECT path, session_id, source_kind,"
+            " size, mtime, unparsed_records, first_ts, last_ts FROM ingest_state"
+        )
+        conn.execute("DROP TABLE ingest_state")
+        conn.execute("ALTER TABLE ingest_state_old RENAME TO ingest_state")
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        before = self._rows()
+
+        with mock.patch.object(sqlite3, "sqlite_version", "3.34.1"):
+            rebuilt = ingest_mod._prepare_schema(conn)
+
+        self.assertFalse(rebuilt, "nothing needed dropping, so nothing needed a rebuild")
+        self.assertIn("archived_at", ingest_mod._table_columns(conn, "ingest_state"))
+        self.assertEqual(self._rows(), before)
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            ingest_mod.SCHEMA_VERSION,
+        )
+
+
+class RetiredColumnDropRefusalTest(unittest.TestCase):
+    """A DROP COLUMN that SQLite structurally refuses must say so, and must NOT
+    fall back to a rebuild (#42(b)).
+
+    SQLite refuses to drop a column an index, view or trigger references. No
+    CPB schema has ever indexed `cost_usd`, so reaching this needs a user who
+    queried their own database directly -- which the durability design
+    positively encourages.
+
+    The obvious fallback is a trap. Rebuilding here meets the reaped-source
+    guard, which refuses precisely when the database is the only surviving copy
+    of its measurements, so on a corpus older than the retention window the
+    sequence becomes *drop refused -> rebuild refused*: two individually
+    correct refusals composing into no upgrade path at all. So the drop refuses
+    with an ACTION instead -- naming the object to remove, which is a one-line,
+    non-destructive step the operator can take, after which the in-place hop
+    proceeds.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-drop-refusal-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("ALTER TABLE api_calls ADD COLUMN cost_usd REAL")
+            conn.execute("UPDATE api_calls SET cost_usd = id * 0.25 + 0.125")
+            conn.execute("PRAGMA user_version = 7")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot(self) -> list[tuple]:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                "SELECT id, session_id, model, output_tokens, cost_usd"
+                " FROM api_calls ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def test_an_index_over_the_retired_column_produces_a_named_refusal(
+        self,
+    ) -> None:
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("CREATE INDEX idx_my_own_cost ON api_calls (cost_usd)")
+            conn.commit()
+        finally:
+            conn.close()
+        before = self._snapshot()
+        self.assertTrue(before, "the fixture must hold rows for this to mean anything")
+
+        with self.assertRaises(SystemExit) as caught:
+            ingest(self.projects, self.db)
+
+        message = str(caught.exception)
+        self.assertIn("REFUSING", message)
+        # The operator cannot act on "something references it".
+        self.assertIn("idx_my_own_cost", message)
+        self.assertIn("cost_usd", message)
+
+    def test_the_refusal_changes_nothing_and_does_not_reach_a_rebuild(
+        self,
+    ) -> None:
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("CREATE INDEX idx_my_own_cost ON api_calls (cost_usd)")
+            conn.commit()
+        finally:
+            conn.close()
+        before = self._snapshot()
+
+        with self.assertRaises(SystemExit):
+            ingest(self.projects, self.db)
+
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertIn("cost_usd", ingest_mod._table_columns(conn, "api_calls"))
+        finally:
+            conn.close()
+        self.assertEqual(self._snapshot(), before)
+
+    def test_removing_the_index_leaves_the_upgrade_available(self) -> None:
+        # The property that makes a refusal legitimate rather than a dead end:
+        # the operator has a next step, and taking it works.
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("CREATE INDEX idx_my_own_cost ON api_calls (cost_usd)")
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(SystemExit):
+            ingest(self.projects, self.db)
+
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("DROP INDEX idx_my_own_cost")
+            conn.commit()
+        finally:
+            conn.close()
+
+        summary = ingest(self.projects, self.db)
+
+        self.assertFalse(summary["schema_rebuilt"])
+        self.assertEqual(summary["files_ingested"], 0)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertNotIn("cost_usd", ingest_mod._table_columns(conn, "api_calls"))
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                ingest_mod.SCHEMA_VERSION,
+            )
+        finally:
+            conn.close()
+
+
+class SchemaCommentPlacementTest(unittest.TestCase):
+    """No `--` comment may live inside a `CREATE TABLE` body (#42(b)).
+
+    `ALTER TABLE ... DROP COLUMN` makes SQLite reconstruct the table's stored
+    CREATE statement. On SQLite 3.45.1 that reconstruction fails when the
+    dropped column is LAST and the text directly above it is a `--` comment:
+    the closing paren is re-appended at the truncation point, which lands
+    inside the commented-out line, so the statement never closes.
+
+        sqlite3.OperationalError: error in table ingest_state after drop
+        column: incomplete input
+
+    Measured 2026-08-05: red on all four CI legs (Python 3.10-3.13, SQLite
+    3.45.1), green on a 3.53.3 laptop, which discards the comment block
+    entirely. The mechanism is inferred from the error string; the version
+    boundary is measured.
+
+    CPB's schema is unusually comment-heavy and three tables ended in a
+    commented column, so the next migration that drops a last column would
+    have passed locally and failed CI -- a failure that arrives after review,
+    on a machine nobody can attach a debugger to.
+
+    This is enforced as an AUTHORING RULE rather than a runtime fallback on
+    purpose. The fallback the issue first proposed -- catch the error and
+    rebuild -- collides with the reaped-source guard, which refuses a rebuild
+    exactly when the database is the only copy of its measurements: two correct
+    refusals composing into no upgrade path. A comment that is not in the
+    stored statement cannot break its reconstruction on any version.
+    """
+
+    def _stored_statements(self) -> dict[str, str]:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(ingest_mod.SCHEMA)
+            return {
+                name: sql
+                for name, sql in conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type='table'"
+                    " AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+        finally:
+            conn.close()
+
+    def test_no_stored_create_statement_carries_a_comment(self) -> None:
+        # Asserted over what SQLITE STORES, not over the text of SCHEMA:
+        # comments ABOVE a CREATE TABLE are not part of the statement and are
+        # free, which is where these ones now live.
+        for table, sql in sorted(self._stored_statements().items()):
+            with self.subTest(table=table):
+                self.assertNotIn("--", sql)
+
+    def test_the_last_column_of_every_table_survives_a_drop(self) -> None:
+        # The property the rule exists to protect, exercised directly. It has
+        # no teeth on a 3.53.3 laptop and full teeth on CI's 3.45.1, which is
+        # the asymmetry that produced the finding in the first place.
+        #
+        # Tables whose last column is a primary key or is named by an index are
+        # skipped: SQLite refuses those drops for a reason that is not the
+        # reconstruction defect, and forcing them would test its refusal
+        # instead of this rule.
+        for table in ingest_mod.DERIVED_TABLES:
+            conn = sqlite3.connect(":memory:")
+            try:
+                conn.executescript(ingest_mod.SCHEMA)
+                *_, name, _type, _notnull, _default, pk = conn.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()[-1]
+                if pk:
+                    continue
+                indexed = False
+                for index in conn.execute(f"PRAGMA index_list({table})").fetchall():
+                    columns = conn.execute(f"PRAGMA index_info({index[1]})")
+                    indexed = indexed or name in {row[2] for row in columns}
+                if indexed:
+                    continue
+                with self.subTest(table=table, column=name):
+                    conn.execute(f"ALTER TABLE {table} DROP COLUMN {name}")
+                    # The reconstruction is lazy on some builds; force SQLite
+                    # to re-read the statement it just wrote.
+                    conn.execute(f"SELECT COUNT(*) FROM {table}")
+            finally:
+                conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
