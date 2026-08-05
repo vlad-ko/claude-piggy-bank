@@ -227,11 +227,11 @@ DERIVED_TABLES = (
 # older shape is rebuilt from scratch rather than migrated in place -- see
 # `_prepare_schema`, and `IN_PLACE_UPGRADE_FROM` below for the narrow case
 # where rebuilding would cost rows to arrive at the identical database.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Versions whose difference from the current shape can be applied WITHOUT
-# deleting a row, so they upgrade in place instead of being dropped and
-# rebuilt. Three such hops exist, and a v6 database makes all three at once:
+# losing a measurement, so they upgrade in place instead of being dropped and
+# rebuilt. Four such hops exist, and a v6 database makes all four at once:
 #
 #   v6 -> v7  ADDS `ingest_runs`, supplied by `CREATE TABLE IF NOT EXISTS`.
 #   v7 -> v8  DROPS `api_calls.cost_usd` (#30), applied by `ALTER TABLE ...
@@ -239,6 +239,10 @@ SCHEMA_VERSION = 9
 #             no rebuild, no DROP TABLE, no row deleted.
 #   v8 -> v9  ADDS `source_shape` (#15), supplied by the same
 #             `CREATE TABLE IF NOT EXISTS`.
+#   v9 -> v10 ADDS `idx_agent_dispatches_task_id`, a UNIQUE index, preceded by
+#             `_dedupe_dispatch_task_ids()` -- the index cannot be created over
+#             a table that already holds duplicates, so the resolution is part
+#             of the hop or the hop cannot run (#36).
 #
 # RE-DECIDED at this bump, not extended by habit -- the comment below has said
 # since v8 that this does not accumulate, so each member was re-checked against
@@ -246,15 +250,32 @@ SCHEMA_VERSION = 9
 #
 #   * 6: needs `ingest_runs` created (empty is true of it), `cost_usd` dropped
 #     in place, `source_shape` created (empty is true of it -- see
-#     IN_PLACE_CREATABLE_TABLES). No row deleted.
-#   * 7: `cost_usd` dropped in place, `source_shape` created. No row deleted.
-#   * 8: `source_shape` created. No row deleted.
+#     IN_PLACE_CREATABLE_TABLES), duplicate dispatch rows resolved.
+#   * 7: `cost_usd` dropped in place, `source_shape` created, duplicates
+#     resolved.
+#   * 8: `source_shape` created, duplicates resolved.
+#   * 9: duplicates resolved.
 #
-# The property that admits a version is "the delta preserves every row", which
-# is what `_prepare_schema`'s refusal guard protects. Whoever bumps
-# SCHEMA_VERSION next has to re-decide it AGAIN: v9 adds a table whose absence
-# is honestly readable, and the next delta may not be.
-IN_PLACE_UPGRADE_FROM = frozenset({6, 7, 8})
+# THE BAR MOVED AT THIS BUMP, and saying so is the point of re-deciding rather
+# than extending. It was "the delta preserves every ROW"; v9 -> v10 deletes
+# rows, so it would fail that bar as written. What it preserves is every
+# DISPATCH: a duplicate `task_id` row is one dispatch recorded in a second
+# transcript, not a second dispatch, and one WHOLE row of the pair survives
+# (`_resolve_dispatch`). Three things keep that from being a licence:
+#
+#   * the migration reaches exactly the state an ordinary ingest at v10 would
+#     have written, because it applies the SAME rule `store_source()` does;
+#   * what it discards is COUNTED and printed, including the ambiguous case
+#     where the discarded row held metadata the survivor does not;
+#   * the alternative is worse in the direction that matters -- a rebuild
+#     reaches the same shape but is REFUSED by the reaped-source guard on
+#     exactly the databases that are the only copy of their history, so
+#     refusing the in-place hop here would stand them all at v9 forever.
+#
+# Whoever bumps SCHEMA_VERSION next has to re-decide this AGAIN, and against
+# the bar as it now stands: a delta that loses a MEASUREMENT belongs nowhere
+# near this set, whatever it does to row counts.
+IN_PLACE_UPGRADE_FROM = frozenset({6, 7, 8, 9})
 
 # The two permissions an in-place upgrade needs, named and bounded, because
 # `CREATE TABLE IF NOT EXISTS` silently grants the first to EVERY table and
@@ -290,6 +311,16 @@ IN_PLACE_CREATABLE_TABLES = frozenset({INGEST_RUNS_TABLE, SHAPE_TABLE})
 IN_PLACE_ADDABLE_COLUMNS: dict[tuple[str, str], str] = {
     ("ingest_state", "archived_at"): "REAL",
 }
+
+# What one `agent_dispatches` row knows about a dispatch BEYOND its identity
+# (#36). Named once, because the richness rule, the divergence check, the
+# insert-time resolution and the migration all have to range over the same
+# fields, and spelling them four times is how they stop doing so.
+#
+# `session_id`, `source_path` and `turn_id` are deliberately NOT here: they
+# identify the RECORDING, not the dispatch, and every row has them, so counting
+# them would make every row equally rich and the rule a coin toss.
+DISPATCH_METADATA_COLUMNS = ("agent_type", "description", "subagent_tokens")
 
 # The column the current shape has RETIRED (#30). Named once: the drop, the
 # "is there anything to drop" gate and the refusal all have to mean the same
@@ -383,6 +414,9 @@ CREATE TABLE IF NOT EXISTS api_calls (
     is_sidechain INTEGER NOT NULL DEFAULT 0,
     message_id TEXT
 );
+-- `task_id` IS the agent, so at most one row may carry each one (#36) -- see
+-- the UNIQUE INDEX at the foot of this schema, and `_resolve_dispatch()` for
+-- how ingest keeps that true.
 CREATE TABLE IF NOT EXISTS agent_dispatches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -510,6 +544,25 @@ CREATE INDEX IF NOT EXISTS idx_api_calls_source_kind ON api_calls (source_kind);
 CREATE INDEX IF NOT EXISTS idx_turns_source_path ON turns (source_path);
 CREATE INDEX IF NOT EXISTS idx_agent_dispatches_source_path
     ON agent_dispatches (source_path);
+-- ONE ROW PER DISPATCH (#36). `serve.py`'s session panel joins measured spend
+-- to `agent_dispatches` on `task_id`, so a second row carrying the same id
+-- counted that agent's whole spend twice -- silently, and only across sessions,
+-- so the figure was non-additive with nothing on the page saying so.
+--
+-- PARTIAL, and the predicate is the point rather than an optimisation: SQLite
+-- treats two NULLs as distinct in a unique index anyway, so a plain
+-- `UNIQUE(task_id)` would look like it constrained every row while exempting
+-- exactly the ones recording an absence. Spelling the exemption out says that
+-- it is INTENDED -- a dispatch whose notification carried no `<task-id>` is its
+-- own dispatch, and NULL is not a shared key (the same rule `message_id`
+-- follows in `_dedupe_calls`).
+--
+-- This is a BACKSTOP, not the mechanism: `store_source()` resolves a collision
+-- before it inserts, so reaching this constraint means the resolution was
+-- bypassed (a second writer, a hand-edit) and an IntegrityError is the right
+-- outcome -- far better than a silently doubled number.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_dispatches_task_id
+    ON agent_dispatches (task_id) WHERE task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_api_calls_agent_id ON api_calls (agent_id);
 CREATE INDEX IF NOT EXISTS idx_subagent_runs_dispatching
     ON subagent_runs (dispatching_session_id);
@@ -1691,13 +1744,111 @@ def delete_source_rows(conn: sqlite3.Connection, source_path: str) -> None:
     conn.execute(f"DELETE FROM {SHAPE_TABLE} WHERE path = ?", (source_path,))
 
 
+@dataclass
+class DispatchCollisions:
+    """Duplicate `task_id`s resolved, and how many of them cost something.
+
+    Two counts and not one, for the reason `_dedupe_calls()` keeps two: the
+    ordinary case is a dispatch recorded twice with the same metadata, where
+    discarding either row loses nothing, and it must stay distinguishable from
+    the case where the discarded row knew something the survivor does not.
+    """
+
+    resolved: int = 0
+    divergent: int = 0
+
+    def add(self, other: "DispatchCollisions") -> None:
+        self.resolved += other.resolved
+        self.divergent += other.divergent
+
+
+def _dispatch_richness(metadata: Sequence[Any]) -> int:
+    """How much this row knows about its dispatch: non-NULL fields, counted.
+
+    The rule is stated as a COUNT rather than a priority order between the
+    fields because no evidence supports ranking them. On the reference corpus
+    (2026-08-05) 11 of the 12 colliding pairs carry byte-identical metadata, so
+    the rule decides exactly one real case: a row with an agent type and a
+    description against one with only a `<subagent_tokens>` figure. Counting
+    keeps the two facts that name the dispatch over the one that measures its
+    peak context -- `agent_type` is what the session panel GROUPS BY, so losing
+    it files a real dispatch under no agent type at all, while losing the
+    figure is counted honestly as a dispatch that reported no peak (a
+    no-sample, which that panel already renders as "(n unreported)").
+
+    Whichever row wins, the other's facts are gone -- which is why the loss is
+    counted (`divergent`) rather than papered over by taking the best field
+    from each. See `_resolve_dispatch`.
+    """
+    return sum(1 for value in metadata if value is not None)
+
+
+def _dispatch_discards_metadata(kept: Sequence[Any], dropped: Sequence[Any]) -> bool:
+    """Does keeping `kept` throw away something `dropped` knew?
+
+    True when the discarded row is not a subset of the survivor: some field it
+    recorded is absent from, or disagrees with, the row being kept. False when
+    the survivor says everything the discarded row said -- the common case, and
+    the one where the choice between them costs nothing.
+    """
+    return any(
+        value is not None and value != keeper
+        for keeper, value in zip(kept, dropped)
+    )
+
+
+def _resolve_dispatch(
+    conn: sqlite3.Connection, task_id: Optional[str], metadata: Sequence[Any]
+) -> tuple[bool, DispatchCollisions]:
+    """Decide whether this dispatch may be inserted, and evict a poorer row.
+
+    Returns `(insert?, collisions)`. ONE WHOLE ROW survives a collision, never
+    a per-field merge -- the rule `_dedupe_calls()` follows for `message.id`,
+    for the same reason: a synthesised row would describe a dispatch that no
+    transcript ever recorded, and this table is joined to measured spend.
+
+    A tie keeps the row ALREADY STORED. Not arbitrary: it makes re-ingesting
+    the poorer transcript a no-op instead of a rewrite, so repeated runs
+    converge instead of churning. Re-ingesting the survivor's own transcript
+    deletes its rows first (`store_source`), so the collision is re-decided
+    from an empty field and lands on the same answer either way.
+
+    NULL `task_id` never collides with anything. It is not a shared key: two
+    notifications that carried no task id are two dispatches, and merging them
+    would delete a real one. The partial UNIQUE index says the same thing in
+    the schema.
+    """
+    collisions = DispatchCollisions()
+    if task_id is None:
+        return True, collisions
+    incumbent = conn.execute(
+        "SELECT id, " + ", ".join(DISPATCH_METADATA_COLUMNS)
+        + " FROM agent_dispatches WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if incumbent is None:
+        return True, collisions
+    collisions.resolved = 1
+    stored = tuple(incumbent[1:])
+    if _dispatch_richness(metadata) > _dispatch_richness(stored):
+        collisions.divergent = int(_dispatch_discards_metadata(metadata, stored))
+        conn.execute("DELETE FROM agent_dispatches WHERE id = ?", (incumbent[0],))
+        return True, collisions
+    collisions.divergent = int(_dispatch_discards_metadata(stored, metadata))
+    return False, collisions
+
+
 def store_source(
     conn: sqlite3.Connection,
     source: Source,
     parsed: ParseResult,
     stat: Optional[os.stat_result] = None,
-) -> None:
+) -> DispatchCollisions:
     """Replace one transcript FILE's rows with a fresh parse (delete + insert).
+
+    Returns the duplicate `task_id`s this file's dispatches collided with, for
+    the caller to report: a dedupe nobody is told about cannot be told apart
+    from a corpus that had no duplicates (#36).
 
     `stat` is the size+mtime observed BEFORE the file was read, and both
     callers pass it. Re-statting here instead would record the state the file
@@ -1776,7 +1927,23 @@ def store_source(
             ),
         )
 
+    # Resolved against the rows ALREADY in the table, which is the whole of
+    # #36: within one transcript `parse_file` has already collapsed repeat
+    # notifications about one task, and every duplicate on the reference corpus
+    # was across two session transcripts (12 task ids, 24 rows, 0 within a
+    # session, measured 2026-08-05). This source's own rows were deleted above,
+    # so an incumbent found here is always another file's.
+    collisions = DispatchCollisions()
     for dispatch in parsed.dispatches.values():
+        metadata = (
+            dispatch.agent_type,
+            dispatch.description,
+            dispatch.subagent_tokens,
+        )
+        insert, resolution = _resolve_dispatch(conn, dispatch.task_id, metadata)
+        collisions.add(resolution)
+        if not insert:
+            continue
         conn.execute(
             "INSERT INTO agent_dispatches (session_id, source_path, turn_id, task_id,"
             " agent_type, description, subagent_tokens) VALUES (?,?,?,?,?,?,?)",
@@ -1785,9 +1952,7 @@ def store_source(
                 source_path,
                 turn_ids[dispatch.turn_index] if dispatch.turn_index is not None else None,
                 dispatch.task_id,
-                dispatch.agent_type,
-                dispatch.description,
-                dispatch.subagent_tokens,
+                *metadata,
             ),
         )
 
@@ -1805,6 +1970,7 @@ def store_source(
             last_ts,
         ),
     )
+    return collisions
 
 
 def run_for_source(source: Source, dispatching_session_id: Optional[str]) -> SubagentRun:
@@ -2087,6 +2253,61 @@ def _drop_retired_cost_column(conn: sqlite3.Connection) -> None:
             "rebuild path is NOT taken automatically here, because it would "
             "refuse over any reaped source and leave no upgrade path at all."
         ) from exc
+
+
+def _dedupe_dispatch_task_ids(conn: sqlite3.Connection) -> DispatchCollisions:
+    """Make `UNIQUE(task_id)` true of a table written before it was (#36).
+
+    v9 and earlier constrained nothing, so a `task_id` recorded by two session
+    transcripts is stored twice -- 12 such ids over 24 rows on the reference
+    corpus, all of them resume pairs across two sessions (measured 2026-08-05).
+    `CREATE UNIQUE INDEX` fails outright over those rows, so this runs FIRST,
+    in its own transaction, before `SCHEMA` is applied.
+
+    The rule is `_resolve_dispatch`'s, deliberately: the migration must land on
+    the state an ordinary ingest at this version would have written, or the
+    same corpus would say two different things depending on when it was
+    ingested. Richest WHOLE row survives; a tie keeps the lowest `id`, which is
+    the row stored first and so the same "keep the incumbent" tie-break.
+
+    Idempotent, and safe on every exit `_prepare_schema` takes: a database with
+    no `agent_dispatches` table (fresh, or mid-rebuild) has nothing to resolve,
+    and one that already carries the index cannot hold a duplicate to find.
+    """
+    collisions = DispatchCollisions()
+    if not _table_columns(conn, "agent_dispatches"):
+        return collisions
+    columns = ", ".join(DISPATCH_METADATA_COLUMNS)
+    duplicates = conn.execute(
+        f"SELECT id, task_id, {columns} FROM agent_dispatches"
+        " WHERE task_id IN (SELECT task_id FROM agent_dispatches"
+        "   WHERE task_id IS NOT NULL GROUP BY task_id HAVING COUNT(*) > 1)"
+        " ORDER BY task_id, id"
+    ).fetchall()
+    grouped: dict[str, list[tuple]] = {}
+    for row in duplicates:
+        grouped.setdefault(row[1], []).append(row)
+
+    doomed: list[int] = []
+    for group in grouped.values():
+        # `max` returns the FIRST maximum, and the rows arrive ordered by id,
+        # so the richest row wins and a tie resolves to the lowest id.
+        kept = max(group, key=lambda row: _dispatch_richness(row[2:]))
+        lost = False
+        for row in group:
+            if row[0] == kept[0]:  # by `id`, which is unique; not by value
+                continue
+            doomed.append(row[0])
+            collisions.resolved += 1
+            lost = lost or _dispatch_discards_metadata(kept[2:], row[2:])
+        collisions.divergent += int(lost)
+
+    if doomed:
+        with conn:
+            conn.executemany(
+                "DELETE FROM agent_dispatches WHERE id = ?", [(i,) for i in doomed]
+            )
+    return collisions
 
 
 def _target_shape() -> dict[str, set[str]]:
@@ -2385,6 +2606,22 @@ def _prepare_schema(conn: sqlite3.Connection) -> bool:
         with conn:
             for table in DERIVED_TABLES:
                 conn.execute(f"DROP TABLE IF EXISTS {table}")
+    # BEFORE `SCHEMA`, which carries the UNIQUE index that cannot be created
+    # over a table still holding duplicates (#36). After the rebuild's drop
+    # loop, where there is by then nothing to resolve.
+    collisions = _dedupe_dispatch_task_ids(conn)
+    if collisions.resolved:
+        # Rows were DELETED from a database that may be the only surviving copy
+        # of its measurements, so this is said out loud on the run that does it
+        # -- once, and never as a silent success.
+        print(
+            f"schema upgrade: {collisions.resolved} duplicate dispatch row(s)"
+            " discarded -- one dispatch recorded by two session transcripts is"
+            " ONE dispatch, and a second row counted its measured spend twice"
+            " (#36). One WHOLE row of each pair was kept, never a per-field"
+            " merge; divergent (the discarded row knew something the survivor"
+            f" does not): {collisions.divergent}. Every task_id is now unique."
+        )
     conn.executescript(SCHEMA)
     if in_place:
         _drop_retired_cost_column(conn)
@@ -2471,6 +2708,13 @@ def ingest(
             # a corpus where either is common cannot read as a clean one.
             "calls_without_message_id": 0,
             "divergent_message_ids": 0,
+            # Dispatch dedupe (#36), counted the same way and for the same
+            # reason. A RUN event, not a standing fact about the corpus: it
+            # counts collisions THIS run resolved, so a run that skipped every
+            # file reports 0 because it resolved none -- which is why the note
+            # is printed only when there is something to say.
+            "duplicate_dispatches_resolved": 0,
+            "divergent_dispatch_task_ids": 0,
             "unparsed_details": [],
             # Transcript-shape census (#15), all read off the DB below so a
             # run that skipped every file still reports the corpus's shape.
@@ -2508,7 +2752,9 @@ def ingest(
                 continue
             parsed = parse_file(source.path, collect_turns=not is_subagent)
             with conn:
-                store_source(conn, source, parsed, stat)
+                collisions = store_source(conn, source, parsed, stat)
+            summary["duplicate_dispatches_resolved"] += collisions.resolved
+            summary["divergent_dispatch_task_ids"] += collisions.divergent
             summary["files_ingested"] += 1
             if is_subagent:
                 summary["subagent_files_ingested"] += 1
@@ -2667,6 +2913,8 @@ def ingest_transcript(
             "unparsed_records": 0,
             "calls_without_message_id": 0,
             "divergent_message_ids": 0,
+            "duplicate_dispatches_resolved": 0,
+            "divergent_dispatch_task_ids": 0,
             "unparsed_details": [],
         }
         stat = transcript.stat()
@@ -2694,9 +2942,11 @@ def ingest_transcript(
                 # `store_source` does INSERT OR REPLACE into ingest_state,
                 # which rewrites the whole row and so clears `archived_at`.
                 # `stat` is the PRE-read one -- see `store_source`.
-                store_source(conn, source, parsed, stat)
+                collisions = store_source(conn, source, parsed, stat)
                 if source.kind == SOURCE_SUBAGENT:
                     store_run(conn, run_for_source(source, dispatcher))
+            summary["duplicate_dispatches_resolved"] = collisions.resolved
+            summary["divergent_dispatch_task_ids"] = collisions.divergent
             summary["files_ingested"] = 1
             summary["records_parsed"] = parsed.records_parsed
             summary["unparsed_records"] = parsed.unparsed_records
@@ -2887,6 +3137,19 @@ def print_dedupe_note(summary: dict[str, Any]) -> None:
             " a per-field synthesis);"
             f" records with no message.id: {summary['calls_without_message_id']}"
             " (kept as individual calls, never merged and never dropped)."
+        )
+    if summary["duplicate_dispatches_resolved"]:
+        # Same shape, one table over (#36): a dispatch recorded by two session
+        # transcripts is ONE dispatch, and the second row made the panel count
+        # its measured spend twice. Printed only when it happened, so it never
+        # reads as a standing claim that a corpus has none.
+        print(
+            "NOTE: dispatch dedupe --"
+            " duplicate task_id(s) resolved this run:"
+            f" {summary['duplicate_dispatches_resolved']} (one WHOLE dispatch"
+            " row kept, never a per-field synthesis); of those, discarded a row"
+            " that knew something the survivor does not:"
+            f" {summary['divergent_dispatch_task_ids']}."
         )
 
 
