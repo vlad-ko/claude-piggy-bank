@@ -29,6 +29,7 @@ from serve import (  # noqa: E402
     STALE_UNKNOWN_NO_RUN_RECORDED,
     STALE_UNKNOWN_NO_RUN_TABLE,
     STALE_UNKNOWN_RUN_IN_FUTURE,
+    STATUS_ARCHIVED,
     Api,
     clamp_limit,
     day_bounds,
@@ -1632,6 +1633,11 @@ class AgentDispatchPeakContextTest(unittest.TestCase):
 # order. `rkcache` is deliberately the cache-read leader while `rkout` is the
 # token leader, which is exactly the pair a cache-read sort gets wrong.
 RANK_SESSION = "rank-fixture"
+# The Eastern day every fixture call is timestamped into (09:1x UTC on
+# 2026-03-04 -> 04:1x Eastern, same date). A reaped run's `dispatched_at`
+# comes from the task index's mtime instead -- i.e. NOW -- so the two are
+# deliberately different days, which is what makes the window tests bite.
+RANK_CALL_DAY = "2026-03-04"
 RANK_AGENTS: dict[str, list[tuple[str, int, int, int, int]]] = {
     # agent_id -> [(model, input, cache_read, cache_write, output), ...]
     "rkout": [("claude-haiku-4-5", 11_000, 400_000, 13_000, 600_000)],
@@ -1654,34 +1660,51 @@ RANK_TOTALS = {
 RANK_BY_TOTAL_TOKENS = ["rkout", "rkcache", "rkopus", "rkmixed"]
 RANK_BY_CACHE_READ = ["rkcache", "rkout", "rkopus", "rkmixed"]
 
-# A FIFTH dispatch, and the one both safety properties of this panel actually
-# turn on: reaped AFTER it was ingested.
+# A FIFTH dispatch, and the one the panel's whole epistemics turn on: reaped
+# AFTER it was ingested (#41).
 #
-# `rkgone` above is reaped-before-ingest -- no transcript ever landed, so its
+# `rkgone` above is reaped-BEFORE-ingest -- no transcript ever landed, so its
 # SQL `total_tokens` is already NULL, NULL collates last under DESC anyway,
-# and the Python null-ing is a no-op on a value that is already None. Both
-# `serve.py` safety properties (the status-first sort key, and `total_tokens`
-# in the unavailable null-list) therefore SURVIVED deliberate mutation against
-# `rkgone` alone: the assertions passed for the wrong reason, which is exactly
-# the "a fixture must not make the defect undetectable" failure in CLAUDE.md.
+# and the Python null-ing is a no-op on a value that is already None. Any
+# assertion made only against `rkgone` therefore passes without the code doing
+# anything, which is exactly the "a fixture must not make the defect
+# undetectable" failure in CLAUDE.md.
 #
 # `rkarch` is the other, load-bearing half of the durability story: ingested
 # on one run, its transcript reaped before the next. `store_subagent_runs()`
 # rebuilds its row as `unavailable` from the task index, while the archive
 # path KEEPS its `api_calls` rows (CLAUDE.md, "Durability -- the DB is not
-# regenerable"). So its raw SQL sort key is 9,003,000, NOT NULL:
+# regenerable"). So its raw SQL sort key is 9,003,000, NOT NULL -- and one
+# status was carrying two facts:
 #
-#   * with the status key moved off first, it ranks #1 and the panel opens
-#     with an all-dashes row;
-#   * with `total_tokens` dropped from the null-list, it renders 9,003,000
-#     beside `cache_read=—` and `model=—`.
+#   * `rkgone` is UNMEASURED: no rows exist, nothing can be shown, and a 0
+#     would file it among the smallest dispatches;
+#   * `rkarch` is MEASURED AND IRREPLACEABLE: the rows exist and this database
+#     is now their only copy. Blanking them rendered a present measurement as
+#     absence -- the project's own rule pointed the wrong way -- and put
+#     9,003,000 tokens in the summary cards and seven dashes in the panel that
+#     ranks by exactly that quantity.
 #
 # Its total is ~8.8x the measured leader's so the ordering property bites at
 # the very top of the list, and its four token classes are pinned mutually
 # different so a swapped column mapping cannot pass either.
 RANK_REAPED = "rkarch"
-RANK_REAPED_CALLS = [("claude-opus-4-8", 3_000_000, 4_000_000, 2_000_000, 3_000)]
+RANK_REAPED_MODEL = "claude-opus-4-8"
+RANK_REAPED_CALLS = [(RANK_REAPED_MODEL, 3_000_000, 4_000_000, 2_000_000, 3_000)]
 RANK_REAPED_TOTAL = 9_003_000
+# The panel's order once the reaped-but-measured run ranks on the total it
+# still has: 9,003,000 outranks every measured row, and only the run with NO
+# measurement at all is held back to the end.
+RANK_BY_TOTAL_WITH_ARCHIVED = [RANK_REAPED] + RANK_BY_TOTAL_TOKENS + ["rkgone"]
+# Fields of an `/api/agents` row that identify the dispatch rather than
+# measure it. Spelled out HERE, independently of `serve.py`, so that a run we
+# hold no calls for can be asserted null in EVERY other field -- including any
+# field added later. A future measured column that forgets the blanking goes
+# red here rather than shipping a fabricated figure.
+AGENT_IDENTITY_KEYS = frozenset({
+    "agent_id", "agent_type", "description", "spawn_depth",
+    "dispatching_session_id", "storing_session_id", "session_id", "status",
+})
 # Every agent that gets a real transcript written, measured or later reaped.
 RANK_TRANSCRIPTS = {**RANK_AGENTS, RANK_REAPED: RANK_REAPED_CALLS}
 
@@ -1810,15 +1833,17 @@ class AgentRankingByTotalTokensTest(unittest.TestCase):
 
     def test_the_returned_order_matches_the_field_the_heading_names(self) -> None:
         # Self-consistency, so a future ORDER BY change on any other column is
-        # red even if this fixture's rows happen to be re-arranged.
+        # red even if this fixture's rows happen to be re-arranged. Ranges over
+        # every row that HAS a total, whatever its status: the ranking key is
+        # the measurement, not the provenance of the transcript behind it.
         totals = [
-            r["total_tokens"] for r in self.rows() if r["status"] == "ingested"
+            r["total_tokens"] for r in self.rows() if r["total_tokens"] is not None
         ]
         self.assertEqual(totals, sorted(totals, reverse=True))
 
     def test_total_tokens_is_the_four_token_classes_summed(self) -> None:
         for row in self.rows():
-            if row["status"] != "ingested":
+            if row["total_tokens"] is None:
                 continue
             with self.subTest(agent=row["agent_id"]):
                 self.assertEqual(
@@ -1871,44 +1896,127 @@ class AgentRankingByTotalTokensTest(unittest.TestCase):
         self.assertIsNotNone(archived, "the reaped source lost its ingest_state row")
         self.assertIsNotNone(archived["archived_at"])
 
-    def test_a_reaped_dispatch_ranks_last_however_large_its_surviving_total(
+    def test_a_reaped_dispatch_reports_the_measurements_that_outlived_it(
         self,
     ) -> None:
-        # Property 1 (serve.py: "The FIRST sort key is the status"). `rkarch`
-        # carries 9,003,000 measured tokens in `api_calls`, so a sort that puts
-        # `total_tokens DESC` first opens the panel with an all-dashes row --
-        # an unmeasured dispatch presented as the single biggest spender.
-        rows = self.rows()
-        statuses = [r["status"] for r in rows]
-        self.assertEqual(rows[0]["agent_id"], RANK_BY_TOTAL_TOKENS[0])
-        self.assertEqual(
-            [r["agent_id"] for r in rows],
-            RANK_BY_TOTAL_TOKENS + [RANK_REAPED, "rkgone"],
-        )
-        # Stated as the property rather than as this fixture's order: every
-        # measured row precedes every unmeasured one, whatever they contain.
-        self.assertEqual(
-            statuses, sorted(statuses, key=lambda s: s == "unavailable"),
-            "an unavailable dispatch was interleaved with the measured ones",
-        )
-
-    def test_a_reaped_dispatch_reports_no_total_even_though_its_rows_survive(
-        self,
-    ) -> None:
-        # Property 2 (serve.py: a 0 -- or here a 9,003,000 -- "would file a
-        # reaped dispatch among the smallest ones"). The DB is now the only
-        # copy of that spend, but this panel cannot attribute it to a run whose
-        # transcript is gone, so it reports absence rather than a number beside
-        # a row of dashes. CLAUDE.md: absence is never rendered as a value.
+        # THE defect (#41). `rkarch`'s transcript is gone, but its `api_calls`
+        # rows are still here and this database is now their only copy --
+        # exactly what the durability design exists to keep. Rendering them as
+        # absence discarded a present measurement, and put 9,003,000 tokens in
+        # the summary cards and seven dashes in the panel at the same time.
         row = {r["agent_id"]: r for r in self.rows()}[RANK_REAPED]
-        self.assertEqual(row["status"], "unavailable")
-        self.assertIsNone(row["total_tokens"])
-        # ALL of it, not just the sort key -- a row showing one live figure
-        # beside six dashes is a worse lie than a row showing none.
-        for key in ("input", "cache_read", "cache_write", "output",
-                    "calls", "model", "first_ts", "last_ts"):
+        model, inp, cache_read, cache_write, output = RANK_REAPED_CALLS[0]
+        self.assertEqual(row["total_tokens"], RANK_REAPED_TOTAL)
+        # Every class separately, and the fixture pins them mutually different,
+        # so a swapped column mapping cannot pass by summing to the same total.
+        self.assertEqual(row["input"], inp)
+        self.assertEqual(row["cache_read"], cache_read)
+        self.assertEqual(row["cache_write"], cache_write)
+        self.assertEqual(row["output"], output)
+        self.assertEqual(row["calls"], len(RANK_REAPED_CALLS))
+        self.assertEqual(row["model"], model)
+        self.assertIsNotNone(row["first_ts"])
+        self.assertIsNotNone(row["last_ts"])
+
+    def test_the_reaped_states_are_two_statuses_not_one(self) -> None:
+        # The distinction itself. "We never measured this" and "we measured it
+        # and the source is now gone" are different claims about the same
+        # missing file, and one status value cannot carry both. Derived from
+        # the evidence and nothing else: `rkarch` has surviving call rows,
+        # `rkgone` has none.
+        by_id = {r["agent_id"]: r for r in self.rows()}
+        self.assertEqual(by_id[RANK_REAPED]["status"], STATUS_ARCHIVED)
+        self.assertEqual(by_id["rkgone"]["status"], "unavailable")
+        self.assertNotEqual(STATUS_ARCHIVED, "unavailable")
+        self.assertNotEqual(STATUS_ARCHIVED, "ingested")
+
+    def test_a_never_measured_dispatch_is_absent_in_every_measured_field(
+        self,
+    ) -> None:
+        # The other direction, which the fix must not break: `rkgone`'s
+        # transcript was reaped before CPB ever read it, so there is nothing to
+        # show and a 0 would file it among the smallest dispatches. Asserted
+        # over EVERY non-identifying key rather than a hand-kept list, so a
+        # measured column added later cannot quietly escape the blanking.
+        row = {r["agent_id"]: r for r in self.rows()}["rkgone"]
+        measured = sorted(set(row) - AGENT_IDENTITY_KEYS)
+        self.assertIn("total_tokens", measured, "the ranking key must be covered")
+        for key in measured:
             with self.subTest(field=key):
                 self.assertIsNone(row[key])
+
+    def test_a_reaped_dispatch_ranks_on_the_total_that_survived_it(self) -> None:
+        # Behaviour change, stated deliberately. The status used to be the
+        # FIRST sort key, so `rkarch` sorted last however large its surviving
+        # total. That was right while the total was blanked and wrong once it
+        # is shown: a panel ranked by total tokens that files its largest
+        # measured dispatch at the bottom is not ranked by total tokens.
+        #
+        # What still holds is the property the status key was protecting: a run
+        # with NO measurement never sorts among the measured ones, because it
+        # has no key to sort by. That is now keyed on the evidence -- rows or
+        # no rows -- rather than on a status that meant both.
+        rows = self.rows()
+        self.assertEqual(
+            [r["agent_id"] for r in rows], RANK_BY_TOTAL_WITH_ARCHIVED
+        )
+        self.assertEqual(rows[0]["agent_id"], RANK_REAPED)
+        has_total = [r["total_tokens"] is not None for r in rows]
+        self.assertEqual(
+            has_total, sorted(has_total, reverse=True),
+            "a dispatch with no measurement was interleaved with the measured ones",
+        )
+
+    def test_the_panel_and_the_summary_cards_agree_over_the_same_window(
+        self,
+    ) -> None:
+        # The reader-visible symptom, asserted end to end: every subagent token
+        # the cards count is attributed to a dispatch in the panel. It diverged
+        # by exactly `rkarch`'s 9,003,000 -- one database, one window, two
+        # answers -- and the panel was the one under-reporting.
+        #
+        # Asserted over BOTH windows because the divergence had two independent
+        # mechanisms of the same size: the blanking (corpus-wide) and the
+        # dispatch-date filter (the day the calls actually fall in).
+        for label, rng in (("corpus-wide", (None, None)),
+                           ("the call day", (RANK_CALL_DAY, RANK_CALL_DAY))):
+            with self.subTest(window=label):
+                start, end = day_bounds(*rng)
+                rows = self.api.agents(start, end, 20)
+                bucket = self.api.summary(start, end)["scope"]["subagent"]
+                card_total = sum(
+                    bucket[k]
+                    for k in ("input", "cache_read", "cache_write", "output")
+                )
+                panel_total = sum(
+                    r["total_tokens"] for r in rows if r["total_tokens"] is not None
+                )
+                self.assertEqual(panel_total, card_total)
+                self.assertEqual(
+                    sum(r["calls"] for r in rows if r["calls"] is not None),
+                    bucket["calls"],
+                )
+
+    def test_a_window_that_holds_the_measurements_lists_the_dispatch(self) -> None:
+        # The second mechanism, worth the same 9,003,000. A reaped run's only
+        # timestamp is `dispatched_at` -- the mtime of its task-index entry,
+        # which is when that entry was last touched, not when the agent ran.
+        # Gating the ROW on it dropped `rkarch` out of the very window its
+        # measurements fall in (panel 1,955,100 vs cards 10,958,100 for
+        # 2026-03-04, measured 2026-08-05) while a corpus-wide view agreed.
+        #
+        # A dispatch belongs in this window if we hold its measurements here OR
+        # its dispatch is dated here. The first is the fact the panel exists to
+        # report and cannot be conditioned on the second.
+        start, end = day_bounds(RANK_CALL_DAY, RANK_CALL_DAY)
+        by_id = {r["agent_id"]: r for r in self.api.agents(start, end, 20)}
+        self.assertIn(RANK_REAPED, by_id)
+        self.assertEqual(by_id[RANK_REAPED]["total_tokens"], RANK_REAPED_TOTAL)
+        self.assertEqual(by_id[RANK_REAPED]["status"], STATUS_ARCHIVED)
+        # And the gate still holds in the other direction: a run with NO
+        # measurement here and no dispatch dated here is not this window's gap,
+        # so it is absent from the list rather than present as a row of dashes.
+        self.assertNotIn("rkgone", by_id)
 
     def test_the_model_is_carried_beside_the_ranking(self) -> None:
         by_id = {r["agent_id"]: r for r in self.rows()}
@@ -1926,6 +2034,27 @@ class AgentRankingByTotalTokensTest(unittest.TestCase):
     def test_the_page_shows_the_ranked_quantity_it_sorted_on(self) -> None:
         # A ranking whose key is not on screen cannot be checked by the reader.
         self.assertIn("r.total_tokens", self.html)
+
+    def test_the_page_names_the_archived_state_and_flags_it_irreplaceable(
+        self,
+    ) -> None:
+        # CLAUDE.md constraint 4: the new state ANNOTATES this panel -- no new
+        # table and no column added just for it. The page reads the third
+        # status value, and where it shows those figures it says why they are
+        # not routine: no re-ingest can reproduce them.
+        self.assertIn(f'"{STATUS_ARCHIVED}"', self.html)
+        self.assertIn("only copy", self.html)
+        # The count of them is stated on the panel -- the established way this
+        # codebase names a partial figure (cf. `dispatches_without_peak`).
+        self.assertIn('id="agents-archived"', self.html)
+
+    def test_the_page_keeps_the_unmeasured_treatment_for_the_unmeasured_row(
+        self,
+    ) -> None:
+        # The absence half must survive the fix: the muted, dashed rendering
+        # keys on `unavailable` ALONE, so a row that has real figures is not
+        # styled as a gap and a row that has none is not styled as data.
+        self.assertIn('r.status === "unavailable"', self.html)
 
 
 if __name__ == "__main__":

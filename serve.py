@@ -83,6 +83,40 @@ SCOPE_INCLUDES_MAIN_ONLY = "main-thread only"
 # whether this window is affected" is a different claim from "it is".
 STATUS_UNAVAILABLE_UNDATED = "unavailable-undated"
 
+# A reaped run we HAD ALREADY MEASURED (#41). `subagent_runs.status` is written
+# from the task index -- "the transcript is not on disk now" -- so one stored
+# value covered two different states of knowledge:
+#
+#   * reaped BEFORE ingest: no `api_calls` row exists, nothing was ever
+#     measured, and the panel must render absence (that stays `unavailable`);
+#   * reaped AFTER ingest: the rows are still here, because an archived source
+#     is archived and not deleted (CLAUDE.md, "Durability"). This database is
+#     now their ONLY copy -- precisely what the durability design exists to
+#     keep -- and blanking them rendered a present measurement as absence.
+#
+# Measured 2026-08-05 on the ranking fixture: one such dispatch counted
+# 9,003,000 tokens in the summary cards for the window while every measured
+# field of its row in the panel that RANKS by that quantity was null -- one
+# database, one window, two answers. Derived at read time, never stored: the
+# distinction IS "do we hold call rows for this dispatch in this window", which
+# the panel's own LEFT JOIN already computes and then threw away, and anything
+# beyond that evidence would be a guess.
+# The word matches the vocabulary the rest of the codebase uses for the same
+# fact -- `ingest_state.archived_at`, `durability.archived_sources`.
+STATUS_ARCHIVED = "archived"
+
+# The `/api/agents` fields that IDENTIFY a dispatch rather than measure it.
+# Every other field that endpoint returns is an aggregate over `api_calls`, so
+# the blanking for a run with no surviving call rows is derived as "not one of
+# these" instead of being hand-listed beside the SELECT. The hand-kept list
+# this replaces had to agree with the ORDER BY and the HAVING with nothing
+# forcing it to: dropping one alias from it was a one-word edit that shipped a
+# fabricated figure. Adding a measured column now blanks by construction.
+AGENT_IDENTITY_FIELDS = frozenset({
+    "agent_id", "agent_type", "description", "spawn_depth",
+    "dispatching_session_id", "storing_session_id", "session_id",
+})
+
 # How old the LAST INGEST RUN may get before the page says so in the banner
 # (#20). It qualifies the run, never the newest measured call: an idle machine
 # legitimately produces no calls for hours, and warning on that would cry stale
@@ -476,22 +510,57 @@ class Api:
         themselves rather than being handed a derived dollar figure to trust.
         A run spanning several models reports "N models", never one of them.
 
-        An `unavailable` run (its transcript reaped from /private/tmp) is
-        listed with NULL figures, never zeros -- the operator must be able to
-        see that an agent ran and that its usage is unknown. The FIRST sort key
-        is the status, so unmeasured runs land at the end deliberately rather
-        than wherever a NULL happens to collate; they read as an explicit gap
-        rather than as the smallest dispatches.
+        **A reaped transcript is two states, not one (#41).** `subagent_runs`
+        records only that the file is gone; whether we ever measured it is a
+        different fact, and it is answered by this query's own LEFT JOIN:
 
-        **Both sides of the join are restricted to the window.** Filtering
+          * no surviving call rows -- nothing was ever measured, so every
+            figure stays NULL. A 0 there would file a reaped dispatch among the
+            smallest ones, and `COUNT(*)` over an unmatched LEFT JOIN hands you
+            exactly that plausible-looking zero. Reported as `unavailable`.
+          * rows survive -- the source was archived rather than deleted after
+            it had been ingested, so the measurement is present and this
+            database is its only copy. It is reported in full, ranked on the
+            total it actually carries, and flagged `STATUS_ARCHIVED` so the
+            page can say those figures cannot be re-derived. Blanking them
+            counted 9,003,000 tokens in the summary cards for a window whose
+            panel reported that same dispatch as unmeasured.
+
+        Like every figure here the distinction is WINDOW-SCOPED, and says so:
+        `unavailable` means "we hold no call rows for this dispatch in this
+        window", not "none exist anywhere". A reaped run measured only outside
+        `[from, to)` is this window's gap, and the window it WAS measured in
+        reports it as `archived` with its figures.
+
+        The FIRST sort key is therefore "has no measurement", not the stored
+        status: a run with nothing to rank by lands at the end deliberately
+        rather than wherever a NULL happens to collate, while a run that has a
+        number ranks on it. SQLite already collates NULL last under `DESC`, so
+        that key changes no row today and no fixture can make it bite -- it is
+        kept to STATE the property rather than depend on an ordering rule the
+        query never says out loud. The blanking, the sort key and the status
+        now read the SAME fact -- `n_calls` -- instead of three spellings free
+        to disagree, which is how one of them (a hand-kept tuple of column
+        aliases) came to be a one-word edit away from a fabricated figure.
+
+        **Both sides of this query are scoped to the window.** Filtering
         only `api_calls` mixed two sets: a dispatch whose calls all fall
         outside `[from, to)` still came back, rendered as in-period activity
         under a panel whose empty state reads "No subagent dispatches in this
         period", and consumed a `LIMIT` slot that a real in-window dispatch
-        needed. So an `ingested` run must have at least one in-window call,
-        and an `unavailable` run must belong to a session that is itself in
-        the window -- otherwise it is not this period's gap. Same defect class
-        as #4955, one layer down.
+        needed. Same defect class as #4955, one layer down.
+
+        A dispatch belongs to this window if EITHER holds: we have its
+        measurements here, or its dispatch is dated here. Both are tested after
+        grouping, because the first is not a property of the `subagent_runs`
+        row. Gating the row itself on `dispatched_at` (a pre-GROUP `WHERE`)
+        dropped a reaped run out of the very window its surviving calls fall
+        in: that timestamp is the mtime of the task-index entry -- when the
+        index was last touched, not when the agent ran -- so it routinely
+        names a different day from the calls. Measured 2026-08-05 on the
+        ranking fixture: for the day holding every call, the panel summed
+        1,955,100 tokens against the cards' 10,958,100, the missing 9,003,000
+        being one archived dispatch the `WHERE` had excluded.
         """
         rows = self.conn.execute(
             "SELECT r.agent_id, r.agent_type, r.description, r.status,"
@@ -507,38 +576,42 @@ class Api:
             " FROM subagent_runs r"
             " LEFT JOIN api_calls a ON a.agent_id = r.agent_id"
             "   AND a.ts >= ? AND a.ts < ?"
-            " WHERE r.status <> ?"
-            "   OR (r.dispatched_at >= ? AND r.dispatched_at < ?)"
             " GROUP BY r.agent_id"
-            " HAVING COUNT(a.id) > 0 OR r.status = ?"
-            " ORDER BY r.status = ?, total_tokens DESC, r.agent_id"
+            " HAVING COUNT(a.id) > 0"
+            "   OR (r.status = ? AND r.dispatched_at >= ? AND r.dispatched_at < ?)"
+            " ORDER BY n_calls = 0, total_tokens DESC, r.agent_id"
             " LIMIT ?",
-            (start, end, STATUS_UNAVAILABLE, start, end,
-             STATUS_UNAVAILABLE, STATUS_UNAVAILABLE, limit),
+            (start, end, STATUS_UNAVAILABLE, start, end, limit),
         ).fetchall()
         out = []
         for r in rows:
             row = dict(r)
-            unavailable = row.pop("status") == STATUS_UNAVAILABLE
+            reaped = row.pop("status") == STATUS_UNAVAILABLE
             n_calls = row.pop("n_calls")
             n_models = row.pop("n_models")
             any_model = row.pop("any_model")
-            row["status"] = STATUS_UNAVAILABLE if unavailable else STATUS_INGESTED
-            # Rule #12: for an unmeasured run every figure stays NULL. A
-            # LEFT JOIN naturally yields COUNT(*) == 0, which is exactly the
-            # plausible-looking zero this issue exists to stop.
-            row["calls"] = None if unavailable else n_calls
+            row["calls"] = n_calls
             row["model"] = (
-                None if unavailable or n_models == 0
+                None if n_models == 0
                 else (any_model if n_models == 1 else f"{n_models} models")
             )
-            if unavailable:
-                # Including `total_tokens`, the key this panel RANKS on: a 0
-                # there would file a reaped dispatch among the smallest ones
-                # instead of showing it as unmeasured.
-                for key in ("input", "cache_read", "cache_write", "output",
-                            "total_tokens", "first_ts", "last_ts"):
-                    row[key] = None
+            if not n_calls:
+                # Rule #12: for a run we hold no calls for, every MEASURED
+                # figure stays NULL -- derived as "everything that is not
+                # identity" so a column added to the SELECT above cannot be
+                # forgotten here and ship a fabricated number.
+                row = {
+                    k: (v if k in AGENT_IDENTITY_FIELDS else None)
+                    for k, v in row.items()
+                }
+            # Assigned last: `status` is the one non-identity field the
+            # blanking must not touch, and it reads the same `n_calls` the
+            # blanking and the sort key do.
+            row["status"] = (
+                (STATUS_UNAVAILABLE if not n_calls else STATUS_ARCHIVED)
+                if reaped
+                else STATUS_INGESTED
+            )
             out.append(row)
         return out
 
