@@ -60,7 +60,13 @@
 </style>
 </head>
 <body>
-<div class="wrap" x-data="report()">
+<!-- The visibility binding is Alpine's own event modifier rather than an
+     `addEventListener` (#8: no code in this page reaches the DOM). It pairs
+     with the `document.hidden` guard in `tickAge`: a tab nobody is looking at
+     stops recomputing, and is brought back up to date the moment it is looked
+     at again, so returning to a tab never shows an age up to a tick out of
+     date. -->
+<div class="wrap" x-data="report()" x-on:visibilitychange.document="tickAge()">
   <h1>Claude Code Usage Report</h1>
   <div class="sub">Token usage from local session transcripts. Dates are America/New_York.</div>
 
@@ -211,17 +217,29 @@
           zero, for a reason this build cannot name
         </span></template>
       </span></template>
+      <!-- #24: both ages are measured against `asOfNow`, NOT the frozen
+           `ingest.as_of` the response was stamped with. They were computed
+           once at page load and never again, so a tab open for two hours went
+           on reading "2 minutes ago" -- and the staleness verdict, which
+           qualifies these very numbers, froze along with them. `asOfNow` is
+           that same server stamp plus the time THIS PAGE has measured since,
+           and `elapsedNote` below says in words that this is elapsed time and
+           not a re-reading. -->
       <template x-if="summary.ingest.last_run_at !== null"><span>Last ingest:
-        <strong x-text="fmtAge(summary.ingest.as_of - summary.ingest.last_run_at)"></strong>
+        <strong x-text="fmtAge(asOfNow - summary.ingest.last_run_at)"></strong>
         (<span x-text="fmtTs(summary.ingest.last_run_at)"></span>)</span></template>
       &middot;
       <template x-if="summary.ingest.newest_call_ts === null"><span>newest measured
         call: <strong>none</strong> &mdash; no API calls ingested</span></template>
       <template x-if="summary.ingest.newest_call_ts !== null"><span>newest measured call:
-        <strong x-text="fmtAge(summary.ingest.as_of - summary.ingest.newest_call_ts)"></strong>
+        <strong x-text="fmtAge(asOfNow - summary.ingest.newest_call_ts)"></strong>
         (<span x-text="fmtTs(summary.ingest.newest_call_ts)"></span>), across ALL
         ingested data &mdash; not this window</span></template>
     </span></template>
+    <!-- Annotates the line whose numbers moved, rather than adding a surface
+         of its own (CLAUDE.md constraint 4), and stays empty until a tick has
+         actually moved them. -->
+    <template x-if="elapsedNote"><span x-text="elapsedNote"></span></template>
   </div>
 
   <div class="cards" id="cards">
@@ -631,6 +649,51 @@ function fmtAge(sec) {
 function isoLocal(d) {
   return d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
 }
+
+// How often the rendered ages are recomputed, in milliseconds (#24).
+//
+// Chosen from the granularity of the TEXT and from the threshold the verdict
+// has to cross, not by feel:
+//
+//   * `fmtSpan` renders whole minutes for everything from 90 s to 90 min,
+//     which is where a tab left open spends nearly all of its life. A 1 s tick
+//     would redraw an identical string 59 times out of 60; at 30 s the
+//     displayed minute is never more than half a tick behind the truth.
+//   * The staleness verdict is re-evaluated on the same tick, so this also
+//     bounds how LATE the banner can be: 30 s is 3.3% of `STALE_AFTER_SECONDS`
+//     (900 s, provenance in serve.py), and the banner exists to flag neglect
+//     measured in hours.
+//
+// The tick RE-READS NOTHING -- no request is made on it. #24's open question A
+// (polling vs SSE vs long-poll for the DATA) is deliberately untouched, not
+// least because `serve.py` is a single-threaded HTTPServer and a held-open
+// connection would block every other request including this page's assets.
+const AGE_TICK_MS = 30000;
+
+// The client half of `serve.py`'s `staleness_verdict()`, and it must answer
+// IDENTICALLY: two definitions of "stale" free to drift apart is the defect
+// class this repository keeps finding. Only the age branch is mirrored -- the
+// two absent-stamp causes are the server's to name, and the page reads
+// `stale_unknown_reason` for them rather than re-deriving a cause.
+//
+// Boundary conditions, all three load-bearing and all three asserted against
+// the Python by translating THIS function in the test suite:
+//
+//   * a null age is null, never a verdict -- nothing to compare;
+//   * a NEGATIVE age is null too, never "stale": a stamp ahead of the clock
+//     means the two disagree, which is not a measurement of how old anything
+//     is (#34);
+//   * `>` and not `>=`, so the threshold second itself is the last fresh one,
+//     which is the rule the UI publishes ("older than the threshold").
+//
+// The threshold is a PARAMETER and is never spelled in this file: it arrives
+// on the payload as `stale_after_seconds`, so there is only one copy of the
+// number and it is the server's.
+function staleFromAge(ageSeconds, thresholdSeconds) {
+  if (ageSeconds === null) return null;
+  if (ageSeconds < 0) return null;
+  return ageSeconds > thresholdSeconds;
+}
 function tokenCols(r) {
   return [r.input, r.cache_read, r.cache_write, r.output];
 }
@@ -719,9 +782,104 @@ function report() {
     // A failure is never dropped by a later render: only a load in which EVERY
     // endpoint succeeded clears it, and `load()` is the one place that happens.
     banner: { loadFailure: null, stale: null, notices: [] },
+    // The page's own clock, and the instant the figures on screen ARRIVED
+    // (#24). Both are local `Date.now()` readings and only their DIFFERENCE is
+    // ever used, so nothing here is compared against the server's clock: the
+    // ages stay measured from `ingest.as_of`, with locally measured elapsed
+    // time added to it. `loadedAt` is null until a load succeeds, because
+    // "when this page last read the database" has no answer before then.
+    now: Date.now(),
+    loadedAt: null,
 
     init() {
       this.setRange(7);
+      // The page's ONLY timer, and it fetches NOTHING (#24). Before it, the
+      // freshness verdict was computed server-side once and frozen in the DOM:
+      // a tab that loaded at an age of 120 s still read "2 minutes ago, not
+      // stale" two hours later, so the banner could never fire on a tab that
+      // stayed open -- the staleness indicator itself went stale.
+      setInterval(() => this.tickAge(), AGE_TICK_MS);
+    },
+
+    // --- the local clock --------------------------------------------------
+    tickAge() {
+      // A tab nobody is looking at has nothing to redraw, and the
+      // `visibilitychange` binding brings it up to date before it is seen
+      // again. Guarded rather than torn down and restarted: a timer whose
+      // callback returns immediately costs less than the bookkeeping would.
+      if (document.hidden) return;
+      this.now = Date.now();
+    },
+
+    // Seconds THIS PAGE has been displaying the figures it last fetched.
+    //
+    // `Date.now()` rather than `performance.now()` on purpose: the monotonic
+    // clock does not advance while the machine is asleep on either macOS or
+    // Linux, so a laptop closed for two hours would wake up UNDER-reporting
+    // the age -- which is the defect being fixed, in miniature.
+    //
+    // Clamped at zero for the cost of that choice: a backwards clock step
+    // FREEZES the age instead of shrinking it. An age that walks backwards
+    // would let a page quietly un-say a warning, and this recompute is never
+    // allowed to be evidence that anything got fresher.
+    get elapsedSinceLoad() {
+      if (this.loadedAt === null) return 0;
+      return Math.max(0, (this.now - this.loadedAt) / 1000);
+    },
+
+    // The server's clock, carried forward by the time this page has measured
+    // since the response arrived -- so the ages stay anchored to the machine
+    // that owns the data and no browser/server skew is introduced by the fix.
+    //
+    // FROZEN when the server could not measure an age at all. An unknown must
+    // not decay into a verdict: a run stamped in the future would otherwise
+    // tick up through zero and out the far side into a confident "stale", a
+    // verdict on a comparison nothing ever made.
+    get asOfNow() {
+      const ingest = this.summary.ingest;
+      if (ingest.stale_unknown_reason !== null) return ingest.as_of;
+      return ingest.as_of + this.elapsedSinceLoad;
+    },
+
+    // How old the last ingest run is NOW, or null when there is no stamp to
+    // subtract from -- which is an absent measurement, not an age of zero.
+    get ingestAge() {
+      const ingest = this.summary.ingest;
+      if (ingest.last_run_at === null) return null;
+      return this.asOfNow - ingest.last_run_at;
+    },
+
+    // What the recompute is allowed to claim, and what it is not. The page
+    // knows TIME HAS PASSED; it does not know that anything was re-read, and a
+    // line that let those be confused would be the frozen-age defect wearing
+    // the opposite mask. Silent until a tick has actually moved the ages, so
+    // a freshly loaded page does not annotate an offset of zero.
+    get elapsedNote() {
+      if (!this.summary) return "";
+      if (this.summary.ingest.stale_unknown_reason !== null) return "";
+      if (this.elapsedSinceLoad < AGE_TICK_MS / 1000) return "";
+      return `The ages above are counted forward on this page: it fetched these `
+        + `figures ${fmtSpan(this.elapsedSinceLoad)} ago and has NOT re-read `
+        + `anything since, so only TIME has passed here — the ages grew, the `
+        + `figures below did not. Reload to re-measure.`;
+    },
+
+    // The staleness the page can work out for ITSELF, once the clock has moved
+    // past the threshold the response arrived under. It may only ever turn the
+    // banner ON -- see `bannerMessages` -- because elapsed time is evidence
+    // that the figures got older and no evidence at all about the database:
+    // ingest may well have run since, and this page has not looked.
+    get localStaleMessage() {
+      if (!this.summary) return null;
+      const ingest = this.summary.ingest;
+      if (staleFromAge(this.ingestAge, ingest.stale_after_seconds) !== true) return null;
+      return `Data on this page is STALE: it was fetched `
+        + `${fmtSpan(this.elapsedSinceLoad)} ago, when ingest.py had last run `
+        + `${fmtAge(ingest.as_of - ingest.last_run_at)}. Counting only the time this `
+        + `page has been open, that is now ${fmtAge(this.ingestAge)} — past the `
+        + `threshold of ${fmtSpan(ingest.stale_after_seconds)}. This page `
+        + `has NOT re-read the database, so it cannot say whether ingest.py has run `
+        + `since: reload to re-measure, and re-run ingest.py if it has not.`;
     },
 
     // --- banner ----------------------------------------------------------
@@ -730,8 +888,19 @@ function report() {
     //   1. load failure -- the numbers are not this response's numbers at all
     //   2. stale data   -- the numbers are real but describe a moment now past
     //   3. notices      -- the numbers are current, with caveats on what is in them
+    //
+    // The staleness slot takes the SERVER's verdict where there is one and the
+    // page's own recompute only where there is not (#24). That `??` is the
+    // asymmetry the recompute turns on: elapsed time can push a database past
+    // the threshold, so the local verdict may raise this warning, and it can
+    // never lower one -- only a real re-fetch is evidence that staleness
+    // ended, and this tick fetches nothing.
     get bannerMessages() {
-      return [this.banner.loadFailure, this.banner.stale, ...this.banner.notices].filter(Boolean);
+      return [
+        this.banner.loadFailure,
+        this.banner.stale ?? this.localStaleMessage,
+        ...this.banner.notices,
+      ].filter(Boolean);
     },
 
     // --- summary ---------------------------------------------------------
@@ -958,14 +1127,28 @@ function report() {
 
     applySummary(payload) {
       this.summary = payload;
+      // The origin the elapsed time is counted from, set HERE and nowhere
+      // else: `applySummary` runs only after every endpoint returned, so a
+      // failed refresh cannot restart the clock and make the page claim it has
+      // just re-read the database ("last updated" means last SUCCESSFUL
+      // update). `now` is reset with it so a fresh load starts at an offset of
+      // exactly zero rather than up to one tick.
+      this.loadedAt = Date.now();
+      this.now = this.loadedAt;
       const msgs = [];
       // `stale` is TRI-STATE: true, false, or null for "no ingest run was ever
       // recorded". Only an actual true warns -- an unknown age is reported by
       // the data-age line, and must not become a banner that can never clear.
+      //
+      // This message is composed ONCE and stays frozen, because only a
+      // re-fetch could move it honestly -- so it is dated to the load it came
+      // from. Undated, it would sit under a data-age line that now counts
+      // forward (#24) and quote a smaller age for the same fact: two ages of
+      // one measurement disagreeing on a single screen.
       this.banner.stale = this.summary.ingest.stale === true
-        ? `Data is STALE: ingest.py last ran ${fmtAge(this.summary.ingest.as_of - this.summary.ingest.last_run_at)}, `
-          + `past the threshold of ${fmtSpan(this.summary.ingest.stale_after_seconds)}. Every figure below `
-          + `describes the transcripts as of THEN, not as of now — re-run ingest.py.`
+        ? `Data is STALE: ingest.py had last run ${fmtAge(this.summary.ingest.as_of - this.summary.ingest.last_run_at)} `
+          + `when this page loaded, past the threshold of ${fmtSpan(this.summary.ingest.stale_after_seconds)}. `
+          + `Every figure below describes the transcripts as of THEN, not as of now — re-run ingest.py.`
         : null;
       // An UNKNOWN age is not a staleness verdict, so it never takes the
       // banner's `stale` slot above — but it must not be left to the grey

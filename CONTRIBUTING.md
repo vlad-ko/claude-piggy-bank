@@ -158,6 +158,34 @@ is documented as a best-known value with its provenance and the symptom to look
 for if it is wrong, while the *property* the code actually guarantees is
 asserted separately. Two facts with different confidence, two tests.
 
+## Versioning
+
+CPB is **1.0.0** and follows Semantic Versioning. Which part to bump is a rule
+with cases and it has one home: [`docs/versioning.md`](docs/versioning.md).
+Read it before a change that touches a flag, an exit status, a route, a payload
+field, or what a figure measures.
+
+Two clauses catch people out, so they are worth knowing before you open the PR
+rather than in review:
+
+- **A stable field name over a changed definition is breaking.** Renaming
+  `subagent_tokens` breaks a client loudly; leaving the name and switching the
+  statistic underneath it breaks a reader silently, which is worse. Both are
+  major here.
+- **A `SCHEMA_VERSION` bump is not, on its own, a major bump** — the migration
+  machinery, not the version number, is what carries compatibility, and it is
+  allowed to absorb the change. That holds *only* while an existing database
+  upgrades without data loss and without a refusal. If your schema change
+  cannot offer that, you have not written a migration, you have written a major
+  release; say so rather than widening `IN_PLACE_UPGRADE_FROM` to make the
+  problem go away.
+
+A correction is not a breaking change — a figure that starts reporting what it
+always claimed to report is a fix, and belongs on the record in `README.md`
+rather than in a major bump. The distinction is drawn in full in that document.
+If your change *is* breaking under the rule, say so in the PR body; that is the
+cheapest moment for anyone to notice.
+
 ## Tests
 
 ```bash

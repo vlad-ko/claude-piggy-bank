@@ -4968,5 +4968,329 @@ class NoMeasurementIsNotAZeroInTheViewTest(unittest.TestCase):
         self.assertNotRegex(label, r"unmeasured\s*\+\s*n|n\s*\+\s*unmeasured")
 
 
+# The tiny JS dialect the mirrored staleness rule is allowed to be written in,
+# and its Python spelling. Deliberately minimal: `js_guarded_returns` raises on
+# anything it cannot translate, so a rewrite of the mirror in a richer style is
+# a LOUD failure rather than a silently skipped comparison.
+JS_TO_PY = (
+    ("===", " == "),
+    ("!==", " != "),
+    (r"\bnull\b", "None"),
+    (r"\btrue\b", "True"),
+    (r"\bfalse\b", "False"),
+)
+# What a translated fragment may contain. The source is this repository's own
+# file, but the check is cheap and it doubles as the "did the translation
+# actually cover this statement" test.
+JS_EXPR_SAFE = re.compile(r"^[\w\s.<>=!()+\-*/]+$")
+
+
+def js_guarded_returns(body: str) -> list[tuple[str | None, str]]:
+    """`(condition, expression)` pairs from a JS body of guarded returns.
+
+    The project ships NO JS runtime (stdlib-only, no Node), so a rule that must
+    hold identically on both sides of the wire cannot simply be executed here.
+    The two available options were a hand-written Python twin of the client
+    rule -- which is a second definition free to drift, i.e. exactly the defect
+    the comparison exists to catch -- or reading the SHIPPED source and
+    translating it. This does the second.
+
+    It accepts only `if (cond) return expr;` lines followed by one bare
+    `return expr;`, which is the whole grammar the mirror is written in, and
+    raises on anything else rather than skipping it.
+    """
+    inner = body.strip()
+    if not (inner.startswith("{") and inner.endswith("}")):  # pragma: no cover
+        raise AssertionError("expected a braced function body")
+    pairs: list[tuple[str | None, str]] = []
+    for raw in inner[1:-1].split(";"):
+        statement = " ".join(raw.split())
+        if not statement:
+            continue
+        guarded = re.fullmatch(r"if \((?P<cond>.+?)\) return (?P<expr>.+)", statement)
+        plain = re.fullmatch(r"return (?P<expr>.+)", statement)
+        if guarded is not None:
+            pairs.append(
+                (_js_to_py(guarded["cond"]), _js_to_py(guarded["expr"]))
+            )
+        elif plain is not None:
+            pairs.append((None, _js_to_py(plain["expr"])))
+        else:
+            raise AssertionError(
+                f"cannot translate {statement!r}: the mirrored rule must stay a "
+                "list of guarded returns, or this comparison silently stops "
+                "covering it"
+            )
+    if not pairs:  # pragma: no cover - an empty mirror is not a mirror
+        raise AssertionError("no statements found in the mirrored rule")
+    return pairs
+
+
+def _js_to_py(fragment: str) -> str:
+    for js, py in JS_TO_PY:
+        fragment = re.sub(js, py, fragment)
+    fragment = " ".join(fragment.split())
+    if not JS_EXPR_SAFE.fullmatch(fragment):
+        raise AssertionError(f"untranslatable fragment: {fragment!r}")
+    return fragment
+
+
+def eval_js_guarded_returns(pairs: Sequence[tuple[str | None, str]], **env):
+    """Run a `js_guarded_returns` table under Python's own semantics."""
+    for cond, expr in pairs:
+        if cond is None or eval(cond, {"__builtins__": {}}, dict(env)):
+            return eval(expr, {"__builtins__": {}}, dict(env))
+    raise AssertionError("the mirrored rule fell off the end without returning")
+
+
+class ClientSideAgeRecomputeTest(unittest.TestCase):
+    """The staleness indicator must not itself go stale (#24).
+
+    #20 Part 1 computes the age and the verdict SERVER-SIDE, once, against an
+    `as_of` stamped at response time, and the page then froze both in the DOM.
+    Measured on merged `main` 2026-08-05: a tab that loaded at age 120 s still
+    read "Last ingest: 2 minutes ago, not stale" two hours later, when the
+    truthful verdict was STALE (`STALE_AFTER_SECONDS` = 900). So the banner
+    could never fire on a tab that stayed open -- it could only appear on a
+    page that was ALREADY stale when it loaded, which is the case least in need
+    of a warning, because the user is right there having just loaded it. #20
+    exists because "a page left open for a week looked identical to one opened
+    a second ago"; the indicator built to expose that had inherited it.
+
+    The fix recomputes the AGE, and nothing else. It issues no request, so it
+    is evidence that time has passed and never evidence that anything was
+    re-read -- #24's open question A (polling vs SSE vs long-poll for the DATA)
+    is untouched, and `serve.py` is still single-threaded. These tests pin the
+    three things that make that non-trivial:
+
+    * a locally recomputed verdict may turn the banner ON and never OFF, since
+      only a real re-fetch is evidence that staleness ended;
+    * an UNKNOWN age must not decay into a verdict as seconds accumulate;
+    * the client rule must agree with `staleness_verdict()` EXACTLY, including
+      the strict `>` boundary and the negative-age branch. Two definitions of
+      "stale" free to drift apart is the defect class this repository keeps
+      finding, so the last one is asserted by translating the shipped client
+      rule and running it against the server's over a table of ages, rather
+      than by reading both and hoping.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    AS_OF = 1_800_000_000.0  # any fixed clock; both rules are functions of AGE
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+
+    # --- the timer -------------------------------------------------------
+
+    def test_the_rendered_age_is_recomputed_on_a_timer(self) -> None:
+        # Without this the page has no mechanism to notice time passing at
+        # all, which is the whole defect.
+        self.assertIn("setInterval(", self.html)
+        self.assertRegex(
+            js_function_body(self.html, "init() {"),
+            r"setInterval\(\s*\(\)\s*=>\s*this\.tickAge\(\),\s*AGE_TICK_MS\s*\)",
+        )
+
+    def test_the_tick_is_far_finer_than_the_threshold_it_must_cross(self) -> None:
+        # The interval bounds how LATE the banner can be. Tied to the server's
+        # constant rather than asserted as a bare number, so raising one and
+        # not the other cannot pass: a tick near the threshold would let a tab
+        # sit stale for a large fraction of the window the banner exists for.
+        found = re.search(r"const AGE_TICK_MS = (\d+);", self.html)
+        self.assertIsNotNone(found, "the tick interval is no longer named")
+        seconds = int(found.group(1)) / 1000
+        self.assertLessEqual(seconds, STALE_AFTER_SECONDS / 20)
+        # ...and not so fine that it redraws an unchanged string: `fmtSpan`
+        # renders whole minutes over the band a left-open tab lives in.
+        self.assertGreaterEqual(seconds, 10)
+
+    def test_the_recompute_issues_no_request(self) -> None:
+        # #24's question A stays open. A tick that re-fetched would be the
+        # polling decision, taken by implementation rather than by the owner.
+        tick = js_function_body(self.html, "tickAge() {")
+        for call in ("fetch(", "getJSON(", "this.load(", "EventSource"):
+            with self.subTest(call=call):
+                self.assertNotIn(call, tick)
+
+    def test_a_hidden_tab_is_not_kept_redrawing(self) -> None:
+        # Nothing to redraw for a tab nobody is looking at; the visibility
+        # binding brings it back up to date before it is seen again.
+        self.assertRegex(
+            js_function_body(self.html, "tickAge() {"),
+            r"if \(document\.hidden\) return",
+        )
+        self.assertRegex(self.html, r'x-on:visibilitychange[.\w]*="tickAge\(\)"')
+
+    # --- what the recompute is allowed to change --------------------------
+
+    def test_the_rendered_ages_are_measured_from_the_carried_clock(self) -> None:
+        # The defect, as an absence: a binding straight off `ingest.as_of` is
+        # the frozen number. Both ages on the line move, not just the one the
+        # verdict reads.
+        band = html_element(self.raw, 'id="data-age"')
+        self.assertIn("asOfNow - summary.ingest.last_run_at", band)
+        self.assertIn("asOfNow - summary.ingest.newest_call_ts", band)
+        self.assertNotIn("summary.ingest.as_of -", band)
+
+    def test_elapsed_time_is_measured_locally_and_never_runs_backwards(self) -> None:
+        # The carried-forward part is the time THIS PAGE measured, added to the
+        # server's own clock -- so no browser/server skew is introduced by the
+        # fix, and a backwards clock step freezes the age instead of making the
+        # data look fresher than the last thing anyone measured.
+        body = js_function_body(self.html, "get elapsedSinceLoad(")
+        self.assertRegex(body, r"Math\.max\(\s*0\s*,")
+        self.assertIn("this.loadedAt", body)
+        self.assertIn("this.now", body)
+        self.assertIn(
+            "ingest.as_of + this.elapsedSinceLoad",
+            js_function_body(self.html, "get asOfNow("),
+        )
+
+    def test_only_a_successful_load_restarts_the_page_clock(self) -> None:
+        # "Last updated" means last SUCCESSFUL update (#24 AC). `applySummary`
+        # runs only after every endpoint returned, so the origin the elapsed
+        # time counts from is set there and nowhere else -- a failed refresh
+        # that reset it would make the page claim it had just re-read.
+        self.assertEqual(self.html.count("this.loadedAt = "), 1)
+        self.assertIn(
+            "this.loadedAt = ", js_function_body(self.html, "applySummary(")
+        )
+
+    def test_a_recomputed_verdict_can_only_turn_the_banner_on(self) -> None:
+        # THE asymmetry. Elapsed time is evidence that the data got older; it
+        # is no evidence at all that anything was re-read, so it may raise the
+        # warning and must never clear one. Structurally: the server's verdict
+        # is consulted first and the local one only where the server's is
+        # absent, and no code outside `applySummary` writes the slot.
+        self.assertRegex(
+            js_function_body(self.html, "get bannerMessages("),
+            r"this\.banner\.stale \?\? this\.localStaleMessage",
+        )
+        self.assertEqual(
+            self.html.count("this.banner.stale = "),
+            1,
+            "a second writer for the staleness slot is how a recompute comes "
+            "to clear a warning it has no grounds to clear",
+        )
+        self.assertIn(
+            "this.banner.stale = ", js_function_body(self.html, "applySummary(")
+        )
+
+    def test_the_recompute_never_turns_an_unknown_age_into_a_verdict(self) -> None:
+        # `stale` is tri-state and `stale_unknown_reason` is non-null exactly
+        # when it is null. An age nobody could measure does not become
+        # measurable because seconds accumulated: a run stamped in the FUTURE
+        # would otherwise tick up through zero and out the far side into a
+        # confident "stale", which is a verdict on a comparison that never
+        # happened. Guarded twice -- the clock is not carried forward at all,
+        # and the age stays null when there is no stamp to subtract from.
+        self.assertIn(
+            "ingest.stale_unknown_reason !== null",
+            js_function_body(self.html, "get asOfNow("),
+        )
+        self.assertIn(
+            "ingest.last_run_at === null",
+            js_function_body(self.html, "get ingestAge("),
+        )
+
+    # --- the two rules must not drift -------------------------------------
+
+    def mirror(self) -> list[tuple[str | None, str]]:
+        return js_guarded_returns(
+            js_function_body(self.html, "function staleFromAge(")
+        )
+
+    def client_verdict(self, age: float | None):
+        return eval_js_guarded_returns(
+            self.mirror(), ageSeconds=age, thresholdSeconds=STALE_AFTER_SECONDS
+        )
+
+    def server_verdict(self, age: float | None):
+        last_run_at = None if age is None else self.AS_OF - age
+        return staleness_verdict(last_run_at, self.AS_OF, run_table_present=True)[0]
+
+    # Both boundary seconds, a real zero, a negative, and the two measured
+    # ingest costs `STALE_AFTER_SECONDS` was chosen against.
+    AGES = (
+        None,
+        -30 * 86400.0,
+        -1.0,
+        0.0,
+        1.8,
+        39.9,
+        STALE_AFTER_SECONDS - 1,
+        STALE_AFTER_SECONDS,
+        STALE_AFTER_SECONDS + 1,
+        1.2 * 3600,
+        30 * 86400.0,
+    )
+
+    def test_the_client_rule_answers_exactly_as_the_server_rule_does(self) -> None:
+        for age in self.AGES:
+            with self.subTest(age=age):
+                self.assertEqual(
+                    self.client_verdict(age),
+                    self.server_verdict(age),
+                    "the page and serve.py disagree about what STALE means",
+                )
+
+    def test_the_table_covers_the_cases_that_tell_the_spellings_apart(self) -> None:
+        # A table that never crosses the boundary agrees with anything, so the
+        # answers themselves are pinned: without a True and a False one second
+        # apart, and a None, the comparison above is vacuous.
+        answers = {self.server_verdict(age) for age in self.AGES}
+        self.assertEqual(answers, {True, False, None})
+        self.assertIs(self.client_verdict(STALE_AFTER_SECONDS), False)
+        self.assertIs(self.client_verdict(STALE_AFTER_SECONDS + 1), True)
+        self.assertIsNone(self.client_verdict(-1.0))
+
+    def test_the_threshold_is_read_from_the_payload_not_spelled_in_the_page(
+        self,
+    ) -> None:
+        # The cheapest way for the two definitions to drift is a second copy of
+        # the number. The page never names one: it compares against the
+        # threshold the response carried.
+        self.assertRegex(
+            self.html,
+            r"staleFromAge\([^)]*ingest\.stale_after_seconds\s*\)",
+        )
+        self.assertNotIn(str(STALE_AFTER_SECONDS), self.html)
+
+    # --- wording -----------------------------------------------------------
+
+    def test_the_page_says_time_passed_and_never_that_data_is_fresh(self) -> None:
+        # The fix's own failure mode, wearing the opposite mask: after a
+        # recompute the page knows time has passed, NOT that anything was
+        # re-read. A line that implies the second is the original defect with
+        # the sign flipped.
+        note = js_function_body(self.html, "get elapsedNote(")
+        for claim in ("NOT re-read", "only TIME has passed", "Reload to re-measure"):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, note)
+        message = js_function_body(self.html, "get localStaleMessage(")
+        self.assertIn("has NOT re-read the database", message)
+        self.assertIn("reload to re-measure", message)
+
+    def test_the_frozen_server_message_is_dated_to_the_load_it_came_from(
+        self,
+    ) -> None:
+        # Found while wiring this: the SERVER's stale message is composed once,
+        # in `applySummary`, and quotes the age it was composed with. Now that
+        # the line above it counts forward, an undated "ingest.py last ran 20
+        # minutes ago" would sit under a data-age line reading 2.2 hours -- two
+        # ages of the same fact disagreeing on one screen, which is the drift
+        # this whole change exists to prevent. It stays frozen (only a re-fetch
+        # could move it honestly) and says WHEN it was measured instead.
+        message = js_function_body(self.html, "applySummary(")
+        self.assertIn("when this page loaded", message)
+
+    def test_the_elapsed_note_is_rendered_where_the_ages_are(self) -> None:
+        # Constraint 4: it ANNOTATES the data-age line the recompute moves,
+        # rather than adding a surface of its own.
+        self.assertIn('x-text="elapsedNote"', html_element(self.raw, 'id="data-age"'))
+
+
 if __name__ == "__main__":
     unittest.main()
