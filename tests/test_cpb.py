@@ -672,3 +672,90 @@ class WorkflowManifestRuleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Docs state the current version in prose, and twice running a release bumped
+# `cpb.VERSION` and left them behind -- 1.0.0 -> 1.1.0, then 1.1.0 -> 1.2.0.
+# Fixing them by hand each time is what produced the second one. A doc that
+# names a version is making a claim about the build, so it is pinned to the
+# build like any other claim.
+#
+# Only the CURRENT version is marked. `docs/versioning.md` cites 1.0.0, 4.0.0
+# and a pre-release tag as worked examples and history, and those must stay
+# free to differ -- a rule that pinned every version literal would force the
+# history to be rewritten at every release, which is how a check becomes a
+# thing people route around.
+VERSION_MARK_OPEN = "<!--cpb:version-->"
+VERSION_MARK_CLOSE = "<!--/cpb:version-->"
+
+# Every file that states the current version. Listed, not globbed: a doc that
+# stops stating it should fail loudly here rather than quietly drop out of the
+# check.
+FILES_STATING_THE_VERSION = (
+    REPO_ROOT / "README.md",
+    REPO_ROOT / "CLAUDE.md",
+    DOCS / "versioning.md",
+)
+
+
+def _marked_versions(text: str) -> list[str]:
+    out = []
+    rest = text
+    while VERSION_MARK_OPEN in rest:
+        _, rest = rest.split(VERSION_MARK_OPEN, 1)
+        if VERSION_MARK_CLOSE not in rest:
+            # An unterminated mark is not "no version stated" -- it is a mark
+            # someone half-removed. Refusing beats reading past it.
+            raise AssertionError("unterminated cpb:version mark")
+        value, rest = rest.split(VERSION_MARK_CLOSE, 1)
+        out.append(value)
+    return out
+
+
+class DocsStateTheShippedVersionTest(unittest.TestCase):
+    """The docs cannot drift from `cpb.VERSION` without going red."""
+
+    def test_every_listed_doc_states_the_version_at_least_once(self) -> None:
+        # Deleting the mark must fail rather than vacuously pass. Without this,
+        # the cheapest way to make the next assertion green is to remove the
+        # claim -- which is exactly the rot being prevented.
+        for path in FILES_STATING_THE_VERSION:
+            with self.subTest(doc=path.name):
+                self.assertTrue(
+                    _marked_versions(path.read_text()),
+                    f"{path.name} no longer states the version; if that is "
+                    f"deliberate, remove it from FILES_STATING_THE_VERSION and "
+                    f"say why.",
+                )
+
+    def test_every_stated_version_is_the_one_that_ships(self) -> None:
+        for path in FILES_STATING_THE_VERSION:
+            for stated in _marked_versions(path.read_text()):
+                with self.subTest(doc=path.name, stated=stated):
+                    self.assertEqual(
+                        stated,
+                        cpb.VERSION,
+                        f"{path.name} says {stated}; cpb.VERSION is "
+                        f"{cpb.VERSION}. Bump the doc, not the constant.",
+                    )
+
+    def test_an_unmarked_version_elsewhere_is_not_pinned(self) -> None:
+        # The rule is deliberately narrow, and this asserts the narrowness so a
+        # later "tighten it" does not silently break the history in
+        # versioning.md. Its worked examples cite versions that are not, and
+        # must not become, the shipped one.
+        rule = VERSIONING_RULE.read_text()
+        unmarked = rule.replace(VERSION_MARK_OPEN, "").replace(
+            VERSION_MARK_CLOSE, ""
+        )
+        others = {
+            token
+            for token in re.findall(r"\b\d+\.\d+\.\d+\b", unmarked)
+            if token != cpb.VERSION
+        }
+        self.assertTrue(
+            others,
+            "versioning.md no longer cites any version other than the shipped "
+            "one, so this test proves nothing -- check the worked examples "
+            "survived.",
+        )
