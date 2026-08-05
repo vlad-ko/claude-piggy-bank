@@ -221,8 +221,12 @@
      already fine is information, and it is what stops this page becoming a
      list of complaints. `.off` is opacity alone, so every word stays on
      screen and selectable. */
+  /* Tight on purpose: the summary is the one level with a hard height budget,
+     and a knob row is one gauge, one imperative, one why and one figure. The
+     padding is the only thing here that can be spent without hiding a
+     measurement, so it is spent. */
   .knob { display:grid; grid-template-columns:60px 1fr 150px; gap:14px; align-items:center;
-          padding:13px 0; border-top:1px solid var(--line); }
+          padding:10px 0; border-top:1px solid var(--line); }
   .knob:first-of-type { border-top:0; }
   .knob.off { opacity:.55; }
   .gauge { width:60px; height:40px; flex:0 0 auto; }
@@ -260,9 +264,11 @@
   /* An unmeasured knob's tag: neither an urgency nor a clean bill of health. */
   .tag-none { background:#eef2ff; color:var(--neutral); }
   .kw { font-size:12px; color:var(--muted); margin-top:3px; }
-  .kmarks { margin-top:4px; font-size:11px; color:var(--muted); }
-  .kmark { margin-right:10px; }
-  .kmark-kind { font-size:10px; letter-spacing:.03em; }
+  /* Every cut point of one dial, one click down. The metric key heads the
+     group because it is what ties a gauge to its whole reading at the details
+     level; on the row itself it was a debugging aid. */
+  .kcuts { margin-top:9px; }
+  .kcuts-h { font-size:11.5px; color:var(--muted); }
   .kfig { text-align:right; }
   .kfig .n { font-size:20px; font-weight:650; letter-spacing:-.02em; line-height:1.15; }
   .kfig .aim { font-size:11px; margin-top:3px; }
@@ -668,8 +674,8 @@
          say rather than by one of them being absent. -->
     <section class="board" id="knobs-note">
       <h2>What you can change today</h2>
-      <div class="body">Worst first, in the order the dated table below ranks them.
-        Each row is a thing you do; a row with nothing to turn is dimmed, not hidden.</div>
+      <div class="body">Worst first, in the dated table's own order. A row with
+        nothing to turn is dimmed, not hidden.</div>
 
       <template x-for="k in (summary ? summary.recommendations.knobs : [])" :key="k.metric">
         <div class="knob" :class="{ off: !k.directive }">
@@ -698,9 +704,19 @@
             <path class="arc-watch" :d="arcPathsFor(k.gauge.segments, 'arc-watch')"></path>
             <path class="arc-act" :d="arcPathsFor(k.gauge.segments, 'arc-act')"></path>
             <path class="arc-extra" :d="arcPathsFor(k.gauge.segments, 'arc-extra')"></path>
-            <path class="tick-cited" :d="tickPathsFor(k.gauge.boundaries, 'tick-cited')"></path>
-            <path class="tick-judged" :d="tickPathsFor(k.gauge.boundaries, 'tick-judged')"></path>
-            <path class="tick-structural" :d="tickPathsFor(k.gauge.boundaries, 'tick-structural')"></path>
+            <!-- THE CUT POINTS, AND THEIR VOICES. Each tone's ticks carry an
+                 SVG `<title>`, so the value of every boundary and the kind of
+                 claim it is are on the dial itself rather than in a caption
+                 reading "at 0.1 judged   at 0.25 judged", which was a debug
+                 dump of the table (#89 review). The same boundaries are stated
+                 in full, with their statements, in the disclosure below --
+                 which is where a reader goes looking. -->
+            <path class="tick-cited" :d="tickPathsFor(k.gauge.boundaries, 'tick-cited')">
+              <title x-text="tickTitleFor(k.gauge.boundaries, 'tick-cited', k.unit)"></title></path>
+            <path class="tick-judged" :d="tickPathsFor(k.gauge.boundaries, 'tick-judged')">
+              <title x-text="tickTitleFor(k.gauge.boundaries, 'tick-judged', k.unit)"></title></path>
+            <path class="tick-structural" :d="tickPathsFor(k.gauge.boundaries, 'tick-structural')">
+              <title x-text="tickTitleFor(k.gauge.boundaries, 'tick-structural', k.unit)"></title></path>
             <path class="needle" :d="needlePath(k.gauge.needle)"></path>
           </svg>
 
@@ -720,34 +736,40 @@
             <!-- WHY, in the table's own words: the metric's `measurement`
                  names exactly what was divided by what, which is the thing a
                  reader checks the figure against. A sentence written here
-                 would be a claim nothing can check. -->
+                 would be a claim nothing can check.
+
+                 THIS LINE IS THE PAGE'S LAST DENSITY PROBLEM, and it is
+                 blocked rather than solved (#89 review). `measurement` is a
+                 precise DEFINITION -- "share of main-thread API calls whose
+                 context reaches at least half the model's documented window
+                 (context_window bands 50-to-90 and at-least-90), over
+                 main-thread calls with a known window" -- which is exactly
+                 right one level down and is two lines of jargon here. What a
+                 summary row needs is a short reader-facing sentence BESIDE
+                 `measurement`, not instead of it. That sentence is prose about
+                 what a metric means, so it belongs in `recommendations.py`
+                 beside the metric it describes; written here it would be a
+                 claim with no date, no owner and nothing to check it against,
+                 which is the whole reason no advice on this page is authored
+                 in this file. Until that field exists this line stays as it
+                 is. -->
             <div class="kw" x-text="k.measurement"></div>
-            <!-- WHERE THE LINES ARE, each in its own voice and each carrying
-                 its own statement. The kind is rendered as a WORD, not only as
-                 a colour: a judged cut point must never be readable as a
-                 documented one. -->
-            <div class="kmarks">
-              <!-- The metric's KEY, which is the one string that ties this
-                   dial to the full reading, its ranges and both of its
-                   provenances one level down. -->
-              <span class="kmark mono" x-text="k.metric"></span>
-              <template x-for="(b, i) in k.gauge.boundaries" :key="i">
-                <span class="kmark" :class="tickVoice(b.kind)"
-                      :title="b.statement">at <span x-text="fmtMetric(b.value)"></span>
-                  <span class="kmark-kind" x-text="b.kind"></span></span>
-              </template>
-            </div>
           </div>
 
-          <!-- THE FIGURE, AND THE DIRECTION TO MOVE. `fmtMetric` renders a
-               null as the em-dash this page reserves for "nobody measured", so
-               a missing reading can never print like a measured zero. -->
+          <!-- THE FIGURE, AND THE DIRECTION TO MOVE, both in the metric's own
+               unit (#89 review): a share prints as a percentage and a ratio as
+               a multiple, because that is how a reader holds them. `fmtUnit`
+               dispatches on the unit the API sent and never on a metric key,
+               and every formatter behind it renders a null as the em-dash this
+               page reserves for "nobody measured" -- so a missing reading can
+               never print like a measured zero, in any unit. -->
           <div class="kfig">
-            <div class="n" x-text="fmtMetric(k.value)"></div>
+            <div class="n" x-text="fmtUnit(k.value, k.unit)"></div>
             <template x-for="(b, i) in targetsOf(k.gauge)" :key="i">
-              <div class="aim" :class="tickVoice(b.kind)">
+              <div class="aim" :class="tickVoice(b.kind)"
+                   :title="b.kind + ': ' + b.statement">
                 <span x-text="aimWord(k.gauge.worse_when)"></span>
-                <strong x-text="fmtMetric(b.value)"></strong></div>
+                <strong x-text="fmtUnit(b.value, k.unit)"></strong></div>
             </template>
             <template x-if="k.value === null">
               <div class="none" x-text="summary.recommendations.unmeasured_note"></div>
@@ -756,6 +778,18 @@
         </div>
       </template>
 
+      <!-- WHERE THE BOUNDARIES ARE STATED IN FULL (#89 review). Every cut
+           point on every dial, with its value, the KIND of claim it is and the
+           sentence behind it -- and the metric key each dial belongs to, which
+           is the string that ties a gauge to its whole reading one level down.
+           None of that is a caption on a summary row; all of it is one click
+           away, marked in its own voice, which is where a reader who wants to
+           audit a line goes looking.
+
+           THE JUDGED THRESHOLD STAYS REACHABLE FROM ITS CONCLUSION. The
+           target IS the visible conclusion, it wears the voice class of the
+           boundary it names, it carries that boundary's kind and statement in
+           its own tooltip, and this list sits directly beneath it. -->
       <details class="disclosure" id="knobs-provenance">
         <summary>Where these lines are drawn, and what they are not</summary>
         <span class="context-line">Every arc, tick and target above is a range in
@@ -766,6 +800,17 @@
           took. Nothing on this page decides where a line goes.</span>
         <span class="context-line context-judged">Table:
           <span x-text="summary ? summary.recommendations.provenance : ''"></span></span>
+        <template x-for="k in (summary ? summary.recommendations.knobs : [])" :key="k.metric">
+          <div class="kcuts">
+            <div class="kcuts-h"><span class="mono" x-text="k.metric"></span></div>
+            <template x-for="(b, i) in k.gauge.boundaries" :key="i">
+              <span class="advice-line" :class="provenanceVoice({ kind: b.kind })">
+                at <strong x-text="fmtUnit(b.value, k.unit)"></strong> &mdash;
+                <strong x-text="b.kind"></strong>:
+                <span x-text="b.statement"></span></span>
+            </template>
+          </div>
+        </template>
       </details>
     </section>
 
@@ -1364,7 +1409,7 @@
       </div></template>
       <template x-if="topOpportunity !== null"><div class="answer">
         Biggest first: <span class="mono" x-text="topOpportunity.metric"></span>
-        reads <strong x-text="fmtMetric(topOpportunity.value)"></strong> &mdash;
+        reads <strong x-text="fmtUnit(topOpportunity.value, topOpportunity.unit)"></strong> &mdash;
         <strong x-text="topOpportunity.severity.toUpperCase()"></strong>.
       </div></template>
       <div class="answer-key">Each reading is looked up in a dated table of
@@ -1414,8 +1459,8 @@
               <details class="disclosure">
                 <summary>Where this range comes from</summary>
                 <span class="advice-line">Range
-                  <strong x-text="fmtMetric(a.range_lower)"></strong> to
-                  <strong x-text="a.range_upper === null ? 'no ceiling' : fmtMetric(a.range_upper)"></strong>,
+                  <strong x-text="fmtUnit(a.range_lower, a.unit)"></strong> to
+                  <strong x-text="a.range_upper === null ? 'no ceiling' : fmtUnit(a.range_upper, a.unit)"></strong>,
                   <!-- The key the order was derived from, published beside the
                        order it produced: `RANKED_BY`'s rule, and the reason
                        `ranking_provenance` above is a field rather than a
@@ -1429,7 +1474,7 @@
                      the tooltip: it is a paragraph qualifying exactly what the
                      citation does and does not cover. -->
                 <span class="advice-line" :class="provenanceVoice(a.lower_provenance)">
-                  Lower edge <span x-text="fmtMetric(a.range_lower)"></span> &mdash;
+                  Lower edge <span x-text="fmtUnit(a.range_lower, a.unit)"></span> &mdash;
                   <strong x-text="a.lower_provenance.kind"></strong>:
                   <span x-text="a.lower_provenance.statement"></span>
                   <template x-if="a.lower_provenance.checked"><span>(<span
@@ -1441,7 +1486,7 @@
                 </span>
                 <template x-if="a.upper_provenance">
                   <span class="advice-line" :class="provenanceVoice(a.upper_provenance)">
-                    Upper edge <span x-text="fmtMetric(a.range_upper)"></span> &mdash;
+                    Upper edge <span x-text="fmtUnit(a.range_upper, a.unit)"></span> &mdash;
                     <strong x-text="a.upper_provenance.kind"></strong>:
                     <span x-text="a.upper_provenance.statement"></span>
                     <template x-if="a.upper_provenance.checked"><span>(<span
@@ -1455,7 +1500,7 @@
               </details>
             </div>
             <div class="fig">
-              <div class="n" x-text="fmtMetric(a.value)"></div>
+              <div class="n" x-text="fmtUnit(a.value, a.unit)"></div>
               <div class="u" x-text="a.severity"></div>
             </div>
           </div>
@@ -1539,7 +1584,7 @@
               <li><strong x-text="a.lever.directive"></strong>
                 <span class="why">Because
                   <span class="mono" x-text="a.metric"></span> reads
-                  <strong x-text="fmtMetric(a.value)"></strong>, which the dated
+                  <strong x-text="fmtUnit(a.value, a.unit)"></strong>, which the dated
                   table calls <strong x-text="a.severity"></strong>.
                   <span x-text="a.recommendation"></span></span></li>
             </template>
@@ -2030,11 +2075,17 @@ function fmtRatio(x) {
   if (x === null || x === undefined) return "—";
   return x.toFixed(2) + "×";
 }
-// #78's readings are shares (0-1) and unbounded ratios in one list, so they get
-// one significant-figures formatter rather than a per-metric unit the payload
-// would have to carry. What each number IS, is stated beside it by the metric's
-// own `measurement` string, which is the field that names what was divided by
-// what -- so the page never has to guess whether it is holding a percentage.
+// A DIMENSIONLESS quantity, to four significant figures.
+//
+// #78's readings were all printed this way, on the argument that shares and
+// unbounded ratios in one list should share one formatter and let each
+// metric's `measurement` string say which it was holding. Looked at on a
+// summary row (#89 review) that reads as a debug view: `0.3034` is a share and
+// a reader holds it as `30.3%`, `3.195` is a multiple and reads as `3.20x`. So
+// the payload now carries the unit and `fmtUnit` below dispatches on it; what
+// is left here is the case that genuinely has no unit -- `depth_in_severity`,
+// which is a position inside a band -- and the fallback for a unit this build
+// has never seen.
 //
 // Absence first, as everywhere: `(0).toPrecision` is a real 0 and `null` is not
 // a reading at all, and a formatter that let the second print like the first
@@ -2042,6 +2093,32 @@ function fmtRatio(x) {
 function fmtMetric(x) {
   if (x === null || x === undefined) return "—";
   return String(Number(x.toPrecision(4)));
+}
+// #89 review: WHAT KIND OF NUMBER a reading is, and therefore how to print it.
+//
+// `fmtMetric` above is right for a dimensionless quantity and wrong for every
+// figure a reader is asked to act on: `0.3034` is a share and reads as `30.3%`,
+// `3.195` is a multiple and reads as `3.20x`. Which of those a metric is comes
+// from the payload (`serve.METRIC_UNITS`), never from a metric key spelled
+// here -- a `if (metric === ...)` in this file would be an enumeration of the
+// metric set in the one place no import guard can reach, which is exactly the
+// defect `RECOMMENDED_METRICS` exists to prevent one layer down.
+//
+// One entry per unit the API can send, and every one of them is a formatter
+// that already ANSWERS ABSENCE BEFORE IT COMPUTES -- a null reading prints the
+// em-dash at every level and in every unit, which is the property this table
+// must not be allowed to cost.
+const UNIT_FORMAT = {
+  share: fmtPct,
+  ratio: fmtRatio,
+  count: fmtCount,
+};
+// A unit this build has never seen falls back to the unitless formatter, which
+// is honest: the figure is still shown, still to four significant figures, and
+// still an em-dash when absent. Never a bare `String(x)`, which would print a
+// float's full tail, and never nothing.
+function fmtUnit(value, unit) {
+  return (UNIT_FORMAT[unit] ?? fmtMetric)(value);
 }
 // Which VOICE a boundary is stated in -- one class per provenance KIND, and
 // the three must stay visibly different. A judged cut point rendered like a
@@ -2124,6 +2201,17 @@ function tickPathsFor(boundaries, tone) {
     .filter(b => tickVoice(b.kind) === tone)
     .map(b => tickPath(b.position))
     .join(" ");
+}
+// What those ticks SAY, as the dial's own `<title>`: the boundary's value in
+// the metric's unit and the kind of claim it is. On the dial rather than in a
+// caption, because "at 0.1 judged   at 0.25 judged" beside a row of advice is
+// a dump of the table and not a sentence -- and in full, with each statement,
+// in the disclosure at the foot of the panel.
+function tickTitleFor(boundaries, tone, unit) {
+  return boundaries
+    .filter(b => tickVoice(b.kind) === tone)
+    .map(b => `${fmtUnit(b.value, unit)} — ${b.kind}: ${b.statement}`)
+    .join("\n");
 }
 // The boundary the reader is aiming for, as a list of NOUGHT OR ONE. A list so
 // the template can bind it without inventing a variable, and nought when the

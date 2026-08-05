@@ -82,6 +82,7 @@ from recommendations import (  # noqa: E402
     WORSE_WHEN_LOWER,
     Lever,
 )
+import serve  # noqa: E402
 from serve import (  # noqa: E402
     CHECK_CONTEXT_MEASURED,
     CHECK_FORMAT_CENSUS,
@@ -122,6 +123,8 @@ from serve import (  # noqa: E402
     HEALTH_STATEMENTS,
     HEALTH_UNCHECKED,
     MEASURED_CONTEXT_MIN,
+    METRIC_UNITS,
+    METRIC_UNIT_KINDS,
     MODEL_MIX_SAMPLE,
     OVER_HALF_WINDOW_BANDS,
     PERCENTILES,
@@ -7104,6 +7107,12 @@ class ThreeLevelPayloadTest(unittest.TestCase):
                     self.assertEqual(knob["value"], reading["value"])
                     self.assertEqual(knob["severity"], reading["severity"])
                     self.assertEqual(knob["measurement"], reading["measurement"])
+                    # The UNIT too (#89 review): one figure printed one way at
+                    # both levels. `30.3%` on the gauge and `0.3034` on the
+                    # diagnosis is the same number in two voices, which a
+                    # levelled page makes easy even though the value cannot
+                    # move.
+                    self.assertEqual(knob["unit"], reading["unit"])
                     lever = reading["lever"]
                     self.assertEqual(
                         knob["directive"], None if lever is None else lever["directive"]
@@ -7417,6 +7426,47 @@ class ThreeLevelPayloadTest(unittest.TestCase):
                     f"{path} is shared between levels and is not a string",
                 )
 
+    def test_every_reading_declares_what_kind_of_number_it_is(self) -> None:
+        # #89 review: the page printed `0.3034` where a reader holds `30.3%`,
+        # because nothing on the payload said which readings are shares and
+        # which are multiples. Every reading now carries it, measured or not --
+        # what kind of number a metric produces does not depend on whether this
+        # window measured one, and the boundaries drawn on an empty dial are in
+        # that unit too.
+        for day in self.ALL_DAYS:
+            block = self.block(day)
+            for knob in block["knobs"]:
+                with self.subTest(day=day, metric=knob["metric"]):
+                    self.assertEqual(knob["unit"], METRIC_UNITS[knob["metric"]])
+                    self.assertIn(knob["unit"], METRIC_UNIT_KINDS)
+
+    def test_the_unit_map_is_total_over_the_wired_metrics(self) -> None:
+        # The guard `RECOMMENDED_METRICS` established, over a second property
+        # of the same set: a metric added to the table with no unit would reach
+        # a reader as a raw float, and `_metric_unit()` refuses rather than
+        # defaulting so that failure cannot be a quiet one.
+        self.assertEqual(set(METRIC_UNITS), set(METRICS))
+        self.assertLessEqual(set(METRIC_UNITS.values()), set(METRIC_UNIT_KINDS))
+        with self.assertRaises(KeyError):
+            serve._metric_unit("no_such_metric")
+
+    def test_shares_and_ratios_are_not_all_one_unit(self) -> None:
+        # Teeth on the fixture: a map that answered "ratio" for everything
+        # would satisfy every assertion above while printing two of the five
+        # readings wrongly. The table holds both kinds and must keep holding
+        # both for these tests to mean anything.
+        self.assertEqual(
+            {METRIC_UNITS[METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW],
+             METRIC_UNITS[METRIC_CACHE_WRITE_ONLY_SHARE]},
+            {"share"},
+        )
+        self.assertEqual(
+            {METRIC_UNITS[METRIC_CACHE_READS_PER_WRITE],
+             METRIC_UNITS[METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL],
+             METRIC_UNITS[METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY]},
+            {"ratio"},
+        )
+
     def test_the_new_blocks_carry_no_money_shaped_field(self) -> None:
         # #30 reaches new payloads too, and a summary level is exactly where a
         # money-shaped figure would be reintroduced: "what do I do?" invites
@@ -7481,6 +7531,12 @@ class SummaryLevelRenderTest(unittest.TestCase):
         cls.raw = (Path(__file__).resolve().parent.parent / "index.html").read_text()
         cls.html = strip_comments(cls.raw)
         cls.knobs = html_element(cls.raw, 'id="knobs-note"')
+        # The knob ROWS alone -- everything above the provenance disclosure.
+        # Several assertions below are about what a reader sees at rest, and
+        # the disclosure states many of the same fields one click down; a
+        # containment check over the whole panel would be satisfied by
+        # evidence from a place the reader is not looking.
+        cls.rows = cls.knobs[: cls.knobs.index('id="knobs-provenance"')]
         cls.strip = html_element(cls.raw, 'id="status-strip"')
         cls.observations = html_element(cls.raw, 'id="observations-note"')
 
@@ -7496,16 +7552,20 @@ class SummaryLevelRenderTest(unittest.TestCase):
         # loop is the mutation: the page would then show only what is wrong,
         # "already fine" and "never measured" would both be absence, and a
         # reader could not tell a short list from a healthy project.
+        # EVERY loop over the list, not just the first: the rows and the
+        # provenance disclosure below them both iterate it, and a filter on
+        # either would hide a knob from one of the two places it is stated.
         loops = re.findall(r'x-for="[^"]*\bin\s*([^"]+)"', self.knobs)
         knobs = [
             iterated.strip()
             for iterated in loops
             if "recommendations.knobs" in iterated
         ]
+        self.assertEqual(len(knobs), 2, "the rows and the disclosure iterate it")
         self.assertEqual(
-            knobs,
-            ["(summary ? summary.recommendations.knobs : [])"],
-            "the knob loop iterates something other than the API's whole list",
+            set(knobs),
+            {"(summary ? summary.recommendations.knobs : [])"},
+            "a knob loop iterates something other than the API's whole list",
         )
 
     def test_a_knob_with_nothing_to_turn_is_dimmed_and_not_dropped(self) -> None:
@@ -7560,6 +7620,91 @@ class SummaryLevelRenderTest(unittest.TestCase):
         self.assertIn("k.gauge.segments", self.knobs)
         self.assertIn("k.gauge.boundaries", self.knobs)
         self.assertIn("k.gauge.worse_when", self.knobs)
+
+    # --- a reading prints as the kind of number it is ----------------------
+
+    def test_the_page_dispatches_on_the_unit_and_never_on_a_metric_key(self) -> None:
+        # A share reads as a percentage and a ratio as a multiple, and WHICH it
+        # is comes from the payload. A metric key spelled in this file would be
+        # a third enumeration of the metric set, in the one place no import
+        # guard can reach -- `RECOMMENDED_METRICS`' defect, one layer out.
+        for key in METRICS:
+            with self.subTest(metric=key):
+                self.assertNotIn(key, self.html)
+        self.assertIn("fmtUnit(k.value, k.unit)", self.knobs)
+        self.assertIn(
+            "return (UNIT_FORMAT[unit] ?? fmtMetric)(value);",
+            js_function_body(self.raw, "function fmtUnit("),
+        )
+
+    def test_the_unit_table_covers_every_unit_the_api_can_send(self) -> None:
+        # A unit with no formatter falls back to the unitless one and prints a
+        # share as `0.3034` -- the defect this whole table was added to fix,
+        # arriving later through an unhandled member.
+        units = re.findall(
+            r"(\w+):\s*(\w+),", re.search(
+                r"const UNIT_FORMAT = \{([^}]*)\}", self.html
+            ).group(1)
+        )
+        self.assertEqual(sorted(k for k, _ in units), sorted(METRIC_UNIT_KINDS))
+        # And every formatter behind it answers absence before it computes, so
+        # a null reading is the em-dash in EVERY unit.
+        for _unit, formatter in units:
+            with self.subTest(formatter=formatter):
+                body = js_function_body(self.raw, f"function {formatter}(")
+                self.assertRegex(body, r"=== null|== null|\?\?")
+
+    def test_the_target_is_printed_in_the_metrics_own_unit(self) -> None:
+        # "aim under 0.1" is the same defect as the headline figure, one line
+        # down: the reader is being asked to move a number they hold as 10%.
+        #
+        # Scoped to the ROWS, not the whole panel. The disclosure prints the
+        # same boundaries and would satisfy a containment check over the panel
+        # on its own -- which is a test passing on evidence from somewhere the
+        # reader is not looking (`scope-lead`'s lesson, one panel over).
+        self.assertIn("fmtUnit(b.value, k.unit)", self.rows)
+        self.assertNotIn("fmtMetric(", self.rows)
+
+    # --- the row is advice, not a dump of the table ------------------------
+
+    def test_the_metric_key_is_not_a_caption_on_the_summary_row(self) -> None:
+        # #89 review: `main_thread_share_over_half_window` in monospace is a
+        # debugging aid on a row of advice. It is genuinely useful for
+        # traceability, so it MOVED rather than went -- to the panel's
+        # provenance disclosure, and to the details level, where a reader has
+        # already asked why.
+        self.assertNotIn('x-text="k.metric"', self.rows)
+        disclosure = html_element(self.raw, 'id="knobs-provenance"')
+        self.assertIn('x-text="k.metric"', disclosure)
+        self.assertIn('x-text="a.metric"', html_element(self.raw, 'id="advice-note"'))
+
+    def test_the_boundaries_are_on_the_dial_and_in_the_disclosure(self) -> None:
+        # #89 review: "at 0.1 judged   at 0.25 judged" is a dump of the table,
+        # not a caption. The provenance discipline survives and MOVES: the
+        # values and kinds ride on the dial's own `<title>`, and every boundary
+        # is stated in full, in its own voice, one click down.
+        self.assertNotIn("kmark", self.rows)
+        self.assertNotIn('x-text="b.kind"', self.rows)
+        for tone in ("tick-cited", "tick-judged", "tick-structural"):
+            with self.subTest(tone=tone):
+                self.assertIn(
+                    f"tickTitleFor(k.gauge.boundaries, '{tone}', k.unit)", self.knobs
+                )
+        disclosure = html_element(self.raw, 'id="knobs-provenance"')
+        for field in ("b.value", "b.kind", "b.statement"):
+            with self.subTest(field=field):
+                self.assertIn(field, disclosure)
+        self.assertIn("provenanceVoice({ kind: b.kind })", disclosure)
+
+    def test_a_judged_target_stays_reachable_from_its_conclusion(self) -> None:
+        # The rule the move must not cost: the target IS the visible
+        # conclusion, so the judgment behind it cannot be a page away. It wears
+        # that boundary's voice class, carries its kind and statement in its
+        # own tooltip, and the disclosure that states it in full is in the same
+        # panel.
+        self.assertIn('class="aim" :class="tickVoice(b.kind)"', self.knobs)
+        self.assertIn(":title=\"b.kind + ': ' + b.statement\"", self.knobs)
+        self.assertIn('id="knobs-provenance"', self.knobs)
 
     def test_the_target_is_the_apis_and_the_direction_is_the_metrics(self) -> None:
         # "Aim under X" names a boundary the API marked, and which way to move
@@ -7815,7 +7960,7 @@ class RecommendationRenderTest(unittest.TestCase):
         # right -- and the rank is the loop index rather than a number the page
         # invents, so it cannot disagree with the order the API published.
         self.assertIn('<div class="rank" x-text="i + 1"></div>', self.band)
-        self.assertIn('<div class="n" x-text="fmtMetric(a.value)"></div>', self.band)
+        self.assertIn('<div class="n" x-text="fmtUnit(a.value, a.unit)"></div>', self.band)
         self.assertRegex(self.raw, r"\.opp\s*\{[^}]+\}")
         self.assertRegex(self.raw, r"\.opp \.fig\s*\{[^}]*text-align:right")
 
@@ -8440,17 +8585,18 @@ class ReportViewSplitTest(unittest.TestCase):
         # runs its figures through the SAME formatters -- the ones
         # `AbsenceIsNeverRenderedAsAValueTest` pins as answering absence before
         # they compute. A second copy of one would be a second rule.
-        for formatter in ("fmtTok", "fmtCount", "fmtPct", "fmtMetric"):
+        for formatter in ("fmtTok", "fmtCount", "fmtPct", "fmtMetric", "fmtUnit"):
             with self.subTest(formatter=formatter):
                 self.assertEqual(self.html.count(f"function {formatter}("), 1)
         self.assertIn("fmtTok(", self.overview)
         self.assertIn("fmtTok(", self.details)
-        # The summary's readings are shares and unbounded ratios in one list,
-        # so `fmtMetric` is its formatter -- and it is the same one the
-        # diagnosis card uses, which is what makes a value that reads "—" at
-        # one level unable to read "0" at another.
-        self.assertIn("fmtMetric(", self.summary_view)
-        self.assertIn("fmtMetric(", self.overview)
+        # A reading is printed in the metric's own unit, and BOTH levels that
+        # show one go through the same dispatcher: the summary would otherwise
+        # print `30.3%` where the diagnosis printed `0.3034`, which is one
+        # figure in two voices -- the drift a levelled page makes easy even
+        # when the value itself cannot move.
+        self.assertIn("fmtUnit(", self.summary_view)
+        self.assertIn("fmtUnit(", self.overview)
 
     # --- the view is in the URL --------------------------------------------
 
@@ -10675,7 +10821,9 @@ class OverviewRestingStateTest(unittest.TestCase):
         detail = html_element(self.raw, 'id="next-detail"')
         self.assertIn('<ol class="next">', detail)
         self.assertIn('x-text="a.lever.directive"', detail)
-        for evidence in ('x-text="a.metric"', "fmtMetric(a.value)", 'x-text="a.severity"'):
+        for evidence in (
+            'x-text="a.metric"', "fmtUnit(a.value, a.unit)", 'x-text="a.severity"'
+        ):
             with self.subTest(evidence=evidence):
                 self.assertIn(evidence, detail)
         self.assertRegex(self.html, r"ol\.next\s*\{[^}]+\}")
