@@ -52,6 +52,7 @@ from context_window import (  # noqa: E402
 )
 from serve import (  # noqa: E402
     CONTEXT_SAMPLE,
+    MEASURED_CONTEXT_MIN,
     PERCENTILES,
     RANKED_BY,
     STALE_AFTER_SECONDS,
@@ -63,7 +64,9 @@ from serve import (  # noqa: E402
     clamp_limit,
     day_bounds,
     eastern_day,
+    has_context_measurement,
     make_handler,
+    measured_context_sql,
     nearest_rank,
     project_of,
     staleness_verdict,
@@ -1928,7 +1931,27 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
 
     # Fields `/api/summary` computes that the page deliberately does not show.
     # An entry must name the reason. Empty is the healthy state.
-    NOT_RENDERED: dict[str, str] = {}
+    NOT_RENDERED: dict[str, str] = {
+        # #25's sample counts, the pair that makes `avg_context` readable:
+        # `avg_context` is now null for a window whose every call carried no
+        # measurement, and these two say which of "no calls" and "no
+        # measurement" produced it. This commit is the data layer; it does not
+        # touch `index.html`, so the pair arrives here declared rather than
+        # drawn -- and the next commit is the one that owes it.
+        #
+        # NAMING THE EXPOSURE, because an allowlist that hides one is worse
+        # than no allowlist: the median card's sample line does not yet state
+        # either count, and the note band still renders the legacy
+        # `avg_context` through a formatter that predates this change. The API
+        # no longer says zero for an inconclusive window; until the view is
+        # bound, the page has not caught up. The timeseries chart, which is
+        # where the defect was observed, is already correct: Chart.js leaves a
+        # null as a gap in the line.
+        "context_calls": "sample count for #25; bound by the view in the follow-up",
+        "unmeasured_calls": (
+            "sample count for #25; bound by the view in the follow-up"
+        ),
+    }
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -2951,8 +2974,9 @@ class NearestRankTest(unittest.TestCase):
 #   * one call has an unknown model, one call has no context measurement at
 #     all, and both are counted rather than banded or dropped;
 #   * the mean lands ABOVE the median (the corpus's skew, in miniature), and
-#     the legacy `avg_context` -- which still divides the same tokens by one
-#     more row -- lands between the two, so no pair of them can be confused.
+#     the pre-#25 `avg_context` -- the same tokens divided by one more row --
+#     lands BETWEEN the two, so no pair of them can be confused and a
+#     regression to that divisor is a different number from either.
 CONTEXT_SESSION = "context-fixture"
 CONTEXT_DAY = "2026-04-07"
 CONTEXT_EMPTY_DAY = "2026-04-06"
@@ -3007,7 +3031,9 @@ EXPECTED_MEDIAN = 300_000
 EXPECTED_SAMPLE_TOTAL = 5_939_474
 EXPECTED_MEAN = EXPECTED_SAMPLE_TOTAL / CONTEXT_SAMPLE_CALLS  # 424,248.1
 EXPECTED_CALLS_ABOVE_MEAN = 6
-# What `AVG(context_size)` still reports: the same tokens over one more row.
+# What `AVG(context_size)` reported BEFORE #25: the same tokens over one more
+# row. Kept, and asserted AGAINST, so a regression to it is red rather than
+# silent.
 EXPECTED_LEGACY_AVG = EXPECTED_SAMPLE_TOTAL / CONTEXT_TOTAL_CALLS  # 395,964.9
 
 
@@ -3141,15 +3167,25 @@ class ContextUtilisationApiTest(unittest.TestCase):
     def test_a_call_with_no_context_measurement_is_counted_not_sampled(self) -> None:
         # #25's population, in one row. Banded, it would file as the most
         # frugal call on the report; sampled, it divides the same tokens by one
-        # more row. `avg_context` still does exactly that -- #25 owns those
-        # call sites -- so the gap between it and `mean` IS the defect, and
-        # these two must not be able to collapse into each other.
+        # more row.
+        #
+        # This assertion was INVERTED by #25, deliberately and not quietly.
+        # When #31 landed, `avg_context` still divided by one more row, and
+        # the gap between it and `mean` WAS that defect made visible -- so
+        # this test pinned the two unequal on purpose. #25 closes the gap by
+        # giving both figures the same definition of "measured", so the same
+        # pin now reads the other way: they must be EQUAL, and neither may be
+        # the legacy figure below. Both directions have teeth -- regress the
+        # guard and `avg_context` returns to `EXPECTED_LEGACY_AVG`, which the
+        # last assertion refuses.
         block = self.block()
         summary = self.api.summary(*day_bounds(None, None))
         self.assertEqual(block["unmeasured_calls"], 1)
-        self.assertAlmostEqual(summary["avg_context"], EXPECTED_LEGACY_AVG)
-        self.assertLess(summary["avg_context"], block["mean"])
-        self.assertNotAlmostEqual(summary["avg_context"], block["mean"])
+        self.assertEqual(summary["unmeasured_calls"], block["unmeasured_calls"])
+        self.assertEqual(summary["context_calls"], block["sample_calls"])
+        self.assertAlmostEqual(summary["avg_context"], EXPECTED_MEAN)
+        self.assertAlmostEqual(summary["avg_context"], block["mean"])
+        self.assertNotAlmostEqual(summary["avg_context"], EXPECTED_LEGACY_AVG)
 
     def test_every_call_is_banded_or_counted_as_a_named_absence(self) -> None:
         # The invariant that makes the bands readable: nothing is silently
@@ -3804,6 +3840,435 @@ class ContextReferentIsBoundTest(unittest.TestCase):
         self.assertRegex(self.raw, r'<div class="note-band" id="context-note">')
         self.assertNotIn("<table", self.band)
         self.assertEqual(self.html.count('class="panel"'), 6, "a panel was added")
+
+
+# ---------------------------------------------------------------------------
+# #25: a call carrying no measurement is not a call that measured zero.
+# ---------------------------------------------------------------------------
+#
+# The fixture is built so that a wrong guard cannot pass, in BOTH directions:
+#
+#   * three rows carry NO measurement -- every token class 0. Two of them are
+#     written with the four keys PRESENT and valued 0, which is what the
+#     records on disk actually look like (measured 2026-08-05: all 82 such
+#     rows in a local corpus carry a complete `usage` block whose token keys
+#     are present and zero), and one with an empty `usage` object, so the two
+#     shapes cannot be handled differently;
+#   * one row is a GENUINE MEASURED ZERO -- `output_tokens: 0` beside a real
+#     60,000-token context -- and it sits ALONE in its own day, so a guard
+#     that suppressed every zero would turn that day INCONCLUSIVE and go red;
+#   * one day's ONLY call is a no-measurement row (the narrow window the issue
+#     observed in the chart: `calls: 1, avg_context: 0`, read by a reader as a
+#     context collapse);
+#   * every mean the five call sites produce is a DIFFERENT number
+#     (52,250 / 36,333 / 100,000 / 66,667 / 50,000 / 9,000 / 24,500 / 60,000),
+#     so a site reading another site's set cannot pass;
+#   * the unmeasured rows carry BOTH a real model id and `<synthetic>`, so a
+#     guard that keyed on the model rather than on the measurement is red.
+NM_BUSY = "m25-busy"
+NM_LONELY = "m25-lonely"
+NM_MIXED_DAY = "2026-05-11"       # measured + unmeasured, main + subagent
+NM_REAL_ZERO_DAY = "2026-05-12"   # one call: a genuine measured zero output
+NM_BLIND_DAY = "2026-05-13"       # one call: no measurement at all
+NM_MEASURED_DAY = "2026-05-14"    # one call, fully measured
+NM_MODEL = "claude-opus-5-20260101"
+NM_SUB_MODEL = "claude-haiku-4-5-20251001"
+NM_SYNTHETIC_MODEL = "<synthetic>"
+
+# The three token classes are deliberately unequal within every call, so a
+# swapped column mapping cannot reproduce the context.
+NM_A_CONTEXT = 40_000    # 7,000 + 11,000 + 22,000
+NM_C_CONTEXT = 60_000    # 5,000 + 13,000 + 42,000, output_tokens 0
+NM_E_CONTEXT = 9_000     # 1,000 + 2,000 + 6,000   (subagent)
+NM_G_CONTEXT = 100_000   # 3,000 + 17,000 + 80,000
+
+NM_TOTAL_CALLS = 7
+NM_MEASURED_CALLS = 4
+NM_UNMEASURED_CALLS = 3
+# Hand-written, then checked against the parts above -- a figure derived only
+# from the fixture would agree with a fixture that had drifted.
+NM_CORPUS_AVG = 209_000 / 4                              # 52,250.0
+NM_CORPUS_AVG_IF_UNGUARDED = 209_000 / 7                 # 29,857.1
+NM_BUSY_AVG = (NM_A_CONTEXT + NM_C_CONTEXT + NM_E_CONTEXT) / 3   # 36,333.3
+NM_LONELY_AVG = float(NM_G_CONTEXT)                      # 100,000.0
+NM_MAIN_AVG = (NM_A_CONTEXT + NM_C_CONTEXT + NM_G_CONTEXT) / 3   # 66,666.7
+NM_SUBAGENT_AVG = float(NM_E_CONTEXT)                    # 9,000.0
+NM_BUSY_MAIN_AVG = (NM_A_CONTEXT + NM_C_CONTEXT) / 2     # 50,000.0
+NM_MIXED_DAY_AVG = (NM_A_CONTEXT + NM_E_CONTEXT) / 2     # 24,500.0
+
+
+def build_no_measurement_corpus(root: Path) -> Path:
+    """Two sessions across four days, one of which measures nothing at all."""
+    project = root / "projects" / "-fixture-no-measurement"
+    project.mkdir(parents=True)
+
+    def record(
+        session: str,
+        day: str,
+        minute: int,
+        model: str,
+        usage: dict[str, int],
+        *,
+        agent_id: str | None = None,
+    ) -> str:
+        message: dict[str, object] = {
+            "id": f"msg-{session}-{day}-{minute}",
+            "model": model,
+            "usage": usage,
+            "content": [{"type": "text", "text": f"{session} {day} {minute}"}],
+        }
+        payload: dict[str, object] = {
+            "type": "assistant",
+            "sessionId": session,
+            "timestamp": f"{day}T15:{minute:02d}:00.000Z",
+            "isSidechain": agent_id is not None,
+            "message": message,
+        }
+        if agent_id is not None:
+            payload["agentId"] = agent_id
+        return json.dumps(payload) + "\n"
+
+    def measured(input_t: int, write: int, read: int, output: int) -> dict[str, int]:
+        return {
+            "input_tokens": input_t,
+            "cache_creation_input_tokens": write,
+            "cache_read_input_tokens": read,
+            "output_tokens": output,
+        }
+
+    # What the records on disk carry: the keys are PRESENT and valued 0.
+    zeros = measured(0, 0, 0, 0)
+
+    busy = [
+        # A -- measured, on the mixed day.
+        record(NM_BUSY, NM_MIXED_DAY, 1, NM_MODEL, measured(7_000, 11_000, 22_000, 13)),
+        # B -- no measurement, on the mixed day, under a REAL model id.
+        record(NM_BUSY, NM_MIXED_DAY, 2, NM_MODEL, zeros),
+        # C -- a GENUINE measured zero: no output tokens, a real 60k context,
+        # alone in its day.
+        record(
+            NM_BUSY, NM_REAL_ZERO_DAY, 3, NM_MODEL, measured(5_000, 13_000, 42_000, 0)
+        ),
+    ]
+    (project / f"{NM_BUSY}.jsonl").write_text("".join(busy))
+
+    subagents = project / NM_BUSY / "subagents"
+    subagents.mkdir(parents=True)
+    sub = [
+        # E -- measured subagent call, on the mixed day.
+        record(
+            NM_BUSY, NM_MIXED_DAY, 4, NM_SUB_MODEL,
+            measured(1_000, 2_000, 6_000, 3), agent_id="agent-nm25a",
+        ),
+        # F -- the OTHER absence shape: an empty `usage` object. It must be
+        # read exactly as B and D are.
+        record(NM_BUSY, NM_MIXED_DAY, 5, NM_SUB_MODEL, {}, agent_id="agent-nm25a"),
+    ]
+    (subagents / "agent-nm25a.jsonl").write_text("".join(sub))
+
+    lonely = [
+        # D -- the narrow window: this day's ONLY call, measuring nothing,
+        # under the model id 76 of the 82 corpus rows carry.
+        record(NM_LONELY, NM_BLIND_DAY, 6, NM_SYNTHETIC_MODEL, zeros),
+        # G -- measured, alone in its day.
+        record(
+            NM_LONELY, NM_MEASURED_DAY, 7, NM_MODEL,
+            measured(3_000, 17_000, 80_000, 5),
+        ),
+    ]
+    (project / f"{NM_LONELY}.jsonl").write_text("".join(lonely))
+    return project
+
+
+class NoMeasurementIsNotAMeasuredZeroTest(unittest.TestCase):
+    """#25: every context mean ranges over the calls that carry a measurement.
+
+    A call with no usage measurement is still COUNTED as a call -- it happened
+    -- and is kept out of the mean, with the two sample counts published beside
+    the aggregate so a reader can see what it ranged over. A window whose only
+    calls carry no measurement reports no average at all rather than 0.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-nomeasure-test-"))
+        projects = build_no_measurement_corpus(cls.tmp)
+        db_path = cls.tmp / "usage.db"
+        ingest(projects, db_path, tasks_dir=cls.tmp / "no-task-index")
+        cls.api = Api(db_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def all_time(self) -> tuple[float, float]:
+        return day_bounds(None, None)
+
+    def day(self, day: str) -> tuple[float, float]:
+        return day_bounds(day, day)
+
+    def test_the_parser_stored_the_rows_faithfully(self) -> None:
+        # The blocking question this issue carried for a year, pinned as a
+        # test: ingest is NOT losing a `usage` block. It stores what is on
+        # disk -- seven calls, three of which report every token class as 0 --
+        # and the defect is downstream, in what the aggregates do with them.
+        rows = self.api.conn.execute(
+            "SELECT input_tokens, cache_read, cache_write, output_tokens,"
+            " context_size FROM api_calls ORDER BY ts, id"
+        ).fetchall()
+        self.assertEqual(len(rows), NM_TOTAL_CALLS)
+        blank = [r for r in rows if r["context_size"] == 0]
+        self.assertEqual(len(blank), NM_UNMEASURED_CALLS)
+        for r in blank:
+            with self.subTest(row=dict(r)):
+                self.assertEqual(
+                    (r["input_tokens"], r["cache_read"], r["cache_write"],
+                     r["output_tokens"]),
+                    (0, 0, 0, 0),
+                )
+        # And the genuine measured zero is stored as a zero OUTPUT beside a
+        # real context -- not as an absence.
+        real_zero = [
+            r for r in rows
+            if r["context_size"] == NM_C_CONTEXT and r["output_tokens"] == 0
+        ]
+        self.assertEqual(len(real_zero), 1)
+
+    def test_the_two_definitions_of_a_measurement_cannot_drift_apart(self) -> None:
+        # SQL and Python each need their own spelling of the predicate; two
+        # spellings free to disagree is how this class of defect recurs. They
+        # are derived from one threshold, and this asserts they select the
+        # same rows over the same table.
+        by_sql = {
+            r["id"]
+            for r in self.api.conn.execute(
+                f"SELECT id FROM api_calls WHERE {measured_context_sql()}"
+            )
+        }
+        by_python = {
+            r["id"]
+            for r in self.api.conn.execute("SELECT id, context_size FROM api_calls")
+            if has_context_measurement(r["context_size"])
+        }
+        self.assertEqual(by_sql, by_python)
+        self.assertEqual(len(by_sql), NM_MEASURED_CALLS)
+        # Aliased for a joined query, the predicate names the same rows.
+        aliased = {
+            r["id"]
+            for r in self.api.conn.execute(
+                "SELECT a.id FROM api_calls a"
+                f" WHERE {measured_context_sql('a.context_size')}"
+            )
+        }
+        self.assertEqual(aliased, by_sql)
+
+    def test_a_genuine_measured_zero_is_below_the_threshold_of_nothing(self) -> None:
+        # The over-correction guard, at the predicate itself. A context of 0
+        # is no prompt accounting at all; ONE token is the smallest thing that
+        # can be measured, and it is a measurement.
+        self.assertEqual(MEASURED_CONTEXT_MIN, 1)
+        self.assertTrue(has_context_measurement(MEASURED_CONTEXT_MIN))
+        self.assertFalse(has_context_measurement(0))
+        # A negative context cannot come from summed token counts, so a row
+        # carrying one is broken -- and the one thing it must not do is join
+        # the sample as the most frugal call on the report.
+        self.assertFalse(has_context_measurement(-1))
+
+    def test_summary_averages_the_measured_calls_and_counts_the_rest(self) -> None:
+        s = self.api.summary(*self.all_time())
+        self.assertEqual(s["calls"], NM_TOTAL_CALLS)
+        self.assertAlmostEqual(s["avg_context"], NM_CORPUS_AVG)
+        self.assertEqual(s["context_calls"], NM_MEASURED_CALLS)
+        self.assertEqual(s["unmeasured_calls"], NM_UNMEASURED_CALLS)
+        # The defect, named: the same tokens over every row rather than over
+        # the rows that carry one.
+        self.assertNotAlmostEqual(s["avg_context"], NM_CORPUS_AVG_IF_UNGUARDED)
+
+    def test_summary_agrees_with_the_context_block_it_carries(self) -> None:
+        # One definition of "measured", so the card's mean and the block's
+        # mean are the same number over the same set. They were deliberately
+        # unequal before this fix, and that inequality WAS the defect.
+        s = self.api.summary(*self.all_time())
+        block = s["context"]
+        self.assertAlmostEqual(s["avg_context"], block["mean"])
+        self.assertEqual(s["context_calls"], block["sample_calls"])
+        self.assertEqual(s["unmeasured_calls"], block["unmeasured_calls"])
+
+    def test_a_window_whose_only_call_measured_nothing_reports_no_average(
+        self,
+    ) -> None:
+        # The observed symptom: on the reference corpus the chart's
+        # `avg context/call` plunged to zero on two days whose single call was
+        # one of these rows, reading as a context collapse.
+        s = self.api.summary(*self.day(NM_BLIND_DAY))
+        self.assertEqual(s["calls"], 1)
+        self.assertIsNone(s["avg_context"], "no sample is not an average of 0")
+        self.assertEqual(s["context_calls"], 0)
+        self.assertEqual(s["unmeasured_calls"], 1)
+
+    def test_a_window_whose_only_call_measured_a_real_zero_still_averages(
+        self,
+    ) -> None:
+        # The mirror-image defect, which is the easy way to get this wrong: a
+        # call that genuinely measured 0 OUTPUT tokens is a healthy sample,
+        # its context was measured, and it must survive the guard.
+        start, end = self.day(NM_REAL_ZERO_DAY)
+        s = self.api.summary(start, end)
+        self.assertEqual(s["calls"], 1)
+        self.assertAlmostEqual(s["avg_context"], float(NM_C_CONTEXT))
+        self.assertEqual(s["context_calls"], 1)
+        self.assertEqual(s["unmeasured_calls"], 0)
+        # And its zero output is summed as the real zero it is, not dropped.
+        self.assertEqual(s["output"], 0)
+
+    def test_an_empty_window_has_no_average_and_no_calls_to_count(self) -> None:
+        s = self.api.summary(*self.day("2026-05-10"))
+        self.assertEqual(s["calls"], 0)
+        self.assertIsNone(s["avg_context"])
+        # A count over an empty set IS a real zero: nothing happened, and that
+        # is corroborated by `calls`.
+        self.assertEqual(s["context_calls"], 0)
+        self.assertEqual(s["unmeasured_calls"], 0)
+
+    def test_the_daily_series_leaves_a_gap_rather_than_plotting_zero(self) -> None:
+        ts = self.api.timeseries(*self.all_time(), by="tokens")
+        by_day = dict(zip(ts["days"], ts["avg_context"]))
+        calls = dict(zip(ts["days"], ts["calls"]))
+        measured = dict(zip(ts["days"], ts["context_calls"]))
+        blank = dict(zip(ts["days"], ts["unmeasured_calls"]))
+        self.assertEqual(
+            ts["days"],
+            [NM_MIXED_DAY, NM_REAL_ZERO_DAY, NM_BLIND_DAY, NM_MEASURED_DAY],
+        )
+        self.assertAlmostEqual(by_day[NM_MIXED_DAY], NM_MIXED_DAY_AVG)
+        self.assertAlmostEqual(by_day[NM_REAL_ZERO_DAY], float(NM_C_CONTEXT))
+        self.assertIsNone(by_day[NM_BLIND_DAY])
+        self.assertAlmostEqual(by_day[NM_MEASURED_DAY], float(NM_G_CONTEXT))
+        # The call still happened on the blind day, and still counts.
+        self.assertEqual(calls, {
+            NM_MIXED_DAY: 4, NM_REAL_ZERO_DAY: 1,
+            NM_BLIND_DAY: 1, NM_MEASURED_DAY: 1,
+        })
+        self.assertEqual(measured, {
+            NM_MIXED_DAY: 2, NM_REAL_ZERO_DAY: 1,
+            NM_BLIND_DAY: 0, NM_MEASURED_DAY: 1,
+        })
+        self.assertEqual(blank, {
+            NM_MIXED_DAY: 2, NM_REAL_ZERO_DAY: 0,
+            NM_BLIND_DAY: 1, NM_MEASURED_DAY: 0,
+        })
+
+    def test_the_daily_series_publishes_a_sample_count_per_point(self) -> None:
+        # An aggregate must name the set it ranges over, and for a series that
+        # means per point -- one number per day, the same length as `days`.
+        ts = self.api.timeseries(*self.all_time(), by="tokens")
+        for key in ("avg_context", "context_calls", "unmeasured_calls", "calls"):
+            with self.subTest(series=key):
+                self.assertEqual(len(ts[key]), len(ts["days"]))
+        for i, day in enumerate(ts["days"]):
+            with self.subTest(day=day):
+                self.assertEqual(
+                    ts["context_calls"][i] + ts["unmeasured_calls"][i],
+                    ts["calls"][i],
+                )
+
+    def test_the_session_list_averages_only_its_measured_calls(self) -> None:
+        rows = {r["id"]: r for r in self.api.sessions(*self.all_time())}
+        self.assertEqual(set(rows), {NM_BUSY, NM_LONELY})
+        busy, lonely = rows[NM_BUSY], rows[NM_LONELY]
+        self.assertEqual(busy["calls"], 5)
+        self.assertAlmostEqual(busy["avg_context"], NM_BUSY_AVG)
+        self.assertEqual(busy["context_calls"], 3)
+        self.assertEqual(busy["unmeasured_calls"], 2)
+        self.assertEqual(lonely["calls"], 2)
+        self.assertAlmostEqual(lonely["avg_context"], NM_LONELY_AVG)
+        self.assertEqual(lonely["context_calls"], 1)
+        self.assertEqual(lonely["unmeasured_calls"], 1)
+
+    def test_a_session_whose_window_holds_only_a_blind_call_is_inconclusive(
+        self,
+    ) -> None:
+        rows = self.api.sessions(*self.day(NM_BLIND_DAY))
+        self.assertEqual([r["id"] for r in rows], [NM_LONELY])
+        self.assertEqual(rows[0]["calls"], 1)
+        self.assertIsNone(rows[0]["avg_context"])
+        self.assertEqual(rows[0]["context_calls"], 0)
+        self.assertEqual(rows[0]["unmeasured_calls"], 1)
+
+    def test_each_scope_bucket_averages_only_its_own_measured_calls(self) -> None:
+        scope = self.api.summary(*self.all_time())["scope"]
+        main, sub = scope["main_thread"], scope["subagent"]
+        self.assertEqual(main["calls"], 5)
+        self.assertAlmostEqual(main["avg_context"], NM_MAIN_AVG)
+        self.assertEqual(main["context_calls"], 3)
+        self.assertEqual(main["unmeasured_calls"], 2)
+        self.assertEqual(sub["calls"], 2)
+        self.assertAlmostEqual(sub["avg_context"], NM_SUBAGENT_AVG)
+        self.assertEqual(sub["context_calls"], 1)
+        self.assertEqual(sub["unmeasured_calls"], 1)
+        # Two scopes, two different means: a bucket reading the other's set --
+        # or the corpus's -- cannot pass.
+        self.assertNotAlmostEqual(main["avg_context"], sub["avg_context"])
+
+    def test_a_scope_with_no_calls_at_all_reports_no_average(self) -> None:
+        scope = self.api.summary(*self.day(NM_BLIND_DAY))["scope"]
+        sub = scope["subagent"]
+        self.assertEqual(sub["calls"], 0)
+        self.assertIsNone(sub["avg_context"])
+        self.assertEqual(sub["context_calls"], 0)
+        self.assertEqual(sub["unmeasured_calls"], 0)
+
+    def test_a_scope_whose_only_call_measured_nothing_reports_no_average(
+        self,
+    ) -> None:
+        scope = self.api.summary(*self.day(NM_BLIND_DAY))["scope"]
+        main = scope["main_thread"]
+        self.assertEqual(main["calls"], 1)
+        self.assertIsNone(main["avg_context"])
+        self.assertEqual(main["context_calls"], 0)
+        self.assertEqual(main["unmeasured_calls"], 1)
+
+    def test_session_detail_scopes_average_only_their_measured_calls(self) -> None:
+        scopes = {
+            s["scope"]: s for s in self.api.session_detail(NM_BUSY)["scopes"]
+        }
+        self.assertEqual(set(scopes), {"main-thread", "subagent"})
+        main, sub = scopes["main-thread"], scopes["subagent"]
+        self.assertEqual(main["calls"], 3)
+        self.assertAlmostEqual(main["avg_context"], NM_BUSY_MAIN_AVG)
+        self.assertEqual(main["context_calls"], 2)
+        self.assertEqual(main["unmeasured_calls"], 1)
+        self.assertEqual(sub["calls"], 2)
+        self.assertAlmostEqual(sub["avg_context"], NM_SUBAGENT_AVG)
+        self.assertEqual(sub["context_calls"], 1)
+        self.assertEqual(sub["unmeasured_calls"], 1)
+
+    def test_every_call_is_in_the_mean_or_counted_beside_it(self) -> None:
+        # The invariant that makes the pair readable at all five sites:
+        # nothing is silently dropped, so sample + unmeasured == calls.
+        start, end = self.all_time()
+        buckets: list[tuple[str, dict]] = [("summary", self.api.summary(start, end))]
+        buckets += [
+            (f"scope:{name}", buckets[0][1]["scope"][name])
+            for name in ("main_thread", "subagent")
+        ]
+        buckets += [(f"session:{r['id']}", r) for r in self.api.sessions(start, end)]
+        buckets += [
+            (f"detail:{session}:{s['scope']}", s)
+            for session in (NM_BUSY, NM_LONELY)
+            for s in self.api.session_detail(session)["scopes"]
+        ]
+        for name, row in buckets:
+            with self.subTest(site=name):
+                self.assertEqual(
+                    row["context_calls"] + row["unmeasured_calls"], row["calls"]
+                )
+                # And the pair is honest about the aggregate beside it.
+                if row["context_calls"] == 0:
+                    self.assertIsNone(row["avg_context"])
+                else:
+                    self.assertIsNotNone(row["avg_context"])
 
 
 if __name__ == "__main__":
