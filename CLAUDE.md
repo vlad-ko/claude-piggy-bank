@@ -173,7 +173,9 @@ resolve publicly and the numbered rules are not the rules in this file.
 
 If you add or change a number, say where it came from and when it was checked.
 Facts about the Claude API are model-dependent — state which models a claim
-covers and cite the source, or say in the code that it is unverified (see
+covers and cite the source (the checked ones are recorded in
+`docs/claude-api-token-accounting.md`, indexed from `docs/README.md`), or say
+in the code that it is unverified (see
 `transcript_slug()`, which documents its Windows encoding as a best-known value
 with the symptom to look for if it is wrong, and separately asserts the property
 the code actually guarantees).
