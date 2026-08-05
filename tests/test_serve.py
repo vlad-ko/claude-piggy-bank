@@ -65,6 +65,7 @@ from recommendations import (  # noqa: E402
     METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
     METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,
     METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
+    METRIC_UNIT_KINDS,
     METRICS,
     PROVENANCE_CITED,
     PROVENANCE_JUDGED,
@@ -81,6 +82,7 @@ from recommendations import (  # noqa: E402
     WORSE_WHEN_HIGHER,
     WORSE_WHEN_LOWER,
     Lever,
+    assess_all,
 )
 import serve  # noqa: E402
 from serve import (  # noqa: E402
@@ -123,8 +125,6 @@ from serve import (  # noqa: E402
     HEALTH_STATEMENTS,
     HEALTH_UNCHECKED,
     MEASURED_CONTEXT_MIN,
-    METRIC_UNITS,
-    METRIC_UNIT_KINDS,
     MODEL_MIX_SAMPLE,
     OVER_HALF_WINDOW_BANDS,
     PERCENTILES,
@@ -7437,35 +7437,50 @@ class ThreeLevelPayloadTest(unittest.TestCase):
             block = self.block(day)
             for knob in block["knobs"]:
                 with self.subTest(day=day, metric=knob["metric"]):
-                    self.assertEqual(knob["unit"], METRIC_UNITS[knob["metric"]])
+                    self.assertEqual(knob["unit"], METRICS[knob["metric"]].unit)
                     self.assertIn(knob["unit"], METRIC_UNIT_KINDS)
 
-    def test_the_unit_map_is_total_over_the_wired_metrics(self) -> None:
-        # The guard `RECOMMENDED_METRICS` established, over a second property
-        # of the same set: a metric added to the table with no unit would reach
-        # a reader as a raw float, and `_metric_unit()` refuses rather than
-        # defaulting so that failure cannot be a quiet one.
-        self.assertEqual(set(METRIC_UNITS), set(METRICS))
-        self.assertLessEqual(set(METRIC_UNITS.values()), set(METRIC_UNIT_KINDS))
-        with self.assertRaises(KeyError):
-            serve._metric_unit("no_such_metric")
+    def test_every_reading_says_what_it_means_to_the_reader(self) -> None:
+        # #89: the summary row's why-line. It is the TABLE's sentence on every
+        # knob, measured or not -- what a metric means does not depend on
+        # whether this window sampled it, and a row that lost its sentence with
+        # its sample would say less about the absence than about the reading.
+        for day in self.ALL_DAYS:
+            block = self.block(day)
+            self.assertEqual(len(block["knobs"]), len(METRICS))
+            for knob in block["knobs"]:
+                with self.subTest(day=day, metric=knob["metric"]):
+                    self.assertEqual(knob["means"], METRICS[knob["metric"]].means)
+                    # And BESIDE the measurement, never instead of it: the
+                    # specification still crosses on the same row, for the
+                    # disclosure that states it in full.
+                    self.assertEqual(
+                        knob["measurement"], METRICS[knob["metric"]].measurement
+                    )
+                    self.assertNotEqual(knob["means"], knob["measurement"])
 
-    def test_shares_and_ratios_are_not_all_one_unit(self) -> None:
-        # Teeth on the fixture: a map that answered "ratio" for everything
-        # would satisfy every assertion above while printing two of the five
-        # readings wrongly. The table holds both kinds and must keep holding
-        # both for these tests to mean anything.
-        self.assertEqual(
-            {METRIC_UNITS[METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW],
-             METRIC_UNITS[METRIC_CACHE_WRITE_ONLY_SHARE]},
-            {"share"},
-        )
-        self.assertEqual(
-            {METRIC_UNITS[METRIC_CACHE_READS_PER_WRITE],
-             METRIC_UNITS[METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL],
-             METRIC_UNITS[METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY]},
-            {"ratio"},
-        )
+    def test_the_unit_is_the_metrics_own_and_serve_holds_no_table_of_them(
+        self,
+    ) -> None:
+        # The migration, pinned in both directions (#89). The unit is a
+        # property of the metric and now lives on it; a second mapping in
+        # `serve.py` would be one enumeration of the metric set too many --
+        # `RECOMMENDED_METRICS`' own defect -- and it is what this branch
+        # removed rather than left beside the table.
+        #
+        # The property the deleted import guards were buying is what matters,
+        # and it is now unconditional: a metric with no unit cannot be
+        # CONSTRUCTED, so the failure no longer waits for something to import
+        # the serving layer.
+        for name in ("METRIC_UNITS", "METRIC_UNIT_KINDS", "_metric_unit"):
+            with self.subTest(attribute=name):
+                self.assertFalse(
+                    hasattr(serve, name),
+                    f"serve.{name} is back: the unit belongs to the metric",
+                )
+        for key, metric in METRICS.items():
+            with self.subTest(metric=key):
+                self.assertIn(metric.unit, METRIC_UNIT_KINDS)
 
     def test_the_new_blocks_carry_no_money_shaped_field(self) -> None:
         # #30 reaches new payloads too, and a summary level is exactly where a
@@ -7678,6 +7693,46 @@ class SummaryLevelRenderTest(unittest.TestCase):
         self.assertIn('x-text="k.metric"', disclosure)
         self.assertIn('x-text="a.metric"', html_element(self.raw, 'id="advice-note"'))
 
+    def test_the_row_says_what_the_number_means_and_not_what_defines_it(
+        self,
+    ) -> None:
+        # #89 review, and the last of the page's density: the row's why-line
+        # printed `measurement`, which is a SPECIFICATION -- right under
+        # "Measures:" one level down, two lines of jargon on a row of advice.
+        # It now prints `means`, the table's own reader sentence.
+        self.assertIn('x-text="k.means"', self.rows)
+        self.assertNotIn('x-text="k.measurement"', self.rows)
+
+    def test_the_measurement_moved_into_the_disclosure_and_was_not_dropped(
+        self,
+    ) -> None:
+        # THE mutation the rule "nothing is deleted" is for, and the cheapest
+        # way to satisfy the test above: drop `measurement` from the summary
+        # instead of re-homing it. Moving a figure behind a disclosure is not
+        # exempting it -- so the specification is still one click away, in the
+        # panel's own disclosure, beside the metric key that identifies the
+        # dial it belongs to.
+        disclosure = html_element(self.raw, 'id="knobs-provenance"')
+        self.assertIn('x-text="k.measurement"', disclosure)
+        self.assertIn('x-text="k.metric"', disclosure)
+        # And it is still stated in full at the level whose job is "why".
+        self.assertIn(
+            'x-text="a.measurement"', html_element(self.raw, 'id="advice-note"')
+        )
+
+    def test_no_reader_sentence_is_authored_in_this_file(self) -> None:
+        # The same rule that holds for the advice, over the field that is
+        # written in plain English and is therefore the tempting one to type
+        # here. A sentence in this page would be a claim with no date, no owner
+        # and nothing to check it against -- and the page and the table would
+        # become two enumerations free to disagree.
+        for key, metric in METRICS.items():
+            with self.subTest(metric=key):
+                self.assertNotIn(metric.means, self.html)
+                # Nor a fragment of one: a "shortened for the row" copy is the
+                # same defect with a diff nobody would notice.
+                self.assertNotIn(metric.means.split(".")[0], self.html)
+
     def test_the_boundaries_are_on_the_dial_and_in_the_disclosure(self) -> None:
         # #89 review: "at 0.1 judged   at 0.25 judged" is a dump of the table,
         # not a caption. The provenance discipline survives and MOVES: the
@@ -7816,6 +7871,68 @@ class SummaryLevelRenderTest(unittest.TestCase):
         # measurement.
         self.assertIn('x-if="summary && !summary.model_mix.busiest"', self.observations)
         self.assertIn("orDash(summary.model_mix.busiest.model)", self.observations)
+
+    # --- the finding stays; the explanation moves --------------------------
+
+    def observation_resting(self) -> str:
+        """The panel with its explanation disclosure removed."""
+        return self.observations.replace(
+            html_element(self.raw, 'id="observation-detail"'), ""
+        )
+
+    def observed_branch(self) -> str:
+        """The branch that renders when a model WAS named, at rest.
+
+        Scoped to that branch on purpose: the unmeasured branch beside it is
+        required to state its sample in the open (an absence says itself), so a
+        check over the whole panel would be satisfied by the wrong half.
+        """
+        resting = self.observation_resting()
+        start = resting.index('x-if="summary && summary.model_mix.busiest"')
+        end = resting.index('x-if="summary && !summary.model_mix.busiest"')
+        return resting[start:end]
+
+    def test_the_observation_itself_is_what_stays_on_screen(self) -> None:
+        # #89's height budget, and the level-2 rule applied one level up: the
+        # FINDING stays at rest, the explanation moves. What a reader must be
+        # able to see without asking is which model ran this window's work --
+        # and that the panel is not advice, which is its HEADING.
+        resting = self.observation_resting()
+        self.assertIn("summary.model_mix.busiest.model", resting)
+        self.assertIn("summary.model_mix.busiest.calls", resting)
+        self.assertIn("summary.model_mix.models", resting)
+        self.assertIn("not something to change", resting)
+        # AND NOT BEHIND A SECOND ONE. Removing the explanation disclosure and
+        # then looking for the headline's bindings is satisfied by a headline
+        # nested inside a disclosure of its own -- a mutation this test
+        # survived when it was written, and the reason the check is on the
+        # ABSENCE of any remaining disclosure rather than on the presence of
+        # some strings.
+        self.assertNotIn("<details", self.observed_branch())
+
+    def test_the_explanation_moved_rather_than_being_dropped(self) -> None:
+        # The mutation: satisfy the test above by deleting the sample and the
+        # reasoning instead of collapsing them. Both must be INSIDE the
+        # disclosure -- an aggregate that stopped naming the set it ranges over
+        # would be a figure with no sample, and the owner decision that this is
+        # not advice would be a heading with no argument behind it.
+        detail = html_element(self.raw, 'id="observation-detail"')
+        self.assertIn("summary.model_mix.sample_is", detail)
+        self.assertIn("Stated, not recommended", detail)
+        self.assertRegex(detail, r"^<details\b")
+        self.assertIn("<summary>", detail)
+        self.assertNotIn("summary.model_mix.sample_is", self.observed_branch())
+        self.assertNotIn("Stated, not recommended", self.observed_branch())
+
+    def test_the_unmeasured_branch_states_its_absence_at_rest(self) -> None:
+        # The one state that may NOT collapse: a window that named no model is
+        # an absence, and an absence says itself in the open. It carries no
+        # disclosure of its own, so "unmeasured, not zero" and the sample it
+        # ranges over are both on screen.
+        at = self.observations.index("!summary.model_mix.busiest")
+        empty = self.observations[at:]
+        self.assertIn("unmeasured, not zero", empty)
+        self.assertNotIn("<details", empty)
 
 
 class RecommendationRenderTest(unittest.TestCase):
@@ -8063,6 +8180,12 @@ class RecommendationVersionTest(unittest.TestCase):
     # each release owed is a fact about that release: overwriting this would
     # make the previous claim unverifiable.
     PER_TTL_REPAYMENT_MINOR = (1, 3, 0)
+    # #89: `recommendations.knobs[].means` is a new payload field -- the
+    # reader-facing sentence the summary rows print instead of `measurement`.
+    # Minor again, and recorded per change rather than by re-pointing one
+    # constant: what each release owed is a fact about that release, and
+    # overwriting it would make the previous claim unverifiable.
+    READER_SENTENCE_MINOR = (1, 6, 0)
 
     def test_serving_the_recommendation_block_owes_a_minor_bump(self) -> None:
         self.assertIn("recommendations", Api.summary.__doc__ or "")
@@ -8089,6 +8212,29 @@ class RecommendationVersionTest(unittest.TestCase):
             "`recommendations` payload, which docs/versioning.md makes a MINOR "
             "release. Bump cpb.VERSION and .claude-plugin/plugin.json together "
             "-- the manifest is the plugin loader's update cache key.",
+        )
+
+    def test_the_reader_sentence_owes_a_further_minor_bump(self) -> None:
+        # Same shape as the two above, and asserted against a SERVED payload
+        # rather than against the table: the field has to be in
+        # `/api/summary`'s `knobs` for the floor to be owed, so a version
+        # bumped without the field and a field shipped without the bump each
+        # fail here.
+        knobs = Api._knobs(
+            assess_all({key: None for key in METRICS})
+        )
+        self.assertEqual(len(knobs), len(METRICS))
+        for knob in knobs:
+            with self.subTest(metric=knob["metric"]):
+                self.assertEqual(knob["means"], METRICS[knob["metric"]].means)
+        parsed = tuple(int(p) for p in cpb.VERSION.split("."))
+        self.assertGreaterEqual(
+            parsed,
+            self.READER_SENTENCE_MINOR,
+            "`knobs[].means` is a new field on the `recommendations` payload, "
+            "which docs/versioning.md makes a MINOR release. Bump cpb.VERSION "
+            "and .claude-plugin/plugin.json together -- the manifest is the "
+            "plugin loader's update cache key.",
         )
 
 
@@ -10037,6 +10183,17 @@ class HealthBandIsBoundTest(unittest.TestCase):
         # vendored Alpine bundle ever fails to load.
         self.assertRegex(detail, r"^<details\b")
 
+    def test_the_verdict_is_one_binding_in_every_form_of_the_card(self) -> None:
+        # #89 renders the card as ONE LINE on the summary level. The tag and
+        # the statement are not part of that: they are rendered by a single
+        # binding each, outside every conditional the shortening uses, so no
+        # form of this card can exist without the verdict on it. A second
+        # rendering "for the short form" is exactly how two levels come to
+        # disagree about a verdict.
+        for field in ("verdict", "statement"):
+            with self.subTest(field=field):
+                self.assertEqual(self.band.count(f"summary.health.{field}"), 1)
+
     def test_the_unparsed_record_warning_is_not_removed_from_the_banner(self) -> None:
         # The health band is a SECOND rendering of `ingest.unparsed_records`,
         # not a replacement for it. Moved out of the banner it would become a
@@ -10046,6 +10203,125 @@ class HealthBandIsBoundTest(unittest.TestCase):
             "this.summary.ingest.unparsed_records > 0",
             js_function_body(self.html, "applySummary("),
         )
+
+
+class SummaryLevelHealthCardTest(unittest.TestCase):
+    """#89: the verdict costs one line on the summary, and never less than that.
+
+    The health card is CHROME -- one element above all three levels, because a
+    verdict over every figure in the report must not be one the reader can
+    navigate away from. It is also, at ~90px of heading, answer and disclosure
+    control, one of the three things standing between the summary level and its
+    stated budget of one screen.
+
+    So on the summary it renders as ONE LINE: the verdict tag and its
+    statement, in the card's own tone, with the numbered question heading and
+    the (closed) checks control dropped. The checks themselves are one click
+    away, at the two levels below, and the tabs that reach them are on screen
+    throughout.
+
+    THE HARD CONSTRAINT, AND HOW IT IS MET. A `failed` verdict must be
+    unmissable at every level. It is not enough to remember that: the condition
+    for shortening is `healthOpen` ITSELF, so anything that expands its own
+    evidence -- `failed`, a state this build has never seen, a load failure --
+    keeps the whole card at every level, by composition. There is no second
+    table to keep in step with `HEALTH_OPEN`, and a change that made `failed`
+    collapse would have to turn `test_a_failed_verdict_cannot_be_collapsed`
+    red first.
+
+    THE LIMIT, STATED PLAINLY. Nothing here can see whether the one-line form
+    is still loud enough to stop a reader, whether the tone reads as a tone at
+    9px of padding, or whether the summary now fits a screen. Only a person
+    looking at the page can judge that, and this page has shipped three defects
+    green for exactly that reason.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+        cls.band = html_element(cls.raw, 'id="health-note"')
+
+    def test_the_short_form_is_decided_by_a_table_over_the_levels(self) -> None:
+        # One entry per view, and a table for the reason `HEALTH_OPEN` is one:
+        # a chain of ifs could quietly return the same default for two levels,
+        # and a test can assert this covers the levels exactly.
+        table = re.search(r"const HEALTH_COMPACT = \{(.*?)\};", self.html, re.S)
+        self.assertIsNotNone(table, "HEALTH_COMPACT is gone")
+        defaults = dict(re.findall(r"(\w+):\s*(true|false)", table.group(1)))
+        self.assertEqual(
+            defaults,
+            {"summary": "true", "overview": "false", "details": "false"},
+            "a level shortens or keeps the verdict against the rule",
+        )
+        self.assertEqual(
+            sorted(defaults),
+            sorted(re.search(r"const VIEWS = \[([^\]]*)\]", self.html)
+                   .group(1).replace('"', "").replace(" ", "").split(",")),
+            "the page has a rule for a level that does not exist, or none for "
+            "one that does",
+        )
+
+    def test_a_level_this_build_does_not_know_gets_the_whole_card(self) -> None:
+        # Same direction as every other fallback on this page: the unfamiliar
+        # case takes the loudest treatment, never the shortened one.
+        self.assertIn("const HEALTH_COMPACT_UNRECOGNISED = false;", self.html)
+        self.assertIn(
+            "?? HEALTH_COMPACT_UNRECOGNISED",
+            js_function_body(self.html, "get healthOneLine("),
+        )
+
+    def test_a_verdict_that_opens_itself_is_never_shortened(self) -> None:
+        # THE hard constraint, as the structure that enforces it: `healthOpen`
+        # is consulted FIRST and returns before the level is even looked at, so
+        # `failed` -- and an unrecognised verdict, and a load failure, both of
+        # which `HEALTH_OPEN` sends the same way -- keeps its heading, its tone
+        # and its six open lines on the summary too.
+        body = js_function_body(self.html, "get healthOneLine(")
+        self.assertRegex(body, r"if \(this\.healthOpen\) return false;")
+        self.assertLess(
+            body.index("healthOpen"),
+            body.index("HEALTH_COMPACT"),
+            "the level is consulted before the verdict, so a proven failure "
+            "can be the thing that gets shortened",
+        )
+
+    def test_the_tag_and_the_statement_survive_the_short_form(self) -> None:
+        # What one-lining may cost is furniture, and this is the list: the
+        # numbered heading and the checks CONTROL. The verdict tag and its
+        # statement are rendered outside both, so no form of this card exists
+        # without them.
+        heading = '<template x-if="!healthOneLine"><h2>'
+        self.assertIn(heading, self.band)
+        answer = self.band[self.band.index('class="answer"'):]
+        self.assertNotIn("healthOneLine", answer[: answer.index("</div>")])
+        self.assertIn("summary.health.verdict", self.band)
+        self.assertIn("summary.health.statement", self.band)
+
+    def test_the_checks_are_hidden_at_one_level_and_deleted_at_none(self) -> None:
+        # The mutation "a disclosure used to drop a figure rather than move
+        # it", in its cheapest form: delete the checks instead of hiding the
+        # control. The element is still in the page, still iterating the API's
+        # own list, still opened by `healthOpen` -- it is one `x-if` that
+        # decides whether this LEVEL renders it, and the other two do.
+        detail = html_element(self.raw, 'id="health-detail"')
+        self.assertIn("summary.health.checks", detail)
+        self.assertEqual(self.html.count('id="health-detail"'), 1)
+        before = self.band[: self.band.index('id="health-detail"')]
+        self.assertIn('x-if="!healthOneLine"', before)
+
+    def test_the_short_form_is_the_same_surface_with_less_padding(self) -> None:
+        # Not a second card, not a second tone table, not a second verdict: one
+        # element, one class, and a padding rule. A short form built as its own
+        # markup would be a second rendering of the verdict, free to drift from
+        # the first.
+        self.assertIn(
+            ":class=\"healthTone + (healthOneLine ? ' compact' : '')\"", self.band
+        )
+        self.assertRegex(self.html, r"\.q\.compact\s*\{[^}]*padding")
+        self.assertEqual(self.html.count('id="health-note"'), 1)
 
 
 class GrowthCurveIsBoundTest(unittest.TestCase):

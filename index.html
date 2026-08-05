@@ -105,6 +105,12 @@
      untouched, so the two levels stay visibly different. */
   .q { background:var(--card); border:1px solid var(--line); border-radius:11px;
        padding:15px 18px 14px; margin-bottom:12px; }
+  /* #89: the one-line form of a card, used by the health verdict on the
+     summary level only. It is the same surface with the same tone and the same
+     verdict text -- what it loses is the padding a heading and a disclosure
+     needed, and nothing else. Never applied to a verdict that expands its own
+     evidence: see `healthOneLine`. */
+  .q.compact { padding:9px 18px; margin-bottom:10px; }
   .q > h2 { font-size:15px; margin:0 0 9px; letter-spacing:-.01em; display:flex;
             align-items:center; gap:8px; }
   .q > h2 .num { width:20px; height:20px; line-height:20px; text-align:center; border-radius:50%;
@@ -511,9 +517,29 @@
        59 sources were ingested before the census existed and are censused only
        when they next change -- so a card that opened on it was a card open for
        ever. The verdict line still says UNCHECKED, in its own tone, and says
-       the bill of health is incomplete. See `HEALTH_OPEN`. -->
-  <section class="q" id="health-note" x-cloak x-show="summary" :class="healthTone">
-    <h2><span class="num">1</span>Is anything blowing up?</h2>
+       the bill of health is incomplete. See `HEALTH_OPEN`.
+
+       #89 SHORTENS IT ON THE SUMMARY LEVEL ONLY, AND ONLY WHERE IT WAS ALREADY
+       COLLAPSED. The summary has a hard height budget and this card spends the
+       height of a heading and a disclosure control on it; at that level it
+       renders as one line -- the verdict tag and its statement, which is the
+       part that must survive -- with the numbered heading and the checks
+       control dropped. The checks themselves are one CLICK away, at the two
+       levels below, and the tabs to reach them are on screen throughout.
+
+       THE CONDITION IS `healthOpen` ITSELF, NOT A SECOND RULE. A verdict that
+       expands its own evidence -- `failed`, an unrecognised state, or a load
+       failure -- keeps the full card at EVERY level, so a proven failure can
+       never be the thing that got shortened. That is the hard constraint on
+       this change, and it is met by composition rather than by remembering:
+       one-lining is `view is the summary AND the verdict did not open itself`,
+       so `HEALTH_OPEN` decides both. See `healthOneLine` and `HEALTH_COMPACT`. -->
+  <section class="q" id="health-note" x-cloak x-show="summary"
+           :class="healthTone + (healthOneLine ? ' compact' : '')">
+    <!-- The numbered heading is question 1's, and it is what a level that is
+         not the four question cards can do without: the summary is not a list
+         of questions, and the verdict below states itself in words. -->
+    <template x-if="!healthOneLine"><h2><span class="num">1</span>Is anything blowing up?</h2></template>
     <template x-if="summary && banner.loadFailure"><div>
       <div class="answer"><span class="tag">CANNOT SAY</span>
         This page's last load FAILED, so the figures below are not this
@@ -529,7 +555,13 @@
            here: `verdict` above is the severity, and a list that reordered
            itself would move a check under the reader every time its answer
            changed. Consumed by iteration, so a check added server-side reaches
-           this card by construction. -->
+           this card by construction.
+
+           Absent on the summary level, and only where the verdict collapsed
+           itself anyway: `healthOneLine` is false for every verdict that opens
+           its own evidence, so what is dropped here is a CLOSED control and
+           never the six lines of a proven failure. -->
+      <template x-if="!healthOneLine">
       <details class="disclosure" id="health-detail" :open="healthOpen">
         <summary>The checks behind that verdict, one line each</summary>
         <template x-for="c in summary.health.checks" :key="c.check">
@@ -545,6 +577,7 @@
           </span>
         </template>
       </details>
+      </template>
     </div></template>
   </section>
 
@@ -733,27 +766,28 @@
               <template x-if="!k.directive && k.severity"><span>Nothing to turn here</span></template>
               <template x-if="!k.severity"><span>No reading in this period</span></template>
             </div>
-            <!-- WHY, in the table's own words: the metric's `measurement`
-                 names exactly what was divided by what, which is the thing a
-                 reader checks the figure against. A sentence written here
-                 would be a claim nothing can check.
+            <!-- WHY, in the table's own words. This line used to print the
+                 metric's `measurement`, which is a precise DEFINITION -- "share
+                 of main-thread API calls whose context reaches at least half
+                 the model's documented window (context_window bands 50-to-90
+                 and at-least-90), over main-thread calls with a known window"
+                 -- exactly right one level down and two lines of jargon on a
+                 row of advice. It was the page's last density problem.
 
-                 THIS LINE IS THE PAGE'S LAST DENSITY PROBLEM, and it is
-                 blocked rather than solved (#89 review). `measurement` is a
-                 precise DEFINITION -- "share of main-thread API calls whose
-                 context reaches at least half the model's documented window
-                 (context_window bands 50-to-90 and at-least-90), over
-                 main-thread calls with a known window" -- which is exactly
-                 right one level down and is two lines of jargon here. What a
-                 summary row needs is a short reader-facing sentence BESIDE
-                 `measurement`, not instead of it. That sentence is prose about
-                 what a metric means, so it belongs in `recommendations.py`
-                 beside the metric it describes; written here it would be a
-                 claim with no date, no owner and nothing to check it against,
-                 which is the whole reason no advice on this page is authored
-                 in this file. Until that field exists this line stays as it
-                 is. -->
-            <div class="kw" x-text="k.measurement"></div>
+                 `means` IS THAT SENTENCE, AND IT IS STILL THE TABLE'S. It sits
+                 on `recommendations.Metric` beside `measurement`, which is
+                 where prose about what a metric means belongs: written here it
+                 would be a claim with no date, no owner and nothing to check
+                 it against, which is why no advice on this page is authored in
+                 this file. `Metric.__post_init__` refuses a metric without
+                 one, so a metric added later cannot arrive here with nothing
+                 to say.
+
+                 `measurement` DID NOT GO ANYWHERE. It states itself in full in
+                 the disclosure at the foot of this panel, and under "Measures:"
+                 on the diagnosis card one level down. Moving a figure behind a
+                 disclosure is not dropping it. -->
+            <div class="kw" x-text="k.means"></div>
           </div>
 
           <!-- THE FIGURE, AND THE DIRECTION TO MOVE, both in the metric's own
@@ -791,7 +825,8 @@
            boundary it names, it carries that boundary's kind and statement in
            its own tooltip, and this list sits directly beneath it. -->
       <details class="disclosure" id="knobs-provenance">
-        <summary>Where these lines are drawn, and what they are not</summary>
+        <summary>What each row measures, where its lines are drawn, and what
+          they are not</summary>
         <span class="context-line">Every arc, tick and target above is a range in
           one dated table, decided
           <strong x-text="summary ? summary.recommendations.as_of : ''"></strong>.
@@ -803,6 +838,13 @@
         <template x-for="k in (summary ? summary.recommendations.knobs : [])" :key="k.metric">
           <div class="kcuts">
             <div class="kcuts-h"><span class="mono" x-text="k.metric"></span></div>
+            <!-- WHAT WAS DIVIDED BY WHAT. The row above says what the number
+                 MEANS; this says what it IS, in the table's own `measurement`
+                 -- the string a reader checks the figure against. It moved
+                 here from the row and was not dropped: a summary row cannot
+                 carry two lines of specification, and a specification nobody
+                 can reach is a figure nobody can audit. -->
+            <div class="kw" x-text="k.measurement"></div>
             <template x-for="(b, i) in k.gauge.boundaries" :key="i">
               <span class="advice-line" :class="provenanceVoice({ kind: b.kind })">
                 at <strong x-text="fmtUnit(b.value, k.unit)"></strong> &mdash;
@@ -825,16 +867,27 @@
          dimmed row among things the reader IS being told to change. -->
     <section class="board" id="observations-note">
       <h2>Worth knowing &mdash; not something to change</h2>
+      <!-- THE FINDING STAYS AT REST; THE EXPLANATION MOVES (#89 review). The
+           observation itself -- which model ran how much of this window's work
+           -- is one line and is the whole point of the panel, so it is the
+           thing on screen. What sits behind the disclosure is the set it
+           ranges over and the REASON it is not advice: both are explanation of
+           a finding already stated, which is exactly the rule level 2 already
+           runs on. The heading says "not something to change" at rest, so the
+           owner's decision is never one click away; only its argument is. -->
       <template x-if="summary && summary.model_mix.busiest"><div class="observation">
         <strong x-text="fmtCount(summary.model_mix.busiest.calls)"></strong> of
         <strong x-text="fmtCount(summary.model_mix.sample_calls)"></strong> API calls
         ran on <span class="mono" x-text="orDash(summary.model_mix.busiest.model)"></span>,
         with <span x-text="fmtCount(summary.model_mix.models)"></span> model(s) named
         in all.
-        <span class="obs-note">Over <span x-text="summary.model_mix.sample_is"></span>.
-          Stated, not recommended: this report counts tokens and cannot see whether
-          a cheaper model would have needed more attempts, so there is no target
-          here and no direction to move.</span>
+        <details class="disclosure" id="observation-detail">
+          <summary>What this counts, and why it is not a knob</summary>
+          <span class="obs-note">Over <span x-text="summary.model_mix.sample_is"></span>.
+            Stated, not recommended: this report counts tokens and cannot see whether
+            a cheaper model would have needed more attempts, so there is no target
+            here and no direction to move.</span>
+        </details>
       </div></template>
       <template x-if="summary && !summary.model_mix.busiest"><div class="observation">
         No call in this period named a model, so there is no mix to report &mdash;
@@ -2466,6 +2519,26 @@ const HEALTH_OPEN = {
 };
 const HEALTH_OPEN_UNRECOGNISED = true;
 
+// #89: which LEVEL renders the verdict as one line, one entry per view, and a
+// table for exactly the reason `HEALTH_OPEN` is one.
+//
+// The card is chrome -- it qualifies every figure at every level, so it is
+// rendered once, above all three, and cannot be navigated away from. What it
+// may do is spend less height where height is the binding constraint: the
+// summary is the one level with a stated budget, and there the heading and the
+// closed disclosure control are furniture around a verdict that states itself.
+//
+// WHAT IT MAY NEVER COST IS THE VERDICT. The tag and its statement are outside
+// this rule entirely -- they are rendered by one binding in every form of the
+// card -- and `healthOneLine` refuses to shorten any verdict that opens its
+// own evidence, so a `failed` one keeps its heading, its tone and its six open
+// lines on every level including this one.
+//
+// A view this build has never seen gets the FULL card, never the short one:
+// the fallback runs the same direction as every other on this page.
+const HEALTH_COMPACT = { summary: true, overview: false, details: false };
+const HEALTH_COMPACT_UNRECOGNISED = false;
+
 // #88: the same rule on question 2, over the API's own five answers.
 //
 // `yes` is the only PROVEN one -- calls measured at or above the judged
@@ -2947,6 +3020,24 @@ function report() {
         return HEALTH_OPEN_UNRECOGNISED;
       }
       return HEALTH_OPEN[this.summary.health.verdict] ?? HEALTH_OPEN_UNRECOGNISED;
+    },
+
+    // #89: whether the verdict renders as ONE LINE -- tag, statement, nothing
+    // else. True only on the summary level, and only for a verdict that had
+    // already collapsed its own evidence.
+    //
+    // THE ORDER OF THE TWO GUARDS IS THE WHOLE SAFETY PROPERTY. `healthOpen`
+    // is consulted FIRST, so anything that expands itself -- a `failed`
+    // verdict, a state this build has never seen, a load failure -- keeps the
+    // full card at every level. A proven failure therefore cannot be the thing
+    // that got shortened, and that is guaranteed by composition rather than by
+    // a second table somebody would have to keep in step with the first.
+    //
+    // A null summary is not a level decision either: the card renders its own
+    // branches then, and `healthOpen` has already answered for it.
+    get healthOneLine() {
+      if (this.healthOpen) return false;
+      return HEALTH_COMPACT[this.view] ?? HEALTH_COMPACT_UNRECOGNISED;
     },
 
     // --- which question card expands its own evidence (#88) ---------------

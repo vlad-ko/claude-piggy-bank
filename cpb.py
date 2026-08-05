@@ -59,7 +59,7 @@ from typing import NamedTuple, Optional, Sequence
 # manifest below repeats it because Claude Code's plugin loader reads that JSON
 # without running Python and uses the version as its update cache key: an
 # unbumped manifest means installed users are never offered the change.
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 PROG = "cpb"
 

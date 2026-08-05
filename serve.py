@@ -194,18 +194,6 @@ CACHE_METRICS = frozenset(
 )
 
 
-def _metric_unit(metric_key: str) -> str:
-    """What kind of number this metric's readings are.
-
-    A plain lookup, and it RAISES on an unknown key rather than defaulting: the
-    import guard below makes the mapping total over the wired set, so a missing
-    entry here is a caller passing something that is not a metric. A default
-    would render an unclassified figure as a bare float, which is the defect
-    this registry exists to remove.
-    """
-    return METRIC_UNITS[metric_key]
-
-
 def _refuse_ungrouped_cache_metrics(
     cache: frozenset[str], wired: frozenset[str]
 ) -> None:
@@ -220,44 +208,16 @@ def _refuse_ungrouped_cache_metrics(
 
 _refuse_ungrouped_cache_metrics(CACHE_METRICS, RECOMMENDED_METRICS)
 
-# WHAT KIND OF NUMBER EACH READING IS, so the page can render `0.3034` as
-# `30.3%` and `3.195` as `3.20x` (#89 review).
-#
-# A share and a ratio are different kinds of quantity and a reader thinks in
-# percent and in multiples, not in four significant figures. The page had one
-# formatter for both because the payload gave it nothing to tell them apart --
-# `fmtMetric`, which is right for a dimensionless depth and wrong for
-# everything a reader is asked to act on.
-#
-# THE PAGE MUST NEVER LEARN A METRIC KEY. A `if (metric === 'cache_reads_per_
-# write')` in `index.html` would be a third enumeration of the metric set, in
-# the one file no import guard can reach. So the unit crosses on the payload,
-# per reading, and the page holds only a formatter per UNIT.
-#
-# WHERE THIS BELONGS, AND WHY IT IS NOT THERE YET. The unit is a property of
-# the metric and its home is `recommendations.Metric`, beside `measurement` and
-# `worse_when` -- one field on each of the five entries, with `Metric` refusing
-# a unit outside the vocabulary. This branch may not edit that module, so the
-# mapping sits here under `RECOMMENDED_METRICS`' own discipline: declared once,
-# checked EXHAUSTIVE at import in both directions, so a metric added to the
-# table without a unit fails `import serve` rather than reaching a reader as a
-# raw float. Moving it is deleting this block and `_metric_unit()`, adding
-# `unit=` to five `Metric(...)` calls, and reading `metric.unit` instead.
-METRIC_UNIT_SHARE = "share"
-METRIC_UNIT_RATIO = "ratio"
-METRIC_UNIT_COUNT = "count"
-# The closed vocabulary. `count` has no metric today and is declared anyway:
-# the page carries one formatter per member, and a unit added to the table with
-# no formatter is the failure this registry exists to make impossible.
-METRIC_UNIT_KINDS = (METRIC_UNIT_SHARE, METRIC_UNIT_RATIO, METRIC_UNIT_COUNT)
-
-METRIC_UNITS: dict[str, str] = {
-    METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW: METRIC_UNIT_SHARE,
-    METRIC_CACHE_WRITE_ONLY_SHARE: METRIC_UNIT_SHARE,
-    METRIC_CACHE_READS_PER_WRITE: METRIC_UNIT_RATIO,
-    METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL: METRIC_UNIT_RATIO,
-    METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY: METRIC_UNIT_RATIO,
-}
+# WHAT KIND OF NUMBER EACH READING IS -- `30.3%` rather than `0.3034`, `3.20x`
+# rather than `3.195` -- IS NOT DECLARED HERE ANY MORE. It shipped as a
+# `METRIC_UNITS` mapping in this file, under an import-time totality guard,
+# because the branch that added it could not edit `recommendations.py`. The
+# unit is a property of the metric, so it now sits on `recommendations.Metric`
+# beside `measurement`, and the guard's property survives in a stronger form: a
+# metric with no unit, or one outside `METRIC_UNIT_KINDS`, cannot be
+# CONSTRUCTED. Everything below reads `METRICS[key].unit`; a second mapping
+# here would be one enumeration of the metric set too many, which is the defect
+# `RECOMMENDED_METRICS` exists to prevent.
 
 
 def _refuse_unhandled_states(
@@ -673,15 +633,6 @@ STRIP_DOTS = (
     STRIP_DOT_KNOBS,
     STRIP_DOT_CACHE,
 )
-# Every metric has a unit, and every unit is one the vocabulary names. Both
-# directions: a metric with no unit reaches a reader as a raw float, and a unit
-# outside the vocabulary reaches the page with no formatter for it.
-_refuse_unhandled_states("METRIC_UNITS", METRIC_UNITS, RECOMMENDED_METRICS)
-if not set(METRIC_UNITS.values()) <= set(METRIC_UNIT_KINDS):
-    raise RuntimeError(
-        "serve.METRIC_UNITS uses units METRIC_UNIT_KINDS does not name: "
-        f"{sorted(set(METRIC_UNITS.values()) - set(METRIC_UNIT_KINDS))}"
-    )
 _refuse_unhandled_states("STRIP_FROM_HEALTH", STRIP_FROM_HEALTH, HEALTH_ORDER)
 _refuse_unhandled_states(
     "STRIP_FROM_CONTEXT", STRIP_FROM_CONTEXT, CONTEXT_ANSWER_STATES
@@ -2685,8 +2636,17 @@ class Api:
             {
                 "metric": a.metric,
                 "measurement": a.measurement,
+                # WHAT THE NUMBER MEANS TO THE READER, beside the
+                # specification and never instead of it (#89 review). The
+                # summary row printed `measurement` because nothing else
+                # existed, and `measurement` is a definition -- exactly right
+                # under "Measures:" one level down, two lines of jargon on a
+                # row of advice. Both are the table's own words: a sentence
+                # composed here would be a claim with no date and no owner,
+                # which is what `RECOMMENDATION_PROVENANCE` is about.
+                "means": METRICS[a.metric].means,
                 "value": a.value,
-                "unit": _metric_unit(a.metric),
+                "unit": METRICS[a.metric].unit,
                 "severity": a.severity,
                 # The module's own action-oriented phrase, composed from a
                 # closed registry inside `Lever`. Never assembled here: a
@@ -2702,11 +2662,14 @@ class Api:
             {
                 "metric": key,
                 "measurement": METRICS[key].measurement,
-                # A metric with no sample still HAS a unit: what kind of number
-                # it would have been does not depend on whether it was
-                # measured, and the boundaries drawn on its empty dial are in
-                # that unit whether or not a needle joins them.
-                "unit": _metric_unit(key),
+                # A metric with no sample still MEANS what it means and still
+                # HAS a unit: neither depends on whether this window measured
+                # one, and the boundaries drawn on an empty dial are in that
+                # unit whether or not a needle joins them. A row that lost its
+                # sentence when the sample went missing would say less about
+                # the absence than about the reading.
+                "means": METRICS[key].means,
+                "unit": METRICS[key].unit,
                 # THREE NULLS, and none of them a zero. No reading, no
                 # severity, nothing to do -- the gauge below carries no needle
                 # for the same reason, and `unmeasured_note` beside it says so
@@ -2997,7 +2960,7 @@ class Api:
             # `0.3034` as `30.3%` and as `0.3034` would be the same number in
             # two voices, which is the drift a levelled page makes easy even
             # when the value itself cannot move.
-            "unit": _metric_unit(assessment.metric),
+            "unit": METRICS[assessment.metric].unit,
             "severity": assessment.severity,
             "recommendation": assessment.recommendation,
             "lever": cls._lever_payload(assessment.lever),
