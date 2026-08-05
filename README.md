@@ -45,7 +45,7 @@ that ships the numbers themselves — ingest, the server, the page — has no mo
 in it at all. This is a rule CPB imposes on itself, not one Claude Code imposes
 on plugins.
 
-CPB is **1.1.0** and follows [Semantic
+CPB is **<!--cpb:version-->1.2.0<!--/cpb:version-->** and follows [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html). What that promises you is
 written down rather than left to be guessed at: the command line, the HTTP API,
 and **what each figure measures** are the interface, so a number that changes
@@ -346,9 +346,8 @@ judgments together, each one carries its own provenance. One "sources" line at
 the foot of a table is not enough, because you will read it as covering the row
 you happen to be looking at — so a judged number sitting beside a cited one
 would quietly inherit its credibility. The case that settled it is the
-recommendation table being built under
-[#78](https://github.com/vlad-ko/claude-piggy-bank/issues/78) — not shipped
-yet, but the rule is decided. It keys advice on ranges, and two of its
+recommendation table in
+[#78](https://github.com/vlad-ko/claude-piggy-bank/issues/78), which shipped it. It keys advice on ranges, and two of its
 boundaries are different kinds of thing: **1.0** cache reads per write is
 *documented*, because a single cache read already repays the 5-minute
 cache-write markup (the arithmetic and its source are in

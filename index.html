@@ -52,6 +52,15 @@
      fact; it must not look like the sentence above it. */
   .context-line { display:block; margin-top:5px; }
   .context-judged { font-style:italic; border-left:3px solid #818cf8; padding-left:8px; }
+  /* #78's advice band. `advice-line` is the sub-line of one assessment; the two
+     provenance classes are the per-BOUNDARY grain of the same rule
+     `context-judged` applies to the bands -- a judged cut point must not look
+     like a documented one, and here the two can sit on the two ends of a single
+     range, so the marking is on the edge rather than on the block. */
+  .advice-line { display:block; margin-top:2px; padding-left:14px; }
+  .advice-judged { font-style:italic; border-left:3px solid #818cf8; padding-left:8px; margin-left:6px; }
+  .advice-cited { border-left:3px solid #0f766e; padding-left:8px; margin-left:6px; }
+  .advice-structural { border-left:3px solid #9ca3af; padding-left:8px; margin-left:6px; }
   .util-band { display:inline-block; margin:0 16px 0 0; }
   tbody tr.unmeasured { color:var(--muted); }
   .chartbox { position:relative; height:340px; }
@@ -443,6 +452,142 @@
     </span></template>
   </div>
 
+  <!-- #78/#79: the recommendation table's consumer.
+       ==============================================
+
+       CONSTRAINT 4 (do not overwhelm the UI). This is a note-band, not a
+       table, and it is the page's existing idiom for ANNOTATING the figures
+       above rather than restating them: `#scope-note` annotates the cards and
+       `#context-note` annotates the context card. Every one of the four
+       assessments is a lookup of a figure this page already carries the inputs
+       for -- the saturation share off the per-scope bands directly above, the
+       two cache figures off the cache-read and cache-write cards, the reply
+       ratio off the main-vs-subagent split -- so what earns the space is the
+       verdict on those numbers, not a second copy of them.
+
+       THE RENDERING IS DELIBERATELY PROVISIONAL. #70 splits the report into an
+       overview and a details view; the ranked levers belong on the overview
+       under #66 (ranked opportunities) and #67 (next steps), which is where
+       their shape gets decided. This band exists so the assessments are
+       visible and auditable NOW, not as a layout anyone should preserve. Do
+       not mistake it for a decision.
+
+       THE PAGE PERFORMS NO LOOKUP AND HOLDS NO THRESHOLD (#78). Every
+       boundary, every severity, every word of advice and both provenances are
+       read off `/api/summary`. `tests/test_serve.py` asserts that none of the
+       table's prose appears in this file: advice that could be edited here
+       would be advice with no date, no provenance and no redline.
+
+       AN `ok` IS A POSITIVE STATEMENT and is rendered as one. Healthy entries
+       are shown, not omitted -- if "nothing to change here" were represented
+       by absence, healthy and unmeasured would render identically, which is
+       the rule this repository is built on. Unmeasured metrics get the API's
+       own `unmeasured_note` for the same reason, never a dash and never a 0.
+
+       TWO VOICES, PER BOUNDARY. `#context-note` keeps the documented window
+       and the judged band boundaries in two separately marked voices. Here the
+       same rule runs one level down: a single range can have a CITED lower
+       edge and a JUDGED upper edge, so the marking is on the edge. A judged
+       cut point rendered in a cited one's voice would borrow an authority
+       nobody earned -- which is why the API carries `kind` per boundary and
+       why a judged provenance structurally cannot carry a source. -->
+  <div class="note-band" id="advice-note">
+    <template x-if="!summary"><span>Loading recommendations&hellip;</span></template>
+    <template x-if="summary"><span>
+      <strong>What to change, worst first.</strong>
+      Each line looks one figure above up in a dated table of ranges
+      (decided <span x-text="summary.recommendations.as_of"></span>).
+      <span class="context-line context-judged">Table:
+        <span x-text="summary.recommendations.provenance"></span></span>
+      <span class="context-line context-judged">Order:
+        <span x-text="summary.recommendations.ranking_provenance"></span></span>
+
+      <template x-for="(a, i) in summary.recommendations.ranked" :key="a.metric">
+        <span class="context-line">
+          <strong x-text="'#' + (i + 1) + ' ' + a.severity.toUpperCase()"></strong>
+          &mdash; <strong x-text="a.metric"></strong> =
+          <strong x-text="fmtMetric(a.value)"></strong>
+          <span class="advice-line">Measures: <span x-text="a.measurement"></span>.</span>
+          <span class="advice-line" x-text="a.recommendation"></span>
+          <!-- The lever is the machine-readable half, shown beside the prose so
+               a reader can see WHAT is being changed and WHICH WAY without
+               parsing the sentence. `directive` is composed in the module from
+               a closed registry -- never here -- which is what makes "reduce
+               your cache-read" unrepresentable rather than merely absent. -->
+          <template x-if="a.lever"><span class="advice-line">Lever:
+            <strong x-text="a.lever.directive"></strong>
+            (<span x-text="a.lever.action"></span>
+            <span class="mono" x-text="a.lever.target"></span>).</span></template>
+          <!-- A healthy entry carries NO lever by construction, and says so
+               rather than showing an empty space where the other rows have
+               one. Absence with no explanation is the thing this page refuses
+               to render. -->
+          <template x-if="!a.lever"><span class="advice-line">No lever: this is a
+            healthy reading, so there is nothing here to change.</span></template>
+          <span class="advice-line">Range
+            <strong x-text="fmtMetric(a.range_lower)"></strong> to
+            <strong x-text="a.range_upper === null ? 'no ceiling' : fmtMetric(a.range_upper)"></strong>,
+            <!-- The key the order was derived from, published beside the order
+                 it produced: `RANKED_BY`'s rule, and the reason
+                 `ranking_provenance` above is a field rather than a comment. -->
+            ranked <span x-text="fmtMetric(a.depth_in_severity)"></span> into the
+            <span x-text="a.severity"></span> band.</span>
+          <!-- The two edges, each in its own voice. Written out twice rather
+               than looped, because a helper that reshaped them would spell the
+               field names in JavaScript where the wiring guard cannot follow
+               them to the payload. `covers` rides in the tooltip: it is a
+               paragraph qualifying exactly what the citation does and does not
+               cover, and it must be READABLE without displacing the verdict. -->
+          <span class="advice-line" :class="provenanceVoice(a.lower_provenance)">
+            Lower edge <span x-text="fmtMetric(a.range_lower)"></span> &mdash;
+            <strong x-text="a.lower_provenance.kind"></strong>:
+            <span x-text="a.lower_provenance.statement"></span>
+            <template x-if="a.lower_provenance.checked"><span>(<span
+              x-text="a.lower_provenance.checked"></span>)</span></template>
+            <template x-if="a.lower_provenance.source"><span>Source:
+              <span class="mono" :title="a.lower_provenance.covers"
+                    x-text="a.lower_provenance.source"></span>
+              &mdash; hover for what it covers.</span></template>
+          </span>
+          <template x-if="a.upper_provenance">
+            <span class="advice-line" :class="provenanceVoice(a.upper_provenance)">
+              Upper edge <span x-text="fmtMetric(a.range_upper)"></span> &mdash;
+              <strong x-text="a.upper_provenance.kind"></strong>:
+              <span x-text="a.upper_provenance.statement"></span>
+              <template x-if="a.upper_provenance.checked"><span>(<span
+                x-text="a.upper_provenance.checked"></span>)</span></template>
+              <template x-if="a.upper_provenance.source"><span>Source:
+                <span class="mono" :title="a.upper_provenance.covers"
+                      x-text="a.upper_provenance.source"></span>
+                &mdash; hover for what it covers.</span></template>
+            </span>
+          </template>
+        </span>
+      </template>
+
+      <!-- UNMEASURED IS NAMED, NEVER DROPPED. A metric with no sample that
+           simply vanished would be indistinguishable from a healthy one, which
+           is the defect the whole table exists to avoid -- so the API's own
+           note is rendered against each, and never a dash or a 0.
+
+           Consumed WHOLE, like `context.percentiles`: the keys are metric
+           names the server decides, so the page cannot name them in advance
+           and does not try. `e[0]` is the metric, `e[1]` what would have been
+           measured. -->
+      <template x-if="Object.keys(summary.recommendations.unmeasured).length"><span
+            class="context-line">
+        <strong>Not measured in this period.</strong>
+        <template x-for="e in Object.entries(summary.recommendations.unmeasured)" :key="e[0]">
+          <span class="advice-line">
+            <strong x-text="e[0]"></strong> &mdash;
+            <span x-text="summary.recommendations.unmeasured_note"></span>
+            Would measure: <span x-text="e[1]"></span>.
+          </span>
+        </template>
+      </span></template>
+    </span></template>
+  </div>
+
   <div class="panel">
     <h2>Daily token usage
       <span class="toggle">
@@ -723,6 +868,37 @@ function bandRange(b) {
 function fmtRatio(x) {
   if (x === null || x === undefined) return "—";
   return x.toFixed(2) + "×";
+}
+// #78's readings are shares (0-1) and unbounded ratios in one list, so they get
+// one significant-figures formatter rather than a per-metric unit the payload
+// would have to carry. What each number IS, is stated beside it by the metric's
+// own `measurement` string, which is the field that names what was divided by
+// what -- so the page never has to guess whether it is holding a percentage.
+//
+// Absence first, as everywhere: `(0).toPrecision` is a real 0 and `null` is not
+// a reading at all, and a formatter that let the second print like the first
+// would undo the rule the whole block is built on.
+function fmtMetric(x) {
+  if (x === null || x === undefined) return "—";
+  return String(Number(x.toPrecision(4)));
+}
+// Which VOICE a boundary is stated in -- one class per provenance KIND, and
+// the three must stay visibly different. A judged cut point rendered like a
+// cited one inherits an authority nobody earned, which is #31's
+// `band_provenance` failure mode at #78's per-boundary grain; the page carries
+// it as a TABLE so a test can assert the three are distinct, rather than as a
+// chain of ifs where two branches could quietly return the same class.
+const PROVENANCE_VOICE = {
+  cited: "advice-cited",
+  judged: "advice-judged",
+  structural: "advice-structural",
+};
+// An unrecognised kind falls back to the JUDGED marking, the most cautious of
+// the three, never to the cited one and never to no marking at all: a boundary
+// this page cannot classify is exactly the one that must not read as
+// documented.
+function provenanceVoice(p) {
+  return PROVENANCE_VOICE[p.kind] ?? PROVENANCE_VOICE.judged;
 }
 function fmtTokRounded(n) {
   // The guard comes BEFORE the rounding on purpose: `Math.round(null)` is 0,

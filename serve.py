@@ -64,6 +64,21 @@ from ingest import (
     SUBAGENTS_DIR,
     TASKS_DIR,
 )
+from recommendations import (
+    METRIC_CACHE_READS_PER_WRITE,
+    METRIC_CACHE_WRITE_ONLY_SHARE,
+    METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,
+    METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
+    METRICS,
+    RANKING_PROVENANCE,
+    RECOMMENDATION_PROVENANCE,
+    RECOMMENDATIONS_AS_OF,
+    UNMEASURED_NOTE,
+    Assessment,
+    Lever,
+    Provenance,
+    assess_all,
+)
 EASTERN = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
 VENDOR_DIR = (HERE / "vendor").resolve()
@@ -207,6 +222,21 @@ UTIL_NO_SAMPLE_NO_CONTEXT_MEASUREMENT = (
 UTIL_NO_SAMPLE_NO_DOCUMENTED_WINDOW = (
     "every measured call in this scope ran on a model with no documented "
     "context window, so none of them has a utilisation"
+)
+
+# #78: half the window, as a FRACTION of it -- the point
+# `METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW` counts from. Named rather than
+# written `0.5` inline in the comprehension below, because it is the same
+# judgment `BANDS` already made and the two must be able to be read together.
+HALF_WINDOW = 0.5
+# The bands whose lower edge is at or above half the window, DERIVED from
+# `BANDS` rather than listed. The metric's `measurement` says "reaches at least
+# half the model's documented window", and names `50-to-90` and `at-least-90`
+# as what that is TODAY; a band table that later gained a cut at 0.6 would be
+# part of "at least half" by that definition, and a hand-written pair of keys
+# would silently drop it out of the numerator. Currently exactly those two.
+OVER_HALF_WINDOW_BANDS = frozenset(
+    key for key, _label, lower, _upper in BANDS if lower >= HALF_WINDOW
 )
 
 # #44: the same rule on a SECOND axis -- which PROJECTS a figure ranges over.
@@ -1102,6 +1132,259 @@ class Api:
             ),
         }
 
+    # ----------------------------------------------------------------------
+    # #78: the recommendation table, evaluated here and only here
+    # ----------------------------------------------------------------------
+
+    def _recommendations(
+        self, start: float, end: float, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        """What the window's own figures fall in `recommendations.METRICS`.
+
+        The consumer `recommendations.py` shipped without (#78). The lookup is
+        arithmetic and the advice is data, so the same corpus always yields the
+        same advice and a fixed problem makes its recommendation STOP firing --
+        which is what makes the report dynamic without making it generative
+        (constraint 3: no model produces a figure).
+
+        **The four values are computed from each metric's `measurement` string,
+        not from its key.** That field names exactly what is divided by what,
+        and it is the thing a reader checks the advice against; a query that
+        agreed with the key and disagreed with the measurement would be a wrong
+        number that reads right. Two of the four say so in as many words --
+        `main_vs_subagent_tokens_per_reply` is per API CALL, not per assistant
+        turn, whatever "reply" suggests.
+
+        **A zero denominator yields None, never 0.** `assess()` refuses a
+        non-finite value precisely so this cannot arrive as `inf`, and a share
+        of an empty set is not 0% (the rule `_utilisation_bands()` already
+        applies one block up). A project that never dispatched a subagent has
+        NO ratio of main to subagent tokens -- not a ratio of zero, and not a
+        healthy one -- so it is passed as None and comes back named in
+        `unmeasured`.
+
+        **The mapping handed to `assess_all()` is COMPLETE**, every metric
+        present with None where there is no sample. The module refuses a
+        partial one, and that refusal is right: a caller that forgot a metric
+        and a caller that measured nothing would otherwise produce the same
+        page, and only one of them is telling the truth.
+
+        `context` is passed in rather than recomputed, so the main-thread
+        saturation share is read off the SAME per-scope band tally the page
+        renders. A second query would be a second definition of "over half the
+        window", free to drift from the one the reader is looking at -- the
+        defect `avg_context` and `context.mean` were joined at the hip to stop
+        (#25).
+        """
+        values: dict[str, Optional[float]] = {
+            METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW: (
+                self._main_thread_over_half_window_share(context)
+            ),
+            **self._cache_reuse_metrics(start, end),
+            METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY: (
+                self._main_vs_subagent_tokens_per_call(start, end)
+            ),
+        }
+        assessed = assess_all(values)
+        return {
+            # Two fields, as `context.utilisation` carries `bands_as_of` beside
+            # `band_provenance`: the date the judgments were last decided is a
+            # fact a reader weighs on its own, and burying it inside a sentence
+            # makes it something they have to parse out.
+            "as_of": RECOMMENDATIONS_AS_OF,
+            "provenance": RECOMMENDATION_PROVENANCE,
+            # The ORDER is itself a judgment and carries its own provenance --
+            # `RANKED_BY`'s discipline (a ranking must name the key it orders
+            # by) at the point where the key is a derived depth rather than a
+            # column.
+            "ranking_provenance": RANKING_PROVENANCE,
+            "unmeasured_note": UNMEASURED_NOTE,
+            "ranked": [self._assessment_payload(a) for a in assessed.ranked],
+            # A MAPPING, metric -> what would have been measured, not a list of
+            # rows: an unmeasured metric has no reading, no severity and no
+            # advice, so there are no columns to tabulate. `UNMEASURED_NOTE`
+            # above is the one thing there is to say about every member, said
+            # once. The page consumes it whole, exactly as it consumes
+            # `context.percentiles`, so every member reaches a reader by
+            # construction however many there are.
+            "unmeasured": {
+                key: METRICS[key].measurement for key in assessed.unmeasured
+            },
+        }
+
+    @staticmethod
+    def _main_thread_over_half_window_share(
+        context: dict[str, Any],
+    ) -> Optional[float]:
+        """`METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW`, off the rendered tally.
+
+        Numerator: main-thread banded calls in `OVER_HALF_WINDOW_BANDS`.
+        Denominator: main-thread calls with a known window, which is exactly
+        `banded_calls` -- a call is banded if and only if its context was
+        measured AND its model has a documented window.
+
+        None when that denominator is 0, which is three different absences
+        (`no_sample_reason` says which) and no share at all.
+        """
+        for scope in context["utilisation"]["by_scope"]:
+            if scope["scope"] != SCOPE_MAIN:
+                continue
+            banded_calls = scope["banded_calls"]
+            if not banded_calls:
+                return None
+            over_half = sum(
+                band["calls"]
+                for band in scope["bands"]
+                if band["band"] in OVER_HALF_WINDOW_BANDS
+            )
+            return over_half / banded_calls
+        # Unreachable while `_context()` emits every scope in `SCOPE_ORDER`,
+        # and None rather than 0.0 if that ever changes: a main-thread share
+        # this function could not find is not a main-thread share of nothing.
+        return None
+
+    def _cache_reuse_metrics(
+        self, start: float, end: float
+    ) -> dict[str, Optional[float]]:
+        """`METRIC_CACHE_READS_PER_WRITE` and `METRIC_CACHE_WRITE_ONLY_SHARE`.
+
+        One pass, because both range over the same rows and a second query
+        would be a second sample. Both scopes, which is what the first
+        metric's `measurement` says -- a prefix stored by a subagent and read
+        back by it is the same arithmetic as the main thread's.
+
+        Both are undefined when no call wrote cache, and the two denominators
+        are different quantities that happen to vanish together: `SUM(cache_
+        write)` is tokens and `writing_calls` is calls. Each is checked on its
+        own rather than one standing in for the other.
+
+        `SUM` over no rows is SQL NULL, which is the same answer as 0 here --
+        no call wrote cache -- and both take the None branch.
+        """
+        row = self.conn.execute(
+            "SELECT SUM(cache_read) reads, SUM(cache_write) writes,"
+            " SUM(CASE WHEN cache_write > 0 THEN 1 ELSE 0 END) writing_calls,"
+            " SUM(CASE WHEN cache_write > 0 AND cache_read = 0 THEN 1 ELSE 0 END)"
+            "   write_only_calls"
+            " FROM api_calls WHERE ts >= ? AND ts < ?",
+            (start, end),
+        ).fetchone()
+        writes = row["writes"]
+        writing_calls = row["writing_calls"]
+        return {
+            METRIC_CACHE_READS_PER_WRITE: (
+                (row["reads"] / writes) if writes else None
+            ),
+            METRIC_CACHE_WRITE_ONLY_SHARE: (
+                (row["write_only_calls"] / writing_calls) if writing_calls else None
+            ),
+        }
+
+    def _main_vs_subagent_tokens_per_call(
+        self, start: float, end: float
+    ) -> Optional[float]:
+        """`METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY`, per the measurement.
+
+        Mean total tokens per main-thread API CALL over mean total tokens per
+        subagent API call. The metric's key says "per reply" and its
+        `measurement` says "per API call"; the measurement is the one that
+        names what is divided by what, so it is the one implemented.
+
+        None unless BOTH scopes ran at least one call. A project that never
+        dispatched a subagent has no ratio -- the module's own words -- and an
+        empty subagent scope divided into a main-thread mean is exactly the
+        `inf` `assess()` refuses. None too if the subagent mean is 0, which is
+        a real reading (calls that reported no tokens at all) but still a zero
+        denominator, and so still not a ratio.
+        """
+        means: dict[str, float] = {}
+        for row in self.conn.execute(
+            f"SELECT source_kind, COUNT(*) calls, SUM({TOTAL_TOKENS_SQL}) total"
+            " FROM api_calls WHERE ts >= ? AND ts < ? GROUP BY source_kind",
+            (start, end),
+        ):
+            if row["calls"]:
+                means[row["source_kind"]] = (row["total"] or 0) / row["calls"]
+        main = means.get(SOURCE_MAIN)
+        subagent = means.get(SOURCE_SUBAGENT)
+        if main is None or not subagent:
+            return None
+        return main / subagent
+
+    @classmethod
+    def _assessment_payload(cls, assessment: Assessment) -> dict[str, Any]:
+        """One `Assessment`, flattened for JSON with its provenances intact.
+
+        Both range edges cross with their OWN provenance and each provenance
+        keeps its `kind`, so a cited boundary and a judged one are
+        distinguishable in the payload rather than only in a comment (#78).
+        That is the whole point: flattened to one table-level provenance line,
+        the judged `0.25` would borrow the cited `1.0`'s authority, which is
+        `band_provenance`'s failure mode one level down (#31).
+        """
+        return {
+            "metric": assessment.metric,
+            "measurement": assessment.measurement,
+            "value": assessment.value,
+            "severity": assessment.severity,
+            "recommendation": assessment.recommendation,
+            "lever": cls._lever_payload(assessment.lever),
+            # The key the ranking orders by, published beside the order it
+            # produced -- `RANKED_BY`'s rule, and the reason
+            # `ranking_provenance` is a field rather than a comment.
+            "depth_in_severity": assessment.depth_in_severity,
+            "range_lower": assessment.range_lower,
+            "range_upper": assessment.range_upper,
+            "lower_provenance": cls._provenance_payload(
+                assessment.lower_provenance
+            ),
+            "upper_provenance": cls._provenance_payload(
+                assessment.upper_provenance
+            ),
+        }
+
+    @staticmethod
+    def _lever_payload(lever: Optional[Lever]) -> Optional[dict[str, Any]]:
+        """The machine-readable half of a recommendation, or None.
+
+        None for a healthy entry, which the module guarantees carries no lever:
+        "nothing to change" and "change this" cannot both be true.
+
+        `directive` is READ off the module, never composed here. `lever()`
+        refuses to build a reduce-directive over a discounted token class, and
+        a directive assembled in this file from `action` and `target` would
+        route around that guard -- "Reduce cache-read tokens" is wrong at every
+        scale, and the point of the registry is that it cannot be said.
+        """
+        if lever is None:
+            return None
+        return {
+            "action": lever.action,
+            "target": lever.target,
+            "directive": lever.directive,
+        }
+
+    @staticmethod
+    def _provenance_payload(
+        provenance: Optional[Provenance],
+    ) -> Optional[dict[str, Any]]:
+        """One boundary's provenance, `kind` included, or None for an open end.
+
+        `source`, `checked` and `covers` stay NULL where the kind has none --
+        never "", never "n/a". A judged boundary structurally cannot carry a
+        source (the module raises), and null is how the page can tell that it
+        does not have one rather than that nobody filled it in.
+        """
+        if provenance is None:
+            return None
+        return {
+            "kind": provenance.kind,
+            "statement": provenance.statement,
+            "checked": provenance.checked,
+            "source": provenance.source,
+            "covers": provenance.covers,
+        }
+
     @staticmethod
     def _no_band_sample_reason(
         calls: int, sample_calls: int, banded_calls: int
@@ -1267,6 +1550,12 @@ class Api:
         `context_calls` / `unmeasured_calls` beside it (#25). It is therefore
         the same number as `context.mean`, over the same sample -- one
         definition of "measured", used by both.
+
+        `context` is computed ONCE and handed to `_recommendations()`, which
+        reads the main-thread saturation share off the same per-scope tally the
+        page renders. Recomputing it there would put two definitions of "over
+        half the window" in one payload, free to disagree with each other and
+        with the bands the reader is looking at.
         """
         row = self.conn.execute(
             "SELECT COUNT(*) calls, COUNT(DISTINCT session_id) sessions,"
@@ -1276,13 +1565,15 @@ class Api:
             " FROM api_calls WHERE ts >= ? AND ts < ?",
             (start, end),
         ).fetchone()
+        context = self._context(start, end)
         return {
             **dict(row),
             "ingest": self._ingest_health(),
-            "context": self._context(start, end),
+            "context": context,
             "scope": self._scope(start, end),
             "durability": self._durability(start, end),
             "models": self.models(start, end),
+            "recommendations": self._recommendations(start, end, context),
         }
 
     def timeseries(self, start: float, end: float, by: str) -> dict[str, Any]:
