@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -1849,6 +1850,596 @@ class AdditiveSchemaUpgradeTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(archived, 1, "the archived source survived the upgrade")
+
+
+# An appended API call whose every token class is DELIBERATELY UNEQUAL to
+# every other number in these fixtures, so a swapped column mapping or a
+# double-insert cannot pass the changed-file assertions below.
+APPENDED_CALL = (
+    '{"type":"assistant","sessionId":"session-fixture",'
+    '"timestamp":"2026-07-28T15:20:00.000Z","isSidechain":false,'
+    '"message":{"id":"msg_appended","model":"claude-sonnet-5-20260115",'
+    '"usage":{"input_tokens":3,"cache_creation_input_tokens":5,'
+    '"cache_read_input_tokens":11,"output_tokens":13}}}\n'
+)
+APPENDED = {"i": 3, "cw": 5, "cr": 11, "o": 13}
+APPENDED_SUBAGENT_CALL = (
+    '{"type":"assistant","sessionId":"session-fixture","agentId":"agent-atest1",'
+    '"timestamp":"2026-07-28T15:05:00.000Z","isSidechain":true,"message":'
+    '{"id":"msg_sub_appended","model":"claude-sonnet-5-20260115",'
+    '"usage":{"input_tokens":17,"cache_creation_input_tokens":19,'
+    '"cache_read_input_tokens":23,"output_tokens":29}}}\n'
+)
+
+
+class SingleFileIngestTest(unittest.TestCase):
+    """`--transcript <path>`: ingest exactly ONE file, for hook-driven ingest.
+
+    A Claude Code hook is handed the path of the transcript that just changed,
+    so re-scanning the whole tree is pure waste -- measured against a local
+    transcript corpus of 2,891 files on 2026-08-04: 1.18-2.44 s for a no-op
+    directory scan, 4.09 s when one file had changed.
+
+    The load-bearing constraint is what this mode must NOT do. It looks at one
+    file, so it has no basis whatsoever to conclude anything about any other
+    source: it must never archive, prune or rewrite rows it did not look at.
+    Marking a whole corpus as gone because one hook fired would be exactly the
+    silent, unrecoverable loss the archive rules exist to prevent.
+    """
+
+    MAIN = {"i": 118, "cw": 233, "cr": 456, "o": 76, "n": 5}
+    SUB = {"i": 1030, "cw": 2060, "cr": 4090, "o": 620, "n": 2}
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-single-file-test-"))
+        self.projects_dir, self.tasks_dir = build_corpus(self.tmp)
+        self.main_path = self.projects_dir / "session-fixture.jsonl"
+        subs = self.projects_dir / "session-fixture" / "subagents"
+        self.agent1_path = subs / "agent-atest1.jsonl"
+        self.agent2_path = subs / "agent-atest2.jsonl"
+        # A SECOND main-thread source, so "the file I was pointed at" and
+        # "every other source in this DB" are distinguishable.
+        self.other_path = self.projects_dir / "second-session.jsonl"
+        shutil.copy(FIXTURE, self.other_path)
+        self.db_path = self.tmp / "usage.db"
+        # A DB that already holds a full corpus -- the state a hook actually
+        # fires into.
+        self.baseline = ingest(
+            self.projects_dir, self.db_path, tasks_dir=self.tasks_dir
+        )
+        self.fresh_db = self.tmp / "fresh.db"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def rows(self, db: Path, sql: str, *params) -> list:
+        conn = sqlite3.connect(db)
+        try:
+            conn.row_factory = sqlite3.Row
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+    def q1(self, db: Path, sql: str, *params) -> sqlite3.Row:
+        found = self.rows(db, sql, *params)
+        self.assertTrue(found, f"query returned no row: {sql}")
+        return found[0]
+
+    def append(self, path: Path, record: str) -> None:
+        """Make a source genuinely CHANGED, so the next ingest re-parses it.
+
+        Every "leaves everything else alone" assertion below has to run against
+        the INGEST path, not the skip path -- a test that silently exercises
+        the skip path proves nothing about the writes, and one of these did
+        until a mutation caught it.
+        """
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(record)
+
+    def runs(self, db: Path) -> list:
+        return [tuple(r) for r in self.rows(
+            db, "SELECT * FROM subagent_runs ORDER BY agent_id")]
+
+    # ---- the two source kinds -------------------------------------------
+
+    def test_main_thread_transcript_is_ingested_alone(self) -> None:
+        summary = ingest_mod.ingest_transcript(self.main_path, self.fresh_db)
+        self.assertEqual(summary["files_ingested"], 1)
+        row = self.q1(
+            self.fresh_db,
+            "SELECT COUNT(*) n, SUM(input_tokens) i, SUM(cache_write) cw,"
+            " SUM(cache_read) cr, SUM(output_tokens) o FROM api_calls",
+        )
+        self.assertEqual(
+            (row["n"], row["i"], row["cw"], row["cr"], row["o"]),
+            (self.MAIN["n"], self.MAIN["i"], self.MAIN["cw"], self.MAIN["cr"],
+             self.MAIN["o"]),
+        )
+        # EXACTLY that file: the sibling subagent transcripts and the second
+        # main transcript sit right there on disk and must not be swept in.
+        self.assertEqual(
+            [r["source_path"] for r in self.rows(
+                self.fresh_db, "SELECT DISTINCT source_path FROM api_calls")],
+            [str(self.main_path)],
+        )
+        self.assertEqual(
+            self.q1(self.fresh_db, "SELECT COUNT(*) n FROM ingest_state")["n"], 1
+        )
+
+    def test_subagent_transcript_is_ingested_alone(self) -> None:
+        summary = ingest_mod.ingest_transcript(
+            self.agent1_path, self.fresh_db, tasks_dir=self.tasks_dir
+        )
+        self.assertEqual(summary["files_ingested"], 1)
+        row = self.q1(
+            self.fresh_db,
+            "SELECT COUNT(*) n, SUM(input_tokens) i, SUM(cache_write) cw,"
+            " SUM(cache_read) cr, SUM(output_tokens) o, SUM(is_sidechain) side"
+            " FROM api_calls",
+        )
+        self.assertEqual(
+            (row["n"], row["i"], row["cw"], row["cr"], row["o"]),
+            (self.SUB["n"], self.SUB["i"], self.SUB["cw"], self.SUB["cr"],
+             self.SUB["o"]),
+        )
+        self.assertEqual(row["side"], self.SUB["n"])
+        call = self.q1(
+            self.fresh_db,
+            "SELECT source_kind, agent_id, session_id, turn_id FROM api_calls LIMIT 1",
+        )
+        # The identity comes from the PATH, exactly as the directory globs
+        # derive it: never the `agent-<id>` filename as a session.
+        self.assertEqual(call["source_kind"], "subagent")
+        self.assertEqual(call["agent_id"], "atest1")
+        self.assertEqual(call["session_id"], "session-fixture")
+        self.assertIsNone(call["turn_id"])
+        # A subagent transcript has no turns of its own.
+        self.assertEqual(
+            self.q1(self.fresh_db, "SELECT COUNT(*) n FROM turns")["n"], 0
+        )
+
+    def test_subagent_run_row_is_recorded_for_the_ingested_agent(self) -> None:
+        ingest_mod.ingest_transcript(
+            self.agent1_path, self.fresh_db, tasks_dir=self.tasks_dir
+        )
+        run = self.q1(
+            self.fresh_db, "SELECT * FROM subagent_runs WHERE agent_id = 'atest1'"
+        )
+        self.assertEqual(run["status"], "ingested")
+        self.assertEqual(run["agent_type"], "laravel-expert")
+        self.assertEqual(run["description"], "Fix widget")
+
+    def test_subagent_calls_follow_the_DISPATCHING_session(self) -> None:
+        # atest2 is STORED under session-fixture but DISPATCHED by
+        # other-session. Directory mode charges the dispatcher; single-file
+        # mode must agree, or which session pays depends on which command
+        # happened to ingest the file -- and an unchanged file is SKIPPED
+        # forever afterwards, so the wrong attribution would never be revised.
+        ingest_mod.ingest_transcript(
+            self.agent2_path, self.fresh_db, tasks_dir=self.tasks_dir
+        )
+        self.assertEqual(
+            self.q1(self.fresh_db, "SELECT session_id s FROM api_calls")["s"],
+            "other-session",
+        )
+
+    def test_without_a_task_index_attribution_falls_back_to_the_store(self) -> None:
+        # No index -> the dispatcher is UNKNOWN, so the storing directory is
+        # used and said so, rather than a dispatcher being invented.
+        ingest_mod.ingest_transcript(
+            self.agent2_path, self.fresh_db, tasks_dir=self.tmp / "absent"
+        )
+        self.assertEqual(
+            self.q1(self.fresh_db, "SELECT session_id s FROM api_calls")["s"],
+            "session-fixture",
+        )
+        self.assertIsNone(
+            self.q1(
+                self.fresh_db,
+                "SELECT dispatching_session_id d FROM subagent_runs"
+                " WHERE agent_id = 'atest2'",
+            )["d"]
+        )
+
+    # ---- incremental + idempotent ---------------------------------------
+
+    def test_running_twice_in_a_row_does_not_duplicate_rows(self) -> None:
+        ingest_mod.ingest_transcript(self.main_path, self.fresh_db)
+        before = tuple(self.q1(
+            self.fresh_db,
+            "SELECT (SELECT COUNT(*) FROM api_calls) a,"
+            " (SELECT COUNT(*) FROM turns) t,"
+            " (SELECT COUNT(*) FROM agent_dispatches) d,"
+            " (SELECT COUNT(*) FROM ingest_state) s,"
+            " (SELECT COUNT(*) FROM sessions) e",
+        ))
+        second = ingest_mod.ingest_transcript(self.main_path, self.fresh_db)
+        after = tuple(self.q1(
+            self.fresh_db,
+            "SELECT (SELECT COUNT(*) FROM api_calls) a,"
+            " (SELECT COUNT(*) FROM turns) t,"
+            " (SELECT COUNT(*) FROM agent_dispatches) d,"
+            " (SELECT COUNT(*) FROM ingest_state) s,"
+            " (SELECT COUNT(*) FROM sessions) e",
+        ))
+        self.assertEqual(before, after)
+        # Skipped, not merely deduplicated on the way in: an unchanged file
+        # must not be re-parsed at all, which is the whole point of the mode.
+        self.assertEqual(second["files_skipped"], 1)
+        self.assertEqual(second["files_ingested"], 0)
+        self.assertEqual(second["records_parsed"], 0)
+
+    def test_changed_transcript_is_reparsed_without_duplication(self) -> None:
+        ingest_mod.ingest_transcript(self.main_path, self.fresh_db)
+        with open(self.main_path, "a", encoding="utf-8") as fh:
+            fh.write(APPENDED_CALL)
+        summary = ingest_mod.ingest_transcript(self.main_path, self.fresh_db)
+        self.assertEqual(summary["files_ingested"], 1)
+        row = self.q1(
+            self.fresh_db,
+            "SELECT COUNT(*) n, SUM(input_tokens) i, SUM(cache_write) cw,"
+            " SUM(cache_read) cr, SUM(output_tokens) o FROM api_calls",
+        )
+        self.assertEqual(row["n"], self.MAIN["n"] + 1)
+        self.assertEqual(row["i"], self.MAIN["i"] + APPENDED["i"])
+        self.assertEqual(row["cw"], self.MAIN["cw"] + APPENDED["cw"])
+        self.assertEqual(row["cr"], self.MAIN["cr"] + APPENDED["cr"])
+        self.assertEqual(row["o"], self.MAIN["o"] + APPENDED["o"])
+        # ...and the turns did not double either.
+        self.assertEqual(
+            self.q1(self.fresh_db, "SELECT COUNT(*) n FROM turns")["n"], 3
+        )
+
+    def test_unparsed_records_are_still_counted_not_swallowed(self) -> None:
+        summary = ingest_mod.ingest_transcript(self.main_path, self.fresh_db)
+        self.assertEqual(summary["unparsed_records"], 1)
+        self.assertEqual(len(summary["unparsed_details"]), 1)
+        self.assertEqual(
+            self.q1(self.fresh_db, "SELECT unparsed_records u FROM ingest_state")["u"],
+            1,
+        )
+
+    # ---- refusals --------------------------------------------------------
+
+    def test_a_nonexistent_path_is_an_error_not_a_silent_no_op(self) -> None:
+        missing = self.projects_dir / "no-such-session.jsonl"
+        with self.assertRaises(SystemExit) as caught:
+            ingest_mod.ingest_transcript(missing, self.fresh_db)
+        self.assertIn(str(missing), str(caught.exception))
+
+    def test_a_directory_is_an_error(self) -> None:
+        with self.assertRaises(SystemExit):
+            ingest_mod.ingest_transcript(self.projects_dir, self.fresh_db)
+
+    def test_a_transcript_that_grows_while_it_is_read_is_re_ingested(self) -> None:
+        """The hook fires on a file Claude Code is still writing.
+
+        `store_source()` used to take its own `stat()` AFTER the parse, so a
+        transcript appended to mid-read was recorded at its NEW size while only
+        the older prefix had been parsed. Every later run then saw "unchanged"
+        and skipped it, and the appended calls were lost silently and forever.
+        Recording the PRE-read stat makes the worst case one redundant reparse.
+        """
+        real_parse = ingest_mod.parse_file
+
+        def parse_then_grow(path, collect_turns=True):
+            result = real_parse(path, collect_turns=collect_turns)
+            self.append(Path(path), APPENDED_CALL)  # the writer, mid-read
+            return result
+
+        ingest_mod.parse_file = parse_then_grow
+        try:
+            ingest_mod.ingest_transcript(self.main_path, self.fresh_db)
+        finally:
+            ingest_mod.parse_file = real_parse
+
+        second = ingest_mod.ingest_transcript(self.main_path, self.fresh_db)
+        self.assertEqual(
+            second["files_ingested"], 1,
+            "the record appended during the read must still be pending, not "
+            "recorded as already ingested",
+        )
+        self.assertEqual(
+            self.q1(self.fresh_db, "SELECT COUNT(*) n FROM api_calls")["n"],
+            self.MAIN["n"] + 1,
+        )
+
+    def test_a_subagent_path_with_no_session_directory_is_refused(self) -> None:
+        # Reachable with a RELATIVE path -- `subagents/agent-x.jsonl` has no
+        # session directory above it, and storing its calls under a session id
+        # of "" would invent a session that never existed.
+        with self.assertRaises(ValueError):
+            ingest_mod.source_for_transcript(Path("subagents/agent-x.jsonl"))
+        # ...while the same shape WITH a session directory is accepted, so the
+        # guard cannot pass by rejecting everything.
+        self.assertEqual(
+            ingest_mod.source_for_transcript(
+                Path("sess-1/subagents/agent-x.jsonl")
+            ).session_id,
+            "sess-1",
+        )
+
+    def test_an_unrecognisable_file_is_an_error(self) -> None:
+        notes = self.projects_dir / "notes.txt"
+        notes.write_text("not a transcript\n", encoding="utf-8")
+        with self.assertRaises(SystemExit) as caught:
+            ingest_mod.ingest_transcript(notes, self.fresh_db)
+        self.assertIn(str(notes), str(caught.exception))
+
+    # ---- the highest-risk property: everything else is untouched ---------
+
+    def test_it_archives_nothing_it_did_not_look_at(self) -> None:
+        """One file cannot be evidence about any other file.
+
+        Directory mode archives every tracked source that is no longer on
+        disk. Single-file mode sees ONE path; concluding from it that the
+        other 2,890 sources have vanished would mark a whole corpus as gone.
+        """
+        self.other_path.unlink()  # a source directory mode WOULD archive
+        self.append(self.main_path, APPENDED_CALL)
+        summary = ingest_mod.ingest_transcript(
+            self.main_path, self.db_path, tasks_dir=self.tasks_dir
+        )
+        self.assertEqual(
+            summary["files_ingested"], 1, "must exercise the INGEST path"
+        )
+        state = self.q1(
+            self.db_path,
+            "SELECT archived_at, size FROM ingest_state WHERE path = ?",
+            str(self.other_path),
+        )
+        self.assertIsNone(
+            state["archived_at"],
+            "single-file mode did not look at this source and must make no "
+            "claim about it",
+        )
+        self.assertEqual(
+            self.q1(
+                self.db_path,
+                "SELECT COUNT(*) n FROM api_calls WHERE source_path = ?",
+                str(self.other_path),
+            )["n"],
+            self.MAIN["n"],
+            "rows for an untouched source must survive verbatim",
+        )
+        # The fixture must not make the defect undetectable: prove the deleted
+        # file really IS in the state directory mode reacts to, so the NULL
+        # above is single-file mode declining to conclude, not a no-op corpus.
+        later = ingest(self.projects_dir, self.db_path, tasks_dir=self.tasks_dir)
+        self.assertEqual(later["files_archived"], 1)
+
+    def test_it_prunes_nothing_it_did_not_look_at(self) -> None:
+        # Deliberately on the SKIP path (the sibling above covers the ingest
+        # path): both must be safe, and a hook fires on unchanged files too.
+        self.other_path.unlink()
+        summary = ingest_mod.ingest_transcript(
+            self.main_path, self.db_path, tasks_dir=self.tasks_dir
+        )
+        self.assertEqual(summary["files_skipped"], 1, "must exercise the SKIP path")
+        self.assertEqual(
+            self.q1(
+                self.db_path, "SELECT COUNT(*) n FROM ingest_state WHERE path = ?",
+                str(self.other_path),
+            )["n"],
+            1,
+        )
+
+    def test_it_leaves_every_other_sources_rows_byte_identical(self) -> None:
+        def snapshot() -> list:
+            return [
+                tuple(r) for r in self.rows(
+                    self.db_path,
+                    "SELECT * FROM api_calls WHERE source_path != ?"
+                    " ORDER BY id", str(self.main_path),
+                )
+            ] + [
+                tuple(r) for r in self.rows(
+                    self.db_path,
+                    "SELECT * FROM ingest_state WHERE path != ? ORDER BY path",
+                    str(self.main_path),
+                )
+            ]
+
+        before = snapshot()
+        self.assertTrue(before, "fixture must contain other sources to protect")
+        self.append(self.main_path, APPENDED_CALL)
+        summary = ingest_mod.ingest_transcript(
+            self.main_path, self.db_path, tasks_dir=self.tasks_dir
+        )
+        self.assertEqual(summary["files_ingested"], 1, "must exercise the INGEST path")
+        self.assertEqual(before, snapshot())
+
+    def test_ingesting_a_main_transcript_does_not_wipe_the_subagent_ledger(self) -> None:
+        # `store_subagent_runs()` rebuilds `subagent_runs` and
+        # `task_index_sessions` WHOLESALE from the sources of that run. Reusing
+        # it here would delete every dispatch the one file does not mention --
+        # including `agone`, whose whole purpose is to record spend that can
+        # no longer be measured.
+        before = self.runs(self.db_path)
+        self.assertEqual(len(before), 3, "atest1, atest2 and the reaped agone")
+        self.append(self.main_path, APPENDED_CALL)
+        summary = ingest_mod.ingest_transcript(
+            self.main_path, self.db_path, tasks_dir=self.tasks_dir
+        )
+        self.assertEqual(summary["files_ingested"], 1, "must exercise the INGEST path")
+        self.assertEqual(before, self.runs(self.db_path))
+        self.assertEqual(
+            self.q1(
+                self.db_path,
+                "SELECT status s FROM subagent_runs WHERE agent_id = 'agone'",
+            )["s"],
+            "unavailable",
+        )
+        self.assertEqual(
+            self.q1(self.db_path, "SELECT COUNT(*) n FROM task_index_sessions")["n"],
+            2,
+        )
+
+    def test_ingesting_one_subagent_leaves_the_other_dispatches_alone(self) -> None:
+        # The same hazard from the other side: this run DOES write a
+        # `subagent_runs` row, and only its own.
+        before = {r[0]: r for r in self.runs(self.db_path)}
+        self.append(self.agent1_path, APPENDED_SUBAGENT_CALL)
+        summary = ingest_mod.ingest_transcript(
+            self.agent1_path, self.db_path, tasks_dir=self.tasks_dir
+        )
+        self.assertEqual(summary["files_ingested"], 1, "must exercise the INGEST path")
+        after = {r[0]: r for r in self.runs(self.db_path)}
+        self.assertEqual(set(before), set(after), "no dispatch gained or lost")
+        for agent_id in ("atest2", "agone"):
+            with self.subTest(agent_id=agent_id):
+                self.assertEqual(before[agent_id], after[agent_id])
+        self.assertEqual(
+            self.q1(self.db_path, "SELECT COUNT(*) n FROM task_index_sessions")["n"],
+            2,
+        )
+
+    def test_other_sessions_survive_the_sessions_rebuild(self) -> None:
+        before = [tuple(r) for r in self.rows(
+            self.db_path, "SELECT * FROM sessions ORDER BY id")]
+        self.assertEqual(len(before), 3, "session-fixture, second-session, other-session")
+        self.append(self.agent1_path, APPENDED_SUBAGENT_CALL)
+        summary = ingest_mod.ingest_transcript(
+            self.agent1_path, self.db_path, tasks_dir=self.tasks_dir
+        )
+        self.assertEqual(summary["files_ingested"], 1, "must exercise the INGEST path")
+        after = [tuple(r) for r in self.rows(
+            self.db_path, "SELECT * FROM sessions ORDER BY id")]
+        # Only session-fixture's own footprint moved (it grew by the appended
+        # record); the other two sessions must be untouched.
+        self.assertEqual(
+            [r for r in before if r[0] != "session-fixture"],
+            [r for r in after if r[0] != "session-fixture"],
+        )
+
+    def test_summary_omits_the_counters_for_checks_it_never_ran(self) -> None:
+        # Reporting `files_archived: 0` would state that nothing was found
+        # missing -- a measurement this mode never took. Absent is not zero.
+        summary = ingest_mod.ingest_transcript(self.main_path, self.fresh_db)
+        self.assertNotIn("files_archived", summary)
+        self.assertNotIn("files_pruned", summary)
+
+
+class SingleFileIngestCliTest(unittest.TestCase):
+    """The CLI contract a hook depends on: flags, precedence and EXIT CODES.
+
+    Exercised as a real subprocess, because the exit status is the whole
+    interface -- a hook that swallows a failure into a success makes a broken
+    ingest invisible forever.
+    """
+
+    INGEST = str(Path(__file__).resolve().parent.parent / "ingest.py")
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-single-file-cli-test-"))
+        self.projects_dir = self.tmp / "projects"
+        self.projects_dir.mkdir()
+        self.main_path = self.projects_dir / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.main_path)
+        self.db_path = self.tmp / "usage.db"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_ingest(self, *args: str, env: dict | None = None):
+        environ = dict(os.environ)
+        environ.pop("CPB_DB", None)
+        environ.update(env or {})
+        return subprocess.run(
+            [sys.executable, self.INGEST, *args],
+            capture_output=True, text=True, env=environ, cwd=str(self.tmp),
+        )
+
+    def call_count(self, db: Path) -> int:
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_exit_code_is_zero_and_the_rows_land(self) -> None:
+        proc = self.run_ingest(
+            "--transcript", str(self.main_path), "--db", str(self.db_path)
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.call_count(self.db_path), 5)
+
+    def test_the_summary_line_names_the_file_and_the_counts(self) -> None:
+        proc = self.run_ingest(
+            "--transcript", str(self.main_path), "--db", str(self.db_path)
+        )
+        self.assertIn(str(self.main_path), proc.stdout)
+        self.assertIn("ingested: 1", proc.stdout)
+        self.assertIn("records parsed:", proc.stdout)
+
+    def test_a_missing_transcript_exits_non_zero(self) -> None:
+        proc = self.run_ingest(
+            "--transcript", str(self.tmp / "gone.jsonl"), "--db", str(self.db_path)
+        )
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_transcript_and_projects_dir_are_mutually_exclusive(self) -> None:
+        proc = self.run_ingest(
+            "--transcript", str(self.main_path),
+            "--projects-dir", str(self.projects_dir),
+            "--db", str(self.db_path),
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--transcript", proc.stderr)
+        self.assertFalse(
+            self.db_path.exists(), "a usage error must not half-ingest anything"
+        )
+
+    def test_CPB_DB_points_ingest_at_its_own_database(self) -> None:
+        env_db = self.tmp / "plugin-data" / "usage.db"
+        proc = self.run_ingest(
+            "--transcript", str(self.main_path), env={"CPB_DB": str(env_db)}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(env_db.exists(), "CPB_DB must be honoured, including mkdir")
+        self.assertEqual(self.call_count(env_db), 5)
+
+    def test_the_db_flag_beats_the_env_var(self) -> None:
+        env_db = self.tmp / "env.db"
+        proc = self.run_ingest(
+            "--transcript", str(self.main_path), "--db", str(self.db_path),
+            env={"CPB_DB": str(env_db)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.call_count(self.db_path), 5)
+        self.assertFalse(env_db.exists(), "--db must win outright, not merely first")
+
+    def test_CPB_DB_applies_to_directory_mode_too(self) -> None:
+        # One resolution order for the whole CLI: a plugin that exports CPB_DB
+        # must not find that a full re-ingest silently writes somewhere else.
+        env_db = self.tmp / "both-modes.db"
+        proc = self.run_ingest(
+            "--projects-dir", str(self.projects_dir), env={"CPB_DB": str(env_db)}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.call_count(env_db), 5)
+
+    def test_help_documents_the_env_var(self) -> None:
+        proc = self.run_ingest("--help")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("CPB_DB", proc.stdout)
+
+    def test_resolve_db_path_precedence(self) -> None:
+        default = Path("/default/usage.db")
+        self.assertEqual(
+            ingest_mod.resolve_db_path(Path("/flag.db"), "/env.db", default),
+            Path("/flag.db"),
+        )
+        self.assertEqual(
+            ingest_mod.resolve_db_path(None, "/env.db", default), Path("/env.db")
+        )
+        self.assertEqual(ingest_mod.resolve_db_path(None, None, default), default)
+
+    def test_an_empty_CPB_DB_refuses_rather_than_falling_back(self) -> None:
+        # Falling back would write the measurements to a DIFFERENT database
+        # than the operator configured, and say nothing about it.
+        with self.assertRaises(SystemExit):
+            ingest_mod.resolve_db_path(None, "   ", Path("/default/usage.db"))
 
 
 if __name__ == "__main__":
