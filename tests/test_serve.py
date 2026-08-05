@@ -2182,10 +2182,22 @@ class AgentDispatchPeakContextTest(unittest.TestCase):
             self.assertNotIn("subagent_tokens", row)
 
     def test_reported_peak_tracks_max_context_size_not_measured_spend(self) -> None:
-        # The pinning test the issue asks for: if a future harness release
-        # changes what <subagent_tokens> counts, this goes red instead of the
-        # meaning silently re-diverging. Ratios come from the DB so the
-        # relationship is pinned at the source, not at the API's rounding.
+        # What this pins: CPB's READING of the tag, against a fixture built to
+        # the measured relationship. `<subagent_tokens>` tracks
+        # MAX(context_size) and emphatically not the spend beside it, so an
+        # implementation that swapped the two, summed instead of maxing, or
+        # took the last call's context is red -- pk1's peak is its THIRD call
+        # of four. Ratios come from the DB so the relationship is pinned at the
+        # source, not at the API's rounding.
+        #
+        # What it CANNOT pin, despite the shape of a canary: a harness change.
+        # Both sides of every ratio are written by THIS file -- the tag values
+        # from PEAK_DISPATCHES, the contexts from PEAK_SUBAGENT_CALLS -- so a
+        # Claude Code release that changed what the tag counts would move
+        # neither, and the fixture and its expectations would go on agreeing.
+        # Only re-measuring the tag against a real corpus catches that (the
+        # 1,774-dispatch scan in this class's docstring is that measurement,
+        # and it has a date for the same reason).
         rows = self.api.conn.execute(
             "SELECT d.task_id, d.subagent_tokens reported,"
             " (SELECT MAX(a.context_size) FROM api_calls a"

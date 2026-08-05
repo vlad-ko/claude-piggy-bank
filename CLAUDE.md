@@ -180,7 +180,7 @@ response that never happened — and the ambiguity is counted (a *different* set
 from the 108 above, and re-measure before quoting any of these). Records with no
 `message.id` each stay their own call; `NULL` is not a shared key.
 
-**Schema** (`SCHEMA_VERSION = 9`, `PRAGMA user_version`): `sessions`, `turns`,
+**Schema** (`SCHEMA_VERSION = 11`, `PRAGMA user_version`): `sessions`, `turns`,
 `api_calls`, `agent_dispatches`, `subagent_runs`, `task_index_sessions`,
 `ingest_state`, `ingest_runs`, `source_shape`. Ingest is incremental per file,
 keyed on size+mtime in `ingest_state`; re-ingesting a changed file deletes its
@@ -233,21 +233,42 @@ Consequences encoded in the code, which must be preserved:
   would drop rows whose source file no longer exists. It asks the filesystem,
   not `archived_at`, because that column postdates the older DBs the guard has
   to protect.
-- Which is why a schema change that deletes no row must not go through that
-  rebuild: on any corpus past the retention window the guard would refuse a
+- Which is why a schema change that loses no measurement must not go through
+  that rebuild: on any corpus past the retention window the guard would refuse a
   change that risks nothing, and an untrue refusal is the same class of defect
-  as an untrue number. `IN_PLACE_UPGRADE_FROM` (currently `{6, 7, 8}`) lists
-  the versions whose delta to the **current** shape is row-preserving. Three
-  hops exist, and a v6 database makes all three at once: v6→v7 adds
-  `ingest_runs`; v7→v8 drops `api_calls.cost_usd` (#30) via
+  as an untrue number. `IN_PLACE_UPGRADE_FROM` (currently `{6, 7, 8, 9, 10}`)
+  lists the versions whose delta to the **current** shape can be applied without
+  losing one. Five hops exist, and a v6 database makes all five at once: v6→v7
+  adds `ingest_runs`; v7→v8 drops `api_calls.cost_usd` (#30) via
   `ALTER TABLE ... DROP COLUMN`, gated on a **runtime** check of
-  `sqlite3.sqlite_version` ≥ 3.35; and v8→v9 adds `source_shape` (#15). It is
-  re-decided at every bump against the current shape, never extended by habit,
-  and the sub-3.35 fallback goes through the rebuild path **including** the
-  guard — never around it. A table may be created from nothing by this path
-  only if it is in `IN_PLACE_CREATABLE_TABLES` — only, that is, if an **empty**
-  one is a true statement (#35). `CREATE TABLE IF NOT EXISTS` would otherwise
-  silently grant that to every table, including `turns`, where empty is a lie.
+  `sqlite3.sqlite_version` ≥ 3.35; v8→v9 adds `source_shape` (#15); v9→v10 adds
+  the UNIQUE `idx_agent_dispatches_task_id`, which `_dedupe_dispatch_task_ids()`
+  has to precede because the index cannot be built over a table already holding
+  duplicates (#36); and v10→v11 adds the three nullable cache-miss diagnostic
+  columns to `api_calls` (#5). It is re-decided at every bump against the
+  current shape, never extended by habit, and the sub-3.35 fallback goes through
+  the rebuild path **including** the guard — never around it.
+- **The bar moved at the v10 bump**, which is what re-deciding rather than
+  extending is for. It read "the delta preserves every **row**"; v9→v10 deletes
+  rows, because a duplicate `task_id` is one dispatch recorded by a second
+  transcript, not a second dispatch. What that hop preserves is every
+  *dispatch* — one **whole** row of each pair survives, by the same rule
+  `store_source()` applies, and what it discards is counted and printed. The bar
+  now is the **measurement**: a delta that loses one belongs nowhere near this
+  set, whatever it does to row counts.
+- Two bounded permissions keep "in place" from meaning "whatever is convenient",
+  and they are the same statement about different shapes. A table may be created
+  from nothing only if it is in `IN_PLACE_CREATABLE_TABLES` — only, that is, if
+  an **empty** one is a true statement (#35); `CREATE TABLE IF NOT EXISTS` would
+  otherwise silently grant that to every table, including `turns`, where empty
+  is a lie. A column may be added to a table that already holds rows only if it
+  is in `IN_PLACE_ADDABLE_COLUMNS` — only if **NULL is a true statement about
+  the rows already there**. NULL in `cache_miss_outcome` (#5) means "written
+  before CPB read `message.diagnostics`", i.e. unmeasured, which is true of
+  every row a pre-v11 build wrote and is a *different* statement from `absent`
+  or `no-divergence`; back-filling either would manufacture an observation
+  nobody made, over a whole corpus at once. A NOT NULL column cannot be added
+  this way at all.
 - Windows containing archived sources are flagged in the report banner: totals
   are complete but no longer reproducible by re-ingesting.
 
@@ -281,7 +302,7 @@ Consequences encoded in the code, which must be preserved:
   governs the CLI (exit statuses included), the HTTP API, and **what a figure
   measures** — a stable field name over a changed definition is breaking, a
   *correction* to a figure that was wrong is not. It explicitly does **not**
-  govern `SCHEMA_VERSION`, which is why 6 → 9 was not four major releases; that
+  govern `SCHEMA_VERSION`, which is why 6 → 11 was not five major releases; that
   exclusion holds only while an existing database upgrades without data loss
   and without a refusal, so a schema change that cannot offer that is a major
   release rather than a reason to widen `IN_PLACE_UPGRADE_FROM`.

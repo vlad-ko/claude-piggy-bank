@@ -431,6 +431,69 @@ per-call input tokens across a session is measuring the first — correctly, for
 cost — but it is not a measure of how much the conversation grew, and labelling
 it as such would be the "aggregate that does not name its set" defect.
 
+<a id="ta-10"></a>
+
+## TA-10 — The context window is per model, not one constant: 1M on the current Opus/Sonnet/Fable families, 200K on Claude Haiku 4.5
+
+**Applies to:** exactly the model-id prefixes in the table below, and no others.
+This is the fact CPB's only remaining hand-maintained table rests on, so its
+coverage is its boundary rather than a footnote.
+**Provenance:** Documented. **Checked:** 2026-08-05.
+**Source:** <https://platform.claude.com/docs/en/about-claude/models/overview>
+
+The table lives in `context_window.py` as `CONTEXT_WINDOWS`, dated in code by
+`WINDOWS_AS_OF` (2026-08-05, the same date as this entry — they are bumped
+together, or the date is a claim about a table that no longer exists):
+
+| model-id prefix | documented context window |
+|---|---|
+| `claude-opus-5` | 1,000,000 |
+| `claude-opus-4-8` | 1,000,000 |
+| `claude-opus-4-7` | 1,000,000 |
+| `claude-opus-4-6` | 1,000,000 |
+| `claude-sonnet-5` | 1,000,000 |
+| `claude-sonnet-4-6` | 1,000,000 |
+| `claude-fable-5` | 1,000,000 |
+| `claude-haiku-4-5` | 200,000 |
+
+Lookup is by **longest matching prefix at a `-` boundary** (or an exact match),
+because a family boundary is precisely where a window is free to change:
+`claude-opus-5` cannot match a hypothetical `claude-opus-5x`.
+
+**There is no "1M beta" on these models.** 1M is the default and the maximum for
+the families listed as 1M above — no beta header, no separate tier, standard
+billing. A conditional for one would model a state these models do not have.
+
+**An id this table does not name has no window here.** `window_for_model()`
+returns `None`, never a default, and the call's utilisation is INCONCLUSIVE.
+That is not hypothetical within this file: Claude Mythos 5 and Claude Mythos
+Preview are named by [TA-3](#ta-3), [TA-4](#ta-4), [TA-8](#ta-8) and
+[TA-9](#ta-9) and are **not** in the table above, so CPB has no window for them.
+Defaulting to 1M would be wrong by 5x for Haiku, which is exactly the case a
+default gets silently applied to.
+
+**Measured here** — recorded in `context_window.py` alongside the table,
+measured 2026-08-05 on the reference corpus: the largest
+`claude-haiku-4-5-20251001` call carries **111,700** tokens, which is 55.9% of
+its real 200K window and 11.2% of a wrongly assumed 1M one. A 5x misread that
+moves one call across two band boundaries is why the table is per model rather
+than one constant.
+
+**Why this table is allowed to exist when the rate table was deleted.** Its
+output is a **denominator**: `context_size / window` asserts nothing beyond the
+division. And the staleness stories run opposite ways — a stale rate failed
+*silently* inside a plausible dollar figure, where a stale window fails *loudly*
+as utilisation above 100%, which `serve.py` counts (`over_window_calls`) and the
+report names. That asymmetry is the whole argument, and it is not a licence to
+stop re-checking: this entry's **checked** date and `WINDOWS_AS_OF` are the same
+date on purpose.
+
+**Not covered by this entry:** where the utilisation *bands* sit. Anthropic
+publishes the window; it publishes no guidance on what share of one is wasteful.
+The boundaries are a product-owner judgment carried under a separate date
+(`BANDS_AS_OF`) and a separate API field (`band_provenance`), and merging them
+with this fact would lend a documented figure's authority to a judged one.
+
 ---
 
 ## Corrections made while checking
@@ -478,6 +541,7 @@ Forward links, so a change here is traceable to what it affects:
 - [#6 — thinking re-billed as input on every later turn](https://github.com/vlad-ko/claude-piggy-bank/issues/6) — [TA-1](#ta-1), [TA-3](#ta-3), [TA-4](#ta-4), [TA-5](#ta-5), [TA-6](#ta-6)
 - [#11 — insight layer, detectors for the measured lessons](https://github.com/vlad-ko/claude-piggy-bank/issues/11) — all of them; [TA-9](#ta-9) is the one that says *don't* build a detector
 - [#16 — cache economics observable](https://github.com/vlad-ko/claude-piggy-bank/issues/16) — [TA-7](#ta-7), [TA-8](#ta-8)
+- [#31 — the `context` block in `/api/summary`: window utilisation, its median and its bands](https://github.com/vlad-ko/claude-piggy-bank/issues/31) — [TA-10](#ta-10), the denominator `context_window.py` and `serve.py` both rest on; the band boundaries beside it are **not** from this file and carry their own date
 
 ## Maintaining this file
 
