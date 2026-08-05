@@ -18,6 +18,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Sequence
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -31,7 +32,23 @@ from ingest import (  # noqa: E402
     record_ingest_run,
 )
 from test_ingest import build_corpus  # noqa: E402
+from context_window import (  # noqa: E402
+    BAND_25_TO_50,
+    BAND_50_TO_90,
+    BAND_AT_LEAST_90,
+    BAND_UNDER_25,
+    BANDS,
+    BANDS_AS_OF,
+    CONTEXT_WINDOWS,
+    WINDOW_SOURCE,
+    WINDOWS_AS_OF,
+    band_for,
+    longest_prefix_match,
+    window_for_model,
+)
 from serve import (  # noqa: E402
+    CONTEXT_SAMPLE,
+    PERCENTILES,
     RANKED_BY,
     STALE_AFTER_SECONDS,
     STALE_UNKNOWN_NO_RUN_RECORDED,
@@ -42,6 +59,7 @@ from serve import (  # noqa: E402
     clamp_limit,
     day_bounds,
     eastern_day,
+    nearest_rank,
     project_of,
     staleness_verdict,
 )
@@ -263,7 +281,12 @@ class NoDollarFigureIsRenderedTest(unittest.TestCase):
         )
 
     def test_no_shipped_module_mentions_pricing(self) -> None:
-        for name in ("ingest.py", "serve.py", "index.html"):
+        # `context_window.py` is in the list because it is the one module that
+        # would plausibly want to name the deleted table -- it is a
+        # hand-maintained table of documented facts and it has to justify
+        # existing where that one was removed. It makes the comparison in
+        # prose, without reintroducing the name.
+        for name in ("ingest.py", "serve.py", "context_window.py", "index.html"):
             with self.subTest(module=name):
                 self.assertNotIn("pricing", (self.ROOT / name).read_text())
 
@@ -1761,6 +1784,14 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
         "cache_read": "plotted per-day via /api/timeseries",
         "cache_write": "plotted per-day via /api/timeseries",
         "output": "plotted per-day via /api/timeseries",
+        # #31's data layer, landing ahead of its view DELIBERATELY. The block
+        # is built to be bound declaratively -- named scalars and one ordered
+        # list of bands, no arithmetic left for the template -- and #8 is
+        # rewriting this render layer to Alpine right now, so wiring it into
+        # the string-concatenating `renderSummary` would be written to be
+        # deleted. This entry is the declaration the allowlist exists to
+        # force: it must become a rendered field, not stay here.
+        "context": "payload for #31; bound by the view in the #8 rewrite",
     }
 
     @classmethod
@@ -2556,6 +2587,522 @@ class AgentRankingByTotalTokensTest(unittest.TestCase):
         # keys on `unavailable` ALONE, so a row that has real figures is not
         # styled as a gap and a row that has none is not styled as data.
         self.assertIn('r.status === "unavailable"', self.html)
+
+
+# --- #31: context-window utilisation --------------------------------------
+#
+# The headline `Avg context/call` has no referent: nothing on the page says
+# whether 266.6k is a lot. These tests pin the two halves of the referent --
+# a DOCUMENTED denominator (the model's context window) and a DATED JUDGEMENT
+# (where the bands sit) -- and keep the two provenances apart, because
+# borrowing Anthropic's authority for a boundary Anthropic never published is
+# the failure this repository exists to avoid.
+
+
+class ContextWindowTableTest(unittest.TestCase):
+    """The window table is a documented fact, matched the way rates were.
+
+    The expectations are spelled out here rather than read from
+    `CONTEXT_WINDOWS`: a test that asserts the table equals itself passes over
+    any edit, including the one that matters (a model quietly given the wrong
+    window).
+    """
+
+    # Documented context windows, checked 2026-08-05 against Anthropic's model
+    # reference. Haiku is the reason this is a per-model table at all.
+    DOCUMENTED = {
+        "claude-opus-5": 1_000_000,
+        "claude-opus-4-8": 1_000_000,
+        "claude-opus-4-7": 1_000_000,
+        "claude-opus-4-6": 1_000_000,
+        "claude-sonnet-5": 1_000_000,
+        "claude-sonnet-4-6": 1_000_000,
+        "claude-fable-5": 1_000_000,
+        "claude-haiku-4-5": 200_000,
+    }
+
+    def test_every_documented_model_carries_its_documented_window(self) -> None:
+        self.assertEqual(CONTEXT_WINDOWS, self.DOCUMENTED)
+
+    def test_a_dated_model_id_resolves_to_its_family(self) -> None:
+        # Every id in a transcript carries a date suffix; the table does not.
+        self.assertEqual(window_for_model("claude-opus-5-20260101"), 1_000_000)
+        self.assertEqual(window_for_model("claude-haiku-4-5-20251001"), 200_000)
+
+    def test_haiku_is_a_fifth_of_the_window_the_others_have(self) -> None:
+        # The whole justification for a per-model table. Measured 2026-08-05 on
+        # the reference corpus: Haiku's largest call carries 111,700 tokens --
+        # 55.9% of its 200K window, but 11.2% against a wrongly assumed 1M.
+        self.assertEqual(window_for_model("claude-haiku-4-5-20251001"), 200_000)
+        self.assertNotEqual(window_for_model("claude-haiku-4-5-20251001"), 1_000_000)
+
+    def test_an_unknown_model_has_no_window_at_all(self) -> None:
+        # Rule #12, and the central rule of this feature: no default, and
+        # emphatically not 1M. A window we cannot source produces no
+        # utilisation, so the call is counted as INCONCLUSIVE instead.
+        for model in (
+            "claude-nosuchtier-9-20260101",
+            "<synthetic>",  # Claude Code's local error placeholder
+            "<unknown>",    # ingest.py's own fallback for a model-less record
+            "",
+        ):
+            with self.subTest(model=model):
+                self.assertIsNone(window_for_model(model))
+
+    def test_a_prefix_matches_only_at_a_boundary(self) -> None:
+        # `claude-opus-5` must not match a hypothetical `claude-opus-5x`: the
+        # rule the deleted rate table used, kept because a family boundary is
+        # exactly where a window can change.
+        self.assertIsNone(window_for_model("claude-opus-5x"))
+        self.assertIsNone(window_for_model("claude-opus"))
+        self.assertEqual(window_for_model("claude-opus-5"), 1_000_000)
+
+    def test_the_longest_matching_prefix_wins(self) -> None:
+        # No pair in today's table nests, so the rule is pinned against a
+        # table that does -- otherwise the property is untestable until the
+        # day a nested entry is added, which is the day it must not break.
+        nested = {"claude-opus-4": 111, "claude-opus-4-8": 222}
+        self.assertEqual(longest_prefix_match("claude-opus-4-8-20260101", nested), 222)
+        self.assertEqual(longest_prefix_match("claude-opus-4-7-20260101", nested), 111)
+        # Insertion order must not decide it.
+        reversed_table = dict(reversed(list(nested.items())))
+        self.assertEqual(
+            longest_prefix_match("claude-opus-4-8-20260101", reversed_table), 222
+        )
+
+    def test_the_table_is_dated_so_a_reader_can_judge_its_currency(self) -> None:
+        self.assertEqual(WINDOWS_AS_OF, "2026-08-05")
+        date.fromisoformat(WINDOWS_AS_OF)  # raises if it is not a real date
+        self.assertTrue(WINDOW_SOURCE.startswith("https://"))
+
+    def test_every_window_is_one_of_the_two_documented_sizes(self) -> None:
+        # A typo'd window is the one failure this feature cannot see for
+        # itself below 100%; the sizes are documented and few, so pin them.
+        self.assertEqual(set(CONTEXT_WINDOWS.values()), {200_000, 1_000_000})
+
+
+class UtilisationBandTest(unittest.TestCase):
+    """Where the boundaries sit, and that the LOWER edge is the inclusive one.
+
+    The `>=` vs `>` question is real: a call at exactly 90% of its window is
+    either "probably wrong" or not, and the two readings differ on real data.
+    Every band is half-open, lower-inclusive -- the same convention
+    `day_bounds()` uses for a day.
+    """
+
+    def test_each_boundary_belongs_to_the_band_above_it(self) -> None:
+        self.assertEqual(band_for(0.90), BAND_AT_LEAST_90)
+        self.assertEqual(band_for(0.50), BAND_50_TO_90)
+        self.assertEqual(band_for(0.25), BAND_25_TO_50)
+        self.assertEqual(band_for(0.0), BAND_UNDER_25)
+
+    def test_one_token_below_a_boundary_falls_in_the_band_below(self) -> None:
+        # Expressed as real token counts against a real window rather than as
+        # bare floats: 0.8999999 is a number, 899,999 tokens is a call.
+        self.assertEqual(band_for(899_999 / 1_000_000), BAND_50_TO_90)
+        self.assertEqual(band_for(499_999 / 1_000_000), BAND_25_TO_50)
+        self.assertEqual(band_for(249_999 / 1_000_000), BAND_UNDER_25)
+
+    def test_a_call_over_its_window_stays_in_the_top_band(self) -> None:
+        # >100% is absurd on its face -- a stale table, a beta window, a
+        # corrupt row -- and must not fall off the end of the banding.
+        self.assertEqual(band_for(1.25), BAND_AT_LEAST_90)
+
+    def test_a_negative_fraction_is_refused_rather_than_banded(self) -> None:
+        with self.assertRaises(ValueError):
+            band_for(-0.01)
+
+    def test_the_bands_are_contiguous_and_cover_everything_from_zero(self) -> None:
+        lowers = [lower for _, _, lower, _ in BANDS]
+        uppers = [upper for _, _, _, upper in BANDS]
+        self.assertEqual(lowers, sorted(lowers, reverse=True), "bands run high to low")
+        self.assertIsNone(uppers[0], "the top band is unbounded above")
+        self.assertEqual(lowers[-1], 0.0, "the bottom band starts at zero")
+        for i in range(1, len(BANDS)):
+            with self.subTest(band=BANDS[i][0]):
+                self.assertEqual(uppers[i], lowers[i - 1], "a gap between bands")
+
+    def test_only_the_two_upper_bands_carry_a_judgement(self) -> None:
+        # The boundaries are a product-owner judgement; the WORDS are the
+        # judgement made visible, and no judgement was made about a call under
+        # half its window. A label there would invent one.
+        labels = {key: label for key, label, _, _ in BANDS}
+        self.assertIn("probably wrong", labels[BAND_AT_LEAST_90])
+        self.assertIn("likely wasteful", labels[BAND_50_TO_90])
+        for key in (BAND_25_TO_50, BAND_UNDER_25):
+            with self.subTest(band=key):
+                for verdict in ("wrong", "wasteful", "bloat", "healthy", "good"):
+                    self.assertNotIn(verdict, labels[key])
+
+    def test_the_judgement_is_dated_separately_from_the_window_table(self) -> None:
+        # Two facts with two different owners and two different staleness
+        # stories: re-checking Anthropic's published window does not re-decide
+        # where 50% sits, and one date for both would imply it had.
+        self.assertEqual(BANDS_AS_OF, "2026-08-05")
+        date.fromisoformat(BANDS_AS_OF)
+
+    def test_the_model_window_moves_a_call_across_a_band_boundary(self) -> None:
+        # The 5x misread, as a band change rather than as a ratio: Haiku's
+        # largest measured call (111,700 tokens, reference corpus 2026-08-05)
+        # is over half its window, and would read as a frugal call against the
+        # 1M window every other current model has.
+        against_own = band_for(111_700 / window_for_model("claude-haiku-4-5"))
+        against_wrong = band_for(111_700 / 1_000_000)
+        self.assertEqual(against_own, BAND_50_TO_90)
+        self.assertEqual(against_wrong, BAND_UNDER_25)
+
+
+class NearestRankTest(unittest.TestCase):
+    """Every published percentile is a value some call actually carried."""
+
+    def test_an_empty_sample_has_no_percentile(self) -> None:
+        # Not 0: an empty window is not a window of tiny calls.
+        for p in PERCENTILES:
+            with self.subTest(percentile=p):
+                self.assertIsNone(nearest_rank([], p))
+
+    def test_a_single_call_is_every_percentile_of_itself(self) -> None:
+        for p in PERCENTILES:
+            with self.subTest(percentile=p):
+                self.assertEqual(nearest_rank([77], p), 77)
+
+    def test_the_median_of_an_even_sample_is_an_observed_value(self) -> None:
+        # The interpolating definition returns 30 here -- a context no call
+        # had, and one that can sit on the far side of a band boundary from
+        # both of its neighbours.
+        self.assertEqual(nearest_rank([10, 20, 40, 80], 50), 20)
+
+    def test_the_top_percentile_is_the_largest_call_not_past_it(self) -> None:
+        sample = list(range(1, 101))  # 1..100
+        self.assertEqual(nearest_rank(sample, 99), 99)
+        self.assertEqual(nearest_rank(sample, 10), 10)
+        self.assertEqual(nearest_rank(sample, 100), 100)
+
+
+# The utilisation fixture. Every call is pinned deliberately, and the numbers
+# are chosen so that a plausible wrong implementation goes red:
+#
+#   * the four bands hold 3/4/5/1 calls -- all different, so a band mapping
+#     that swaps two of them cannot pass;
+#   * the SAME context size (250,000) appears on both a 1M model and a 200K
+#     model, landing in DIFFERENT bands. One shared denominator collapses them;
+#   * three calls sit exactly ON a band boundary and three sit one token below
+#     it; one more sits exactly ON its window, which is the limit and not over
+#     it, so `over_window_calls` cannot pass with a `>=`;
+#   * every call carries output tokens, so an implementation that measures
+#     total tokens instead of context pushes each just-below call over its
+#     boundary;
+#   * one call has an unknown model, one call has no context measurement at
+#     all, and both are counted rather than banded or dropped;
+#   * the mean lands ABOVE the median (the corpus's skew, in miniature), and
+#     the legacy `avg_context` -- which still divides the same tokens by one
+#     more row -- lands between the two, so no pair of them can be confused.
+CONTEXT_SESSION = "context-fixture"
+CONTEXT_DAY = "2026-04-07"
+CONTEXT_EMPTY_DAY = "2026-04-06"
+OPUS_1M = "claude-opus-5-20260101"
+HAIKU_200K = "claude-haiku-4-5-20251001"
+UNKNOWN_MODEL = "claude-nosuchtier-9-20260101"
+# (model, context_size, output_tokens, expected band -- None = no window)
+CONTEXT_CALLS = [
+    (OPUS_1M, 900_000, 3, BAND_AT_LEAST_90),      # exactly 90.0%
+    (OPUS_1M, 899_999, 5, BAND_50_TO_90),         # one token below it
+    (OPUS_1M, 600_000, 7, BAND_50_TO_90),
+    (OPUS_1M, 500_000, 11, BAND_50_TO_90),        # exactly 50.0%
+    (OPUS_1M, 499_999, 13, BAND_25_TO_50),        # one token below it
+    (OPUS_1M, 350_000, 17, BAND_25_TO_50),
+    (OPUS_1M, 300_000, 19, BAND_25_TO_50),
+    (OPUS_1M, 250_000, 23, BAND_25_TO_50),        # exactly 25.0%
+    (OPUS_1M, 249_999, 29, BAND_UNDER_25),        # one token below it
+    (HAIKU_200K, 250_000, 31, BAND_AT_LEAST_90),  # 125% of a 200K window
+    (HAIKU_200K, 200_000, 37, BAND_AT_LEAST_90),  # exactly ITS window: not over
+    (HAIKU_200K, 111_700, 41, BAND_50_TO_90),     # 55.9%; 11.2% against 1M
+    (HAIKU_200K, 50_000, 43, BAND_25_TO_50),      # exactly 25%; 5% against 1M
+    (UNKNOWN_MODEL, 777_777, 47, None),           # no window: INCONCLUSIVE
+]
+# A record whose `usage` carries output tokens and no prompt accounting at
+# all -- the population #25 is about. Its context is 0, which is not a small
+# context: it is no measurement of one.
+CONTEXT_ZERO_OUTPUT = 53
+CONTEXT_TOTAL_CALLS = len(CONTEXT_CALLS) + 1                       # 15
+CONTEXT_SAMPLE_CALLS = len(CONTEXT_CALLS)                          # 14
+CONTEXT_BANDED_CALLS = sum(1 for *_, band in CONTEXT_CALLS if band is not None)
+# Hand-written, then checked against the table above: a count derived only
+# from the fixture would agree with a fixture that had drifted.
+EXPECTED_BAND_CALLS = {
+    BAND_AT_LEAST_90: 3,
+    BAND_50_TO_90: 4,
+    BAND_25_TO_50: 5,
+    BAND_UNDER_25: 1,
+}
+# Nearest-rank over the 14 measured contexts, sorted:
+#    50,000  111,700  200,000  249,999  250,000  250,000  300,000
+#   350,000  499,999  500,000  600,000  777,777  899,999  900,000
+# All six percentiles land on DIFFERENT values, so a swapped mapping is red.
+EXPECTED_PERCENTILES = {
+    "p10": 111_700,
+    "p25": 249_999,
+    "p50": 300_000,
+    "p75": 600_000,
+    "p90": 899_999,
+    "p99": 900_000,
+}
+EXPECTED_MEDIAN = 300_000
+EXPECTED_SAMPLE_TOTAL = 5_939_474
+EXPECTED_MEAN = EXPECTED_SAMPLE_TOTAL / CONTEXT_SAMPLE_CALLS  # 424,248.1
+EXPECTED_CALLS_ABOVE_MEAN = 6
+# What `AVG(context_size)` still reports: the same tokens over one more row.
+EXPECTED_LEGACY_AVG = EXPECTED_SAMPLE_TOTAL / CONTEXT_TOTAL_CALLS  # 395,964.9
+
+
+def build_context_corpus(root: Path) -> Path:
+    """One session whose calls span both window sizes, plus the two absences.
+
+    Returns the PROJECT directory, which is what `ingest()` scans -- one
+    project per directory, as `default_projects_dir()` resolves it.
+    """
+    project = root / "projects" / "-fixture-context"
+    project.mkdir(parents=True)
+
+    def call(n: int, model: str, usage: dict[str, int]) -> str:
+        return json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": CONTEXT_SESSION,
+                "timestamp": f"{CONTEXT_DAY}T15:{n:02d}:00.000Z",
+                "isSidechain": False,
+                "message": {
+                    "id": f"msg-context-{n}",
+                    "model": model,
+                    "usage": usage,
+                    "content": [{"type": "text", "text": f"call {n}"}],
+                },
+            }
+        ) + "\n"
+
+    lines = []
+    for n, (model, context, output, _band) in enumerate(CONTEXT_CALLS):
+        # Three deliberately unequal classes summing to the target context, so
+        # a swapped column mapping cannot reproduce it.
+        lines.append(
+            call(
+                n,
+                model,
+                {
+                    "input_tokens": 1_000,
+                    "cache_creation_input_tokens": 2_000,
+                    "cache_read_input_tokens": context - 3_000,
+                    "output_tokens": output,
+                },
+            )
+        )
+    lines.append(
+        call(
+            len(CONTEXT_CALLS),
+            OPUS_1M,
+            {"output_tokens": CONTEXT_ZERO_OUTPUT},
+        )
+    )
+    (project / f"{CONTEXT_SESSION}.jsonl").write_text("".join(lines))
+    return project
+
+
+class ContextUtilisationApiTest(unittest.TestCase):
+    """`/api/summary`'s `context` block: the median, the spread and the bands.
+
+    Asserted through the real ingest path, so the block is measured over rows
+    written the way production writes them.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-context-test-"))
+        projects = build_context_corpus(cls.tmp)
+        db_path = cls.tmp / "usage.db"
+        ingest(projects, db_path, tasks_dir=cls.tmp / "no-task-index")
+        cls.api = Api(db_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def block(self, day: str | None = None) -> dict:
+        return self.api.summary(*day_bounds(day, day))["context"]
+
+    def test_the_fixture_holds_what_it_claims_to(self) -> None:
+        # A fixture that drifted from the expectations above would make every
+        # assertion below a statement about a different corpus.
+        summary = self.api.summary(*day_bounds(None, None))
+        self.assertEqual(summary["calls"], CONTEXT_TOTAL_CALLS)
+        counted: dict[str, int] = {}
+        for *_, band in CONTEXT_CALLS:
+            if band is not None:
+                counted[band] = counted.get(band, 0) + 1
+        self.assertEqual(counted, EXPECTED_BAND_CALLS)
+        self.assertEqual(
+            sum(context for _, context, _, _ in CONTEXT_CALLS),
+            EXPECTED_SAMPLE_TOTAL,
+        )
+
+    def test_the_headline_is_a_median_of_the_measured_calls(self) -> None:
+        block = self.block()
+        self.assertEqual(block["median"], EXPECTED_MEDIAN)
+        self.assertEqual(block["sample_calls"], CONTEXT_SAMPLE_CALLS)
+        self.assertEqual(block["sample_is"], CONTEXT_SAMPLE)
+
+    def test_the_spread_reports_every_percentile_it_publishes(self) -> None:
+        block = self.block()
+        self.assertEqual(block["percentiles"], EXPECTED_PERCENTILES)
+        self.assertEqual(
+            sorted(block["percentiles"]), sorted(f"p{p}" for p in PERCENTILES)
+        )
+
+    def test_the_median_is_the_p50_it_publishes(self) -> None:
+        # One quantity, one spelling: a headline that disagreed with the spread
+        # beside it would be two answers to the same question.
+        block = self.block()
+        self.assertEqual(block["median"], block["percentiles"]["p50"])
+
+    def test_the_mean_is_kept_beside_the_median_and_named_as_the_skew(
+        self,
+    ) -> None:
+        # The mean survives only as EVIDENCE about the distribution -- it is
+        # 1.45x the median here and only 5 of 11 calls exceed it. On the
+        # reference corpus (2026-08-05) it is 1.53x with 28.7% above.
+        block = self.block()
+        self.assertAlmostEqual(block["mean"], EXPECTED_MEAN)
+        self.assertGreater(block["mean"], block["median"])
+        self.assertAlmostEqual(
+            block["mean_over_median"], EXPECTED_MEAN / EXPECTED_MEDIAN
+        )
+        self.assertEqual(block["calls_above_mean"], EXPECTED_CALLS_ABOVE_MEAN)
+        self.assertAlmostEqual(
+            block["share_above_mean"],
+            EXPECTED_CALLS_ABOVE_MEAN / CONTEXT_SAMPLE_CALLS,
+        )
+
+    def test_a_call_with_no_context_measurement_is_counted_not_sampled(self) -> None:
+        # #25's population, in one row. Banded, it would file as the most
+        # frugal call on the report; sampled, it divides the same tokens by one
+        # more row. `avg_context` still does exactly that -- #25 owns those
+        # call sites -- so the gap between it and `mean` IS the defect, and
+        # these two must not be able to collapse into each other.
+        block = self.block()
+        summary = self.api.summary(*day_bounds(None, None))
+        self.assertEqual(block["unmeasured_calls"], 1)
+        self.assertAlmostEqual(summary["avg_context"], EXPECTED_LEGACY_AVG)
+        self.assertLess(summary["avg_context"], block["mean"])
+        self.assertNotAlmostEqual(summary["avg_context"], block["mean"])
+
+    def test_every_call_is_banded_or_counted_as_a_named_absence(self) -> None:
+        # The invariant that makes the bands readable: nothing is silently
+        # dropped, so band counts + INCONCLUSIVE + unmeasured == the window's
+        # calls, the same number the summary card shows.
+        block = self.block()
+        util = block["utilisation"]
+        self.assertEqual(
+            sum(b["calls"] for b in util["bands"])
+            + util["unknown_model_calls"]
+            + block["unmeasured_calls"],
+            self.api.summary(*day_bounds(None, None))["calls"],
+        )
+        self.assertEqual(util["banded_calls"], CONTEXT_BANDED_CALLS)
+
+    def test_each_call_is_banded_against_its_own_model_window(self) -> None:
+        util = self.block()["utilisation"]
+        self.assertEqual(
+            {b["band"]: b["calls"] for b in util["bands"]}, EXPECTED_BAND_CALLS
+        )
+
+    def test_the_bands_are_reported_high_to_low_with_their_boundaries(self) -> None:
+        # A declarative template renders this list as-is: the label, the
+        # boundaries and the share are all in the payload, so the view does no
+        # arithmetic and cannot invent a boundary of its own.
+        util = self.block()["utilisation"]
+        self.assertEqual(
+            [b["band"] for b in util["bands"]],
+            [BAND_AT_LEAST_90, BAND_50_TO_90, BAND_25_TO_50, BAND_UNDER_25],
+        )
+        top = util["bands"][0]
+        self.assertEqual(top["lower"], 0.90)
+        self.assertIsNone(top["upper"])
+        self.assertAlmostEqual(
+            top["share"], EXPECTED_BAND_CALLS[BAND_AT_LEAST_90] / CONTEXT_BANDED_CALLS
+        )
+        self.assertAlmostEqual(sum(b["share"] for b in util["bands"]), 1.0)
+
+    def test_an_unknown_model_is_named_rather_than_given_a_window(self) -> None:
+        # THE rule of this feature. The call keeps its place in the context
+        # distribution -- its size was measured -- and has no utilisation at
+        # all, so it is counted and named instead of banded.
+        util = self.block()["utilisation"]
+        self.assertEqual(util["unknown_model_calls"], 1)
+        self.assertEqual(util["unknown_models"], [UNKNOWN_MODEL])
+        # Still in the distribution: the sample is the banded calls PLUS it,
+        # so dropping it would move the median and the mean as well as this
+        # count.
+        self.assertEqual(
+            util["banded_calls"] + util["unknown_model_calls"],
+            self.block()["sample_calls"],
+        )
+        self.assertEqual(util["banded_calls"], CONTEXT_SAMPLE_CALLS - 1)
+
+    def test_a_call_over_its_window_is_counted_where_a_reader_can_see_it(
+        self,
+    ) -> None:
+        # What makes a stale window table safe in a way a stale rate table was
+        # not: a wrong denominator produces utilisation over 100%, which is
+        # absurd on its face -- but only if someone counts it.
+        #
+        # A call that exactly FILLS its window is not one of them: the window
+        # is a limit, and reaching it is the limit working. The fixture holds
+        # one of each, so `>` cannot be relaxed to `>=` without going red.
+        util = self.block()["utilisation"]
+        self.assertEqual(util["over_window_calls"], 1)
+        self.assertEqual(
+            {b["band"]: b["calls"] for b in util["bands"]}[BAND_AT_LEAST_90],
+            EXPECTED_BAND_CALLS[BAND_AT_LEAST_90],
+            "the call at exactly 100% is still in the top band",
+        )
+
+    def test_the_window_and_the_bands_carry_different_provenances(self) -> None:
+        # Getting this wrong would lend Anthropic's authority to a boundary
+        # this project invented.
+        util = self.block()["utilisation"]
+        self.assertEqual(util["windows_as_of"], WINDOWS_AS_OF)
+        self.assertEqual(util["bands_as_of"], BANDS_AS_OF)
+        self.assertIn(WINDOW_SOURCE, util["window_provenance"])
+        self.assertIn("documented", util["window_provenance"])
+        self.assertIn("product-owner judgment", util["band_provenance"])
+        self.assertIn("not an Anthropic recommendation", util["band_provenance"])
+        self.assertNotIn("Anthropic recommend", util["window_provenance"])
+
+    def test_a_window_with_no_calls_reports_no_sample_rather_than_zero(self) -> None:
+        # An empty period is not a period of tiny, healthy calls (rule #12).
+        block = self.block(CONTEXT_EMPTY_DAY)
+        self.assertEqual(block["sample_calls"], 0)
+        self.assertEqual(block["unmeasured_calls"], 0)
+        for field in (
+            "median", "mean", "mean_over_median", "calls_above_mean",
+            "share_above_mean",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNone(block[field])
+        for name, value in block["percentiles"].items():
+            with self.subTest(percentile=name):
+                self.assertIsNone(value)
+        util = block["utilisation"]
+        self.assertEqual(util["banded_calls"], 0)
+        for band in util["bands"]:
+            with self.subTest(band=band["band"]):
+                self.assertEqual(band["calls"], 0)
+                self.assertIsNone(band["share"], "a share of an empty set is not 0%")
+        self.assertEqual(util["unknown_models"], [])
+
+    def test_the_block_is_window_scoped_like_every_other_figure(self) -> None:
+        self.assertEqual(self.block(CONTEXT_DAY), self.block())
+        self.assertNotEqual(self.block(CONTEXT_EMPTY_DAY), self.block())
 
 
 if __name__ == "__main__":
