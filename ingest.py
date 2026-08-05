@@ -207,6 +207,87 @@ USAGE_TOKEN_KEYS = (
     "output_tokens",
 )
 
+# CACHE-MISS DIAGNOSTICS (#5). Claude Code sends the `cache-diagnosis-2026-04-07`
+# beta header and PERSISTS Anthropic's own answer on the response record, so CPB
+# READS the classification and never re-derives it. Re-derivation was not merely
+# redundant, it was impossible: 0 assistant records on this machine carry a
+# `system` or `tools` field, on the message or on the record, so nothing local
+# could ever separate `system_changed` from `tools_changed`.
+#
+# REFERENCE CORPUS for every count in this region: one developer machine's local
+# transcripts, 3,012 files, checked 2026-08-05 -- 341,597 assistant records on
+# the first scan and 341,840 on a second an hour later, which is the point:
+# it is one operator's usage, it grows and gets reaped between scans, and every
+# figure below is a dated SAMPLE rather than a constant. Re-measure before
+# quoting any of them.
+#
+# The keys, on `message`, and inside it. Named once because the reader, the
+# tests and (later) the report must mean the same field.
+DIAGNOSTICS_KEY = "diagnostics"
+CACHE_MISS_REASON_KEY = "cache_miss_reason"
+CACHE_MISS_TYPE_KEY = "type"
+CACHE_MISSED_TOKENS_KEY = "cache_missed_input_tokens"
+
+# The taxonomy, in TWO families -- which is the whole of why it is not one
+# frozenset. The API reports the EARLIEST divergence point, so a type names the
+# first thing that differed, and the absence of a type is not proof of
+# stability.
+#
+# Counts by distinct `message.id` on the reference corpus above:
+# unavailable 549, messages_changed 325, previous_message_not_found 206,
+# tools_changed 93, system_changed 36, model_changed 10. All six occur --
+# including the two a transcript-only re-derivation could never have separated.
+CACHE_MISS_MODEL_CHANGED = "model_changed"
+CACHE_MISS_SYSTEM_CHANGED = "system_changed"
+CACHE_MISS_TOOLS_CHANGED = "tools_changed"
+CACHE_MISS_MESSAGES_CHANGED = "messages_changed"
+CACHE_MISS_PREVIOUS_MESSAGE_NOT_FOUND = "previous_message_not_found"
+CACHE_MISS_UNAVAILABLE = "unavailable"
+
+# Something the request CHANGED, which is a cause a reader can act on.
+CACHE_MISS_DIVERGENCE_TYPES = frozenset({
+    CACHE_MISS_MODEL_CHANGED,
+    CACHE_MISS_SYSTEM_CHANGED,
+    CACHE_MISS_TOOLS_CHANGED,
+    CACHE_MISS_MESSAGES_CHANGED,
+})
+# NO COMPARISON WAS PRODUCED. Neither of these is a divergence and neither is
+# evidence that anything changed: `previous_message_not_found` means no
+# fingerprint was stored for that id, and `unavailable` means the comparison did
+# not happen -- it is also where a differing `thinking`, `output_config`
+# (`effort`), `tool_choice`, `context_management`, `output_format` or beta-header
+# set lands, and where conversations past the comparison horizon land (TA-6,
+# TA-7). Storing them so that a later reader can total them as causes would
+# INVENT a cause, in the detector written to avoid exactly that; 755 of the
+# 1,219 classified calls above are these two.
+CACHE_MISS_NO_COMPARISON_TYPES = frozenset({
+    CACHE_MISS_PREVIOUS_MESSAGE_NOT_FOUND,
+    CACHE_MISS_UNAVAILABLE,
+})
+CACHE_MISS_TYPES = CACHE_MISS_DIVERGENCE_TYPES | CACHE_MISS_NO_COMPARISON_TYPES
+
+# WHAT THE READ FOUND, stored in `api_calls.cache_miss_outcome`. This vocabulary
+# is disjoint from the one above on purpose: the outcome answers "what kind of
+# sample is this call", the reason answers "which member of the taxonomy", and a
+# shared spelling would let a reader group by one while reading the other.
+#
+# NULL is a sixth reading and belongs to none of these -- see the schema comment
+# above `api_calls` for why it must stay outside the vocabulary.
+CACHE_DIAG_ABSENT = "absent"  # read; the record carried no `diagnostics` key
+CACHE_DIAG_NO_DIVERGENCE = "no-divergence"  # a real zero-divergence SAMPLE
+CACHE_DIAG_DIVERGENCE = "divergence"  # classified, and a cause
+CACHE_DIAG_NO_COMPARISON = "no-comparison"  # classified, and NOT a cause
+CACHE_DIAG_UNRECOGNISED = "unrecognised"  # a type this build cannot place
+CACHE_DIAG_UNREADABLE = "unreadable"  # a shape the reader cannot trust
+CACHE_DIAG_OUTCOMES = frozenset({
+    CACHE_DIAG_ABSENT,
+    CACHE_DIAG_NO_DIVERGENCE,
+    CACHE_DIAG_DIVERGENCE,
+    CACHE_DIAG_NO_COMPARISON,
+    CACHE_DIAG_UNRECOGNISED,
+    CACHE_DIAG_UNREADABLE,
+})
+
 # EVERY table this tool creates. ONE list, used by both the probe and the drop
 # loop in `_prepare_schema` -- two lists is how `subagent_runs` and
 # `task_index_sessions` were omitted from the rebuild in the first place.
@@ -227,7 +308,7 @@ DERIVED_TABLES = (
 # older shape is rebuilt from scratch rather than migrated in place -- see
 # `_prepare_schema`, and `IN_PLACE_UPGRADE_FROM` below for the narrow case
 # where rebuilding would cost rows to arrive at the identical database.
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Versions whose difference from the current shape can be applied WITHOUT
 # losing a measurement, so they upgrade in place instead of being dropped and
@@ -243,6 +324,10 @@ SCHEMA_VERSION = 10
 #             `_dedupe_dispatch_task_ids()` -- the index cannot be created over
 #             a table that already holds duplicates, so the resolution is part
 #             of the hop or the hop cannot run (#36).
+#   v10 -> v11 ADDS three nullable `api_calls` columns for the cache-miss
+#             diagnostics (#5), applied by `ALTER TABLE ... ADD COLUMN` -- see
+#             IN_PLACE_ADDABLE_COLUMNS for why NULL is a TRUE statement about
+#             every row already there.
 #
 # RE-DECIDED at this bump, not extended by habit -- the comment below has said
 # since v8 that this does not accumulate, so each member was re-checked against
@@ -250,15 +335,18 @@ SCHEMA_VERSION = 10
 #
 #   * 6: needs `ingest_runs` created (empty is true of it), `cost_usd` dropped
 #     in place, `source_shape` created (empty is true of it -- see
-#     IN_PLACE_CREATABLE_TABLES), duplicate dispatch rows resolved.
+#     IN_PLACE_CREATABLE_TABLES), duplicate dispatch rows resolved, the three
+#     diagnostics columns added.
 #   * 7: `cost_usd` dropped in place, `source_shape` created, duplicates
-#     resolved.
-#   * 8: `source_shape` created, duplicates resolved.
-#   * 9: duplicates resolved.
+#     resolved, diagnostics columns added.
+#   * 8: `source_shape` created, duplicates resolved, diagnostics columns added.
+#   * 9: duplicates resolved, diagnostics columns added.
+#   * 10: diagnostics columns added, and NOTHING else -- the v10 shape is the
+#     current one minus those three columns.
 #
-# THE BAR MOVED AT THIS BUMP, and saying so is the point of re-deciding rather
-# than extending. It was "the delta preserves every ROW"; v9 -> v10 deletes
-# rows, so it would fail that bar as written. What it preserves is every
+# THE BAR MOVED AT THE v10 BUMP, and saying so is the point of re-deciding
+# rather than extending. It was "the delta preserves every ROW"; v9 -> v10
+# deletes rows, so it would fail that bar as written. What it preserves is every
 # DISPATCH: a duplicate `task_id` row is one dispatch recorded in a second
 # transcript, not a second dispatch, and one WHOLE row of the pair survives
 # (`_resolve_dispatch`). Three things keep that from being a licence:
@@ -274,8 +362,11 @@ SCHEMA_VERSION = 10
 #
 # Whoever bumps SCHEMA_VERSION next has to re-decide this AGAIN, and against
 # the bar as it now stands: a delta that loses a MEASUREMENT belongs nowhere
-# near this set, whatever it does to row counts.
-IN_PLACE_UPGRADE_FROM = frozenset({6, 7, 8, 9})
+# near this set, whatever it does to row counts. v10 was admitted at this bump
+# under that bar and not under the older one: its delta deletes no row AND
+# loses no measurement, because the columns it gains had no value on any
+# existing row to lose.
+IN_PLACE_UPGRADE_FROM = frozenset({6, 7, 8, 9, 10})
 
 # The two permissions an in-place upgrade needs, named and bounded, because
 # `CREATE TABLE IF NOT EXISTS` silently grants the first to EVERY table and
@@ -308,8 +399,22 @@ IN_PLACE_CREATABLE_TABLES = frozenset({INGEST_RUNS_TABLE, SHAPE_TABLE})
 # column existed asserted implicitly, and the next run recomputes it from the
 # filesystem anyway. A NOT NULL column cannot be added this way at all, and a
 # nullable one whose NULL would read as a measurement must not be.
+#
+# The three cache-miss columns (#5) clear it for a different reason, and the
+# reason is the design: NULL in `cache_miss_outcome` means "this row was written
+# before CPB read `message.diagnostics`" -- UNMEASURED. That is true of every
+# row a pre-v11 build wrote, by construction, since no such build ever looked.
+# It is a DIFFERENT statement from every value the reader can write, including
+# `absent` ("read, and the record carried no diagnostics") and `no-divergence`
+# ("read, and it reported no divergence"). Back-filling either onto those rows
+# would manufacture an observation nobody made, over a whole corpus at once.
+# They are re-read when their source file next changes -- the same resolution
+# `source_shape` takes for an uncensused source (#15), and for the same reason.
 IN_PLACE_ADDABLE_COLUMNS: dict[tuple[str, str], str] = {
     ("ingest_state", "archived_at"): "REAL",
+    ("api_calls", "cache_miss_outcome"): "TEXT",
+    ("api_calls", "cache_miss_reason"): "TEXT",
+    ("api_calls", "cache_missed_input_tokens"): "INTEGER",
 }
 
 # What one `agent_dispatches` row knows about a dispatch BEYOND its identity
@@ -397,6 +502,45 @@ CREATE TABLE IF NOT EXISTS turns (
 --
 -- `message_id` is the API's own id for this response. NULL is legitimate and is
 -- NOT a shared key: two NULL-id records are two calls, never one.
+--
+-- CACHE-MISS DIAGNOSTICS: THREE COLUMNS, BECAUSE ONE CANNOT SAY IT (#5).
+-- Anthropic's own classification is persisted at `message.diagnostics`, at
+-- exactly this table's grain (one row per `message.id`), so it is read onto the
+-- call. Reading it produces FOUR distinct facts that a single nullable column
+-- would collapse into two:
+--
+--   no `diagnostics` key      -> INCONCLUSIVE. Claude Code persisting the field
+--                                is Claude Code behaviour, not an API
+--                                guarantee (#15), so its absence is "not
+--                                sampled" -- never "no divergence". 108 of
+--                                341,597 assistant records here, and all 108
+--                                are model `<synthetic>`, the local-error
+--                                placeholders (measured, not assumed).
+--   `diagnostics` naming no reason -> a REAL zero-divergence sample: first
+--                                turn, or nothing diverged. 338,692 records.
+--   `diagnostics` naming a type -> classified, and in one of two families,
+--                                because `previous_message_not_found` and
+--                                `unavailable` are NOT divergences.
+--   this row predates the read -> NULL, and nothing else in the vocabulary.
+--
+-- Hence `cache_miss_outcome` (which of those, and which family -- see
+-- CACHE_DIAG_*) beside `cache_miss_reason` (which member of the taxonomy, the
+-- API's own spelling, NULL unless it named one). The redundancy between them is
+-- deliberate: the outcome is what a reader GROUPS BY, so no query has to know
+-- that two of the six types must be excluded from a "why did the cache miss"
+-- total, and no future reader can accidentally count them as a cause.
+--
+-- `cache_missed_input_tokens` is Anthropic's own ESTIMATE, stored verbatim:
+-- "derived from byte lengths before tokenization, so treat it as a magnitude
+-- indicator rather than a billing number. It can differ from (and occasionally
+-- exceed) `usage.input_tokens`." It is NOT clamped and NOT validated against
+-- `input_tokens` -- measured, it exceeded `input_tokens` on 1,144 of 1,144
+-- records carrying it (2026-08-05), which is expected rather than anomalous
+-- because `input_tokens` counts only the tokens after the last cache
+-- breakpoint. A clamp would corrupt every one of them; a validation would
+-- reject every one of them. NULL means no magnitude was read -- the API
+-- supplies none for the two no-comparison types -- and never 0, which would
+-- say the miss cost nothing.
 CREATE TABLE IF NOT EXISTS api_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -412,7 +556,10 @@ CREATE TABLE IF NOT EXISTS api_calls (
     output_tokens INTEGER NOT NULL,
     context_size INTEGER NOT NULL,
     is_sidechain INTEGER NOT NULL DEFAULT 0,
-    message_id TEXT
+    message_id TEXT,
+    cache_miss_outcome TEXT,
+    cache_miss_reason TEXT,
+    cache_missed_input_tokens INTEGER
 );
 -- `task_id` IS the agent, so at most one row may carry each one (#36) -- see
 -- the UNIQUE INDEX at the foot of this schema, and `_resolve_dispatch()` for
@@ -755,6 +902,18 @@ class ApiCall:
     output_tokens: int
     is_sidechain: bool
     message_id: Optional[str] = None
+    # Anthropic's own cache-miss classification, READ off `message.diagnostics`
+    # (#5). See `_read_cache_diagnostics` for what each field can say and the
+    # schema comment above `api_calls` for why it takes three of them.
+    cache_miss_outcome: Optional[str] = None
+    cache_miss_reason: Optional[str] = None
+    cache_missed_input_tokens: Optional[int] = None
+    # NOT stored: a fact about the READ, not about the call. True when some part
+    # of a PRESENT `diagnostics` object defeated the reader, which the stored
+    # columns cannot distinguish from "the API supplied none" -- both are "no
+    # sample". Counted per call after dedupe and said out loud, so a release
+    # that changed the shape cannot pass as a corpus that never missed.
+    diagnostics_unreadable: bool = False
 
     @property
     def context_size(self) -> int:
@@ -831,6 +990,13 @@ class ParseResult:
     # `output_tokens` -- the genuinely ambiguous case, ~1 in 19,000 on the
     # corpus this was measured against.
     divergent_message_ids: int = 0
+    # Cache-miss diagnostics coverage (#5), per CALL (post-dedupe). Two counts,
+    # never one and never folded into the classified buckets: "the record
+    # carried no `diagnostics` at all" and "it carried one this reader could not
+    # fully trust" are different absences, and a corpus where either became
+    # common would otherwise read as a corpus that stopped missing the cache.
+    calls_without_diagnostics: int = 0
+    calls_with_unreadable_diagnostics: int = 0
     # The transcript-SHAPE census for this file (#15): `(fact, name) -> records`,
     # written to `source_shape` verbatim. See `new_shape_census()` for why it
     # starts non-empty.
@@ -1304,7 +1470,23 @@ def parse_file(path: Path, collect_turns: bool = True) -> ParseResult:
                     f"{path.name}:{line_no}: {rtype or '(no type)'}: {exc}"
                 )
     result.calls = _dedupe_calls(result)
+    _count_cache_diagnostics(result)
     return result
+
+
+def _count_cache_diagnostics(result: ParseResult) -> None:
+    """Count the calls whose classification could not be read (#5).
+
+    AFTER dedupe, so the grain is the CALL (`message.id`) that the diagnostics
+    field itself is reported at -- counting records would multiply every figure
+    by however many content blocks Claude Code happened to stream.
+    """
+    result.calls_without_diagnostics = sum(
+        1 for call in result.calls if call.cache_miss_outcome == CACHE_DIAG_ABSENT
+    )
+    result.calls_with_unreadable_diagnostics = sum(
+        1 for call in result.calls if call.diagnostics_unreadable
+    )
 
 
 def _census_record(record: dict, rtype: Any, result: ParseResult) -> None:
@@ -1417,6 +1599,13 @@ def _dedupe_calls(result: ParseResult) -> list[ApiCall]:
     ids -- an observation about that corpus on that date, not a property of
     either rule, and not the 109 the README reports for the older corpus.
 
+    The same rule carries the cache-miss classification (#5): it is a property
+    of the CALL, so the surviving whole record brings its own and no field of it
+    is merged with another record's. Measured 2026-08-05, records of one id
+    disagreed on `diagnostics` in 0 of 169,331 cases, so nothing is lost by
+    that; if a release ever makes them disagree, one real record's answer is
+    still the only honest thing to store.
+
     **A missing id is not a shared key.** Records without `message.id` each
     stay their own call. Dropping them would silently delete real spend, and
     grouping them together would merge unrelated calls; both are worse than
@@ -1448,6 +1637,91 @@ def _dedupe_calls(result: ParseResult) -> list[ApiCall]:
     order = {id(c): i for i, c in enumerate(result.calls)}
     deduped.sort(key=lambda c: order[id(c)])
     return deduped
+
+
+def _missed_input_tokens(reason: dict) -> tuple[Optional[int], bool]:
+    """Anthropic's byte-length ESTIMATE, verbatim, plus "could it be read".
+
+    Deliberately NOT clamped and NOT checked against `usage.input_tokens`: the
+    docs say it "can differ from (and occasionally exceed)" it, and measured
+    here it exceeded it on 1,144 of 1,144 records carrying it (2026-08-05),
+    because `input_tokens` counts only the tokens after the last cache
+    breakpoint. Either guard would corrupt or reject every real value.
+
+    A key that is ABSENT is not a failure -- the two no-comparison types never
+    carry one (0 of 1,653 such records) -- so it returns `(None, False)`. A key
+    that is PRESENT with a value this reader cannot use returns `(None, True)`:
+    no number is invented, and the fact that one was offered and refused is
+    counted.
+
+    Stricter than `tok()` on purpose, in two places. `bool` is excluded because
+    it is an `int` in Python and `True` would store as a plausible 1. A FLOAT is
+    excluded too, where `tok()` accepts one: this field is documented as a token
+    count and was an `int` on 1,144 of 1,144 records carrying it, so a float is
+    a shape change, and truncating it to fit would be that change applied
+    silently to a number nobody could then question.
+    """
+    if CACHE_MISSED_TOKENS_KEY not in reason:
+        return None, False
+    value = reason[CACHE_MISSED_TOKENS_KEY]
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, True
+    return value, False
+
+
+def _read_cache_diagnostics(
+    message: dict,
+) -> tuple[str, Optional[str], Optional[int], bool]:
+    """Read `message.diagnostics` (#5). Returns (outcome, reason, missed, unreadable).
+
+    A READ, never a derivation: Anthropic classifies the miss and Claude Code
+    persists the answer, so there is no comparison of consecutive calls here and
+    must not be one -- the transcript does not carry the inputs one would need
+    (0 assistant records carry a `system` or `tools` field, measured 2026-08-05
+    over the reference corpus named beside CACHE_MISS_TYPES).
+
+    Every branch returns a NAMED outcome, so a call this function looked at is
+    never silently unclassified; only a row written before this function existed
+    reads NULL. The order of the branches is the order of the facts:
+
+      * key absent            -> `absent`. Read, and there was nothing to read.
+      * `null`, or an object naming no reason -> `no-divergence`. A real
+        zero-divergence SAMPLE, and the corpus's overwhelming majority. Both
+        spellings say the same thing; only the first occurs here.
+      * a named type          -> its family, or `unrecognised` when this build
+        has never heard of it. Guessing a seventh type's family would invent
+        the answer, and dropping it would hide the release that added it -- so
+        the name is stored and neither family claims it.
+      * anything else         -> `unreadable`. A shape this reader cannot trust
+        yields no classification at all rather than a plausible one.
+
+    An unreadable `diagnostics` is NOT a parse failure: the record's `usage` was
+    fine, and refusing to classify a call must never cost it its measured
+    tokens. So this never raises.
+    """
+    if DIAGNOSTICS_KEY not in message:
+        return CACHE_DIAG_ABSENT, None, None, False
+    diagnostics = message[DIAGNOSTICS_KEY]
+    if diagnostics is None:
+        return CACHE_DIAG_NO_DIVERGENCE, None, None, False
+    if not isinstance(diagnostics, dict):
+        return CACHE_DIAG_UNREADABLE, None, None, True
+    reason = diagnostics.get(CACHE_MISS_REASON_KEY)
+    if reason is None:
+        return CACHE_DIAG_NO_DIVERGENCE, None, None, False
+    if not isinstance(reason, dict):
+        return CACHE_DIAG_UNREADABLE, None, None, True
+    miss_type = reason.get(CACHE_MISS_TYPE_KEY)
+    if not isinstance(miss_type, str) or not miss_type:
+        return CACHE_DIAG_UNREADABLE, None, None, True
+    if miss_type in CACHE_MISS_DIVERGENCE_TYPES:
+        outcome = CACHE_DIAG_DIVERGENCE
+    elif miss_type in CACHE_MISS_NO_COMPARISON_TYPES:
+        outcome = CACHE_DIAG_NO_COMPARISON
+    else:
+        outcome = CACHE_DIAG_UNRECOGNISED
+    missed, refused = _missed_input_tokens(reason)
+    return outcome, miss_type, missed, refused
 
 
 def _parse_assistant(
@@ -1485,6 +1759,7 @@ def _parse_assistant(
             raise ValueError(f"non-numeric usage value for {key}: {value!r}")
         return int(value)
 
+    outcome, miss_reason, missed_tokens, unreadable = _read_cache_diagnostics(message)
     result.calls.append(
         ApiCall(
             turn_index=current_turn,
@@ -1499,6 +1774,10 @@ def _parse_assistant(
                 message["id"] if isinstance(message.get("id"), str) and message["id"]
                 else None
             ),
+            cache_miss_outcome=outcome,
+            cache_miss_reason=miss_reason,
+            cache_missed_input_tokens=missed_tokens,
+            diagnostics_unreadable=unreadable,
         )
     )
 
@@ -1907,8 +2186,9 @@ def store_source(
         conn.execute(
             "INSERT INTO api_calls (session_id, source_path, source_kind, agent_id,"
             " turn_id, ts, model, input_tokens, cache_read, cache_write,"
-            " output_tokens, context_size, is_sidechain, message_id)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " output_tokens, context_size, is_sidechain, message_id,"
+            " cache_miss_outcome, cache_miss_reason, cache_missed_input_tokens)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 source.session_id,
                 source_path,
@@ -1924,6 +2204,9 @@ def store_source(
                 call.context_size,
                 1 if call.is_sidechain else 0,
                 call.message_id,
+                call.cache_miss_outcome,
+                call.cache_miss_reason,
+                call.cache_missed_input_tokens,
             ),
         )
 
@@ -2708,6 +2991,11 @@ def ingest(
             # a corpus where either is common cannot read as a clean one.
             "calls_without_message_id": 0,
             "divergent_message_ids": 0,
+            # Cache-miss diagnostics coverage (#5). Counted apart from every
+            # classified bucket: a call CPB could not classify is not a call
+            # that did not miss the cache.
+            "calls_without_diagnostics": 0,
+            "calls_with_unreadable_diagnostics": 0,
             # Dispatch dedupe (#36), counted the same way and for the same
             # reason. A RUN event, not a standing fact about the corpus: it
             # counts collisions THIS run resolved, so a run that skipped every
@@ -2762,6 +3050,10 @@ def ingest(
             summary["unparsed_records"] += parsed.unparsed_records
             summary["calls_without_message_id"] += parsed.calls_without_message_id
             summary["divergent_message_ids"] += parsed.divergent_message_ids
+            summary["calls_without_diagnostics"] += parsed.calls_without_diagnostics
+            summary["calls_with_unreadable_diagnostics"] += (
+                parsed.calls_with_unreadable_diagnostics
+            )
             summary["unparsed_details"].extend(parsed.unparsed_details)
 
         # Reconcile: a transcript deleted/renamed on disk must not leave its
@@ -2913,6 +3205,8 @@ def ingest_transcript(
             "unparsed_records": 0,
             "calls_without_message_id": 0,
             "divergent_message_ids": 0,
+            "calls_without_diagnostics": 0,
+            "calls_with_unreadable_diagnostics": 0,
             "duplicate_dispatches_resolved": 0,
             "divergent_dispatch_task_ids": 0,
             "unparsed_details": [],
@@ -2952,6 +3246,10 @@ def ingest_transcript(
             summary["unparsed_records"] = parsed.unparsed_records
             summary["calls_without_message_id"] = parsed.calls_without_message_id
             summary["divergent_message_ids"] = parsed.divergent_message_ids
+            summary["calls_without_diagnostics"] = parsed.calls_without_diagnostics
+            summary["calls_with_unreadable_diagnostics"] = (
+                parsed.calls_with_unreadable_diagnostics
+            )
             summary["unparsed_details"] = list(parsed.unparsed_details)
             # THIS FILE's shape census, and only this file's (#15). Directory
             # mode reads the corpus-wide roll-up off the database; doing that
@@ -3153,6 +3451,33 @@ def print_dedupe_note(summary: dict[str, Any]) -> None:
         )
 
 
+def print_cache_diagnostics_note(summary: dict[str, Any]) -> None:
+    """Calls whose cache-miss classification could not be read (#5).
+
+    Printed only when there is something to say, so its appearance MEANS
+    something -- and never as a share of the classified calls, which would
+    invite reading "0.03% unclassified" as a rounding error rather than as the
+    first sign that a Claude Code release stopped writing the field.
+
+    Both counts range over the calls INGESTED THIS RUN. An all-skipped
+    incremental run reports nothing here, which is correct: it read no record
+    and so observed no absence. The standing fact is the stored
+    `cache_miss_outcome` column, which every reader can total per window.
+    """
+    absent = summary.get("calls_without_diagnostics") or 0
+    unreadable = summary.get("calls_with_unreadable_diagnostics") or 0
+    if not absent and not unreadable:
+        return
+    print(
+        "NOTE: cache-miss diagnostics --"
+        f" calls with no `diagnostics` field: {absent};"
+        f" calls whose `diagnostics` this tool found unreadable: {unreadable}."
+        " Both are UNCLASSIFIED, not 'no divergence': Claude Code persisting"
+        " Anthropic's classification is a Claude Code behaviour, not an API"
+        " guarantee, so its absence is unmeasured rather than clean (#15)."
+    )
+
+
 def _named_counts(census: dict[Optional[str], int]) -> str:
     """`name=count` pairs for a census, with the absence bucket named as one.
 
@@ -3262,6 +3587,7 @@ def run_transcript_mode(transcript: Path, db_path: Path) -> None:
         " no claim is made about any other source."
     )
     print_dedupe_note(summary)
+    print_cache_diagnostics_note(summary)
     print_shape_note(summary)
     print_inconclusive_note(summary)
 
@@ -3372,6 +3698,7 @@ def main() -> None:
             "sessions with subagent transcripts:"
             f" {summary['sessions_with_subagent_transcripts']}"
         )
+    print_cache_diagnostics_note(summary)
     print_shape_note(summary)
     print_inconclusive_note(summary)
 
