@@ -1344,9 +1344,45 @@ RANK_TOTALS = {
 RANK_BY_TOTAL_TOKENS = ["rkout", "rkcache", "rkopus", "rkmixed"]
 RANK_BY_CACHE_READ = ["rkcache", "rkout", "rkopus", "rkmixed"]
 
+# A FIFTH dispatch, and the one both safety properties of this panel actually
+# turn on: reaped AFTER it was ingested.
+#
+# `rkgone` above is reaped-before-ingest -- no transcript ever landed, so its
+# SQL `total_tokens` is already NULL, NULL collates last under DESC anyway,
+# and the Python null-ing is a no-op on a value that is already None. Both
+# `serve.py` safety properties (the status-first sort key, and `total_tokens`
+# in the unavailable null-list) therefore SURVIVED deliberate mutation against
+# `rkgone` alone: the assertions passed for the wrong reason, which is exactly
+# the "a fixture must not make the defect undetectable" failure in CLAUDE.md.
+#
+# `rkarch` is the other, load-bearing half of the durability story: ingested
+# on one run, its transcript reaped before the next. `store_subagent_runs()`
+# rebuilds its row as `unavailable` from the task index, while the archive
+# path KEEPS its `api_calls` rows (CLAUDE.md, "Durability -- the DB is not
+# regenerable"). So its raw SQL sort key is 9,003,000, NOT NULL:
+#
+#   * with the status key moved off first, it ranks #1 and the panel opens
+#     with an all-dashes row;
+#   * with `total_tokens` dropped from the null-list, it renders 9,003,000
+#     beside `cache_read=—` and `model=—`.
+#
+# Its total is ~8.8x the measured leader's so the ordering property bites at
+# the very top of the list, and its four token classes are pinned mutually
+# different so a swapped column mapping cannot pass either.
+RANK_REAPED = "rkarch"
+RANK_REAPED_CALLS = [("claude-opus-4-8", 3_000_000, 4_000_000, 2_000_000, 3_000)]
+RANK_REAPED_TOTAL = 9_003_000
+# Every agent that gets a real transcript written, measured or later reaped.
+RANK_TRANSCRIPTS = {**RANK_AGENTS, RANK_REAPED: RANK_REAPED_CALLS}
+
 
 def build_ranking_corpus(root: Path) -> tuple[Path, Path]:
-    """A session dispatching four measured agents and one reaped one."""
+    """A session dispatching four measured agents and two reaped ones.
+
+    Reaping is a two-step story, so this only lays down the corpus in its
+    pre-reap state: the caller ingests, calls `reap_ingested_transcript()`,
+    and ingests again.
+    """
     projects = root / "projects"
     subagents = projects / RANK_SESSION / "subagents"
     subagents.mkdir(parents=True)
@@ -1359,7 +1395,7 @@ def build_ranking_corpus(root: Path) -> tuple[Path, Path]:
         "timestamp": "2026-03-04T09:00:00.000Z",
         "message": {"role": "user", "content": "Delegate"},
     }))
-    for agent_id, calls in RANK_AGENTS.items():
+    for agent_id, calls in RANK_TRANSCRIPTS.items():
         (subagents / f"agent-{agent_id}.jsonl").write_text("".join(
             rec({
                 "type": "assistant", "sessionId": RANK_SESSION,
@@ -1384,7 +1420,7 @@ def build_ranking_corpus(root: Path) -> tuple[Path, Path]:
     tasks = root / "tasks"
     index = tasks / RANK_SESSION / "tasks"
     index.mkdir(parents=True)
-    for agent_id in RANK_AGENTS:
+    for agent_id in RANK_TRANSCRIPTS:
         (index / f"{agent_id}.output").symlink_to(
             subagents / f"agent-{agent_id}.jsonl"
         )
@@ -1392,6 +1428,19 @@ def build_ranking_corpus(root: Path) -> tuple[Path, Path]:
     # ranking must not read that as the cheapest agent.
     (index / "rkgone.output").symlink_to(subagents / "agent-rkgone.jsonl")
     return projects, tasks
+
+
+def reap_ingested_transcript(projects: Path) -> None:
+    """Delete `RANK_REAPED`'s transcript, leaving its task-index entry behind.
+
+    What Claude Code's `cleanupPeriodDays` does between two ingests: the
+    canonical transcript goes, the index symlink stays and dangles. Only the
+    subagent's own files are touched -- the sidecar goes with it, because a
+    reap takes the directory entry, not just the JSONL.
+    """
+    subagents = projects / RANK_SESSION / "subagents"
+    (subagents / f"agent-{RANK_REAPED}.jsonl").unlink()
+    (subagents / f"agent-{RANK_REAPED}.meta.json").unlink()
 
 
 class AgentRankingByTotalTokensTest(unittest.TestCase):
@@ -1416,8 +1465,15 @@ class AgentRankingByTotalTokensTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-ranking-test-"))
         projects, tasks = build_ranking_corpus(cls.tmp)
-        ingest(projects, cls.tmp / "usage.db", tasks_dir=tasks)
-        cls.api = Api(cls.tmp / "usage.db")
+        cls.db = cls.tmp / "usage.db"
+        # TWO ingests, which is the whole point of `rkarch`: the first measures
+        # it, the reap takes its transcript, the second archives the source
+        # (rows KEPT) and rebuilds its run row as `unavailable`. One ingest
+        # cannot produce a dispatch that is unmeasured and has measurements.
+        ingest(projects, cls.db, tasks_dir=tasks)
+        reap_ingested_transcript(projects)
+        ingest(projects, cls.db, tasks_dir=tasks)
+        cls.api = Api(cls.db)
         cls.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
 
     @classmethod
@@ -1470,6 +1526,79 @@ class AgentRankingByTotalTokensTest(unittest.TestCase):
         self.assertEqual(rows[-1]["agent_id"], "rkgone")
         self.assertEqual(rows[-1]["status"], "unavailable")
         self.assertIsNone(rows[-1]["total_tokens"])
+
+    # --- the reaped-AFTER-ingest dispatch: measurements outlive the source ---
+
+    def test_fixture_landed_a_reaped_dispatch_that_still_has_its_call_rows(
+        self,
+    ) -> None:
+        # THE guard. Both properties below are vacuous unless the raw sort key
+        # `serve.agents()` reads for `rkarch` is a large NUMBER while its
+        # status is `unavailable`. `rkgone` cannot establish that -- it has no
+        # call rows at all, so its SQL total is NULL and every assertion about
+        # NULL-handling passes without the code doing anything.
+        status = self.api.conn.execute(
+            "SELECT status FROM subagent_runs WHERE agent_id = ?", (RANK_REAPED,)
+        ).fetchone()
+        self.assertIsNotNone(status, f"{RANK_REAPED} has no subagent_runs row")
+        self.assertEqual(status["status"], "unavailable")
+        # Archived, not pruned: the rows the first ingest wrote are still here.
+        calls, total = self.api.conn.execute(
+            "SELECT COUNT(*), SUM(input_tokens + cache_read + cache_write"
+            " + output_tokens) FROM api_calls WHERE agent_id = ?",
+            (RANK_REAPED,),
+        ).fetchone()
+        self.assertEqual(calls, len(RANK_REAPED_CALLS))
+        self.assertEqual(total, RANK_REAPED_TOTAL)
+        # ...and it is bigger than the measured leader, so an ordering that
+        # reads it as a number cannot come out looking right by accident.
+        self.assertGreater(total, max(RANK_TOTALS.values()))
+        # The source really is gone from disk and marked archived.
+        archived = self.api.conn.execute(
+            "SELECT archived_at FROM ingest_state WHERE path LIKE ?",
+            (f"%agent-{RANK_REAPED}.jsonl",),
+        ).fetchone()
+        self.assertIsNotNone(archived, "the reaped source lost its ingest_state row")
+        self.assertIsNotNone(archived["archived_at"])
+
+    def test_a_reaped_dispatch_ranks_last_however_large_its_surviving_total(
+        self,
+    ) -> None:
+        # Property 1 (serve.py: "The FIRST sort key is the status"). `rkarch`
+        # carries 9,003,000 measured tokens in `api_calls`, so a sort that puts
+        # `total_tokens DESC` first opens the panel with an all-dashes row --
+        # an unmeasured dispatch presented as the single biggest spender.
+        rows = self.rows()
+        statuses = [r["status"] for r in rows]
+        self.assertEqual(rows[0]["agent_id"], RANK_BY_TOTAL_TOKENS[0])
+        self.assertEqual(
+            [r["agent_id"] for r in rows],
+            RANK_BY_TOTAL_TOKENS + [RANK_REAPED, "rkgone"],
+        )
+        # Stated as the property rather than as this fixture's order: every
+        # measured row precedes every unmeasured one, whatever they contain.
+        self.assertEqual(
+            statuses, sorted(statuses, key=lambda s: s == "unavailable"),
+            "an unavailable dispatch was interleaved with the measured ones",
+        )
+
+    def test_a_reaped_dispatch_reports_no_total_even_though_its_rows_survive(
+        self,
+    ) -> None:
+        # Property 2 (serve.py: a 0 -- or here a 9,003,000 -- "would file a
+        # reaped dispatch among the smallest ones"). The DB is now the only
+        # copy of that spend, but this panel cannot attribute it to a run whose
+        # transcript is gone, so it reports absence rather than a number beside
+        # a row of dashes. CLAUDE.md: absence is never rendered as a value.
+        row = {r["agent_id"]: r for r in self.rows()}[RANK_REAPED]
+        self.assertEqual(row["status"], "unavailable")
+        self.assertIsNone(row["total_tokens"])
+        # ALL of it, not just the sort key -- a row showing one live figure
+        # beside six dashes is a worse lie than a row showing none.
+        for key in ("input", "cache_read", "cache_write", "output",
+                    "calls", "model", "first_ts", "last_ts"):
+            with self.subTest(field=key):
+                self.assertIsNone(row[key])
 
     def test_the_model_is_carried_beside_the_ranking(self) -> None:
         by_id = {r["agent_id"]: r for r in self.rows()}

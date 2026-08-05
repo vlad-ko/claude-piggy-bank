@@ -2705,7 +2705,14 @@ class DropColumnCapabilityTest(unittest.TestCase):
         self.assertFalse(ingest_mod._sqlite_supports_drop_column("3.34"))
 
     def test_an_unreadable_version_is_not_supported(self) -> None:
-        for value in ("", "not-a-version", "3.x.1", "3"):
+        # "4" is the case that gives the `len(parsed) < 2` guard teeth. The
+        # other single-component string here, "3", is rejected by the version
+        # comparison anyway -- padded to (3, 0, 0) it is already below the
+        # (3, 35, 0) floor -- so the guard could be DELETED with the suite
+        # green. "4" pads to (4, 0, 0), which clears the floor: without the
+        # guard a string saying nothing whatever about a minor release reads
+        # as a permission to run DROP COLUMN.
+        for value in ("", "not-a-version", "3.x.1", "3", "4"):
             with self.subTest(value=value):
                 self.assertFalse(ingest_mod._sqlite_supports_drop_column(value))
 
@@ -2934,6 +2941,86 @@ class SchemaVersionSetsAreDecidedTest(unittest.TestCase):
 
     def test_the_shipped_schema_creates_no_money_column(self) -> None:
         self.assertNotIn("cost_usd", ingest_mod.SCHEMA)
+
+
+class PreV5ShortcutIsGatedOnDropColumnTest(unittest.TestCase):
+    """The pre-v5 in-place hop refuses to run without DROP COLUMN (#30).
+
+    That branch adds `ingest_state.archived_at` and then stamps
+    `user_version = 8`. Reaching v8 also means shedding `api_calls.cost_usd`,
+    so the branch is gated on `_sqlite_supports_drop_column()`: on an older
+    library it must fall through to the rebuild, which reaches the same shape
+    by re-parsing. Ungated, an ancient SQLite would either raise mid-upgrade
+    or stamp "v8" on a table still carrying the retired money column -- a
+    version number asserting a shape that is not there.
+
+    Pinning this is awkward because the suite's other version tests patch
+    `sqlite3.sqlite_version` while the real library happily executes DROP
+    COLUMN, so the statement itself cannot be made to fail. This intercepts
+    `_drop_retired_cost_column` instead and asserts on WHETHER IT IS REACHED,
+    which is the decision the gate actually makes. Both directions are pinned:
+    the modern-version half proves the fixture reaches the branch at all, so
+    the "not reached" assertion is not passing for want of a code path.
+    """
+
+    def _pre_v5_database(self) -> sqlite3.Connection:
+        """A v8 schema wound back to the pre-v5 shape: no `archived_at`.
+
+        `ingest_state` is left EMPTY so the reaped-source guard upstream has
+        nothing to refuse over -- this test is about the gate below it.
+        """
+        tmp = Path(tempfile.mkdtemp(prefix="cpb-prev5-gate-test-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        conn = sqlite3.connect(tmp / "usage.db")
+        self.addCleanup(conn.close)
+        ingest_mod._prepare_schema(conn)
+        conn.execute("ALTER TABLE ingest_state DROP COLUMN archived_at")
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        columns = ingest_mod._table_columns(conn, "ingest_state")
+        # The branch's own preconditions, asserted rather than assumed.
+        self.assertNotIn("archived_at", columns)
+        self.assertIn("source_kind", columns)
+        return conn
+
+    def test_a_modern_sqlite_takes_the_shortcut(self) -> None:
+        # The control. Without it, the assertion below could pass because the
+        # fixture never reaches the branch, not because the gate held.
+        conn = self._pre_v5_database()
+        with mock.patch.object(sqlite3, "sqlite_version", "3.45.0"), \
+                mock.patch.object(ingest_mod, "_drop_retired_cost_column") as drop:
+            rebuilt = ingest_mod._prepare_schema(conn)
+        self.assertFalse(rebuilt, "the in-place hop should not rebuild")
+        drop.assert_called_once()
+        self.assertIn(
+            "archived_at", ingest_mod._table_columns(conn, "ingest_state")
+        )
+
+    def test_an_old_sqlite_falls_through_to_the_rebuild_instead(self) -> None:
+        conn = self._pre_v5_database()
+
+        def unreachable(_conn: sqlite3.Connection) -> None:
+            raise AssertionError(
+                "the pre-v5 shortcut ran on a SQLite without DROP COLUMN"
+            )
+
+        with mock.patch.object(sqlite3, "sqlite_version", "3.34.1"), \
+                mock.patch.object(
+                    ingest_mod, "_drop_retired_cost_column", side_effect=unreachable
+                ) as drop:
+            rebuilt = ingest_mod._prepare_schema(conn)
+        drop.assert_not_called()
+        self.assertTrue(rebuilt, "the old-SQLite path must rebuild, not shortcut")
+        # The rebuild reaches the SAME shape the shortcut would have: the
+        # fall-through is a slower route to v8, not a skipped upgrade.
+        self.assertIn(
+            "archived_at", ingest_mod._table_columns(conn, "ingest_state")
+        )
+        self.assertNotIn("cost_usd", ingest_mod._table_columns(conn, "api_calls"))
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            ingest_mod.SCHEMA_VERSION,
+        )
 
 
 if __name__ == "__main__":
