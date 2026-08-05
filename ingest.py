@@ -244,16 +244,28 @@ CREATE TABLE IF NOT EXISTS ingest_state (
     archived_at REAL
 );
 -- WHEN this tool last ran (#20). One row, or NONE AT ALL -- an empty table is
--- "no run has ever been recorded", which every database written before v7 is,
--- and which the report renders as an unknown age rather than as an age of
--- zero or an ingest at the epoch.
+-- "no run has ever completed over this database", which the report renders as
+-- an unknown age rather than as an age of zero or an ingest at the epoch. A
+-- database written before v7 has no table here at all, which is a DIFFERENT
+-- absence: it could not have recorded a run. The two are told apart in
+-- `serve.staleness_verdict`, because only the second is explained by age.
 --
 -- Deliberately not a column on `ingest_state`: that table is per SOURCE FILE
 -- and its `mtime` is the FILE's mtime, a different fact that reads like this
 -- one. A run is a fact about the ingester, so it gets its own row, and an
 -- all-skipped run -- which touches no `ingest_state` row -- still records it.
--- `finished_at` dates COMPLETION: a run that raised never stamps, so a broken
--- ingest ages visibly instead of claiming to have refreshed.
+-- `finished_at` dates COMPLETION: a run that raised never stamps, so it cannot
+-- claim to have refreshed. What that buys depends on what came before it, and
+-- the difference is the whole of #34:
+--
+--   * with an earlier successful run, the stale stamp stays and the database
+--     ages visibly -- the report's age keeps climbing past the threshold;
+--   * with NO earlier run, the table is simply empty, which is the same shape
+--     an in-place upgrade leaves behind until the first run completes. That
+--     absence ages not at all. `serve.py` reports it as an unknown age
+--     (`stale: null`) with `stale_unknown_reason` naming which absence it is,
+--     so a database at this schema is never rendered as one too old to record
+--     run times -- the benign reading the page used to assert for all of them.
 CREATE TABLE IF NOT EXISTS ingest_runs (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     finished_at REAL NOT NULL
