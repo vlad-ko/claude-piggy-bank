@@ -265,45 +265,104 @@ CREATE INDEX IF NOT EXISTS idx_subagent_runs_status ON subagent_runs (status);
 TASK_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 TOOL_USE_ID_RE = re.compile(r"<tool-use-id>([^<]+)</tool-use-id>")
 SUBAGENT_TOKENS_RE = re.compile(r"<subagent_tokens>(\d+)</subagent_tokens>")
-# Provenance markers, in match order. Each is a tag Claude Code itself writes
-# at the START of a turn's text, so its presence there PROVES who submitted the
-# turn.
+# Provenance markers, in match order. Each is a literal that Claude Code or the
+# CLI itself writes at the START of a turn's text, so its presence there PROVES
+# who submitted the turn. Not one of them is prose a person composes.
 #
 # REFERENCE CORPUS for every count in this region: one developer machine's
-# local transcript corpus, 48 main-thread session files, 6,643
-# user turns, checked 2026-08-04. It is one operator's usage, not a sample of
-# Claude Code users, and it is live -- re-measuring later will not reproduce
-# these exactly. Every tag below sat at offset 0 of its turn in 100% of its
-# occurrences there: 1,992 task-notification, 45 system-reminder, 18
-# local-command-stdout, 32 local-command-caveat, 331 command-message/-name.
+# local transcript corpus, 49 main-thread session files, 7,199 user turns,
+# checked 2026-08-05. It is one operator's usage, not a sample of Claude Code
+# users, and it is live -- re-measuring later will not reproduce these exactly.
+# Every marker below sat at offset 0 of its turn in 100% of its occurrences
+# there: 2,131 task-notification, 45 system-reminder, 21 local-command-stdout,
+# 35 local-command-caveat, 334 command-message/-name, 12 bash-input, 12
+# bash-stdout, 105 compaction, 342 skill preamble, 35 interrupt, 33 image.
 #
 # `<command-message>` and `<command-name>` are BOTH listed because a slash
-# command that produces no stdout emits only those two (305 of the 331 turns
-# lead with the message, 26 with the name), and testing `"<local-command" in
+# command that produces no stdout emits only those two (305 of the 334 turns
+# lead with the message, 29 with the name), and testing `"<local-command" in
 # text` missed every one -- which is how `/wizard` came to be a "cron tick".
-TURN_PROVENANCE_TAGS: tuple[tuple[str, str], ...] = (
+# `<bash-input>`/`<bash-stdout>` are bash mode (`!cmd`): the same class of gap,
+# found by inventorying EVERY leading `<tag>` in the corpus rather than by
+# waiting for the next one to be noticed. Those eight tags are now the whole
+# set that occurs.
+#
+# The last four are not tags, and #26 left all of them asserting `human`:
+#   * the compaction literal is Claude Code's OWN continuation message, a fixed
+#     string at offset 0 -- structurally STRONGER evidence than the tick
+#     sentinel below. These turns carry a whole rolled-up summary, so booking
+#     them to a person misattributes real context spend, not just a label.
+#   * the skill preamble is the harness injecting a skill's base directory.
+#   * the interrupt notice and the image placeholder are both text the CLI
+#     SUBSTITUTES for something the user did not type as prose; one label,
+#     because the emitter is one emitter.
+# `[Image:` is anchored on the short prefix although the corpus form is
+# uniformly `[Image: source: <path>]` (33/33): a variant should degrade into
+# the residual's honest refusal, not be asserted, and no prompt a person writes
+# begins with those seven characters. Neither bracket marker was found hiding a
+# person's words behind it -- 0 of 33 image turns carry any prose after the
+# placeholders, and all 35 interrupt notices are the notice and nothing else.
+# A composite turn would be labelled by its OPENING, as every marker here is.
+TURN_PROVENANCE_MARKERS: tuple[tuple[str, str], ...] = (
     ("<task-notification>", "task-notification"),
     ("<system-reminder>", "system-reminder"),
     ("<local-command-stdout>", "local-command"),
     ("<local-command-caveat>", "local-command"),
     ("<command-message>", "local-command"),
     ("<command-name>", "local-command"),
+    ("<bash-input>", "local-command"),
+    ("<bash-stdout>", "local-command"),
+    ("This session is being continued from a previous conversation", "compaction"),
+    ("Base directory for this skill:", "skill-injection"),
+    ("[Request interrupted by user", "harness-notice"),
+    ("[Image:", "harness-notice"),
 )
 
-# A scheduled tick opens with an ALL-CAPS sentinel ending in the word TICK and
-# closed by punctuation -- `PR-CYCLE TICK.`, `PIPELINE TICK —`. Anchored with
-# `.match()`, never searched: the sentinel is a claim about who spoke, and a
-# human sentence CONTAINING one of these words is not that speaker.
+# The label for a turn whose opening matches NO marker above. It is a refusal,
+# not a class: "nothing here says who submitted this". #26 called it `human`,
+# which the report then rendered as a peer row beside `task-notification` --
+# absence rendered as a value. On the reference corpus that bucket held at
+# least 2,143 of 3,877 turns (55.3%) that provably were not a person typing.
+UNATTRIBUTED = "unattributed"
+
+# The scheduler sentinels this classifier is willing to ASSERT. Matched at
+# offset 0 only -- a sentence CONTAINING one of these is not its speaker -- and
+# only as a whole token, so `PIPELINE TICKET` is not `PIPELINE TICK`. No
+# closing punctuation is required: #26 demanded one, so a scheduler ending its
+# sentinel with a newline failed SILENTLY into the residual.
 #
-# This is weaker evidence than the tags above -- a scheduler submits ordinary
-# prompt text, so the sentinel is a CONVENTION of the scheduling tool, not
-# something Claude Code guarantees -- and it is deliberately a shape rather
-# than a list of literals, because an unlisted tick name fails SILENTLY into
-# `human`, which is exactly the bug being fixed here. Yield on the reference
-# corpus: 348 turns in four families -- PIPELINE TICK 259, PR-CYCLE TICK 69,
-# PRECEDENT-GARAGE COHORT TICK 18, RESOURCE-MANAGER TICK 2 -- and nothing else,
-# i.e. no all-caps human opener was swept up.
-CRON_TICK_RE = re.compile(r"[A-Z][A-Z0-9 +/&-]{0,40}\bTICK\b\s*[.:—-]")
+# Weaker evidence than the markers above: a scheduler submits ordinary prompt
+# text, so a sentinel is a CONVENTION of the scheduling tool, not something
+# Claude Code guarantees. Yield on the reference corpus: 348 turns --
+# PIPELINE TICK 259, PR-CYCLE TICK 69, PRECEDENT-GARAGE COHORT TICK 18,
+# RESOURCE-MANAGER TICK 2.
+CRON_TICK_SENTINELS: tuple[str, ...] = (
+    "PIPELINE TICK",
+    "PR-CYCLE TICK",
+    "PRECEDENT-GARAGE COHORT TICK",
+    "RESOURCE-MANAGER TICK",
+)
+CRON_TICK_LISTED_RE = re.compile(
+    "(?:%s)(?![A-Za-z0-9])" % "|".join(re.escape(s) for s in CRON_TICK_SENTINELS)
+)
+
+# A LIST cannot grow itself, so drift has to be visible. This shape -- an
+# all-caps run ending in the word TICK -- routes an opening that looks like a
+# sentinel but is not listed to its own bucket, carrying its own token cost,
+# where an operator either adds the name or dismisses it.
+#
+# It deliberately does NOT assert `cron-tick`, because a shape cannot: #26 used
+# one and it had to reject a person shouting about the tick while accepting a
+# scheduler name nobody had listed, which are opposite requirements. It failed
+# the first -- `STOP THE TICK. it is eating my context` was booked as the tick's
+# own cost, which is verbatim the defect #26 says it fixed, now needing caps
+# lock. So tick-shaped-but-unlisted is INCONCLUSIVE, and says so.
+#
+# TICK must END the sentinel (the lookahead rejects a further capitalised word),
+# because every measured sentinel ends there and `ALL TICK BOXES MUST BE
+# CHECKED` is a shouted sentence, not a scheduler. Bounded `{0,40}` and
+# `.match()`-anchored; measured flat at ~0.3 us/call.
+CRON_TICK_SHAPE_RE = re.compile(r"[A-Z][A-Z0-9 +/&-]{0,40}\bTICK\b(?![ \t]+[A-Z0-9])")
 
 
 @dataclass(frozen=True)
@@ -464,40 +523,65 @@ def parse_ts(record: dict) -> Optional[float]:
 def classify_turn(text: str) -> str:
     """Classify a turn by PROVENANCE -- who submitted it -- from its opening.
 
-    Not by topic. The distinction is the whole point (#4): the previous version
+    Not by topic. The distinction is the whole point (#4): the original version
     searched `cron`, `PR-cycle` and `wakeup` anywhere in a 600-char window, so
-    it answered "what is this turn ABOUT", and a human asking whether the cron
-    tick was worth keeping was booked as the cron tick's own cost. On the
-    reference corpus above it erred in BOTH directions:
+    it answered "what is this turn ABOUT", and a person asking whether the cron
+    tick was worth keeping was booked as the cron tick's own cost.
 
-      * 117 of 117 `wakeup` turns only MENTIONED the word -- it appeared at
-        offset >= 40 every time and at offset 0 never once, so the arm had a
-        100% false-positive rate and is gone. No start-anchored wakeup marker
-        exists in the corpus; a scheduled wakeup announces itself with a tick
-        sentinel and is classified `cron-tick`. The label is not kept as an
-        empty bucket, which would read as "measured, none found".
-      * 259 genuine `PIPELINE TICK` ticks were booked as `human`, because the
-        pattern happened to list other tick names. That bucket was larger than
-        all 145 turns the classifier did call `cron-tick`.
+    THERE IS NO `human` LABEL. Every return value below names an emitter that
+    a literal at offset 0 proves, or else refuses. `who typed this` is not a
+    question a transcript answers: the record of a scheduler's submission and
+    of a person's are byte-identical prose. #26 answered it anyway, by making
+    `human` the sole exit for an unrecognised opening, and the report rendered
+    that as a peer row beside `task-notification`. Re-measured on the reference
+    corpus above, at least 2,143 of those 3,877 turns (55.3%) provably were not
+    a person typing -- 1,573 `[auto-resume ...]`, 342 skill preambles, 106
+    `autonomous ...`, 105 compaction continuations, 33 image placeholders, 35
+    interrupt notices. A session table reading "human: 3,877" was wrong by more
+    than half. `unattributed` is the same measurement without the claim.
 
     A marker only counts at the START of the text. Deeper in, it is quoted
     content -- this turn's own text may end with an appended `<system-reminder>`
-    without the harness having spoken.
+    without the harness having spoken, and a person asking about compaction
+    quotes the compaction literal.
 
-    `human` is the residual: no provenance marker found. It is a weaker claim
-    than the labelled classes and callers should read it that way. Two shapes
-    are deliberately left in it rather than guessed at, pending evidence of who
-    emits them: `[auto-resume ...]` (1,573 turns) and `autonomous ...` (123).
+    Three things are deliberately NOT given an emitter:
+
+      * `[auto-resume ...]` (1,573 turns), `autonomous ...` (106) and
+        `[wizard heartbeat]` (28). Plainly bulk-injected, but nothing in Claude
+        Code writes them: they are one scheduling tool's PROSE convention, and
+        a person can type the same characters (one corpus turn quotes them
+        while asking about this very classifier). Naming an emitter would be
+        the guess #26 set out to delete. Refusing now costs nothing, because
+        the residual no longer asserts a person.
+      * an opening that is tick-SHAPED but whose sentinel is not listed. It
+        gets `cron-tick-unlisted` -- inconclusive, and loud, so that neither a
+        scheduler name nobody has added nor a person shouting about the tick is
+        silently absorbed by a neighbouring bucket.
+
+    The `wakeup` label removed in #26 stays removed: 117 of 117 were topic
+    matches on a word that sat at offset >= 40 every time and at offset 0 never
+    once, and no start-anchored wakeup marker exists in the corpus. #26's
+    stated reason for the removal -- "a scheduled wakeup announces itself with
+    a tick sentinel and is classified `cron-tick`" -- is FALSE and is corrected
+    here: replaying those 117 turns yields `{'human': 114, 'local-command': 3}`
+    and zero `cron-tick` (checked 2026-08-05). What actually happened is that
+    114 scheduled turns moved into `human` and were read as people typing,
+    which is the defect above; their real openings are scheduler prose and,
+    three times, the compaction literal. An empty `wakeup` bucket would still
+    be worse -- it would read as "measured, none found".
     """
     # `.lstrip()` on a bounded slice: leading whitespace must not defeat the
     # anchor, and the slice keeps this off the length of a large paste.
     head = text[:600].lstrip()
-    for tag, turn_type in TURN_PROVENANCE_TAGS:
-        if head.startswith(tag):
+    for marker, turn_type in TURN_PROVENANCE_MARKERS:
+        if head.startswith(marker):
             return turn_type
-    if CRON_TICK_RE.match(head):
+    if CRON_TICK_LISTED_RE.match(head):
         return "cron-tick"
-    return "human"
+    if CRON_TICK_SHAPE_RE.match(head):
+        return "cron-tick-unlisted"
+    return UNATTRIBUTED
 
 
 def user_text(content: Any) -> Optional[str]:

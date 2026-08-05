@@ -85,7 +85,7 @@ class IngestTest(unittest.TestCase):
         ).fetchall()
         by_type = {r["turn_type"]: r["n"] for r in rows}
         self.assertEqual(
-            by_type, {"human": 1, "task-notification": 1, "system-reminder": 1}
+            by_type, {"unattributed": 1, "task-notification": 1, "system-reminder": 1}
         )
 
     def test_tool_result_only_user_record_is_not_a_turn(self) -> None:
@@ -95,9 +95,9 @@ class IngestTest(unittest.TestCase):
         )
 
     def test_api_calls_attributed_to_most_recent_turn(self) -> None:
-        human_turn = self.q1("SELECT id FROM turns WHERE turn_type = 'human'")
+        prompt_turn = self.q1("SELECT id FROM turns WHERE turn_type = 'unattributed'")
         n = self.q1(
-            "SELECT COUNT(*) n FROM api_calls WHERE turn_id = ?", human_turn["id"]
+            "SELECT COUNT(*) n FROM api_calls WHERE turn_id = ?", prompt_turn["id"]
         )["n"]
         # sonnet call, Agent tool_use call, sidechain fable call
         self.assertEqual(n, 3)
@@ -1485,15 +1485,15 @@ class ClassifyTurnProvenanceTest(unittest.TestCase):
     """
 
     # -- the filed false positive: topic word, human provenance -------------
-    def test_human_turn_ABOUT_cron_is_human(self) -> None:
+    def test_turn_ABOUT_cron_is_not_charged_to_cron(self) -> None:
         text = (
             "this is consuming way too much context (likely because of our "
             "cron addition) - can we look at whether the PR-cycle tick is "
             "worth keeping at all?"
         )
-        self.assertEqual(classify_turn(text), "human")
+        self.assertEqual(classify_turn(text), "unattributed")
 
-    def test_human_turn_ABOUT_wakeups_is_human(self) -> None:
+    def test_turn_ABOUT_wakeups_is_not_charged_to_a_wakeup(self) -> None:
         # Shape of the real false positives: a long operator prompt whose body
         # says "THIS WAKEUP:". The word sat at offset >= 40 in 117 of 117
         # corpus matches, never at 0, so provenance was never what was matched.
@@ -1501,10 +1501,10 @@ class ClassifyTurnProvenanceTest(unittest.TestCase):
             "Drive the open reviews and keep the queue moving forward. "
             "THIS WAKEUP: (1) re-check the build, (2) report back."
         )
-        self.assertEqual(classify_turn(text), "human")
+        self.assertEqual(classify_turn(text), "unattributed")
         self.assertNotEqual(classify_turn(text), "wakeup")
 
-    def test_human_turn_QUOTING_a_marker_is_not_stolen_by_it(self) -> None:
+    def test_turn_QUOTING_a_marker_is_not_stolen_by_it(self) -> None:
         # A marker deeper in the text is quoted content, not provenance.
         # Anchoring is what stops a human turn with an appended
         # <system-reminder> from being filed as harness-injected.
@@ -1512,12 +1512,16 @@ class ClassifyTurnProvenanceTest(unittest.TestCase):
             "why does this turn classify the way it does?\n"
             "<system-reminder>the reminder body</system-reminder>"
         )
-        self.assertEqual(classify_turn(text), "human")
+        self.assertEqual(classify_turn(text), "unattributed")
 
-    def test_typed_slash_text_without_harness_tags_is_human(self) -> None:
+    def test_typed_slash_text_without_harness_tags_is_not_a_command(self) -> None:
         # The harness REWRITES a real invocation into <command-*> tags, so bare
-        # "/wizard:" prose in the transcript was typed by the operator.
-        self.assertEqual(classify_turn("/wizard: resume the queue please"), "human")
+        # "/wizard:" prose in the transcript was NOT submitted by the command
+        # machinery. Who typed it is a separate question the classifier does
+        # not answer, so it refuses rather than crediting a person.
+        self.assertEqual(
+            classify_turn("/wizard: resume the queue please"), "unattributed"
+        )
 
     # -- the filed false negative: real ticks that fell through -------------
     def test_genuine_pr_cycle_tick_is_cron_tick(self) -> None:
@@ -1534,10 +1538,11 @@ class ClassifyTurnProvenanceTest(unittest.TestCase):
         self.assertEqual(classify_turn(text), "cron-tick")
 
     def test_other_measured_tick_sentinels_are_cron_tick(self) -> None:
-        # Two more shapes measured in the corpus (18 and 2 turns). The rule is
-        # the ALL-CAPS sentinel, not an enumeration that ages out silently.
+        # Two more families measured in the corpus (18 and 2 turns). Which
+        # names are TRUSTED, and what happens to one that is not, is
+        # CronTickSentinelTest's subject.
         self.assertEqual(
-            classify_turn("SOME-COHORT TICK — act, do not report.\n\nfirst:"),
+            classify_turn("PRECEDENT-GARAGE COHORT TICK — act, do not report."),
             "cron-tick",
         )
         self.assertEqual(
@@ -1548,18 +1553,15 @@ class ClassifyTurnProvenanceTest(unittest.TestCase):
     def test_tick_sentinel_must_be_a_whole_word_at_the_start(self) -> None:
         # Guards the sentinel against the obvious over-matches. A human
         # SHOUTING about a ticket is not a scheduler.
-        self.assertEqual(classify_turn("TICKET #12 IS STILL OPEN."), "human")
+        self.assertEqual(classify_turn("TICKET #12 IS STILL OPEN."), "unattributed")
         self.assertEqual(
-            classify_turn("please check every TICK. of the pipeline"), "human"
+            classify_turn("please check every TICK. of the pipeline"), "unattributed"
         )
         # TICK must be its OWN word: without the word boundary this shouted
         # sentence matches on the tail of "STICK" and becomes a scheduler.
-        self.assertEqual(classify_turn("MAKE IT STICK."), "human")
-        # ... and the sentinel must CLOSE with punctuation, not merely lead a
-        # shouted sentence that happens to use the word.
-        self.assertEqual(classify_turn("ALL TICK BOXES MUST BE CHECKED"), "human")
+        self.assertEqual(classify_turn("MAKE IT STICK."), "unattributed")
 
-    def test_human_turn_QUOTING_a_tick_sentinel_is_still_human(self) -> None:
+    def test_turn_QUOTING_a_tick_sentinel_is_not_the_tick(self) -> None:
         # The anchor is what separates this from the filed defect: discussing
         # a tick must not be charged to the tick. This is the exact shape that
         # made issue #11's attribution detector unsafe to build on.
@@ -1567,7 +1569,7 @@ class ClassifyTurnProvenanceTest(unittest.TestCase):
             "the scheduler keeps firing 'PIPELINE TICK — drive open reviews' "
             "every ten minutes and it is burning context. can we stop it?"
         )
-        self.assertEqual(classify_turn(text), "human")
+        self.assertEqual(classify_turn(text), "unattributed")
 
     # -- the slash-command arm -----------------------------------------------
     def test_slash_command_with_no_stdout_is_local_command(self) -> None:
@@ -1620,7 +1622,243 @@ class ClassifyTurnProvenanceTest(unittest.TestCase):
         )
 
     def test_empty_text_is_not_a_provenance_claim(self) -> None:
-        self.assertEqual(classify_turn(""), "human")
+        self.assertEqual(classify_turn(""), "unattributed")
+
+
+class ClassifyTurnResidualTest(unittest.TestCase):
+    """The residual REFUSES to name a submitter instead of asserting `human`.
+
+    #26 classified by provenance but kept `human` as the only exit for an
+    unrecognised opening, and `index.html` renders it as a peer row beside
+    `task-notification`. That makes "no marker found" read as the positive
+    claim "a person typed this" -- absence rendered as a value, the rule
+    CLAUDE.md leads with.
+
+    Re-measured over one developer machine's local transcript corpus (49
+    main-thread session files, 7,199 user turns, checked 2026-08-05), the
+    3,877-turn `human` bucket #26 published held at least 2,143 turns that
+    provably were not a person typing. The four largest were structural and
+    are recognised below; each sat at offset 0 in 100% of its occurrences:
+    the compaction literal (105/105), the skill-injection preamble (342/342),
+    the interrupt notice (35/35) and the image placeholder (33/33).
+
+    Every fixture is synthetic and hand-written; no captured session content,
+    and no path that names a user.
+    """
+
+    def test_unrecognised_opening_refuses_to_claim_a_human_typed_it(self) -> None:
+        # The load-bearing assertion of this class. "No marker matched" is not
+        # evidence of a person, and must not be reported as one.
+        self.assertEqual(classify_turn("please rebase this branch"), "unattributed")
+        self.assertNotEqual(classify_turn("please rebase this branch"), "human")
+
+    def test_compaction_continuation_is_claude_code_not_a_person(self) -> None:
+        # A FIXED Claude Code literal at offset 0 -- structurally stronger
+        # evidence than the tick sentinel the classifier already trusts, yet
+        # #26 filed all 105 corpus occurrences as `human`. These turns are
+        # large (they carry the whole rolled-up summary), so booking them to a
+        # person misattributes real context spend, not just a label.
+        text = (
+            "This session is being continued from a previous conversation that "
+            "ran out of context. The conversation is summarized below:\n"
+            "Analysis: the operator asked for a rebase."
+        )
+        self.assertEqual(classify_turn(text), "compaction")
+
+    def test_skill_injection_preamble_is_the_harness(self) -> None:
+        # 342 corpus turns, the single largest structural family inside the old
+        # `human` bucket. The harness prepends this when a skill is loaded.
+        text = (
+            "Base directory for this skill: /tmp/skills/example-skill\n"
+            "Use this to resolve relative paths."
+        )
+        self.assertEqual(classify_turn(text), "skill-injection")
+
+    def test_interrupt_and_image_placeholders_are_harness_notices(self) -> None:
+        # Both are text the CLI SUBSTITUTES for something the user did not type
+        # as prose. One label, because the emitter is the same.
+        self.assertEqual(
+            classify_turn("[Request interrupted by user]"), "harness-notice"
+        )
+        self.assertEqual(
+            classify_turn("[Request interrupted by user for tool use]"),
+            "harness-notice",
+        )
+        self.assertEqual(
+            classify_turn("[Image: source: /tmp/screenshot.png]"), "harness-notice"
+        )
+
+    def test_bash_mode_tags_are_local_commands(self) -> None:
+        # Same class of gap as the `<command-message>` miss #26 fixed: these are
+        # Claude Code's own tags and were falling into the residual. A full
+        # inventory of leading `<tag>` forms in the corpus is now covered --
+        # these two were the only ones left unhandled (12 turns each).
+        self.assertEqual(
+            classify_turn("<bash-input>gh auth status</bash-input>"), "local-command"
+        )
+        self.assertEqual(
+            classify_turn("<bash-stdout>ok</bash-stdout>"), "local-command"
+        )
+
+    def test_a_quoted_marker_deeper_in_the_text_is_not_provenance(self) -> None:
+        # The anchor has to hold for the new markers too, or a person asking
+        # about compaction becomes compaction.
+        text = (
+            "why do I keep seeing 'This session is being continued from a "
+            "previous conversation that ran out of context'? it is expensive."
+        )
+        self.assertEqual(classify_turn(text), "unattributed")
+
+    def test_scheduler_prefixes_stay_in_the_residual_unguessed(self) -> None:
+        # 1,573 `[auto-resume ...]` + 106 `autonomous ...` + 28
+        # `[wizard heartbeat]` turns. Plainly bulk-injected, but no component of
+        # Claude Code writes them -- they are one scheduling tool's prose
+        # convention, and a person can type the same characters. Naming an
+        # emitter here would be the guess #26 set out to remove. Now that the
+        # residual refuses instead of asserting, leaving them there costs
+        # nothing: `unattributed` is the true statement about them.
+        self.assertEqual(
+            classify_turn("[auto-resume pipeline] sweep the open reviews"),
+            "unattributed",
+        )
+        self.assertEqual(
+            classify_turn("autonomous - drive the queue to merge-ready"),
+            "unattributed",
+        )
+
+
+class CronTickSentinelTest(unittest.TestCase):
+    """A tick is a LISTED sentinel; a tick-SHAPED opener is flagged, not guessed.
+
+    #26 matched a shape (`[A-Z][A-Z0-9 +/&-]{0,40}\\bTICK\\b\\s*[.:-]`) and
+    asserted `cron-tick` on it. A shape cannot do that job, because it is asked
+    to pull in two opposite directions at once: reject a person shouting about
+    the tick, and accept a scheduler name nobody has listed yet. It failed
+    both -- `STOP THE TICK. it is eating my context` was booked as the tick's
+    own cost (the exact defect #26 says it fixed, now requiring caps lock),
+    while a sentinel closed by a NEWLINE fell silently into the residual.
+
+    So: an enumerated list ASSERTS, and the shape only routes the leftovers to
+    a loud `cron-tick-unlisted` bucket that surfaces drift instead of guessing
+    in either direction. The list is the four families measured on the
+    reference corpus; sentinel names are invented here, as fixtures must be.
+    """
+
+    # -- direction 1: a person shouting is not the scheduler -----------------
+    def test_a_person_shouting_about_the_tick_is_never_the_tick(self) -> None:
+        # Reproduced verbatim against #26's implementation: all three returned
+        # `cron-tick`, i.e. a person complaining about the tick was charged to
+        # the tick. They are tick-SHAPED, so refusing (`cron-tick-unlisted`) is
+        # the honest answer -- but they must never be asserted as the tick.
+        for text in (
+            "STOP THE TICK. it is eating my context",
+            "WHY IS THE TICK: firing so often?",
+            "TODO FIX THE TICK.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(classify_turn(text), "cron-tick")
+                self.assertEqual(classify_turn(text), "cron-tick-unlisted")
+
+    # -- direction 2: a listed sentinel must not need punctuation ------------
+    def test_a_listed_sentinel_closed_by_a_newline_is_still_the_tick(self) -> None:
+        # #26 required a closing `[.:-]`, so a scheduler that terminates its
+        # sentinel with a newline -- or with nothing -- failed SILENTLY into the
+        # residual. Silent failure is what the shape was chosen to avoid.
+        self.assertEqual(classify_turn("PIPELINE TICK\nDo the thing"), "cron-tick")
+        self.assertEqual(classify_turn("PIPELINE TICK"), "cron-tick")
+
+    def test_listed_sentinels_with_punctuation_still_classify(self) -> None:
+        self.assertEqual(
+            classify_turn("PR-CYCLE TICK. Drive every open PR."), "cron-tick"
+        )
+        self.assertEqual(
+            classify_turn("PIPELINE TICK - drive open reviews."), "cron-tick"
+        )
+        self.assertEqual(
+            classify_turn("RESOURCE-MANAGER TICK. Measure host capacity."),
+            "cron-tick",
+        )
+
+    def test_a_listed_sentinel_must_be_a_whole_token(self) -> None:
+        # `PIPELINE TICKET` is not `PIPELINE TICK`.
+        self.assertEqual(classify_turn("PIPELINE TICKET #12 IS OPEN."), "unattributed")
+
+    # -- the drift bucket ----------------------------------------------------
+    def test_an_unlisted_tick_name_is_flagged_rather_than_guessed(self) -> None:
+        # The reason the list is safe: a scheduler name nobody has added shows
+        # up as its own operator-visible bucket carrying its own token cost,
+        # instead of being silently absorbed by either neighbour.
+        self.assertEqual(
+            classify_turn("DEPLOY-WATCH TICK - redeploy if main is green"),
+            "cron-tick-unlisted",
+        )
+        self.assertEqual(classify_turn("DEPLOY-WATCH TICK\ngo"), "cron-tick-unlisted")
+
+    def test_tick_must_END_the_sentinel_to_be_tick_shaped(self) -> None:
+        # A shouted sentence that merely uses the word mid-phrase is not a
+        # sentinel in any direction, and must not pollute the drift bucket.
+        self.assertEqual(
+            classify_turn("ALL TICK BOXES MUST BE CHECKED"), "unattributed"
+        )
+
+    def test_the_word_boundary_still_holds_in_both_buckets(self) -> None:
+        self.assertEqual(classify_turn("MAKE IT STICK."), "unattributed")
+        self.assertEqual(classify_turn("TICKET #12 IS STILL OPEN."), "unattributed")
+        self.assertEqual(
+            classify_turn("please check every TICK. of the pipeline"), "unattributed"
+        )
+
+    def test_quoting_a_listed_sentinel_is_not_speaking_it(self) -> None:
+        text = (
+            "the scheduler keeps firing 'PIPELINE TICK - drive open reviews' "
+            "every ten minutes and it is burning context. can we stop it?"
+        )
+        self.assertEqual(classify_turn(text), "unattributed")
+
+
+class ScheduledWakeupProvenanceTest(unittest.TestCase):
+    """What actually happened to the turns the pre-#26 code called `wakeup`.
+
+    `classify_turn`'s docstring justified dropping the `wakeup` label with "a
+    scheduled wakeup announces itself with a tick sentinel and is classified
+    `cron-tick`". That is false. Replaying the 117 turns the old code labelled
+    `wakeup` through #26's classifier yields `{'human': 114, 'local-command':
+    3}` -- ZERO reach `cron-tick` (checked 2026-08-05). Their real openings are
+    scheduler prose (`[auto-resume ...]`, `autonomous - ...`) and, three times,
+    Claude Code's compaction literal.
+
+    Dropping the label is still right -- 117 of 117 were topic matches on a
+    word sitting at offset >= 40 -- but the reason has to be true, because 114
+    of those turns landed in `human` and were then read as people typing.
+    """
+
+    def test_a_scheduled_wakeup_carries_no_tick_sentinel(self) -> None:
+        for text in (
+            "[auto-resume pipeline] FIRM-SCOPE sweep. re-check the build.",
+            "autonomous - drive the cohort to merge-ready.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(classify_turn(text), "cron-tick")
+                self.assertNotEqual(classify_turn(text), "cron-tick-unlisted")
+                # ... and, the part that was actually wrong: they are not
+                # evidence of a person either.
+                self.assertEqual(classify_turn(text), "unattributed")
+
+    def test_a_wakeup_era_turn_may_be_a_compaction_continuation(self) -> None:
+        # 3 of the 117 were this. They are Claude Code's own text.
+        text = (
+            "This session is being continued from a previous conversation that "
+            "ran out of context. Wakeup cadence was the topic."
+        )
+        self.assertEqual(classify_turn(text), "compaction")
+
+    def test_the_topic_word_wakeup_never_decides_provenance(self) -> None:
+        text = (
+            "Drive the open reviews and keep the queue moving forward. "
+            "THIS WAKEUP: (1) re-check the build, (2) report back."
+        )
+        self.assertEqual(classify_turn(text), "unattributed")
+        self.assertNotEqual(classify_turn(text), "wakeup")
 
 
 class ClassifyTurnEndToEndTest(unittest.TestCase):
@@ -1668,6 +1906,17 @@ class ClassifyTurnEndToEndTest(unittest.TestCase):
                 "can we drop the cron tick? it eats context on every wakeup.",
                 "2026-08-04T10:03:00.000Z",
             ),
+            self._record(
+                "u5",
+                "This session is being continued from a previous conversation "
+                "that ran out of context. The conversation is summarized below:",
+                "2026-08-04T10:04:00.000Z",
+            ),
+            self._record(
+                "u6",
+                "DEPLOY-WATCH TICK\nredeploy if main is green",
+                "2026-08-04T10:05:00.000Z",
+            ),
         ]
         (projects / "sess-classify.jsonl").write_text(
             "\n".join(lines) + "\n", encoding="utf-8"
@@ -1687,7 +1936,13 @@ class ClassifyTurnEndToEndTest(unittest.TestCase):
         ).fetchall()
         self.assertEqual(
             {r["turn_type"]: r["n"] for r in rows},
-            {"local-command": 1, "cron-tick": 2, "human": 1},
+            {
+                "local-command": 1,
+                "cron-tick": 2,
+                "compaction": 1,
+                "cron-tick-unlisted": 1,
+                "unattributed": 1,
+            },
         )
 
     def test_no_record_was_dropped_as_unparsed(self) -> None:
