@@ -1,7 +1,7 @@
 {
   "name": "claude-piggy-bank",
   "displayName": "Claude Piggy Bank",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Ingests the session transcripts Claude Code writes on your machine into SQLite and serves a local report on where your context and token spend actually went. Standard library only; nothing leaves the machine.",
   "author": {
     "name": "Vlad Ko",
