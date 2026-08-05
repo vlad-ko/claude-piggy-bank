@@ -3,15 +3,24 @@
 <head>
 <meta charset="utf-8">
 <title>Claude Code Usage Report</title>
+<!-- Both libraries are VENDORED, never fetched (see vendor/README.md). This
+     page renders the user's own prompts, file paths and source code, so a
+     third-party script in it is a privacy and supply-chain surface, not just a
+     dependency -- CLAUDE.md constraint 2. Alpine is deferred, so the inline
+     component factory at the foot of this file is defined before it boots. -->
 <script src="/vendor/chart.umd.min.js"></script>
+<script defer src="/vendor/alpine.min.js"></script>
 <style>
   :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2430; --muted:#67707c; --line:#e3e6ea; --accent:#2563eb; }
   * { box-sizing: border-box; }
+  /* Alpine strips x-cloak once it boots; until then it hides the elements
+     whose visibility x-show owns, so a panel cannot flash open empty. */
+  [x-cloak] { display:none !important; }
   body { margin:0; font:14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
   .wrap { max-width:1200px; margin:0 auto; padding:20px; }
   h1 { font-size:20px; margin:0 0 4px; }
   .sub { color:var(--muted); margin-bottom:16px; }
-  .banner { background:#fef3c7; border:1px solid #f59e0b; color:#78350f; padding:10px 14px; border-radius:8px; margin-bottom:14px; display:none; }
+  .banner { background:#fef3c7; border:1px solid #f59e0b; color:#78350f; padding:10px 14px; border-radius:8px; margin-bottom:14px; }
   .data-age { color:var(--muted); font-size:12px; margin-bottom:8px; }
   .data-age strong { color:var(--ink); }
   .data-age.unknown strong { color:#92400e; }
@@ -34,46 +43,293 @@
   tbody tr.clickable { cursor:pointer; }
   tbody tr.clickable:hover { background:#eef2ff; }
   .toggle { float:right; font-size:12px; }
+  /* Named once instead of repeated as an inline style string on every heading
+     that carries a caveat, and on the row whose figures are UNMEASURED. */
+  .toggle-note { font-weight:normal; color:var(--muted); font-size:12px; }
+  .panel-note { display:block; }
+  /* #31's annotation on the context card. `context-judged` marks the ONE claim
+     in this band that is a product-owner judgment rather than a documented
+     fact; it must not look like the sentence above it. */
+  .context-line { display:block; margin-top:5px; }
+  .context-judged { font-style:italic; border-left:3px solid #818cf8; padding-left:8px; }
+  .util-band { display:inline-block; margin:0 16px 0 0; }
+  tbody tr.unmeasured { color:var(--muted); }
   .chartbox { position:relative; height:340px; }
-  #detail { display:none; }
   #detail .close { float:right; cursor:pointer; color:var(--muted); background:none; border:none; font:inherit; padding:0; }
   .mono { font-family:ui-monospace, monospace; font-size:12px; }
 </style>
 </head>
 <body>
-<div class="wrap">
+<div class="wrap" x-data="report()">
   <h1>Claude Code Usage Report</h1>
   <div class="sub">Token usage from local session transcripts. Dates are America/New_York.</div>
-  <div class="banner" id="banner"></div>
-  <div class="note-band" id="scope-note">Loading scope&hellip;</div>
+
+  <!-- ONE banner element, three things that can want it: a failed load, the
+       staleness warning, and the routine data-quality notices. Each used to
+       write the element directly, so whichever ran LAST decided which true
+       statement the reader was allowed to see -- and the reader would be shown
+       one warning with no sign the other existed. That is this project's own
+       rule (a fact that cannot be shown must not be silently replaced by a
+       milder one) failing inside the feature built to enforce it.
+
+       So there is exactly ONE binding, over `bannerMessages`, which composes in
+       a FIXED order chosen by how badly the figures on screen can mislead. A
+       second writer is now impossible rather than merely discouraged: no code
+       reaches this element at all. -->
+  <div class="banner" id="banner" x-cloak x-show="bannerMessages.length"
+       x-text="bannerMessages.join(' ')"></div>
+
+  <!-- #4966: every figure on this page names the SCOPE it ranges over. Subagent
+       API calls live in separate `<session>/subagents/agent-*.jsonl`
+       transcripts; when none were ingested the numbers are main-thread-only and
+       this band says so, because "no subagent transcripts on disk" and
+       "subagents spent nothing" are different facts (rule #12) and must not
+       render identically. -->
+  <div class="note-band" id="scope-note">
+    <template x-if="!summary"><span>Loading scope&hellip;</span></template>
+    <template x-if="summary"><span>
+      <template x-if="!summary.scope.coverage.sessions_with_subagent_transcripts"><span>
+        <strong>Scope: MAIN-THREAD ONLY.</strong> No <code>subagents/</code> transcripts
+        were found for any of the
+        <span x-text="summary.scope.coverage.sessions"></span> session(s) in this
+        period, so subagent spend is <strong>unmeasured, not zero</strong>
+        &mdash; every figure below is a main-thread figure, not a session total.
+      </span></template>
+      <template x-if="summary.scope.coverage.sessions_with_subagent_transcripts"><span>
+        <strong>Scope: main-thread + subagent.</strong>
+        <span x-text="summary.scope.coverage.subagent_files.toLocaleString()"></span>
+        subagent transcript(s) across
+        <span x-text="summary.scope.coverage.sessions_with_subagent_transcripts"></span> of
+        <span x-text="summary.scope.coverage.sessions"></span> session(s) in this period
+        are included. Subagent calls have no main-thread turn, so they appear
+        under the "subagent" bucket in the by-turn-type chart.
+      </span></template>
+
+      <!-- #44: the PROJECT axis, annotating this same band rather than adding a
+           panel. The plugin keeps ONE database per install, so a user-scope
+           install ingests every project the user opens into the same file and
+           every figure below becomes a sum across them, worded as though it
+           described one.
+
+           SILENT when the database holds a single project -- the ordinary case
+           must not start announcing a dimension it does not have, and a notice
+           that never varies is a notice nobody reads. Two counts, not one:
+           `in_window` is what the figures cover, `in_database` is what the file
+           mixes together, and a project ingested but idle in this window is a
+           measured zero rather than an absence, so narrowing the dates must not
+           quietly shrink the claim.
+
+           COUNTS, not names. A project name is the working directory with its
+           separators folded to `-`, so it carries the username and the repo
+           name; eighteen of them would also swamp a one-line band.
+           `/api/summary` carries them for anyone who needs them, exactly as the
+           durability block carries its source paths while the banner states a
+           count. -->
+      <template x-if="summary.scope.projects.in_database > 1"><span>
+        <template x-if="summary.scope.projects.in_window > 1"><span><strong>Across
+          <span x-text="summary.scope.projects.in_window"></span>
+          projects.</strong> Every figure below is a CROSS-PROJECT total, not one
+          project's<span x-text="crossProjectTail"></span></span></template>
+        <template x-if="summary.scope.projects.in_window <= 1"><span><strong>This database holds
+          <span x-text="summary.scope.projects.in_database"></span>
+          projects</strong><span x-text="narrowProjectTail"></span></span></template>
+        Project names are not rendered here; <code>/api/summary</code> lists them
+        under <code>scope.projects</code>.
+      </span></template>
+      <template x-if="summary.scope.projects.unattributed_calls"><span>
+        <strong><span x-text="summary.scope.projects.unattributed_calls.toLocaleString()"></span>
+        call(s)</strong> in this period come from a path the transcript layout
+        cannot parse, so their project is <strong>UNKNOWN</strong> &mdash; counted
+        in the totals below, and in no project above.
+      </span></template>
+
+      <!-- Every count above is scoped to the SELECTED WINDOW, exactly like the
+           buckets it describes -- except `runs_undated_unavailable`, which is
+           corpus-wide because those runs carry no timestamp to window by, and
+           which is labelled as such here rather than blended in. -->
+      <template x-if="summary.scope.coverage.runs_undated_unavailable"><span>
+        <strong><span x-text="summary.scope.coverage.runs_undated_unavailable"></span>
+        reaped dispatch(es)</strong> carry no readable timestamp, so they belong
+        to no date window and are counted here instead (corpus-wide, not
+        window-scoped).
+      </span></template>
+    </span></template>
+  </div>
 
   <div class="filters" id="filters">
-    <button data-range="1">24h</button>
-    <button data-range="7" class="active">7d</button>
-    <button data-range="30">30d</button>
-    <button data-range="all">All</button>
+    <button :class="{ active: range === '1' }" @click="setRange(1)">24h</button>
+    <button :class="{ active: range === '7' }" @click="setRange(7)">7d</button>
+    <button :class="{ active: range === '30' }" @click="setRange(30)">30d</button>
+    <button :class="{ active: range === 'all' }" @click="setRange('all')">All</button>
     <span>Custom:</span>
-    <input type="date" id="from"> <input type="date" id="to">
-    <button id="apply">Apply</button>
+    <input type="date" id="from" :value="from ?? ''" @input="from = $event.target.value || null">
+    <input type="date" id="to" :value="to ?? ''" @input="to = $event.target.value || null">
+    <button id="apply" @click="applyCustomRange()">Apply</button>
   </div>
 
   <!-- #20: how old these numbers are, immediately above the numbers -- a
-       freshness note in a corner is one nobody reads before trusting a total. -->
-  <!-- "not loaded yet" rather than "loading", because it stays TRUE if the
-       first load fails: renderDataAge only ever runs on a successful one. -->
-  <div class="data-age" id="data-age">Data age: not loaded yet.</div>
+       freshness note in a corner is one nobody reads before trusting a total.
 
-  <div class="cards" id="cards"></div>
+       TWO facts, never collapsed into a single "data age" number. `last_run_at`
+       is when this tool last LOOKED at the transcripts; `newest_call_ts` is the
+       newest call it FOUND, corpus-wide rather than window-scoped. A fresh run
+       over an idle machine shows a recent first value and an old second one and
+       is perfectly healthy -- merging them would report that as staleness, and
+       would hide a week-old database whose last-seen call happens to be recent.
+
+       A null `last_run_at` is not an age of zero and not a stale-forever
+       verdict. Nor is it one thing: this branch used to state ONE cause ("this
+       database predates CPB recording ingest times") for an absence with
+       several, and it picked the only benign one. A database that HAS the run
+       table and no row is at a schema that records run times and has had no
+       ingest finish over it -- a crash, an upgrade not yet followed by a run,
+       or a recorder failing every time. That reader was told their data was
+       merely old. So the cause comes from the API, which knows what it can and
+       cannot tell (`stale_unknown_reason`), and the page states only that.
+
+       "not loaded yet" rather than "loading", because it stays TRUE if the
+       first load fails: `summary` is only ever assigned by a successful one. -->
+  <div class="data-age" id="data-age"
+       :class="{ unknown: summary && summary.ingest.last_run_at === null }">
+    <template x-if="!summary"><span>Data age: not loaded yet.</span></template>
+    <template x-if="summary"><span>
+      <template x-if="summary.ingest.last_run_at === null"><span>
+        <template x-if="summary.ingest.stale_unknown_reason === 'no-run-table'"><span>
+          <strong>Last ingest: not recorded</strong> &mdash; this database predates
+          CPB recording ingest times, so its age is UNKNOWN, not zero. Run
+          <code>ingest.py</code> to start recording it
+        </span></template>
+        <template x-if="summary.ingest.stale_unknown_reason === 'no-run-recorded'"><span>
+          <strong>Last ingest: NEVER COMPLETED</strong> &mdash; this database does
+          record ingest times and holds no run, so its age is UNKNOWN, not zero:
+          either no <code>ingest.py</code> run has finished over it yet, or one
+          <strong>may have failed</strong> &mdash; a run that raises never stamps.
+          Re-run <code>ingest.py</code> and check that it exits cleanly
+        </span></template>
+        <template x-if="!['no-run-table', 'no-run-recorded'].includes(summary.ingest.stale_unknown_reason)"><span>
+          <strong>Last ingest: not recorded</strong> &mdash; its age is UNKNOWN, not
+          zero, for a reason this build cannot name
+        </span></template>
+      </span></template>
+      <template x-if="summary.ingest.last_run_at !== null"><span>Last ingest:
+        <strong x-text="fmtAge(summary.ingest.as_of - summary.ingest.last_run_at)"></strong>
+        (<span x-text="fmtTs(summary.ingest.last_run_at)"></span>)</span></template>
+      &middot;
+      <template x-if="summary.ingest.newest_call_ts === null"><span>newest measured
+        call: <strong>none</strong> &mdash; no API calls ingested</span></template>
+      <template x-if="summary.ingest.newest_call_ts !== null"><span>newest measured call:
+        <strong x-text="fmtAge(summary.ingest.as_of - summary.ingest.newest_call_ts)"></strong>
+        (<span x-text="fmtTs(summary.ingest.newest_call_ts)"></span>), across ALL
+        ingested data &mdash; not this window</span></template>
+    </span></template>
+  </div>
+
+  <div class="cards" id="cards">
+    <template x-for="(c, i) in cards" :key="i">
+      <div class="card">
+        <div class="label" x-text="c.label"></div>
+        <div class="value" x-text="c.value"></div>
+        <template x-if="c.note"><div class="note" x-text="c.note"></div></template>
+      </div>
+    </template>
+  </div>
+
+  <!-- #31: the REFERENT for the context card above. "Avg context/call 266.6k"
+       is a fact with no scale: nothing said whether that is a lot. This band
+       annotates the card it sits under rather than adding a panel (CLAUDE.md
+       constraint 4) -- the median displaced the mean in the card itself, and
+       what is left here is the evidence for that displacement, the spread, and
+       the utilisation the median is measured against.
+
+       TWO PROVENANCES, NEVER MERGED. The denominator is Anthropic's DOCUMENTED
+       context window. Where the band boundaries sit is a dated PRODUCT-OWNER
+       JUDGMENT that Anthropic publishes nothing about. They are rendered as two
+       separate statements, each led by what kind of claim it is and the judged
+       one visually marked, because presenting the second in the first's voice
+       would borrow an authority this project has not earned -- which is the
+       whole reason the API carries them as two fields with two dates. -->
+  <div class="note-band" id="context-note">
+    <template x-if="!summary"><span>Loading context&hellip;</span></template>
+    <template x-if="summary && !summary.context.sample_calls"><span>
+      <strong>Context: no measured sample.</strong> No call in this period carried a
+      measured context size, so there is no median and no utilisation to report.
+      <span x-text="fmtCount(summary.context.unmeasured_calls)"></span> call(s) carry no
+      context accounting at all &mdash; UNMEASURED, not zero.
+    </span></template>
+    <template x-if="summary && summary.context.sample_calls"><span>
+      <!-- Why the card leads with a median. The mean is kept because it is
+           EVIDENCE OF THE SKEW and nothing else: a figure most calls fall below
+           is not describing them. -->
+      <strong>Median, not mean.</strong> The mean over the same sample is
+      <span x-text="fmtTok(summary.context.mean)"></span>,
+      <span x-text="fmtRatio(summary.context.mean_over_median)"></span> the median, and only
+      <span x-text="fmtPct(summary.context.share_above_mean)"></span> of measured calls
+      (<span x-text="fmtCount(summary.context.calls_above_mean)"></span> of
+      <span x-text="fmtCount(summary.context.sample_calls)"></span>) sit above it, so it
+      describes the tail rather than a typical call. The legacy
+      <em>Avg context/call</em> divides the same tokens across EVERY row, including
+      those with no context accounting, and reads
+      <span x-text="fmtTokRounded(summary.avg_context)"></span>: a different figure over a
+      different set, not a rounding difference.
+
+      <span class="context-line">Spread: <span x-text="contextSpread"></span></span>
+
+      <span class="context-line">Against each model's own documented window, over
+        <span x-text="fmtCount(summary.context.utilisation.banded_calls)"></span> banded
+        call(s):</span>
+      <span class="context-line">
+        <!-- Ordered high to low by the API, so the template neither sorts nor
+             labels: the verdicts on the top two bands are the data layer's
+             words, and only those two carry one because only those two were
+             judged. -->
+        <template x-for="(b, i) in summary.context.utilisation.bands" :key="i">
+          <!-- The trailing space is load-bearing: the chips are inline-block,
+               so they read correctly on screen either way, but without it the
+               page's text -- copied, or read aloud -- runs one band's share
+               into the next band's label. -->
+          <span class="util-band"><span x-text="b.label"></span>:
+            <strong x-text="fmtCount(b.calls)"></strong>
+            (<span x-text="fmtPct(b.share)"></span>) </span>
+        </template>
+      </span>
+
+      <template x-if="summary.context.utilisation.unknown_model_calls"><span class="context-line">
+        <strong><span x-text="fmtCount(summary.context.utilisation.unknown_model_calls)"></span>
+        call(s)</strong> ran on a model this build has no documented window for
+        (<span x-text="summary.context.utilisation.unknown_models.join(', ')"></span>), so
+        their utilisation is <strong>UNKNOWN, not low</strong> &mdash; their context is
+        counted in the spread above and they are banded nowhere.
+      </span></template>
+      <template x-if="summary.context.utilisation.over_window_calls"><span class="context-line">
+        <strong>INCONCLUSIVE:</strong>
+        <span x-text="fmtCount(summary.context.utilisation.over_window_calls)"></span> call(s)
+        measure ABOVE 100% of their model's window. That is impossible unless this
+        build's window table has gone stale, so treat the bands as suspect rather
+        than the calls as extraordinary.
+      </span></template>
+      <template x-if="summary.context.unmeasured_calls"><span class="context-line">
+        <span x-text="fmtCount(summary.context.unmeasured_calls)"></span> call(s) in this
+        period carry no context accounting at all. They are counted here and kept out
+        of the median, the mean and the bands &mdash; 0 is not a measurement of a
+        context, and banded it would file as the most frugal call on the report.
+      </span></template>
+
+      <span class="context-line">Denominator:
+        <span x-text="summary.context.utilisation.window_provenance"></span></span>
+      <span class="context-line context-judged">Boundaries:
+        <span x-text="summary.context.utilisation.band_provenance"></span></span>
+    </span></template>
+  </div>
 
   <div class="panel">
     <h2>Daily token usage
       <span class="toggle">
-        <label><input type="radio" name="by" value="class" checked> by token class</label>
-        <label><input type="radio" name="by" value="turntype"> by turn type</label>
-        <label><input type="radio" name="by" value="scope"> by scope (main vs subagent)</label>
+        <label><input type="radio" name="by" value="class" checked x-model="by" @change="load()"> by token class</label>
+        <label><input type="radio" name="by" value="turntype" x-model="by" @change="load()"> by turn type</label>
+        <label><input type="radio" name="by" value="scope" x-model="by" @change="load()"> by scope (main vs subagent)</label>
       </span>
     </h2>
-    <div class="chartbox"><canvas id="chart"></canvas></div>
+    <div class="chartbox"><canvas id="chart" x-ref="chart"></canvas></div>
   </div>
 
   <div class="panel">
@@ -82,20 +338,108 @@
          fixes in the dispatch panel below -- smaller only because no dollar
          column made the claim look precise. -->
     <h2>Token usage by model (largest cache-read first)
-      <span class="toggle" style="font-weight:normal;color:var(--muted);font-size:12px;">
+      <span class="toggle toggle-note">
         the same model is a separate row per scope -- main-thread and subagent are never merged
       </span>
     </h2>
+    <!-- Window-level token usage by model. `models()` splits every model by
+         scope on purpose, so the same model appears once per scope and the two
+         are never summed into a figure that hides which side spent it.
+
+         An empty list renders an explicit "no calls in this period" row rather
+         than an empty table: a blank table body is indistinguishable from a
+         failed fetch, and the tool's posture is that absence must never render
+         as a value. Not-loaded-yet renders NEITHER -- it is a third state. -->
     <div style="overflow-x:auto"><table id="models"><thead><tr>
       <th>Model</th><th>Scope</th><th>Calls</th>
       <th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th>
-    </tr></thead><tbody></tbody></table></div>
+    </tr></thead><tbody>
+      <template x-for="(r, i) in (summary ? summary.models : [])" :key="i">
+        <tr>
+          <td x-text="r.model"></td>
+          <td x-text="r.scope"></td>
+          <td x-text="fmtCount(r.calls)"></td>
+          <template x-for="(v, j) in tokenCols(r)" :key="j"><td x-text="fmtTok(v)"></td></template>
+        </tr>
+      </template>
+      <template x-if="summary && !summary.models.length">
+        <tr><td colspan="7">No API calls in this period.</td></tr>
+      </template>
+    </tbody></table></div>
   </div>
 
-  <div class="panel" id="detail">
-    <button type="button" class="close" id="detail-close" aria-label="Close session details">✕ close</button>
-    <h2 id="detail-title">Session</h2>
-    <div id="detail-body"></div>
+  <div class="panel" id="detail" x-cloak x-show="detail" x-ref="detailPanel">
+    <button type="button" class="close" aria-label="Close session details"
+            @click="detail = null; detailId = null">✕ close</button>
+    <h2 id="detail-title" x-text="detailId ? 'Session ' + detailId : 'Session'"></h2>
+    <div id="detail-body">
+      <template x-if="detail"><div>
+        <h3>By scope (main-thread vs subagent)</h3>
+        <table><thead><tr><th>Scope</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>
+          <template x-for="(r, i) in detail.scopes" :key="i">
+            <tr>
+              <td x-text="r.scope"></td><td x-text="r.calls"></td>
+              <template x-for="(v, j) in tokenCols(r)" :key="j"><td x-text="fmtTok(v)"></td></template>
+            </tr>
+          </template>
+          <template x-if="!detail.scopes.length">
+            <tr><td colspan="6">No API calls recorded for this session.</td></tr>
+          </template>
+        </tbody></table>
+        <h3>By turn type</h3>
+        <table><thead><tr><th>Turn type</th><th>Turns</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>
+          <template x-for="(r, i) in detail.turn_types" :key="i">
+            <tr>
+              <td x-text="r.turn_type"></td><td x-text="r.turns"></td><td x-text="r.calls"></td>
+              <template x-for="(v, j) in tokenCols(r)" :key="j"><td x-text="fmtTok(v)"></td></template>
+            </tr>
+          </template>
+        </tbody></table>
+        <h3>By model</h3>
+        <table><thead><tr><th>Model</th><th></th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>
+          <template x-for="(r, i) in detail.models" :key="i">
+            <tr>
+              <td x-text="r.model"></td><td></td><td x-text="r.calls"></td>
+              <template x-for="(v, j) in tokenCols(r)" :key="j"><td x-text="fmtTok(v)"></td></template>
+            </tr>
+          </template>
+        </tbody></table>
+        <!-- #10: peak context and spend are two different quantities, side by
+             side. The self-reported `<subagent_tokens>` tag is a HIGH-WATER MARK
+             (how big the subagent's context got), so it is shown as the largest
+             single dispatch, never summed; spend is measured from the subagent
+             transcripts. A dispatch that reported no peak, or whose transcript
+             was never measured, is counted beside the figure rather than folded
+             into it -- a partial column must read as the lower bound it is, and
+             never as a 0. -->
+        <h3>Agent dispatches: peak context vs measured spend</h3>
+        <table><thead><tr><th>Agent type</th><th>Dispatches</th><th title="The subagent-reported &lt;subagent_tokens&gt; figure is a PEAK CONTEXT high-water mark -- how big the subagent's context got, not how much it consumed. Shown for the largest single dispatch; summing high-water marks is meaningless. '(n unreported)' = dispatches that emitted no figure -- no sample, not zero.">Peak context (largest dispatch)</th><th title="Cumulative tokens measured from the subagent transcripts -- what these dispatches actually consumed. Typically ~50x the peak-context figure beside it. '(n unmeasured)' = dispatches with no transcript read, so this total is a LOWER BOUND.">Measured spend (tokens)</th></tr></thead><tbody>
+          <template x-for="(r, i) in detail.agent_types" :key="i">
+            <tr>
+              <td x-text="r.agent_type"></td>
+              <td x-text="r.dispatches"></td>
+              <td><span x-text="fmtTok(r.peak_context_tokens)"></span><template x-if="r.dispatches_without_peak"><span x-text="' (' + r.dispatches_without_peak + ' unreported)'"></span></template></td>
+              <td><span x-text="fmtTok(r.measured_tokens)"></span><template x-if="r.dispatches_without_spend"><span x-text="' (' + r.dispatches_without_spend + ' unmeasured)'"></span></template></td>
+            </tr>
+          </template>
+          <template x-if="!detail.agent_types.length">
+            <tr><td colspan="4">No agent dispatches recorded.</td></tr>
+          </template>
+        </tbody></table>
+        <h3>Top turns by cache-read</h3>
+        <table><thead><tr><th>When</th><th>Type</th><th>Calls</th><th>Cache read</th><th>Preview</th></tr></thead><tbody>
+          <template x-for="(r, i) in detail.outlier_turns" :key="i">
+            <tr>
+              <td x-text="fmtTs(r.ts)"></td>
+              <td x-text="r.turn_type"></td>
+              <td x-text="r.calls"></td>
+              <td x-text="fmtTok(r.cache_read)"></td>
+              <td class="preview" x-text="r.preview"></td>
+            </tr>
+          </template>
+        </tbody></table>
+      </div></template>
+    </div>
   </div>
 
   <div class="panel">
@@ -106,7 +450,31 @@
       <th>Input</th><th>Cache read</th>
       <th>Cache write</th><th>Output</th><th>Avg ctx/call</th>
       <th title="Task-tool dispatches within the selected from/to period.">Dispatches</th>
-    </tr></thead><tbody></tbody></table></div>
+    </tr></thead><tbody>
+      <template x-for="(r, i) in (sessions ?? [])" :key="i">
+        <tr class="clickable" role="button" tabindex="0"
+            @click="showDetail(r.id)"
+            @keydown.enter.prevent="showDetail(r.id)"
+            @keydown.space.prevent="showDetail(r.id)">
+          <td class="mono" x-text="r.id.slice(0, 8)"></td>
+          <td x-text="fmtTs(r.last_ts)"></td>
+          <td x-text="fmtCount(r.calls)"></td>
+          <!-- The subagent-call COUNT alone is a rule-#12 trap: a plain "0"
+               reads as "this session dispatched nothing" when it can equally
+               mean "its transcripts were reaped" or "nothing was ever
+               scanned". `subagent_status` is the API's answer to that and was
+               computed but never rendered (#4651 shape) -- so the count now
+               always carries its own provenance. -->
+          <td><span :title="subagentStatus(r)[1]"><span x-text="fmtCount(r.subagent_calls)"></span><template x-if="subagentStatus(r)[0]"><strong x-text="subagentStatus(r)[0]"></strong></template></span></td>
+          <template x-for="(v, j) in tokenCols(r)" :key="j"><td x-text="fmtTok(v)"></td></template>
+          <td x-text="fmtTok(Math.round(r.avg_context))"></td>
+          <td x-text="r.dispatches"></td>
+        </tr>
+      </template>
+      <template x-if="sessions && !sessions.length">
+        <tr><td colspan="10">No sessions in this period.</td></tr>
+      </template>
+    </tbody></table></div>
   </div>
 
   <div class="panel">
@@ -114,22 +482,48 @@
          place that phrase is decided (#30). It read "by spend" for its whole
          life while the query ordered by cache-read alone. -->
     <h2>Top subagent dispatches (by total tokens)
-      <span class="toggle" style="font-weight:normal;color:var(--muted);font-size:12px;">
+      <span class="toggle toggle-note">
         model is shown because tokens are not tiers -- "unavailable" = transcript reaped BEFORE it was ever measured, so usage is UNKNOWN, never 0
       </span>
       <!-- #41: how many rows below are measurements that outlived their
            source. Filled from the rows already fetched -- an annotation on
            this panel, in the same shape as the "(n unmeasured)" counters
            below it, not another table. -->
-      <span id="agents-archived" style="display:block;font-weight:normal;color:var(--muted);font-size:12px;"></span>
+      <span id="agents-archived" class="toggle-note panel-note" x-text="archivedDispatchNote"></span>
     </h2>
+    <!-- #4966: this is "which agent consumed that" in one look -- the exact gap
+         the issue's live evidence found (the biggest agent appeared nowhere in
+         the tool's output). #30 made the heading true: the rows are ordered by
+         TOTAL TOKENS, the column shown here, with the model beside it so the
+         reader weighs the tier themselves. A run with NO measurement has NULL
+         figures from the API and fmtTok renders null as "—", never "0"; an
+         `archived` run has real ones and is rendered like the measured rows it
+         ranks among, with the status column carrying why they cannot be
+         regenerated. -->
     <div style="overflow-x:auto"><table id="agents"><thead><tr>
       <th>Agent</th><th>Type</th><th>Description</th><th>Session</th>
       <th title="The model these calls ran on. Weigh the tier yourself: a large Haiku dispatch can outrank a small Opus one. 'N models' = the run spanned several; '—' = unmeasured.">Model</th>
       <th>Calls</th><th>Cache read</th>
       <th title="Input + cache-read + cache-write + output, measured from the subagent transcript. This column is what the table is sorted by.">Total tokens</th>
       <th>Status</th>
-    </tr></thead><tbody></tbody></table></div>
+    </tr></thead><tbody>
+      <template x-for="(r, i) in (agents ?? [])" :key="i">
+        <tr :class="{ unmeasured: isUnmeasuredDispatch(r) }">
+          <td class="mono" x-text="(r.agent_id || '').slice(0, 10)"></td>
+          <td x-text="r.agent_type ?? '(unknown)'"></td>
+          <td class="preview" x-text="r.description ?? ''"></td>
+          <td class="mono" x-text="(r.session_id || '').slice(0, 8)"></td>
+          <td x-text="orDash(r.model)"></td>
+          <td x-text="fmtCount(r.calls)"></td>
+          <td x-text="fmtTok(r.cache_read)"></td>
+          <td x-text="fmtTok(r.total_tokens)"></td>
+          <td :title="agentStatus(r)[1]" x-text="agentStatus(r)[0]"></td>
+        </tr>
+      </template>
+      <template x-if="agents && !agents.length">
+        <tr><td colspan="9">No subagent dispatches in this period.</td></tr>
+      </template>
+    </tbody></table></div>
   </div>
 
   <div class="panel">
@@ -137,13 +531,33 @@
     <div style="overflow-x:auto"><table id="outliers"><thead><tr>
       <th>When</th><th>Session</th><th>Model</th><th>Turn type</th><th>Cache read</th>
       <th>Context</th><th>Turn preview</th>
-    </tr></thead><tbody></tbody></table></div>
+    </tr></thead><tbody>
+      <template x-for="(r, i) in (outliers ?? [])" :key="i">
+        <tr>
+          <td x-text="fmtTs(r.ts)"></td>
+          <td class="mono" x-text="r.session_id.slice(0, 8)"></td>
+          <td><span x-text="r.model"></span><template x-if="r.is_sidechain"><span> (side)</span></template></td>
+          <td x-text="r.turn_type ?? '(no turn)'"></td>
+          <td x-text="fmtTok(r.cache_read)"></td>
+          <td x-text="fmtTok(r.context_size)"></td>
+          <td class="preview" x-text="r.preview ?? ''"></td>
+        </tr>
+      </template>
+      <template x-if="outliers && !outliers.length">
+        <tr><td colspan="7">No calls in this period.</td></tr>
+      </template>
+    </tbody></table></div>
   </div>
 </div>
 
 <script>
 "use strict";
-let state = { from: null, to: null, by: "class", chart: null };
+
+// ---------------------------------------------------------------------------
+// Formatters. Every one of these must render ABSENCE as absence: `null` is not
+// a measurement of zero, and the whole tool is built on being able to tell the
+// two apart, so "—" is the only honest rendering of a missing figure.
+// ---------------------------------------------------------------------------
 
 function fmtTok(n) {
   if (n === null || n === undefined) return "—";
@@ -151,6 +565,29 @@ function fmtTok(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
   return String(n);
+}
+function fmtCount(n) {
+  if (n === null || n === undefined) return "—";
+  return n.toLocaleString();
+}
+function orDash(v) {
+  return v ?? "—";
+}
+function fmtPct(x) {
+  // A share of an empty set is not 0% (#31 returns null for exactly that), and
+  // "0% of calls are in this band" is a measurement nobody made.
+  if (x === null || x === undefined) return "—";
+  return (x * 100).toFixed(1) + "%";
+}
+function fmtRatio(x) {
+  if (x === null || x === undefined) return "—";
+  return x.toFixed(2) + "×";
+}
+function fmtTokRounded(n) {
+  // The guard comes BEFORE the rounding on purpose: `Math.round(null)` is 0,
+  // so rounding first turns a window that measured nothing into a measured 0.
+  if (n === null || n === undefined) return "—";
+  return fmtTok(Math.round(n));
 }
 function fmtTs(ts) {
   if (ts === null || ts === undefined) return "—";
@@ -170,250 +607,23 @@ function fmtAge(sec) {
   if (sec < 0) return "in the future (clock skew)";
   return fmtSpan(sec) + " ago";
 }
-function esc(s) {
-  // textContent/innerHTML only escapes &, <, > -- not quotes, and this value
-  // is interpolated into a double-quoted data-id attribute (line below).
-  return String(s ?? "").replace(/[&<>"']/g, c => (
-    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
-  ));
-}
 function isoLocal(d) {
   return d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+function tokenCols(r) {
+  return [r.input, r.cache_read, r.cache_write, r.output];
 }
 async function getJSON(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(url + " -> " + r.status);
   return r.json();
 }
-function rangeQS() {
-  const p = new URLSearchParams();
-  if (state.from) p.set("from", state.from);
-  if (state.to) p.set("to", state.to);
-  return p.toString();
-}
 
-function card(label, value, note) {
-  return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div>${note ? `<div class="note">${note}</div>` : ""}</div>`;
-}
-
-// #4966: every figure on this page names the SCOPE it ranges over. Subagent
-// API calls live in separate `<session>/subagents/agent-*.jsonl` transcripts;
-// when none were ingested the numbers are main-thread-only and this note says
-// so, because "no subagent transcripts on disk" and "subagents spent nothing"
-// are different facts (rule #12) and must not render identically.
-function renderScopeNote(scope) {
-  const el = document.getElementById("scope-note");
-  const cov = scope.coverage;
-  // Every count here is scoped to the SELECTED WINDOW, exactly like the
-  // buckets it describes -- except `runs_undated_unavailable`, which is
-  // corpus-wide because those runs carry no timestamp to window by, and which
-  // is labelled as such below rather than blended in.
-  const undated = cov.runs_undated_unavailable
-    ? ` <strong>${cov.runs_undated_unavailable} reaped dispatch(es)</strong> carry ` +
-      `no readable timestamp, so they belong to no date window and are counted ` +
-      `here instead (corpus-wide, not window-scoped).`
-    : "";
-  // #44: the PROJECT axis, annotating this same line rather than adding a
-  // panel. The plugin keeps ONE database per install, so a user-scope install
-  // ingests every project the user opens into the same file and every figure
-  // below becomes a sum across them, worded as though it described one.
-  //
-  // SILENT when the database holds a single project -- the ordinary case must
-  // not start announcing a dimension it does not have, and a notice that never
-  // varies is a notice nobody reads. Two counts, not one: `in_window` is what
-  // the figures cover, `in_database` is what the file mixes together, and a
-  // project ingested but idle in this window is a measured zero rather than an
-  // absence, so narrowing the dates must not quietly shrink the claim.
-  //
-  // COUNTS, not names. A project name is the working directory with its
-  // separators folded to `-`, so it carries the username and the repo name;
-  // eighteen of them would also swamp a one-line band. `/api/summary` carries
-  // them for anyone who needs them, exactly as the durability block carries
-  // its source paths while the banner states a count.
-  const p = scope.projects;
-  let projects = "";
-  if (p.in_database > 1) {
-    projects = p.in_window > 1
-      ? ` <strong>Across ${p.in_window} projects.</strong> Every figure below is ` +
-        `a CROSS-PROJECT total, not one project's` +
-        (p.in_database > p.in_window
-          ? `, and this database holds ${p.in_database} projects in all — the ` +
-            `other ${p.in_database - p.in_window} ` +
-            `${p.in_database - p.in_window === 1 ? "has" : "have"} no calls in ` +
-            `this period, which is a measured zero, not an absence.`
-          : `.`)
-      : ` <strong>This database holds ${p.in_database} projects</strong>, of ` +
-        `which ${p.in_window} ${p.in_window === 1 ? "has" : "have"} calls in ` +
-        `this period &mdash; so the figures below cover ` +
-        `${p.in_window === 1 ? "that one" : "none of them"}. The rest are a ` +
-        `measured zero here, not absent.`;
-    projects +=
-      ` Project names are not rendered here; <code>/api/summary</code> lists ` +
-      `them under <code>scope.projects</code>.`;
-  }
-  if (p.unattributed_calls) {
-    projects +=
-      ` <strong>${p.unattributed_calls.toLocaleString()} call(s)</strong> in ` +
-      `this period come from a path the transcript layout cannot parse, so ` +
-      `their project is <strong>UNKNOWN</strong> &mdash; counted in the totals ` +
-      `below, and in no project above.`;
-  }
-  if (!cov.sessions_with_subagent_transcripts) {
-    el.innerHTML =
-      `<strong>Scope: MAIN-THREAD ONLY.</strong> No <code>subagents/</code> ` +
-      `transcripts were found for any of the ${cov.sessions} session(s) in ` +
-      `this period, so subagent spend is <strong>unmeasured, not zero</strong> ` +
-      `&mdash; every figure below is a main-thread figure, not a session total.` +
-      projects + undated;
-    return;
-  }
-  el.innerHTML =
-    `<strong>Scope: main-thread + subagent.</strong> ` +
-    `${cov.subagent_files.toLocaleString()} subagent transcript(s) across ` +
-    `${cov.sessions_with_subagent_transcripts} of ${cov.sessions} session(s) ` +
-    `in this period are included. Subagent calls have no main-thread turn, so ` +
-    `they appear under the "subagent" bucket in the by-turn-type chart.` +
-    projects + undated;
-}
-
-// ONE banner element, three things that can want it: a failed load, the
-// staleness warning, and the routine data-quality notices. Each used to write
-// the element directly, so whichever ran LAST decided which true statement the
-// reader was allowed to see -- and the reader would be shown one warning with
-// no sign the other existed. That is this project's own rule (a fact that
-// cannot be shown must not be silently replaced by a milder one) failing
-// inside the feature built to enforce it.
-//
-// So there is exactly one writer, composing in a FIXED order chosen by how
-// badly the figures on screen can mislead:
-//   1. load failure -- the numbers are not this response's numbers at all
-//   2. stale data   -- the numbers are real but describe a moment now past
-//   3. notices      -- the numbers are current, with caveats on what is in them
-// A failure is never dropped by a later render: only a load in which EVERY
-// endpoint succeeded clears it, and `loadAll` is the one place that happens.
-let bannerState = { loadFailure: null, stale: null, notices: [] };
-
-function renderBanner() {
-  const msgs = [bannerState.loadFailure, bannerState.stale, ...bannerState.notices].filter(Boolean);
-  const el = document.getElementById("banner");
-  el.style.display = msgs.length ? "block" : "none";
-  el.textContent = msgs.join(" ");
-}
-
-// #20: TWO facts, never collapsed into a single "data age" number.
-// `last_run_at` is when this tool last LOOKED at the transcripts;
-// `newest_call_ts` is the newest call it FOUND, corpus-wide rather than
-// window-scoped. A fresh run over an idle machine shows a recent first value
-// and an old second one and is perfectly healthy -- merging them would report
-// that as staleness, and would hide a week-old database whose last-seen call
-// happens to be recent.
-//
-// A null `last_run_at` is not an age of zero and not a stale-forever verdict.
-// Nor is it one thing: this branch used to state ONE cause ("this database
-// predates CPB recording ingest times") for an absence with several, and it
-// picked the only benign one. A database that HAS the run table and no row is
-// at a schema that records run times and has had no ingest finish over it --
-// a crash, an upgrade not yet followed by a run, or a recorder failing every
-// time. That reader was told their data was merely old.
-//
-// So the cause comes from the API, which knows what it can and cannot tell
-// (`stale_unknown_reason`), and the page states only that.
-function renderDataAge(ing) {
-  const el = document.getElementById("data-age");
-  const parts = [];
-  if (ing.last_run_at === null) {
-    if (ing.stale_unknown_reason === "no-run-table") {
-      parts.push(
-        `<strong>Last ingest: not recorded</strong> — this database predates ` +
-        `CPB recording ingest times, so its age is UNKNOWN, not zero. Run ` +
-        `<code>ingest.py</code> to start recording it`
-      );
-    } else if (ing.stale_unknown_reason === "no-run-recorded") {
-      parts.push(
-        `<strong>Last ingest: NEVER COMPLETED</strong> — this database does ` +
-        `record ingest times and holds no run, so its age is UNKNOWN, not ` +
-        `zero: either no <code>ingest.py</code> run has finished over it yet, ` +
-        `or one <strong>may have failed</strong> — a run that raises never ` +
-        `stamps. Re-run <code>ingest.py</code> and check that it exits cleanly`
-      );
-    } else {
-      parts.push(
-        `<strong>Last ingest: not recorded</strong> — its age is UNKNOWN, ` +
-        `not zero, for a reason this build cannot name`
-      );
-    }
-  } else {
-    parts.push(`Last ingest: <strong>${esc(fmtAge(ing.as_of - ing.last_run_at))}</strong> (${esc(fmtTs(ing.last_run_at))})`);
-  }
-  if (ing.newest_call_ts === null) {
-    parts.push(`newest measured call: <strong>none</strong> — no API calls ingested`);
-  } else {
-    parts.push(
-      `newest measured call: <strong>${esc(fmtAge(ing.as_of - ing.newest_call_ts))}</strong> ` +
-      `(${esc(fmtTs(ing.newest_call_ts))}), across ALL ingested data — not this window`
-    );
-  }
-  el.innerHTML = parts.join(" · ");
-  el.classList.toggle("unknown", ing.last_run_at === null);
-}
-
-function renderSummary(s) {
-  const noData = !s.calls;
-  const cards = [
-    card("Input tokens", noData ? "—" : fmtTok(s.input)),
-    card("Cache-read tokens", noData ? "—" : fmtTok(s.cache_read)),
-    card("Cache-write tokens", noData ? "—" : fmtTok(s.cache_write)),
-    card("Output tokens", noData ? "—" : fmtTok(s.output)),
-    card("Sessions", s.sessions),
-    card(
-      "API calls",
-      s.calls.toLocaleString(),
-      `${s.scope.main_thread.calls.toLocaleString()} main-thread + ` +
-      `${s.scope.subagent.calls.toLocaleString()} subagent`
-    ),
-    card("Avg context/call", noData ? "—" : fmtTok(Math.round(s.avg_context))),
-  ];
-  document.getElementById("cards").innerHTML = cards.join("");
-
-  renderScopeNote(s.scope);
-  renderModels(s.models);
-
-  renderDataAge(s.ingest);
-
-  const msgs = [];
-  // `stale` is TRI-STATE: true, false, or null for "no ingest run was ever
-  // recorded". Only an actual true warns -- an unknown age is reported by the
-  // data-age line above, and must not become a banner that can never clear.
-  bannerState.stale = s.ingest.stale === true
-    ? `Data is STALE: ingest.py last ran ${fmtAge(s.ingest.as_of - s.ingest.last_run_at)}, ` +
-      `past the threshold of ${fmtSpan(s.ingest.stale_after_seconds)}. Every figure below ` +
-      `describes the transcripts as of THEN, not as of now — re-run ingest.py.`
-    : null;
-  // An UNKNOWN age is not a staleness verdict, so it never takes the banner's
-  // `stale` slot above — but it must not be left to the grey data-age line
-  // either. These are the two unknowns a reader can act on, in the same
-  // register as the archived-source and unparsed-record notices below.
-  if (s.ingest.stale_unknown_reason === "run-in-future") msgs.push(
-    `INCONCLUSIVE: the last recorded ingest is dated in the FUTURE ` +
-    `(${fmtTs(s.ingest.last_run_at)}, ahead of this server's clock). The ` +
-    `database's age cannot be measured, so nothing below is qualified as ` +
-    `fresh or stale — check the clock, or whether this database was copied ` +
-    `from another machine.`);
-  if (s.ingest.stale_unknown_reason === "no-run-recorded") msgs.push(
-    `INCONCLUSIVE: no ingest.py run has ever COMPLETED over this database, ` +
-    `which holds ${s.ingest.files.toLocaleString()} ingested file(s). Its age ` +
-    `is unknown and may be unbounded — a run that raises never stamps, so a ` +
-    `failing ingest looks exactly like this. Re-run ingest.py and check it ` +
-    `exits cleanly.`);
-  if (s.ingest.files === 0) msgs.push("No files ingested yet — run ingest.py.");
-  if (s.ingest.unparsed_records > 0) msgs.push(`INCONCLUSIVE: ${s.ingest.unparsed_records} unparsed record(s) across ingested files — totals may undercount.`);
-  // Totals here are COMPLETE — the archived calls are counted. What they are
-  // not is reproducible: those transcripts are gone, so this database is the
-  // only copy and re-ingesting will not bring them back. Back it up.
-  if (!s.durability.reproducible) msgs.push(`${s.durability.archived_calls} call(s) in this window come from ${s.durability.archived_sources} transcript(s) no longer on disk — counted in the totals, but NOT reproducible by re-ingesting. This database is their only copy.`);
-  bannerState.notices = msgs;
-  renderBanner();
-}
+// There is no `esc()` any more, and there must never be one again. Every value
+// on this page is bound with `x-text`, which sets textContent -- markup in a
+// prompt, a file path or a model name cannot become markup here by
+// construction. `x-html` is not used anywhere and would reintroduce exactly
+// that surface.
 
 const CLASS_COLORS = { input: "#2563eb", cache_read: "#059669", cache_write: "#d97706", output: "#dc2626" };
 // One colour per turn-type series, cycled. Must stay >= the number of keys the
@@ -422,85 +632,6 @@ const CLASS_COLORS = { input: "#2563eb", cache_read: "#059669", cache_write: "#d
 // bucket = 11.
 const TT_COLORS = ["#2563eb", "#059669", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#be185d", "#64748b",
                    "#65a30d", "#9333ea", "#0f766e", "#b45309"];
-
-function renderChart(ts) {
-  const keys = Object.keys(ts.series);
-  const datasets = keys.map((k, i) => ({
-    label: k,
-    data: ts.series[k],
-    backgroundColor: CLASS_COLORS[k] || TT_COLORS[i % TT_COLORS.length],
-    stack: "tokens",
-    yAxisID: "y",
-  }));
-  datasets.push({
-    type: "line",
-    label: "avg context/call",
-    data: ts.avg_context,
-    borderColor: "#111827",
-    backgroundColor: "#111827",
-    yAxisID: "y2",
-    tension: 0.2,
-    pointRadius: 2,
-  });
-  if (state.chart) state.chart.destroy();
-  state.chart = new Chart(document.getElementById("chart"), {
-    type: "bar",
-    data: { labels: ts.days, datasets },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      scales: {
-        x: { stacked: true },
-        y: { stacked: true, ticks: { callback: v => fmtTok(v) }, title: { display: true, text: "tokens/day" } },
-        y2: { position: "right", grid: { drawOnChartArea: false }, ticks: { callback: v => fmtTok(v) }, title: { display: true, text: "avg context/call" } },
-      },
-      plugins: { tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmtTok(c.raw)}` } } },
-    },
-  });
-}
-
-// The subagent-call COUNT alone is a rule-#12 trap: a plain "0" reads as
-// "this session dispatched nothing" when it can equally mean "its transcripts
-// were reaped" or "nothing was ever scanned". `subagent_status` is the API's
-// answer to that and was computed but never rendered (#4651 shape) -- so the
-// count now always carries its own provenance.
-const SUBAGENT_STATUS = {
-  "measured": ["", "Subagent transcripts were read for this session."],
-  "unavailable": [" !", "INCOMPLETE: a dispatch dated into this period had its transcript reaped, so this count is a LOWER BOUND -- not zero."],
-  "unavailable-undated": [" ?", "A reaped dispatch exists for this session but carries no timestamp, so whether it falls in this period is unknown. Treat the count as unverified."],
-  "none": [" 0", "The task index was scanned and lists no dispatch -- a real zero."],
-  "unknown": [" ?", "The task index was never scanned for this session, so subagent spend is UNMEASURED, not zero."],
-};
-
-function subagentCell(r) {
-  const [mark, why] = SUBAGENT_STATUS[r.subagent_status] || [" ?", "Unrecognized subagent status."];
-  const n = r.subagent_calls.toLocaleString();
-  return mark
-    ? `<span title="${esc(why)}">${n}<strong>${esc(mark)}</strong></span>`
-    : `<span title="${esc(why)}">${n}</span>`;
-}
-
-function renderSessions(rows) {
-  const tb = document.querySelector("#sessions tbody");
-  tb.innerHTML = rows.map(r => `
-    <tr class="clickable" data-id="${esc(r.id)}">
-      <td class="mono">${esc(r.id.slice(0, 8))}</td>
-      <td>${fmtTs(r.last_ts)}</td>
-      <td>${r.calls.toLocaleString()}</td>
-      <td>${subagentCell(r)}</td>
-      <td>${fmtTok(r.input)}</td><td>${fmtTok(r.cache_read)}</td>
-      <td>${fmtTok(r.cache_write)}</td><td>${fmtTok(r.output)}</td>
-      <td>${fmtTok(Math.round(r.avg_context))}</td>
-      <td>${r.dispatches}</td>
-    </tr>`).join("") || `<tr><td colspan="10">No sessions in this period.</td></tr>`;
-  tb.querySelectorAll("tr.clickable").forEach(tr => {
-    tr.tabIndex = 0;
-    tr.setAttribute("role", "button");
-    tr.addEventListener("click", () => showDetail(tr.dataset.id));
-    tr.addEventListener("keydown", e => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); showDetail(tr.dataset.id); }
-    });
-  });
-}
 
 // The three states a dispatch can be in, spelled once: label, and the tooltip
 // that says what the figures beside it are worth (#41). "Reaped" is not one
@@ -516,181 +647,293 @@ const AGENT_STATUS = {
     "The transcript was reaped before it was ever measured, so this dispatch's usage is UNKNOWN — never 0."],
 };
 
-function renderAgents(rows) {
-  // #4966: this is "which agent consumed that" in one look -- the exact gap
-  // the issue's live evidence found (the biggest agent appeared nowhere in the
-  // tool's output). #30 made the heading true: the rows are ordered by TOTAL
-  // TOKENS, the column shown here, with the model beside it so the reader
-  // weighs the tier themselves. A run with NO measurement has NULL figures from
-  // the API and fmtTok renders null as "—", never "0"; an `archived` run has
-  // real ones and is rendered like the measured rows it ranks among, with the
-  // status column carrying why they cannot be regenerated.
-  const archived = rows.filter(r => r.status === "archived").length;
-  document.getElementById("agents-archived").textContent = archived
-    ? `${archived} of these dispatches ${archived === 1 ? "is" : "are"} archived: `
-      + "measured, then the transcript was reaped. Their figures are complete "
-      + "but irreplaceable — this database is their only copy, and no re-ingest "
-      + "can reproduce them."
-    : "";
-  document.querySelector("#agents tbody").innerHTML = rows.map(r => {
-    const [label, why] = AGENT_STATUS[r.status] ?? [r.status, ""];
-    return `
-    <tr${r.status === "unavailable" ? ' style="color:var(--muted)"' : ""}>
-      <td class="mono">${esc((r.agent_id || "").slice(0, 10))}</td>
-      <td>${esc(r.agent_type ?? "(unknown)")}</td>
-      <td class="preview">${esc(r.description ?? "")}</td>
-      <td class="mono">${esc((r.session_id || "").slice(0, 8))}</td>
-      <td>${esc(r.model ?? "—")}</td>
-      <td>${r.calls === null ? "—" : r.calls.toLocaleString()}</td>
-      <td>${fmtTok(r.cache_read)}</td>
-      <td>${fmtTok(r.total_tokens)}</td>
-      <td title="${esc(why)}">${esc(label)}</td>
-    </tr>`;
-  }).join("") || `<tr><td colspan="9">No subagent dispatches in this period.</td></tr>`;
+const SUBAGENT_STATUS = {
+  "measured": ["", "Subagent transcripts were read for this session."],
+  "unavailable": [" !", "INCOMPLETE: a dispatch dated into this period had its transcript reaped, so this count is a LOWER BOUND -- not zero."],
+  "unavailable-undated": [" ?", "A reaped dispatch exists for this session but carries no timestamp, so whether it falls in this period is unknown. Treat the count as unverified."],
+  "none": [" 0", "The task index was scanned and lists no dispatch -- a real zero."],
+  "unknown": [" ?", "The task index was never scanned for this session, so subagent spend is UNMEASURED, not zero."],
+};
+
+function report() {
+  return {
+    // --- state -----------------------------------------------------------
+    // `null` for every payload, never `[]`: "not fetched yet" and "the window
+    // holds none" are different facts, and only the second one is allowed to
+    // render "No sessions in this period."
+    range: "7",
+    from: null,
+    to: null,
+    by: "class",
+    summary: null,
+    sessions: null,
+    agents: null,
+    outliers: null,
+    detail: null,
+    detailId: null,
+    chart: null,
+    // A failure is never dropped by a later render: only a load in which EVERY
+    // endpoint succeeded clears it, and `load()` is the one place that happens.
+    banner: { loadFailure: null, stale: null, notices: [] },
+
+    init() {
+      this.setRange(7);
+    },
+
+    // --- banner ----------------------------------------------------------
+    // The FIXED precedence, chosen by how badly the figures on screen can
+    // mislead:
+    //   1. load failure -- the numbers are not this response's numbers at all
+    //   2. stale data   -- the numbers are real but describe a moment now past
+    //   3. notices      -- the numbers are current, with caveats on what is in them
+    get bannerMessages() {
+      return [this.banner.loadFailure, this.banner.stale, ...this.banner.notices].filter(Boolean);
+    },
+
+    // --- summary ---------------------------------------------------------
+    get cards() {
+      if (!this.summary) return [];
+      const noData = !this.summary.calls;
+      return [
+        { label: "Input tokens", value: noData ? "—" : fmtTok(this.summary.input) },
+        { label: "Cache-read tokens", value: noData ? "—" : fmtTok(this.summary.cache_read) },
+        { label: "Cache-write tokens", value: noData ? "—" : fmtTok(this.summary.cache_write) },
+        { label: "Output tokens", value: noData ? "—" : fmtTok(this.summary.output) },
+        { label: "Sessions", value: this.summary.sessions },
+        {
+          label: "API calls",
+          value: this.summary.calls.toLocaleString(),
+          note: `${this.summary.scope.main_thread.calls.toLocaleString()} main-thread + `
+            + `${this.summary.scope.subagent.calls.toLocaleString()} subagent`,
+        },
+        // #31: the MEDIAN is the headline, and it displaced the mean rather
+        // than joining it. `AVG(context_size)` describes the tail's pull on an
+        // average, not a typical call -- measured on the reference corpus, mean
+        // 237,304 against median 155,333, with only 28.6% of calls above the
+        // mean. A card that 71.4% of calls fall below is not describing them.
+        // The mean survives in the band below as evidence of that skew, which
+        // is the only thing it is good for here.
+        {
+          label: "Median context/call",
+          value: fmtTok(this.summary.context.median),
+          note: `${fmtCount(this.summary.context.sample_calls)} `
+            + `${this.summary.context.sample_is}`,
+        },
+      ];
+    },
+
+    // Ordered by the percentile IN THE KEY rather than by the payload's key
+    // order, so a reordered dict upstream cannot silently re-label the spread.
+    get contextPercentiles() {
+      return Object.entries(this.summary.context.percentiles)
+        .map(([key, value]) => ({ key, value, at: Number(key.slice(1)) }))
+        .sort((a, b) => a.at - b.at);
+    },
+
+    get contextSpread() {
+      return this.contextPercentiles
+        .map(p => `${p.key} ${fmtTok(p.value)}`)
+        .join(" · ");
+    },
+
+    // The two project sentences are composed in JS and bound with `x-text`
+    // rather than assembled as markup: both continue the preceding <strong>
+    // with a comma and no space, which HTML's whitespace collapsing would
+    // otherwise turn into "projects , of which".
+    get crossProjectTail() {
+      const p = this.summary.scope.projects;
+      if (p.in_database <= p.in_window) return ".";
+      const others = p.in_database - p.in_window;
+      return `, and this database holds ${p.in_database} projects in all — the `
+        + `other ${others} ${others === 1 ? "has" : "have"} no calls in this `
+        + `period, which is a measured zero, not an absence.`;
+    },
+
+    get narrowProjectTail() {
+      const p = this.summary.scope.projects;
+      return `, of which ${p.in_window} ${p.in_window === 1 ? "has" : "have"} calls `
+        + `in this period — so the figures below cover `
+        + `${p.in_window === 1 ? "that one" : "none of them"}. The rest are a `
+        + `measured zero here, not absent.`;
+    },
+
+    // --- sessions / dispatches -------------------------------------------
+    subagentStatus(r) {
+      return SUBAGENT_STATUS[r.subagent_status] || [" ?", "Unrecognized subagent status."];
+    },
+
+    agentStatus(r) {
+      return AGENT_STATUS[r.status] ?? [r.status, ""];
+    },
+
+    // The absence half: the muted rendering keys on `unavailable` ALONE, so a
+    // row that has real figures is not styled as a gap and a row that has none
+    // is not styled as data.
+    isUnmeasuredDispatch(r) {
+      return r.status === "unavailable";
+    },
+
+    get archivedDispatchNote() {
+      const archived = (this.agents ?? []).filter(r => r.status === "archived").length;
+      return archived
+        ? `${archived} of these dispatches ${archived === 1 ? "is" : "are"} archived: `
+          + "measured, then the transcript was reaped. Their figures are complete "
+          + "but irreplaceable — this database is their only copy, and no re-ingest "
+          + "can reproduce them."
+        : "";
+    },
+
+    // --- chart -----------------------------------------------------------
+    // Chart.js draws to a canvas, so this half stays imperative on purpose:
+    // there is no declarative binding for a canvas, and pretending otherwise
+    // would contort the one part of the page that genuinely is a drawing.
+    drawChart(ts) {
+      const keys = Object.keys(ts.series);
+      const datasets = keys.map((k, i) => ({
+        label: k,
+        data: ts.series[k],
+        backgroundColor: CLASS_COLORS[k] || TT_COLORS[i % TT_COLORS.length],
+        stack: "tokens",
+        yAxisID: "y",
+      }));
+      datasets.push({
+        type: "line",
+        label: "avg context/call",
+        data: ts.avg_context,
+        borderColor: "#111827",
+        backgroundColor: "#111827",
+        yAxisID: "y2",
+        tension: 0.2,
+        pointRadius: 2,
+      });
+      if (this.chart) this.chart.destroy();
+      this.chart = new Chart(this.$refs.chart, {
+        type: "bar",
+        data: { labels: ts.days, datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          scales: {
+            x: { stacked: true },
+            y: { stacked: true, ticks: { callback: v => fmtTok(v) }, title: { display: true, text: "tokens/day" } },
+            y2: { position: "right", grid: { drawOnChartArea: false }, ticks: { callback: v => fmtTok(v) }, title: { display: true, text: "avg context/call" } },
+          },
+          plugins: { tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmtTok(c.raw)}` } } },
+        },
+      });
+    },
+
+    // --- fetching --------------------------------------------------------
+    rangeQS() {
+      const p = new URLSearchParams();
+      if (this.from) p.set("from", this.from);
+      if (this.to) p.set("to", this.to);
+      return p.toString();
+    },
+
+    reportLoadFailure(e) {
+      // A failed refresh must say so, not leave the previous numbers on screen
+      // looking current (CodeRabbit finding -- stale data read as current).
+      // Highest precedence in `bannerMessages`, and cleared only by a load in
+      // which every endpoint returned.
+      this.banner.loadFailure = "Load failed: " + e.message + " -- displayed figures may be stale.";
+    },
+
+    async load() {
+      const qs = this.rangeQS();
+      let summary, ts, sessions, agents, outliers;
+      try {
+        [summary, ts, sessions, agents, outliers] = await Promise.all([
+          getJSON("/api/summary?" + qs),
+          getJSON("/api/timeseries?" + qs + "&by=" + this.by),
+          getJSON("/api/sessions?" + qs),
+          getJSON("/api/agents?" + qs + "&limit=15"),
+          getJSON("/api/outliers?" + qs + "&limit=20"),
+        ]);
+      } catch (e) {
+        this.reportLoadFailure(e);
+        return;
+      }
+      // Every endpoint returned, so the previous failure is genuinely resolved
+      // -- the ONE place that is true, and therefore the only place it is
+      // cleared.
+      this.banner.loadFailure = null;
+      this.applySummary(summary);
+      this.drawChart(ts);
+      this.sessions = sessions;
+      this.agents = agents;
+      this.outliers = outliers;
+    },
+
+    applySummary(payload) {
+      this.summary = payload;
+      const msgs = [];
+      // `stale` is TRI-STATE: true, false, or null for "no ingest run was ever
+      // recorded". Only an actual true warns -- an unknown age is reported by
+      // the data-age line, and must not become a banner that can never clear.
+      this.banner.stale = this.summary.ingest.stale === true
+        ? `Data is STALE: ingest.py last ran ${fmtAge(this.summary.ingest.as_of - this.summary.ingest.last_run_at)}, `
+          + `past the threshold of ${fmtSpan(this.summary.ingest.stale_after_seconds)}. Every figure below `
+          + `describes the transcripts as of THEN, not as of now — re-run ingest.py.`
+        : null;
+      // An UNKNOWN age is not a staleness verdict, so it never takes the
+      // banner's `stale` slot above — but it must not be left to the grey
+      // data-age line either. These are the two unknowns a reader can act on,
+      // in the same register as the archived-source and unparsed-record
+      // notices below.
+      if (this.summary.ingest.stale_unknown_reason === "run-in-future") msgs.push(
+        `INCONCLUSIVE: the last recorded ingest is dated in the FUTURE `
+        + `(${fmtTs(this.summary.ingest.last_run_at)}, ahead of this server's clock). The `
+        + `database's age cannot be measured, so nothing below is qualified as `
+        + `fresh or stale — check the clock, or whether this database was copied `
+        + `from another machine.`);
+      if (this.summary.ingest.stale_unknown_reason === "no-run-recorded") msgs.push(
+        `INCONCLUSIVE: no ingest.py run has ever COMPLETED over this database, `
+        + `which holds ${this.summary.ingest.files.toLocaleString()} ingested file(s). Its age `
+        + `is unknown and may be unbounded — a run that raises never stamps, so a `
+        + `failing ingest looks exactly like this. Re-run ingest.py and check it `
+        + `exits cleanly.`);
+      if (this.summary.ingest.files === 0) msgs.push("No files ingested yet — run ingest.py.");
+      if (this.summary.ingest.unparsed_records > 0) msgs.push(`INCONCLUSIVE: ${this.summary.ingest.unparsed_records} unparsed record(s) across ingested files — totals may undercount.`);
+      // Totals here are COMPLETE — the archived calls are counted. What they
+      // are not is reproducible: those transcripts are gone, so this database
+      // is the only copy and re-ingesting will not bring them back. Back it up.
+      if (!this.summary.durability.reproducible) msgs.push(`${this.summary.durability.archived_calls} call(s) in this window come from ${this.summary.durability.archived_sources} transcript(s) no longer on disk — counted in the totals, but NOT reproducible by re-ingesting. This database is their only copy.`);
+      this.banner.notices = msgs;
+    },
+
+    async showDetail(id) {
+      let d;
+      try {
+        d = await getJSON("/api/session?id=" + encodeURIComponent(id));
+      } catch (e) {
+        this.reportLoadFailure(e);
+        return;
+      }
+      this.detailId = id;
+      this.detail = d;
+      this.$nextTick(() => this.$refs.detailPanel.scrollIntoView({ behavior: "smooth" }));
+    },
+
+    // --- range controls --------------------------------------------------
+    setRange(days) {
+      this.range = String(days);
+      if (days === "all") {
+        this.from = null;
+        this.to = null;
+      } else {
+        const now = new Date();
+        this.to = isoLocal(now);
+        this.from = isoLocal(new Date(now.getTime() - (days - 1) * 86400e3));
+      }
+      this.load();
+    },
+
+    applyCustomRange() {
+      this.range = null;
+      this.load();
+    },
+  };
 }
-
-function renderOutliers(rows) {
-  document.querySelector("#outliers tbody").innerHTML = rows.map(r => `
-    <tr>
-      <td>${fmtTs(r.ts)}</td>
-      <td class="mono">${esc(r.session_id.slice(0, 8))}</td>
-      <td>${esc(r.model)}${r.is_sidechain ? " (side)" : ""}</td>
-      <td>${esc(r.turn_type ?? "(no turn)")}</td>
-      <td>${fmtTok(r.cache_read)}</td>
-      <td>${fmtTok(r.context_size)}</td>
-      <td class="preview">${esc(r.preview ?? "")}</td>
-    </tr>`).join("") || `<tr><td colspan="7">No calls in this period.</td></tr>`;
-}
-
-function tokenCols(r) {
-  return `<td>${fmtTok(r.input)}</td><td>${fmtTok(r.cache_read)}</td><td>${fmtTok(r.cache_write)}</td><td>${fmtTok(r.output)}</td>`;
-}
-
-// Window-level token usage by model. `models()` splits every model by scope on
-// purpose, so the same model appears once per scope and the two are never
-// summed into a figure that hides which side spent it.
-//
-// An empty list renders an explicit "no calls in this period" row rather than
-// an empty table: a blank table body is indistinguishable from a failed fetch,
-// and the tool's posture is that absence must never render as a value.
-function renderModels(models) {
-  const body = document.querySelector("#models tbody");
-  if (!models || models.length === 0) {
-    body.innerHTML = `<tr><td colspan="7">No API calls in this period.</td></tr>`;
-    return;
-  }
-  body.innerHTML = models.map(r =>
-    `<tr><td>${esc(r.model)}</td><td>${esc(r.scope)}</td>` +
-    `<td>${r.calls.toLocaleString()}</td>${tokenCols(r)}</tr>`
-  ).join("");
-}
-
-async function showDetail(id) {
-  let d;
-  try {
-    d = await getJSON("/api/session?id=" + encodeURIComponent(id));
-  } catch (e) {
-    reportLoadFailure(e);
-    return;
-  }
-  document.getElementById("detail-title").textContent = "Session " + id;
-  const tt = d.turn_types.map(r => `<tr><td>${esc(r.turn_type)}</td><td>${r.turns}</td><td>${r.calls}</td>${tokenCols(r)}</tr>`).join("");
-  const mm = d.models.map(r => `<tr><td>${esc(r.model)}</td><td></td><td>${r.calls}</td>${tokenCols(r)}</tr>`).join("");
-  // #10: peak context and spend are two different quantities, side by side.
-  // The self-reported `<subagent_tokens>` tag is a HIGH-WATER MARK (how big
-  // the subagent's context got), so it is shown as the largest single
-  // dispatch, never summed; spend is measured from the subagent transcripts.
-  // A dispatch that reported no peak, or whose transcript was never measured,
-  // is counted beside the figure rather than folded into it -- a partial
-  // column must read as the lower bound it is, and never as a 0.
-  const at = d.agent_types.map(r =>
-    `<tr><td>${esc(r.agent_type)}</td><td>${r.dispatches}</td>` +
-    `<td>${fmtTok(r.peak_context_tokens)}${r.dispatches_without_peak ? ` (${r.dispatches_without_peak} unreported)` : ""}</td>` +
-    `<td>${fmtTok(r.measured_tokens)}${r.dispatches_without_spend ? ` (${r.dispatches_without_spend} unmeasured)` : ""}</td></tr>`
-  ).join("") || `<tr><td colspan="4">No agent dispatches recorded.</td></tr>`;
-  const ot = d.outlier_turns.map(r => `<tr><td>${fmtTs(r.ts)}</td><td>${esc(r.turn_type)}</td><td>${r.calls}</td><td>${fmtTok(r.cache_read)}</td><td class="preview">${esc(r.preview)}</td></tr>`).join("");
-  const sc = d.scopes.map(r => `<tr><td>${esc(r.scope)}</td><td>${r.calls}</td>${tokenCols(r)}</tr>`).join("")
-    || `<tr><td colspan="6">No API calls recorded for this session.</td></tr>`;
-  document.getElementById("detail-body").innerHTML = `
-    <h3>By scope (main-thread vs subagent)</h3>
-    <table><thead><tr><th>Scope</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>${sc}</tbody></table>
-    <h3>By turn type</h3>
-    <table><thead><tr><th>Turn type</th><th>Turns</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>${tt}</tbody></table>
-    <h3>By model</h3>
-    <table><thead><tr><th>Model</th><th></th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>${mm}</tbody></table>
-    <h3>Agent dispatches: peak context vs measured spend</h3>
-    <table><thead><tr><th>Agent type</th><th>Dispatches</th><th title="The subagent-reported &lt;subagent_tokens&gt; figure is a PEAK CONTEXT high-water mark -- how big the subagent's context got, not how much it consumed. Shown for the largest single dispatch; summing high-water marks is meaningless. '(n unreported)' = dispatches that emitted no figure -- no sample, not zero.">Peak context (largest dispatch)</th><th title="Cumulative tokens measured from the subagent transcripts -- what these dispatches actually consumed. Typically ~50x the peak-context figure beside it. '(n unmeasured)' = dispatches with no transcript read, so this total is a LOWER BOUND.">Measured spend (tokens)</th></tr></thead><tbody>${at}</tbody></table>
-    <h3>Top turns by cache-read</h3>
-    <table><thead><tr><th>When</th><th>Type</th><th>Calls</th><th>Cache read</th><th>Preview</th></tr></thead><tbody>${ot}</tbody></table>`;
-  const panel = document.getElementById("detail");
-  panel.style.display = "block";
-  panel.scrollIntoView({ behavior: "smooth" });
-}
-function hideDetail() { document.getElementById("detail").style.display = "none"; }
-document.getElementById("detail-close").addEventListener("click", hideDetail);
-
-function reportLoadFailure(e) {
-  // A failed refresh must say so, not leave the previous numbers on screen
-  // looking current (CodeRabbit finding -- stale data read as current).
-  // Highest precedence in `renderBanner`, and cleared only by a load in which
-  // every endpoint returned.
-  bannerState.loadFailure = "Load failed: " + e.message + " -- displayed figures may be stale.";
-  renderBanner();
-}
-
-async function loadAll() {
-  const qs = rangeQS();
-  let summary, ts, sessions, agents, outliers;
-  try {
-    [summary, ts, sessions, agents, outliers] = await Promise.all([
-      getJSON("/api/summary?" + qs),
-      getJSON("/api/timeseries?" + qs + "&by=" + state.by),
-      getJSON("/api/sessions?" + qs),
-      getJSON("/api/agents?" + qs + "&limit=15"),
-      getJSON("/api/outliers?" + qs + "&limit=20"),
-    ]);
-  } catch (e) {
-    reportLoadFailure(e);
-    return;
-  }
-  // Every endpoint returned, so the previous failure is genuinely resolved --
-  // the ONE place that is true, and therefore the only place it is cleared.
-  bannerState.loadFailure = null;
-  renderSummary(summary);
-  renderChart(ts);
-  renderSessions(sessions);
-  renderAgents(agents);
-  renderOutliers(outliers);
-}
-
-function setRange(days) {
-  if (days === "all") { state.from = null; state.to = null; }
-  else {
-    const now = new Date();
-    state.to = isoLocal(now);
-    state.from = isoLocal(new Date(now.getTime() - (days - 1) * 86400e3));
-  }
-  document.getElementById("from").value = state.from ?? "";
-  document.getElementById("to").value = state.to ?? "";
-  loadAll();
-}
-
-document.querySelectorAll("#filters button[data-range]").forEach(b =>
-  b.addEventListener("click", () => {
-    document.querySelectorAll("#filters button").forEach(x => x.classList.remove("active"));
-    b.classList.add("active");
-    setRange(b.dataset.range === "all" ? "all" : Number(b.dataset.range));
-  }));
-document.getElementById("apply").addEventListener("click", () => {
-  document.querySelectorAll("#filters button").forEach(x => x.classList.remove("active"));
-  state.from = document.getElementById("from").value || null;
-  state.to = document.getElementById("to").value || null;
-  loadAll();
-});
-document.querySelectorAll('input[name="by"]').forEach(r =>
-  r.addEventListener("change", () => { state.by = r.value; loadAll(); }));
-
-setRange(7);
 </script>
 </body>
 </html>
