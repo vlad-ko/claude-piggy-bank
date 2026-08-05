@@ -26,10 +26,14 @@ from test_ingest import build_corpus  # noqa: E402
 from serve import (  # noqa: E402
     RANKED_BY,
     STALE_AFTER_SECONDS,
+    STALE_UNKNOWN_NO_RUN_RECORDED,
+    STALE_UNKNOWN_NO_RUN_TABLE,
+    STALE_UNKNOWN_RUN_IN_FUTURE,
     Api,
     clamp_limit,
     day_bounds,
     eastern_day,
+    staleness_verdict,
 )
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "session-fixture.jsonl"
@@ -857,6 +861,70 @@ class DataStalenessTest(unittest.TestCase):
         block = self._ingest_block()
         self.assertTrue(block["stale"])
 
+    def test_a_run_stamped_in_the_FUTURE_is_not_a_freshness_verdict(self) -> None:
+        # Reproduced 2026-08-05: a `finished_at` 30 days ahead of the server's
+        # clock gives an age of -2,592,000 s, and `(as_of - last_run_at) >
+        # STALE_AFTER_SECONDS` answered False -- "the data is fresh" -- while
+        # the data-age line on the same render read "in the future (clock
+        # skew)". One surface refused, the adjacent one answered.
+        #
+        # Three ways in, one of them explicitly in scope per CLAUDE.md's
+        # Durability section: clock skew, a database copied between machines,
+        # an NTP step during a run.
+        self._set_run_stamp(time.time() + 30 * 86400)
+        block = self._ingest_block()
+        self.assertIsNone(block["stale"], "a negative age is not a fresh verdict")
+        self.assertEqual(
+            block["stale_unknown_reason"], STALE_UNKNOWN_RUN_IN_FUTURE
+        )
+        # ...and it is distinguishable from "no run was ever recorded": the
+        # stamp is right there, it is the CLOCKS that disagree.
+        self.assertIsNotNone(block["last_run_at"])
+
+    def test_a_real_verdict_carries_no_unknown_reason(self) -> None:
+        # The reason field qualifies an ABSENT verdict. Present beside a real
+        # one, it would be a second, contradictory answer to the same question.
+        self._set_run_stamp(time.time())
+        block = self._ingest_block()
+        self.assertIs(block["stale"], False)
+        self.assertIsNone(block["stale_unknown_reason"])
+        self._set_run_stamp(time.time() - (STALE_AFTER_SECONDS + 60))
+        block = self._ingest_block()
+        self.assertIs(block["stale"], True)
+        self.assertIsNone(block["stale_unknown_reason"])
+
+    def test_data_with_no_completed_run_is_NOT_a_database_that_predates_recording(
+        self,
+    ) -> None:
+        # `ingest.py`'s schema comment promises that "a run that raised never
+        # stamps, so a broken ingest ages visibly". The table is here -- this
+        # database is at the current schema and holds real measurements -- and
+        # no run has ever completed over it. That is a crashed or never-
+        # finished ingest, and the page used to state, with confidence, the one
+        # cause it CANNOT be.
+        self._write(f"DELETE FROM {INGEST_RUNS_TABLE}")
+        block = self._ingest_block()
+        self.assertIsNone(block["stale"])
+        self.assertEqual(
+            block["stale_unknown_reason"],
+            STALE_UNKNOWN_NO_RUN_RECORDED,
+            "a schema that RECORDS run times cannot predate recording them",
+        )
+        # The facts that make it "crashed" rather than "empty and new".
+        self.assertGreater(block["files"], 0)
+        self.assertIsNotNone(block["newest_call_ts"])
+
+    def test_only_a_MISSING_run_table_reads_as_predating_run_recording(self) -> None:
+        # The one absence the database really can attribute: no table at all.
+        # serve.py never migrates, so this is what a user who upgrades CPB and
+        # opens the report before re-running ingest.py actually has.
+        self._write(f"DROP TABLE {INGEST_RUNS_TABLE}")
+        block = self._ingest_block()
+        self.assertIsNone(block["stale"])
+        self.assertEqual(
+            block["stale_unknown_reason"], STALE_UNKNOWN_NO_RUN_TABLE
+        )
+
     def test_the_threshold_and_the_clock_it_is_measured_against_are_published(
         self,
     ) -> None:
@@ -884,6 +952,109 @@ class DataStalenessTest(unittest.TestCase):
         # The run itself DID happen, and is a separate fact from what it found.
         self.assertIsNotNone(block["last_run_at"])
         self.assertFalse(block["stale"])
+
+
+class StalenessThresholdTest(unittest.TestCase):
+    """The threshold's VALUE, its boundary, and the sign of the age (#37).
+
+    Every other staleness test stamps its fixture RELATIVE to the constant
+    (`time.time() - (STALE_AFTER_SECONDS + 60)`), so the whole suite moves with
+    it: on 2026-08-05 `STALE_AFTER_SECONDS` could be set to 25 hours -- past
+    the 1.2 h incident that opened #20, i.e. past the only case the feature
+    exists for -- and CI stayed green. The number with the most carefully
+    documented provenance in the change was the one nothing tested.
+
+    So this class asserts the constant against the two MEASUREMENTS that chose
+    it rather than against itself, and asserts the verdict at the exact second
+    on either side of it. `staleness_verdict` is a pure function of
+    (`last_run_at`, `as_of`) precisely so that boundary can be stated without
+    patching a clock, which would pin the test to a mocking seam instead.
+    """
+
+    # The unflagged staleness that opened #20: the reference install was this
+    # far behind with the page reading exactly as it does when current. A
+    # threshold at or above it would not have fired on its own motivating case.
+    INCIDENT_SECONDS = 1.2 * 3600
+    # What a refresh COSTS -- the floor, or the banner fires on people who are
+    # re-ingesting. Measured 2026-08-04 on macOS 15 against that machine's
+    # largest corpus (2,891 files, 1.9 GB): cold full ingest 39.9 s, all-skipped
+    # incremental re-run 1.8 s. Both are quoted in serve.py beside the constant.
+    COLD_INGEST_SECONDS = 39.9
+    INCREMENTAL_INGEST_SECONDS = 1.8
+
+    AS_OF = 1_800_000_000.0  # any fixed clock; the verdict is a function of AGE
+
+    def verdict(self, age: float) -> tuple:
+        return staleness_verdict(
+            self.AS_OF - age, self.AS_OF, run_table_present=True
+        )
+
+    def test_the_threshold_is_fifteen_minutes(self) -> None:
+        self.assertEqual(
+            STALE_AFTER_SECONDS,
+            900,
+            "changing this number is a deliberate act: re-derive it from a "
+            "fresh ingest measurement and update serve.py's provenance block",
+        )
+
+    def test_the_threshold_fires_on_the_incident_that_motivated_the_feature(
+        self,
+    ) -> None:
+        # The ceiling, stated as behaviour rather than as a comparison of
+        # constants: the case #20 was filed over must come out STALE.
+        self.assertEqual(self.verdict(self.INCIDENT_SECONDS), (True, None))
+
+    def test_the_threshold_clears_the_cost_of_re_ingesting(self) -> None:
+        # The floor. A threshold near the cost of a refresh would fire on
+        # people who ARE re-ingesting, which is how a banner gets ignored.
+        self.assertGreater(STALE_AFTER_SECONDS, 10 * self.COLD_INGEST_SECONDS)
+        self.assertEqual(self.verdict(self.COLD_INGEST_SECONDS), (False, None))
+        self.assertEqual(
+            self.verdict(self.INCREMENTAL_INGEST_SECONDS), (False, None)
+        )
+
+    def test_exactly_the_threshold_is_still_fresh(self) -> None:
+        # `>`, not `>=`: the rule the UI publishes is "older than
+        # `stale_after_seconds`", so the threshold second itself is the last
+        # fresh one. Stated because it is the only place the two spellings
+        # differ, and nothing else in the suite can tell them apart.
+        self.assertEqual(self.verdict(STALE_AFTER_SECONDS), (False, None))
+
+    def test_one_second_either_side_of_the_threshold_straddles_the_verdict(
+        self,
+    ) -> None:
+        self.assertEqual(self.verdict(STALE_AFTER_SECONDS - 1), (False, None))
+        self.assertEqual(self.verdict(STALE_AFTER_SECONDS + 1), (True, None))
+
+    def test_a_run_that_just_finished_is_a_real_zero_not_an_unknown(self) -> None:
+        # Age 0 is a MEASURED age, and the freshest one there is. It must not
+        # be swept into the "cannot tell" branch along with the negative ages.
+        self.assertEqual(self.verdict(0.0), (False, None))
+
+    def test_a_negative_age_is_cannot_tell_and_never_a_verdict(self) -> None:
+        # #34. `abs()` on the subtraction survives every other test in this
+        # suite and turns "these two clocks disagree" into "this data is old";
+        # the unmutated expression turned it into "this data is fresh". Both
+        # answer a question the arithmetic cannot: with the stamp ahead of the
+        # server's clock there is no age to compare with anything.
+        for age in (-1.0, -(STALE_AFTER_SECONDS + 60), -30 * 86400.0):
+            with self.subTest(age=age):
+                self.assertEqual(
+                    self.verdict(age), (None, STALE_UNKNOWN_RUN_IN_FUTURE)
+                )
+
+    def test_the_two_absent_stamps_are_told_apart_by_the_table(self) -> None:
+        # No stamp has two causes and they are not the same claim: no table is
+        # a database written before CPB recorded run times; an empty table is
+        # a database that records them and over which no run has ever finished.
+        self.assertEqual(
+            staleness_verdict(None, self.AS_OF, run_table_present=False),
+            (None, STALE_UNKNOWN_NO_RUN_TABLE),
+        )
+        self.assertEqual(
+            staleness_verdict(None, self.AS_OF, run_table_present=True),
+            (None, STALE_UNKNOWN_NO_RUN_RECORDED),
+        )
 
 
 def js_function_body(html: str, decl: str) -> str:
@@ -975,6 +1146,89 @@ class BannerPrecedenceTest(unittest.TestCase):
         self.assertRegex(body, r"if \(ing\.last_run_at === null\) \{")
         self.assertRegex(body, r"if \(ing\.newest_call_ts === null\) \{")
         self.assertIn("not recorded", body)
+
+
+class DataAgeCauseTest(unittest.TestCase):
+    """The page may not assert a cause the payload cannot support (#34).
+
+    `renderDataAge`'s null branch said "this database predates CPB recording
+    ingest times" -- ONE named cause, stated with confidence, for an absence
+    with three reachable ones. Two of the three (an ingest that raised after
+    the schema was stamped, an upgrade whose run table is empty until a run
+    completes) describe a database that is at the CURRENT schema and whose
+    ingest has not finished, possibly for a month. Those readers were told
+    their database was merely old, and the most stale state the tool can be in
+    produced its weakest signal: a grey line, no banner, indefinitely.
+
+    Structural assertions, with the same limit `BannerPrecedenceTest` records:
+    the project ships no JS runtime (stdlib-only, no Node), so these pin the
+    branch and the vocabulary rather than executing the render. They are
+    written against the reason strings `serve.py` defines, so a rename on
+    either side goes red instead of silently unwiring the branch.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+
+    def data_age(self) -> str:
+        return js_function_body(self.html, "function renderDataAge(")
+
+    def summary(self) -> str:
+        return js_function_body(self.html, "function renderSummary(")
+
+    def test_the_data_age_line_branches_on_the_reason_the_api_reports(self) -> None:
+        body = self.data_age()
+        self.assertIn("ing.stale_unknown_reason", body)
+        for reason in (STALE_UNKNOWN_NO_RUN_TABLE, STALE_UNKNOWN_NO_RUN_RECORDED):
+            with self.subTest(reason=reason):
+                self.assertIn(f'"{reason}"', body)
+
+    def test_the_predates_claim_is_reachable_only_under_the_missing_table(
+        self,
+    ) -> None:
+        # THE defect: the claim itself is fine, unconditionally making it is
+        # not. Asserted as "appears once, after the guard that establishes it",
+        # because a second copy outside the branch is exactly the regression.
+        body = self.data_age()
+        self.assertEqual(body.count("predates"), 1)
+        self.assertLess(
+            body.index(f'"{STALE_UNKNOWN_NO_RUN_TABLE}"'),
+            body.index("predates"),
+            "the 'predates CPB' claim is made before anything establishes it",
+        )
+
+    def test_a_crashed_ingest_is_named_as_a_possible_cause(self) -> None:
+        body = self.data_age()
+        self.assertIn("may have failed", body)
+
+    def test_clock_skew_is_raised_as_an_operator_visible_notice(self) -> None:
+        # A verdict of "cannot tell" belongs in the same register as the
+        # archived-source and unparsed-record notices, not only in the grey
+        # data-age line -- `fmtAge` already prints "in the future (clock skew)"
+        # there while nothing above it says the freshness verdict is void.
+        body = self.summary()
+        self.assertRegex(
+            body,
+            r'stale_unknown_reason === "%s"\)\s*msgs\.push\('
+            % re.escape(STALE_UNKNOWN_RUN_IN_FUTURE),
+        )
+
+    def test_a_database_with_no_completed_run_raises_a_notice_too(self) -> None:
+        body = self.summary()
+        self.assertRegex(
+            body,
+            r'stale_unknown_reason === "%s"\)\s*msgs\.push\('
+            % re.escape(STALE_UNKNOWN_NO_RUN_RECORDED),
+        )
+
+    def test_neither_notice_becomes_a_staleness_verdict(self) -> None:
+        # The banner's `stale` slot stays reserved for an actual `true`. An
+        # unknown age that seized it would be a warning the reader cannot
+        # clear by re-running ingest when the cause is a skewed clock.
+        body = self.summary()
+        self.assertIn("s.ingest.stale === true", body)
+        self.assertEqual(body.count("bannerState.stale ="), 1)
 
 
 class SummaryPayloadIsWiredTest(unittest.TestCase):
@@ -1282,9 +1536,65 @@ class AgentDispatchPeakContextTest(unittest.TestCase):
         # Ranking by the self-reported peak put `reviewer` (480,000 reported,
         # zero measured spend) at the top of a panel a reader consults to see
         # what delegation cost.
+        #
+        # What this proves and what it does NOT (#37): the returned ORDER is
+        # pinned, and the property that an unmeasured row never precedes a
+        # measured one is stated rather than left to the reader of a literal
+        # list. It cannot prove the `measured_tokens IS NULL` sort key is
+        # present -- SQLite collates NULL last under DESC anyway, so deleting
+        # that key changes no row of any fixture. The key is pinned on the
+        # executed statement in the test below instead.
         detail = self.api.session_detail(PEAK_SESSION)
-        order = [r["agent_type"] for r in detail["agent_types"]]
-        self.assertEqual(order, ["backend-expert", "architect", "reviewer"])
+        rows = detail["agent_types"]
+        self.assertEqual(
+            [r["agent_type"] for r in rows],
+            ["backend-expert", "architect", "reviewer"],
+        )
+        measured = [r["measured_tokens"] is not None for r in rows]
+        self.assertEqual(
+            measured,
+            sorted(measured, reverse=True),
+            "an unmeasured dispatch was interleaved with the measured ones",
+        )
+        spends = [r["measured_tokens"] for r in rows if r["measured_tokens"] is not None]
+        self.assertEqual(spends, sorted(spends, reverse=True))
+
+    def test_unmeasured_last_is_stated_in_the_query_not_left_to_the_engine(
+        self,
+    ) -> None:
+        """The NULL-ordering key is asserted on the statement that ran (#37).
+
+        This one is deliberately structural, and the reason is the finding: the
+        behavioural test above passes with `measured_tokens IS NULL` DELETED,
+        because SQLite already sorts NULL last under `DESC`. No fixture can
+        make that mutation red -- the two orderings are identical for every
+        possible input on this engine -- so a behavioural assertion here would
+        be pinning an incidental property of the engine while reading as a
+        guarantee about the panel. That is the failure this issue is about.
+
+        What the explicit key buys is what the test therefore states: the rule
+        "unmeasured ranks last" is expressed by the query and survives the
+        column direction being flipped, the engine changing its NULL
+        collation, or the ordering moving into Python. It is captured from the
+        connection's trace callback rather than grepped out of `serve.py`, so
+        an ORDER BY that is edited but never executed cannot satisfy it.
+        """
+        executed: list[str] = []
+        self.api.conn.set_trace_callback(executed.append)
+        try:
+            self.api.session_detail(PEAK_SESSION)
+        finally:
+            self.api.conn.set_trace_callback(None)
+        ranked = [s for s in executed if "FROM agent_dispatches d" in s]
+        self.assertEqual(
+            len(ranked), 1, "expected exactly one agent-type ranking query"
+        )
+        order_by = ranked[0].split("ORDER BY", 1)[1].strip()
+        self.assertTrue(
+            order_by.startswith("measured_tokens IS NULL"),
+            "the FIRST sort key must be the presence of a measurement, not the "
+            f"measurement itself; ORDER BY was: {order_by}",
+        )
 
     def test_the_page_renders_peak_context_and_no_longer_calls_it_spend(self) -> None:
         # The API being right while the page still says "spend" is the whole

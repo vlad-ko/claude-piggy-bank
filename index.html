@@ -258,18 +258,40 @@ function renderBanner() {
 // that as staleness, and would hide a week-old database whose last-seen call
 // happens to be recent.
 //
-// A null `last_run_at` is not an age of zero and not a stale-forever verdict:
-// it is a database written before CPB recorded run times at all, and it says
-// exactly that.
+// A null `last_run_at` is not an age of zero and not a stale-forever verdict.
+// Nor is it one thing: this branch used to state ONE cause ("this database
+// predates CPB recording ingest times") for an absence with several, and it
+// picked the only benign one. A database that HAS the run table and no row is
+// at a schema that records run times and has had no ingest finish over it --
+// a crash, an upgrade not yet followed by a run, or a recorder failing every
+// time. That reader was told their data was merely old.
+//
+// So the cause comes from the API, which knows what it can and cannot tell
+// (`stale_unknown_reason`), and the page states only that.
 function renderDataAge(ing) {
   const el = document.getElementById("data-age");
   const parts = [];
   if (ing.last_run_at === null) {
-    parts.push(
-      `<strong>Last ingest: not recorded</strong> — this database predates ` +
-      `CPB recording ingest times, so its age is UNKNOWN, not zero. Run ` +
-      `<code>ingest.py</code> to start recording it`
-    );
+    if (ing.stale_unknown_reason === "no-run-table") {
+      parts.push(
+        `<strong>Last ingest: not recorded</strong> — this database predates ` +
+        `CPB recording ingest times, so its age is UNKNOWN, not zero. Run ` +
+        `<code>ingest.py</code> to start recording it`
+      );
+    } else if (ing.stale_unknown_reason === "no-run-recorded") {
+      parts.push(
+        `<strong>Last ingest: NEVER COMPLETED</strong> — this database does ` +
+        `record ingest times and holds no run, so its age is UNKNOWN, not ` +
+        `zero: either no <code>ingest.py</code> run has finished over it yet, ` +
+        `or one <strong>may have failed</strong> — a run that raises never ` +
+        `stamps. Re-run <code>ingest.py</code> and check that it exits cleanly`
+      );
+    } else {
+      parts.push(
+        `<strong>Last ingest: not recorded</strong> — its age is UNKNOWN, ` +
+        `not zero, for a reason this build cannot name`
+      );
+    }
   } else {
     parts.push(`Last ingest: <strong>${esc(fmtAge(ing.as_of - ing.last_run_at))}</strong> (${esc(fmtTs(ing.last_run_at))})`);
   }
@@ -317,6 +339,22 @@ function renderSummary(s) {
       `past the threshold of ${fmtSpan(s.ingest.stale_after_seconds)}. Every figure below ` +
       `describes the transcripts as of THEN, not as of now — re-run ingest.py.`
     : null;
+  // An UNKNOWN age is not a staleness verdict, so it never takes the banner's
+  // `stale` slot above — but it must not be left to the grey data-age line
+  // either. These are the two unknowns a reader can act on, in the same
+  // register as the archived-source and unparsed-record notices below.
+  if (s.ingest.stale_unknown_reason === "run-in-future") msgs.push(
+    `INCONCLUSIVE: the last recorded ingest is dated in the FUTURE ` +
+    `(${fmtTs(s.ingest.last_run_at)}, ahead of this server's clock). The ` +
+    `database's age cannot be measured, so nothing below is qualified as ` +
+    `fresh or stale — check the clock, or whether this database was copied ` +
+    `from another machine.`);
+  if (s.ingest.stale_unknown_reason === "no-run-recorded") msgs.push(
+    `INCONCLUSIVE: no ingest.py run has ever COMPLETED over this database, ` +
+    `which holds ${s.ingest.files.toLocaleString()} ingested file(s). Its age ` +
+    `is unknown and may be unbounded — a run that raises never stamps, so a ` +
+    `failing ingest looks exactly like this. Re-run ingest.py and check it ` +
+    `exits cleanly.`);
   if (s.ingest.files === 0) msgs.push("No files ingested yet — run ingest.py.");
   if (s.ingest.unparsed_records > 0) msgs.push(`INCONCLUSIVE: ${s.ingest.unparsed_records} unparsed record(s) across ingested files — totals may undercount.`);
   // Totals here are COMPLETE — the archived calls are counted. What they are

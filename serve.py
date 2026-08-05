@@ -103,6 +103,23 @@ STATUS_UNAVAILABLE_UNDATED = "unavailable-undated"
 # not latency. Re-check the floor if ingest ever stops being incremental.
 STALE_AFTER_SECONDS = 15 * 60
 
+# Why `stale` is null, when it is (#34). Spelled ONCE here and read by name in
+# `index.html`, because the page used to name a cause of its own -- and named
+# the one cause the database could rule out.
+#
+# No database written before `ingest_runs` existed can record a run, so a
+# missing TABLE is the only absence attributable to the schema's age.
+STALE_UNKNOWN_NO_RUN_TABLE = "no-run-table"
+# The table is here and empty: this database RECORDS run times and no run has
+# ever finished over it. Three causes collapse into this one value and the
+# database cannot tell them apart -- an ingest that raised after the schema was
+# stamped, an in-place upgrade not yet followed by a run, a wrong-shaped table
+# that makes the recorder raise every time. It does not claim which; what it
+# rules out is "too old to record", which is what the page used to assert.
+STALE_UNKNOWN_NO_RUN_RECORDED = "no-run-recorded"
+# The stamp is AHEAD of the server's clock, so there is no age to compare.
+STALE_UNKNOWN_RUN_IN_FUTURE = "run-in-future"
+
 MIN_LIMIT = 1
 MAX_LIMIT = 500
 DEFAULT_LIMIT = 20
@@ -145,6 +162,57 @@ def clamp_limit(raw: Optional[str]) -> int:
     return max(MIN_LIMIT, min(value, MAX_LIMIT))
 
 
+def staleness_verdict(
+    last_run_at: Optional[float], as_of: float, run_table_present: bool
+) -> tuple[Optional[bool], Optional[str]]:
+    """`(stale, why_unknown)` -- tri-state, with the absence NAMED (#34).
+
+    Split out of `_ingest_health` so the boundary can be asserted at the exact
+    second without a patched clock: the verdict is a pure function of the two
+    timestamps and of whether the database can record a run at all.
+
+    `stale` is True, False, or None for "cannot tell", and `why_unknown` is
+    non-null exactly when `stale` is None. Two absences are told apart because
+    they are different claims to their reader, not because the distinction is
+    cheap: "no run was ever recorded" and "runs are recorded and the last one
+    is dated in the future" are both unknown ages with entirely different
+    remedies.
+
+    A NEGATIVE age is the arithmetic case this tri-state exists for, and it is
+    the one it used to answer. `(as_of - last_run_at) > STALE_AFTER_SECONDS`
+    returns False for a stamp 30 days ahead of the server's clock -- "the data
+    is fresh" -- while `index.html`'s own `fmtAge()` prints "in the future
+    (clock skew)" on the same render. Reproduced 2026-08-05; reachable through
+    clock skew, an NTP step mid-run, or a database copied between machines,
+    which CLAUDE.md's Durability section puts explicitly in scope.
+
+    It reports None rather than `abs()`'s "stale". `abs()` is a defensible
+    choice and is the wrong one here: it converts "these two clocks disagree by
+    30 days" into a confident statement that the data is 30 days old, which is
+    a measurement nothing took. The field is already tri-state, the honest
+    branch already exists, and the remedy differs -- a genuinely stale database
+    is fixed by re-running ingest, a skewed one is not. "Cannot tell" is the
+    only reading supported by the arithmetic, and it is loud: the page raises a
+    notice for it rather than leaving it to the grey data-age line.
+
+    A ZERO age stays a verdict, not an unknown: a run that just finished is the
+    freshest sample there is, and a real 0 must stay distinguishable from no
+    sample (CLAUDE.md). The comparison is strict, so `STALE_AFTER_SECONDS`
+    itself is the last fresh second -- the rule the UI publishes is "older
+    than the threshold".
+    """
+    if last_run_at is None:
+        return None, (
+            STALE_UNKNOWN_NO_RUN_RECORDED
+            if run_table_present
+            else STALE_UNKNOWN_NO_RUN_TABLE
+        )
+    age = as_of - last_run_at
+    if age < 0:
+        return None, STALE_UNKNOWN_RUN_IN_FUTURE
+    return age > STALE_AFTER_SECONDS, None
+
+
 class Api:
     """Query layer over the ingested DB. One connection per server (serialized)."""
 
@@ -152,31 +220,50 @@ class Api:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
 
+    def _has_ingest_runs_table(self) -> bool:
+        """Can this database record an ingest run AT ALL?
+
+        The one thing that tells the two no-stamp absences apart, and the
+        reason it is asked separately: a database whose schema predates run
+        recording cannot have a stamp, while a database that HAS the table and
+        no row is one over which no run has ever finished. Those read
+        identically as `last_run_at: null` and mean opposite things to the
+        person holding them (#34).
+
+        Asked of `sqlite_master` rather than by catching `OperationalError`,
+        because that except would also swallow a corrupt or locked database and
+        report the failure as a merely old schema.
+        """
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+                (INGEST_RUNS_TABLE,),
+            ).fetchone()
+            is not None
+        )
+
     def _last_ingest_run(self) -> Optional[float]:
         """When `ingest.py` last COMPLETED, or None if that was never recorded.
 
-        Two different absences collapse to the same None, and both are an
-        honest "no sample" rather than a value:
+        Two different absences reach this None, and both are an honest "no
+        sample" rather than a value:
 
         * a pre-v7 database has no `ingest_runs` table at all -- `serve.py`
           never migrates, it reads the database as the ingester left it, so a
           user who upgrades CPB and opens the report before re-running ingest
           is in exactly this state;
-        * a v7 database that has not been ingested since the upgrade has the
-          table and no row.
+        * a database WITH the table and no row: no run has ever finished over
+          it, whether because one raised, because the in-place upgrade path
+          leaves the table empty until a run completes, or because the
+          recorder itself is failing.
 
         Neither is an ingest at the epoch and neither is stale-forever: the
-        age is UNKNOWN, and `_ingest_health` says so with `stale: null`.
-
-        The missing table is detected by asking `sqlite_master` rather than by
-        catching `OperationalError`, because that except would also swallow a
-        corrupt or locked database and report the failure as an unknown age.
+        age is UNKNOWN, and `_ingest_health` says so with `stale: null` --
+        naming WHICH absence it has in `stale_unknown_reason`, because the
+        second one is a broken ingest and the page used to render it as the
+        first, a benign old database.
         """
-        present = self.conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
-            (INGEST_RUNS_TABLE,),
-        ).fetchone()
-        if present is None:
+        if not self._has_ingest_runs_table():
             return None
         row = self.conn.execute(
             f"SELECT finished_at FROM {INGEST_RUNS_TABLE}"
@@ -214,6 +301,18 @@ class Api:
             "SELECT MAX(ts) newest FROM api_calls"
         ).fetchone()["newest"]
         as_of = time.time()
+        # Tri-state on purpose: True, False, or None for "cannot tell" -- and
+        # when it cannot tell, WHICH unknown it has, because the page cannot
+        # be left to guess a cause (#34). `stale_unknown_reason` is non-null
+        # exactly when `stale` is null.
+        #
+        # The table check is asked twice per response (here and inside
+        # `_last_ingest_run`) rather than threaded through: it is one indexed
+        # `sqlite_master` lookup, and the alternative is a method whose answer
+        # depends on the caller having asked the right question first.
+        stale, stale_unknown_reason = staleness_verdict(
+            last_run_at, as_of, self._has_ingest_runs_table()
+        )
         return {
             "files": row["files"],
             "unparsed_records": row["unparsed"],
@@ -221,12 +320,8 @@ class Api:
             "newest_call_ts": newest_call_ts,
             "as_of": as_of,
             "stale_after_seconds": STALE_AFTER_SECONDS,
-            # Tri-state on purpose: True, False, or None for "cannot tell".
-            "stale": (
-                None
-                if last_run_at is None
-                else (as_of - last_run_at) > STALE_AFTER_SECONDS
-            ),
+            "stale": stale,
+            "stale_unknown_reason": stale_unknown_reason,
         }
 
     def _durability(self, start: float, end: float) -> dict[str, Any]:
