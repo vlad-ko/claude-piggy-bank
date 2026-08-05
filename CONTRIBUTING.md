@@ -78,9 +78,22 @@ re-checks those digests and that neither bundle contains a way to reach the
 network, so a vendored upgrade is a deliberate change to that file rather than a
 silent one.
 
-**3. No model in the loop.** Every detector is SQL, arithmetic, or JSON
-parsing. Adding an API call would break both the offline guarantee and the
-premise that measuring cost is free.
+**3. No model produces a figure.** Three claims, three scopes — see
+`CLAUDE.md` for the full statement. In short: **every figure** is SQL,
+arithmetic or JSON parsing, absolutely and everywhere; **the report** —
+`ingest.py`, `serve.py`, `index.html` — runs free and offline, spending no
+tokens and making no network call; and **guidance**, in session, may use the
+model already present, bounded to `commands/cpb.md`.
+
+The boundary a review will hold you to: **a model may read a finished
+measurement and explain it; it may never produce, compute, estimate or fill in
+a figure.** A model asked for a number it was not given will supply a fluent,
+plausible one — *absence rendered as a value*, arriving by a route no
+`Optional[int]` can catch.
+
+Note the cost claim is scoped: the report is free, `/cpb` spends tokens in a
+session you are already paying for. Two claims, two scopes; do not restore the
+sentence that made them one.
 
 **4. Do not overwhelm the UI.** The information is useful; a wall of it is not.
 A new detector earns its space by displacing or annotating something, not by

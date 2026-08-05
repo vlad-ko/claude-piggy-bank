@@ -36,8 +36,9 @@ anyone who has it in a script. `_exit_status()` reproduces CPython's own
 report a run that measured nothing as a run that measured zero. `VERSION` lives
 in `cpb.py`; `.claude-plugin/plugin.json` repeats it as a literal because the
 plugin loader reads that JSON without running Python, and `tests/test_cpb.py`
-pins the two equal. CPB is **1.0.0** under SemVer, and what a bump *means* is
-`docs/versioning.md` — see Commits and PRs below.
+pins the two equal. CPB is **1.1.0** under SemVer (`cpb.VERSION` is the
+authority; this line lagged a release once already and may again), and what a
+bump *means* is `docs/versioning.md` — see Commits and PRs below.
 
 Both scripts default `--db` to `db/usage.db` (gitignored); `ingest.py` also
 reads `CPB_DB`, `serve.py` deliberately does not (pass `--db "$CPB_DB"`).
@@ -83,8 +84,47 @@ even if the code is good.
    handler. `vendor/README.md` records each one's version, origin and SHA-256,
    and the suite re-checks those digests and that neither bundle can reach the
    network.
-3. **No model in the loop.** Every figure is SQL, arithmetic or JSON parsing.
-   Running CPB must stay free.
+3. **No model produces a figure.** Three claims with three different scopes,
+   written out separately because the old one-line form ("no model in the
+   loop; running CPB must stay free") collapsed them into one and so forbade,
+   read literally, something now allowed.
+   - **Every figure is SQL, arithmetic or JSON parsing** — absolute,
+     everywhere, unchanged. Nothing a model says becomes a number CPB shows.
+   - **The report runs free and offline** — absolute, unchanged, and it is the
+     whole of `ingest.py`, `serve.py` and `index.html`. Ingesting and reading
+     the report spends no tokens and makes no network call, whatever else
+     changes.
+   - **Guidance, in session, may use the model already present** — new, and
+     bounded to `commands/cpb.md`. `/cpb` runs inside a session the user is
+     already paying for, and *it does not produce measurement, it produces
+     guidance*.
+
+   The boundary, stated positively rather than as an exception, because an
+   exception invites the next reader to look for more of them: **a model may
+   read a finished measurement and explain it; it may never produce, compute,
+   estimate or fill in a figure.** A model asked for a number it was not given
+   will supply a fluent, plausible one — that is *absence rendered as a value*
+   (below) arriving by a route no `Optional[int]` can catch, and it is why the
+   line sits exactly here rather than anywhere looser. So `/cpb` may summarise
+   what the report already computed; it may not compute.
+
+   **This is CPB's own constraint, not an Anthropic requirement.** Claude Code
+   command files *are* prompts — `commands/cpb.md` is one, and `docs/plugin.md`
+   lists it as the `/cpb` command — and the plugin reference imposes no limit
+   on what a command may ask the model to do (external:
+   `code.claude.com/docs/en/plugins-reference`, the revision
+   `tests/test_plugin_manifest.py` cites as checked 2026-08-05; that reference
+   is silent on the question rather than permissive about it, and was not
+   re-fetched when this was written). CPB declines latitude it has, for
+   figures, and takes it for guidance.
+
+   **The cost claim is scoped, not dropped.** "Running CPB costs nothing" was
+   true of the whole tool and no longer is. The report stays free; `/cpb`
+   spends tokens in a session already being paid for, which Claude Code
+   surfaces as a per-plugin *context cost* in the `/plugin` panel
+   (product-owner report, 2026-08-05; not verified against the Claude Code
+   docs here). Two claims, two scopes — do not restore the sentence that made
+   them one.
 4. **Do not overwhelm the UI.** A new detector earns space by displacing or
    annotating something, not by appending another table.
 
@@ -143,7 +183,12 @@ only `serve.py` reads.
 build step. `.claude-plugin/plugin.json` is the manifest; `hooks/hooks.json`
 declares three triggers (`SubagentStop`, `Stop`, `SessionEnd`) that each run
 `hooks/cpb_ingest_hook.py`, which spawns `ingest.py --transcript` for **exactly
-one file**; `commands/cpb.md` is the `/cpb` command. `${CLAUDE_PLUGIN_DATA}`
+one file**; `commands/cpb.md` is the `/cpb` command. Its decided behaviour
+([#79](https://github.com/vlad-ko/claude-piggy-bank/issues/79)): **summarise,
+then always link to the report — never become the only path to a number.** The
+page is the reproducible artifact; two model runs produce two different
+summaries, and a measurement has to be reproducible where a conversation does
+not. `${CLAUDE_PLUGIN_DATA}`
 holds the database because `${CLAUDE_PLUGIN_ROOT}` is replaced on every update
 and the DB is not regenerable. The reasoning, with its sources, is in
 `docs/plugin.md` — read it before changing any of those files.
@@ -211,6 +256,29 @@ about (`band_provenance`, `BANDS_AS_OF`). They cross the API as two fields with
 two dates so the page can never present the judged one in the documented one's
 voice. An unknown model keeps its context and loses its utilisation; a
 zero-context row is `unmeasured_calls`, never banded as the most frugal call.
+
+**Provenance is per boundary, not per table.** The rule above generalises:
+where several judgments are presented together, **each carries its own
+provenance**, and a judged value must never inherit a cited value's credibility
+by sitting next to it. One provenance line for a whole table is not enough,
+because the reader attaches it to whichever row they are reading. The case that
+forced the generalisation is the recommendation table under
+[#78](https://github.com/vlad-ko/claude-piggy-bank/issues/78), which keys
+advice on ranges: its `1.0` boundary on cache reads-per-write is **documented**
+— TA-8 in `docs/claude-api-token-accounting.md` (Documented, checked
+2026-08-04) works the arithmetic out, `1.25 + 0.1` against `2 x 1.0` at two
+sends, 1.35 against 2.00, so the *first* read already repays the 5-minute write
+markup and one read per write is where it is repaid — while its `0.25` boundary
+on main-session saturation is **product-owner judgment with no source at all**.
+A single table-level provenance line would let the second borrow the first's
+authority: `band_provenance`'s failure mode reappearing one level down. Note
+what the citation does and does not cover: TA-8 documents `1.0` for the
+**5-minute** write only. The 1-hour write is 2x and needs **two** reads (2.10
+against 2.00 at n=2, still a loss), and TA-8 warns in as many words against
+compressing either into "repays on the second hit" — so a `1.0` boundary
+applied to 1-hour cache writes would be a judged number wearing a cited
+number's clothes, which is the same defect this rule exists to stop. #78 is in
+progress; the rule is decided, the module is not shipped.
 
 **Serve** is `http.server` + `sqlite3`, bound to loopback, with a Host-header
 check against DNS rebinding. Routes: `/api/summary`, `/api/timeseries`,

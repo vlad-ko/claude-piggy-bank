@@ -19,13 +19,33 @@ already writes locally into SQLite and serves a single-page report over them.
   renders fully offline. `vendor/README.md` records each one's version, origin
   and SHA-256, and the test suite re-checks those digests and that neither
   bundle contains a way to reach the network.
-- **No model in the loop.** Every number is arithmetic, SQL, or JSON parsing.
-  Running CPB costs nothing.
+- **No model produces a figure.** Every number is arithmetic, SQL, or JSON
+  parsing. No model computes, estimates, rounds or fills in a figure CPB shows,
+  anywhere. **Ingesting and reading the report is free and offline** —
+  `cpb.py ingest`, `cpb.py serve` and the page itself spend no tokens and make
+  no network call.
 
-That last point is deliberate. This is a tool for understanding what your
-sessions consume; it would be a poor one if using it consumed anything.
+That last point is deliberate, and so is the scope of it. This is a tool for
+understanding what your sessions consume; it would be a poor one if
+*measuring* consumed anything. Measuring is free.
 
-CPB is **1.0.0** and follows [Semantic
+**One place a model is involved, and the line is drawn precisely.** `/cpb`, the
+in-session command, reads the finished report and summarises it — so it spends
+tokens, in a session you are already paying for. Claude Code shows that as a
+per-plugin *context cost* in the `/plugin` panel, so you can see it before you
+use it. (That is how the panel behaves as reported to this project on
+2026-08-05; it is not a claim checked against Claude Code's documentation
+here.) The boundary is: **a model may read a finished measurement and explain
+it; it may never produce, compute, estimate or fill in a figure.** A model
+asked for a number it does not have will give you a fluent one, which is the
+same failure as [rendering absence as a
+value](#absence-is-never-rendered-as-a-value) with better prose. `/cpb`
+summarises the report and always links you to it; see [Use](#use). Everything
+that ships the numbers themselves — ingest, the server, the page — has no model
+in it at all. This is a rule CPB imposes on itself, not one Claude Code imposes
+on plugins.
+
+CPB is **1.1.0** and follows [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html). What that promises you is
 written down rather than left to be guessed at: the command line, the HTTP API,
 and **what each figure measures** are the interface, so a number that changes
@@ -166,8 +186,15 @@ From inside Claude Code, once the plugin is enabled:
 /cpb
 ```
 
-That starts the report server and gives you the URL. Everything below works the
-same from a plain checkout, with or without the plugin.
+That starts the report server, summarises what it found, and **always gives you
+the URL**. The summary is a way in, not a substitute for the page: two runs of a
+model produce two different summaries, and a measurement has to be reproducible
+where a conversation does not. The page is the artifact you can cite, screenshot
+or come back to — so `/cpb` will never be the only path to a number, and it will
+never state a figure the report does not already show.
+
+Everything below works the same from a plain checkout, with or without the
+plugin. `cpb.py ingest` and `cpb.py serve` involve no model at all.
 
 ### The `cpb` command
 
@@ -313,6 +340,22 @@ The two travel across the API as two fields with two dates, and are rendered as
 two separate statements with the judged one visually marked. Presenting a
 judgment in a documented fact's voice would borrow an authority this project has
 not earned — which is the whole reason the split exists.
+
+**And the split is per boundary, not per table.** Wherever CPB shows several
+judgments together, each one carries its own provenance. One "sources" line at
+the foot of a table is not enough, because you will read it as covering the row
+you happen to be looking at — so a judged number sitting beside a cited one
+would quietly inherit its credibility. The case that settled it is the
+recommendation table being built under
+[#78](https://github.com/vlad-ko/claude-piggy-bank/issues/78) — not shipped
+yet, but the rule is decided. It keys advice on ranges, and two of its
+boundaries are different kinds of thing: **1.0** cache reads per write is
+*documented*, because a single cache read already repays the 5-minute
+cache-write markup (the arithmetic and its source are in
+[TA-8](docs/claude-api-token-accounting.md#ta-8), checked 2026-08-04), while
+**0.25** main-session saturation has **no source at all** and is a dated
+judgment. Two numbers that look alike and are not alike, so each says for
+itself which it is.
 
 ### What the bands refuse to say
 
