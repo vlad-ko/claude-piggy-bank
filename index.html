@@ -341,7 +341,12 @@ function renderSummary(s) {
 }
 
 const CLASS_COLORS = { input: "#2563eb", cache_read: "#059669", cache_write: "#d97706", output: "#dc2626" };
-const TT_COLORS = ["#2563eb", "#059669", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#be185d", "#64748b"];
+// One colour per turn-type series, cycled. Must stay >= the number of keys the
+// "by turn type" chart can produce, or two series share a colour and the stack
+// silently misreads: 9 turn_type values + "(no turn)" + the subagent scope
+// bucket = 11.
+const TT_COLORS = ["#2563eb", "#059669", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#be185d", "#64748b",
+                   "#65a30d", "#9333ea", "#0f766e", "#b45309"];
 
 function renderChart(ts) {
   const keys = Object.keys(ts.series);
