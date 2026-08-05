@@ -7,6 +7,8 @@ swapped column mapping (e.g. cache_read <-> cache_write) cannot pass.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -3050,20 +3052,23 @@ class SchemaVersionSetsAreDecidedTest(unittest.TestCase):
 
     It is not cumulative by habit: a version belongs in it only while every
     difference between its shape and the CURRENT one can be applied without
-    deleting a row. This test cannot judge that for a future version -- what it
-    pins is that the set was re-read at the bump, by tying it to the three hops
-    (#20's added table, #30's dropped column, #15's added census table) that
-    were actually reasoned about.
+    losing a measurement. This test cannot judge that for a future version --
+    what it pins is that the set was re-read at the bump, by tying it to the
+    four hops (#20's added table, #30's dropped column, #15's added census
+    table, #36's uniqueness) that were actually reasoned about.
     """
 
-    def test_schema_version_is_9(self) -> None:
-        self.assertEqual(ingest_mod.SCHEMA_VERSION, 9)
+    def test_schema_version_is_10(self) -> None:
+        self.assertEqual(ingest_mod.SCHEMA_VERSION, 10)
 
-    def test_only_the_three_reasoned_hops_upgrade_in_place(self) -> None:
-        # v8 was re-checked against the CURRENT shape at this bump, not
-        # inherited: v8 -> v9 adds `source_shape` and nothing else, and an
-        # empty one is true of a v8 database (see IN_PLACE_CREATABLE_TABLES).
-        self.assertEqual(ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7, 8}))
+    def test_only_the_four_reasoned_hops_upgrade_in_place(self) -> None:
+        # v9 was re-checked against the CURRENT shape at this bump, not
+        # inherited: v9 -> v10 adds the UNIQUE index over `task_id`, which
+        # needs the duplicates already stored resolved first. That deletes
+        # rows, so the bar this set applies had to be RESTATED at the bump --
+        # what the hop preserves is every DISPATCH, not every row, and the
+        # reasoning is written out above the constant.
+        self.assertEqual(ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7, 8, 9}))
 
     def test_the_current_version_is_not_in_the_upgrade_set(self) -> None:
         # A no-op hop is not an upgrade; listing it would make the branch
@@ -4836,6 +4841,599 @@ class RealTranscriptShapeSmokeTest(unittest.TestCase):
             0,
             "every real API call measured a context of 0 tokens.",
         )
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-dispatch fixtures (#36)
+# ---------------------------------------------------------------------------
+#
+# Every value below is deliberately UNEQUAL to every other, and the two rows of
+# each colliding pair are deliberately ASYMMETRIC: they carry different
+# metadata, so a per-field merge, a wrong "richest" rule and a plain "last one
+# wins" all produce different rows and only one of them is the row these tests
+# assert. A fixture whose duplicate rows were identical would pass under every
+# one of those rules, which is the fixture-makes-the-defect-undetectable
+# failure CLAUDE.md forbids.
+
+DISPATCH_USAGE = {
+    "input_tokens": 11,
+    "cache_creation_input_tokens": 22,
+    "cache_read_input_tokens": 33,
+    "output_tokens": 44,
+}
+
+
+def dispatch_lines(
+    session: str,
+    seq: int,
+    *,
+    task_id: str = None,
+    agent_type: str = None,
+    description: str = None,
+    subagent_tokens: int = None,
+    tool_use_id: str = None,
+) -> str:
+    """One dispatch, in the two records a transcript actually records it as.
+
+    An `Agent` tool_use carries the agent type and description; the
+    `<task-notification>` turn that closes it carries the task id and the
+    self-reported `<subagent_tokens>` figure. They are SEPARATE records on
+    purpose -- a resumed session's transcript can hold the notification without
+    the tool_use that opened it, which is precisely how the two rows of a real
+    collision come to differ in richness (measured 2026-08-05: 15 of the 24
+    duplicate rows on the reference corpus carry no `agent_type` at all).
+
+    `tool_use_id` reuses an earlier dispatch's tool_use rather than emitting a
+    new one, which is how a repeat notification about ONE task is written.
+    """
+    lines = ""
+    if tool_use_id is None and (agent_type is not None or description is not None):
+        tool_use_id = f"toolu-{session}-{seq}"
+        lines += json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": session,
+                "timestamp": f"2026-08-05T12:{seq:02d}:00.000Z",
+                "message": {
+                    "id": f"msg-{session}-{seq}",
+                    "model": "claude-sonnet-5-20260115",
+                    "usage": dict(DISPATCH_USAGE),
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_use_id,
+                            "name": "Agent",
+                            "input": {
+                                "subagent_type": agent_type,
+                                "description": description,
+                                "prompt": "do the thing",
+                            },
+                        }
+                    ],
+                },
+            }
+        ) + "\n"
+    text = "<task-notification>\n"
+    if task_id is not None:
+        text += f"<task-id>{task_id}</task-id>\n"
+    if tool_use_id is not None:
+        text += f"<tool-use-id>{tool_use_id}</tool-use-id>\n"
+    text += "<status>completed</status>\n"
+    if subagent_tokens is not None:
+        text += (
+            f"<usage><subagent_tokens>{subagent_tokens}</subagent_tokens></usage>\n"
+        )
+    text += "</task-notification>"
+    return lines + json.dumps(
+        {
+            "type": "user",
+            "sessionId": session,
+            "timestamp": f"2026-08-05T12:{seq:02d}:30.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        }
+    ) + "\n"
+
+
+# The resume pair the reference corpus is made of: ONE dispatch recorded in TWO
+# session transcripts. `resume-a` sorts first, so it is ingested first and is
+# the incumbent for every collision below.
+RESUME_A = (
+    # RICHER side of a collision: named agent and description, but the
+    # transcript never captured a <subagent_tokens> figure.
+    dispatch_lines(
+        "resume-a", 1,
+        task_id="task-shared",
+        agent_type="backend-expert",
+        description="Rebuild the ledger",
+    )
+    # POORER side of the eviction collision: only the self-reported figure.
+    + dispatch_lines("resume-a", 2, task_id="task-evict", subagent_tokens=6553)
+    # A dispatch only this transcript records: the single-row control.
+    + dispatch_lines(
+        "resume-a", 3,
+        task_id="task-solo-a",
+        agent_type="frontend-expert",
+        description="Restyle the panel",
+        subagent_tokens=4211,
+    )
+    # No <task-id> at all. NULL is not a shared key: this row and the one in
+    # resume-b are two dispatches, never one.
+    + dispatch_lines(
+        "resume-a", 4,
+        agent_type="reviewer",
+        description="Look again",
+        subagent_tokens=1307,
+    )
+    # SAME-SESSION repeat: two notifications about one task in one file, the
+    # second carrying the finished figure. Handled before the database sees it.
+    + dispatch_lines(
+        "resume-a", 5,
+        task_id="task-twice",
+        agent_type="docs-expert",
+        description="Write it down",
+        subagent_tokens=100,
+    )
+    + dispatch_lines(
+        "resume-a", 6,
+        task_id="task-twice",
+        tool_use_id="toolu-resume-a-5",
+        subagent_tokens=2200,
+    )
+    # EQUALLY rich side of a tie, and the one stored first. Its counterpart in
+    # resume-b knows exactly as much and says something different, so the
+    # tie-break is the only thing that can decide between them.
+    + dispatch_lines(
+        "resume-a", 7,
+        task_id="task-tie",
+        agent_type="tie-expert",
+        description="Weighs the same",
+    )
+)
+
+RESUME_B = (
+    # POORER side of `task-shared`: no tool_use survived into this transcript,
+    # so no agent type and no description -- but it DID capture a figure the
+    # richer row lacks, which is the genuinely ambiguous case.
+    dispatch_lines("resume-b", 1, task_id="task-shared", subagent_tokens=9973)
+    # RICHER side of `task-evict`, arriving second: it must EVICT the row
+    # already stored, or "richest wins" is really "first wins".
+    + dispatch_lines(
+        "resume-b", 2,
+        task_id="task-evict",
+        agent_type="wizard",
+        description="Finish the ledger",
+        subagent_tokens=6553,
+    )
+    + dispatch_lines(
+        "resume-b", 3,
+        agent_type="reviewer-two",
+        description="Look once more",
+        subagent_tokens=8081,
+    )
+    # The other side of the tie: same richness, different values. A tie keeps
+    # the row already stored, so this one must LOSE -- and "richest wins" read
+    # as ">=" would keep it instead.
+    + dispatch_lines(
+        "resume-b", 4,
+        task_id="task-tie",
+        agent_type="tie-imposter",
+        description="Also weighs the same",
+    )
+)
+
+
+class DuplicateDispatchTaskIdTest(unittest.TestCase):
+    """One dispatch recorded in two transcripts is ONE row (#36).
+
+    `agent_dispatches` had no uniqueness on `task_id`, and the session panel
+    joins measured spend to it, so where two rows shared a `task_id` the same
+    agent's spend was counted twice. Measured 2026-08-05 on a reference corpus:
+    1,865 dispatch rows, 1,853 distinct `task_id`s, 12 duplicated ids over 24
+    rows, ALL of them across two sessions and none within one -- resume chains,
+    where a session continues under a new id and the same dispatch is recorded
+    again. `calls_for_agent` is identical for both rows of a pair because the
+    `task_id` IS the agent, which is what makes it one dispatch rather than two.
+
+    The rules these tests pin, in the shape `_dedupe_calls()` established for
+    `message.id`:
+
+      * ONE WHOLE ROW survives. Never a per-field merge -- a synthesised row
+        describes a dispatch that no transcript recorded.
+      * RICHEST wins, and richness is the count of non-NULL metadata fields.
+      * A tie keeps the row already stored, so a re-ingest does not churn.
+      * NULL `task_id` is NOT a shared key.
+      * The collision is COUNTED, and so is the case where the discarded row
+        carried something the survivor does not.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-dispatch-dedupe-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.a = self.projects / "resume-a.jsonl"
+        self.a.write_text(RESUME_A)
+        self.b = self.projects / "resume-b.jsonl"
+        self.b.write_text(RESUME_B)
+        self.db = self.tmp / "usage.db"
+        self.summary = ingest(self.projects, self.db)
+
+    def _rows(self) -> dict:
+        conn = sqlite3.connect(self.db)
+        try:
+            return {
+                task_id: (session_id, agent_type, description, subagent_tokens)
+                for task_id, session_id, agent_type, description, subagent_tokens
+                in conn.execute(
+                    "SELECT task_id, session_id, agent_type, description,"
+                    " subagent_tokens FROM agent_dispatches"
+                    " WHERE task_id IS NOT NULL"
+                )
+            }
+        finally:
+            conn.close()
+
+    def test_each_task_id_is_stored_exactly_once(self) -> None:
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        rows, distinct = conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT task_id) FROM agent_dispatches"
+            " WHERE task_id IS NOT NULL"
+        ).fetchone()
+        self.assertEqual(distinct, 5)  # shared, evict, solo-a, twice, tie
+        self.assertEqual(rows, distinct)
+
+    def test_the_richest_whole_row_survives_never_a_field_merge(self) -> None:
+        # The anti-merge assertion. A per-field maximum would report
+        # backend-expert / Rebuild the ledger / 9973 -- a dispatch neither
+        # transcript recorded. `subagent_tokens` MUST still be NULL here.
+        self.assertEqual(
+            self._rows()["task-shared"],
+            ("resume-a", "backend-expert", "Rebuild the ledger", None),
+        )
+
+    def test_a_richer_row_evicts_one_already_stored(self) -> None:
+        # Ingested second and kept, so the rule is richness and not arrival
+        # order. The evicted row's figure agreed, so nothing was lost with it.
+        self.assertEqual(
+            self._rows()["task-evict"],
+            ("resume-b", "wizard", "Finish the ledger", 6553),
+        )
+
+    def test_a_tie_keeps_the_row_already_stored(self) -> None:
+        # Both rows know exactly as much, so richness cannot decide and the
+        # tie-break has to. Keeping the incumbent is what makes re-ingesting
+        # the other transcript a no-op rather than a rewrite.
+        self.assertEqual(
+            self._rows()["task-tie"],
+            ("resume-a", "tie-expert", "Weighs the same", None),
+        )
+
+    def test_a_dispatch_only_one_transcript_records_is_untouched(self) -> None:
+        self.assertEqual(
+            self._rows()["task-solo-a"],
+            ("resume-a", "frontend-expert", "Restyle the panel", 4211),
+        )
+
+    def test_a_repeat_notification_in_one_file_keeps_the_finished_figure(self) -> None:
+        # Two notifications about ONE task in ONE transcript are two
+        # notifications, not two recordings of one -- the later carries the
+        # finished figure, so the in-file rule stays "last wins" and the
+        # cross-file rule is the one that asks about richness. The row never
+        # reaches the database twice, so no collision is counted for it.
+        self.assertEqual(
+            self._rows()["task-twice"],
+            ("resume-a", "docs-expert", "Write it down", 2200),
+        )
+
+    def test_null_task_ids_are_two_dispatches_and_never_merged(self) -> None:
+        # Guarded TWICE, which is why this one needs a two-line mutation to go
+        # red: `_resolve_dispatch` returns before it looks anything up, and the
+        # lookup itself uses `= ?`, which matches no row when the value is
+        # NULL. Removing either alone leaves the behaviour correct; removing
+        # both merges these two rows and this assertion fails (verified).
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        rows = conn.execute(
+            "SELECT session_id, subagent_tokens FROM agent_dispatches"
+            " WHERE task_id IS NULL ORDER BY session_id"
+        ).fetchall()
+        self.assertEqual(rows, [("resume-a", 1307), ("resume-b", 8081)])
+
+    def test_the_collisions_are_counted_and_the_lossy_one_named_apart(self) -> None:
+        # Three collisions; TWO of them discarded a row carrying something the
+        # survivor does not have (`task-shared`'s figure, `task-tie`'s names).
+        # `task-evict`'s discarded row agreed on everything it knew, so nothing
+        # went with it. A silent dedupe is indistinguishable from no
+        # duplicates, which is the whole reason this pair of counts exists.
+        self.assertEqual(self.summary["duplicate_dispatches_resolved"], 3)
+        self.assertEqual(self.summary["divergent_dispatch_task_ids"], 2)
+
+    def test_the_run_note_carries_both_counts_and_only_when_there_are_any(
+        self,
+    ) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ingest_mod.print_dedupe_note(self.summary)
+        note = out.getvalue()
+        self.assertIn("duplicate task_id(s) resolved this run: 3", note)
+        self.assertIn("survivor does not: 2", note)
+
+        quiet = dict(self.summary)
+        quiet["duplicate_dispatches_resolved"] = 0
+        quiet["divergent_dispatch_task_ids"] = 0
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ingest_mod.print_dedupe_note(quiet)
+        # Silence where there is nothing to report, so the line means
+        # something when it appears -- and never reads as a standing claim
+        # that this corpus has no duplicates.
+        self.assertNotIn("dispatch dedupe", out.getvalue())
+
+    def test_the_dispatch_count_is_not_silently_reduced(self) -> None:
+        # Deduping SPEND must not quietly delete dispatches: the five distinct
+        # task ids plus the two unkeyed rows are all still there.
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM agent_dispatches").fetchone()[0], 7
+        )
+
+    def test_the_unique_index_is_the_backstop_that_proves_the_dedupe(self) -> None:
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO agent_dispatches (session_id, source_path, task_id)"
+                " VALUES ('resume-c', 'nowhere.jsonl', 'task-shared')"
+            )
+        conn.rollback()
+        # ...and it exempts NULL, deliberately and visibly: two more unkeyed
+        # rows are two more dispatches.
+        conn.execute(
+            "INSERT INTO agent_dispatches (session_id, source_path, task_id)"
+            " VALUES ('resume-c', 'nowhere.jsonl', NULL)"
+        )
+        conn.execute(
+            "INSERT INTO agent_dispatches (session_id, source_path, task_id)"
+            " VALUES ('resume-d', 'nowhere.jsonl', NULL)"
+        )
+        conn.rollback()
+
+    def test_re_ingesting_a_source_reaches_the_same_rows(self) -> None:
+        # The resolution has to CONVERGE: re-parsing the loser's transcript
+        # deletes its own rows first, so the collision is re-decided from
+        # scratch every time and must land on the same answer.
+        before = self._rows()
+        os.utime(self.b, (0, 0))
+        summary = ingest(self.projects, self.db)
+        self.assertEqual(summary["files_ingested"], 1)
+        self.assertEqual(self._rows(), before)
+
+    def test_single_file_mode_resolves_and_counts_the_same_collision(self) -> None:
+        # Both modes store through `store_source`, which is what keeps them
+        # from describing one dispatch differently.
+        os.utime(self.b, (0, 0))
+        summary = ingest_mod.ingest_transcript(self.b, self.db)
+        self.assertEqual(summary["files_ingested"], 1)
+        # This file loses `task-shared` and `task-tie` to rows resume-a stored;
+        # its own `task-evict` row was deleted with the rest of its source's
+        # rows first, so it faces no incumbent and is simply re-inserted.
+        self.assertEqual(summary["duplicate_dispatches_resolved"], 2)
+        self.assertEqual(summary["divergent_dispatch_task_ids"], 2)
+        self.assertEqual(
+            self._rows()["task-shared"],
+            ("resume-a", "backend-expert", "Rebuild the ledger", None),
+        )
+
+
+class DispatchDedupeMigrationTest(unittest.TestCase):
+    """v9 -> v10 resolves the duplicates already stored, IN PLACE (#36).
+
+    A `UNIQUE` index cannot be created over a table that already holds
+    duplicates, so the dedupe of existing rows is part of the migration or the
+    migration does not run at all. The route matters as much as the result:
+
+      * a table REBUILD would reach the same shape and would be REFUSED by the
+        reaped-source guard on exactly the databases that matter most -- the
+        ones older than Claude Code's retention window, where the rows are the
+        only surviving copy;
+      * so the hop is a `CREATE UNIQUE INDEX` preceded by the dedupe, which
+        deletes nothing but a second recording of a dispatch another surviving
+        row still records.
+
+    Verified on copies of four real databases (v6/v7/v8/v9, 2026-08-05): 1,865
+    dispatch rows, 12 duplicated task ids over 24 rows in every one, 0 rows
+    with a NULL `task_id`, 7 tracked sources already gone from disk. After the
+    upgrade: 1,853 rows, 1,853 distinct task ids, every `api_calls`, `turns`
+    and `ingest_state` row untouched.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-dispatch-migration-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.a = self.projects / "resume-a.jsonl"
+        self.a.write_text(RESUME_A)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+        self._downgrade_to_v9()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        return conn
+
+    def _downgrade_to_v9(self) -> None:
+        """The shape v9 shipped: no uniqueness, so a duplicate row can exist.
+
+        Two duplicates, both INSERTED as the second transcript of a resume
+        chain recorded them rather than as copies of the rows already there, so
+        a migration that kept the wrong row of either cannot pass:
+
+          * `task-shared` -- POORER in metadata, and carrying the one figure
+            the stored row lacks. Richness decides it.
+          * `task-solo-a` -- EQUALLY rich and saying something different, so
+            only the tie-break can decide it. Inserted second, so it holds the
+            higher `id` and must lose.
+        """
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("DROP INDEX idx_agent_dispatches_task_id")
+            conn.executemany(
+                "INSERT INTO agent_dispatches (session_id, source_path, turn_id,"
+                " task_id, agent_type, description, subagent_tokens)"
+                " VALUES ('resume-b', ?, NULL, ?, ?, ?, ?)",
+                [
+                    (str(self.projects / "resume-b.jsonl"),
+                     "task-shared", None, None, 9973),
+                    (str(self.projects / "resume-b.jsonl"),
+                     "task-solo-a", "frontend-imposter", "Restyle it wrongly", 4211),
+                ],
+            )
+            conn.execute("PRAGMA user_version = 9")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _state(self) -> tuple:
+        conn = sqlite3.connect(self.db)
+        try:
+            return (
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM ingest_state").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM agent_dispatches").fetchone()[0],
+            )
+        finally:
+            conn.close()
+
+    def _dispatch_rows(self) -> list:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                "SELECT session_id, task_id, agent_type, description,"
+                " subagent_tokens FROM agent_dispatches"
+                " ORDER BY task_id IS NULL, task_id, session_id"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def test_the_fixture_really_is_a_v9_database_with_duplicates(self) -> None:
+        version, _calls, _turns, _state, dispatches = self._state()
+        self.assertEqual(version, 9)
+        self.assertEqual(dispatches, 8)  # 6 parsed + 2 hand-built duplicates
+        conn = self._conn()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM agent_dispatches"
+                " WHERE task_id IN ('task-shared', 'task-solo-a')"
+            ).fetchone()[0],
+            4,
+        )
+
+    def test_the_upgrade_is_in_place_and_deletes_nothing_else(self) -> None:
+        before = self._state()
+
+        rebuilt = ingest_mod._prepare_schema(self._conn())
+
+        self.assertFalse(rebuilt, "a rebuild would meet the reaped-source guard")
+        after = self._state()
+        self.assertEqual(after[0], ingest_mod.SCHEMA_VERSION)
+        # api_calls, turns and ingest_state are untouched; one duplicate
+        # dispatch row -- and only that -- is gone.
+        self.assertEqual(after[1:4], before[1:4])
+        self.assertEqual(after[4], before[4] - 2)
+
+    def test_the_row_the_migration_keeps_is_the_richest_whole_row(self) -> None:
+        ingest_mod._prepare_schema(self._conn())
+        kept = [
+            row for row in self._dispatch_rows()
+            if row[1] in ("task-shared", "task-solo-a")
+        ]
+        # `task-shared` keeps the richer row WITH ITS NULL FIGURE: a per-field
+        # merge would have written 9973 beside a name from the other row, a
+        # dispatch neither transcript recorded. `task-solo-a` is the tie, and
+        # keeps the row stored first.
+        self.assertEqual(
+            kept,
+            [
+                ("resume-a", "task-shared", "backend-expert",
+                 "Rebuild the ledger", None),
+                ("resume-a", "task-solo-a", "frontend-expert",
+                 "Restyle the panel", 4211),
+            ],
+        )
+
+    def test_the_upgrade_is_not_refused_over_a_reaped_source(self) -> None:
+        # The case the whole migration design turns on: every transcript gone,
+        # so the database is the only copy and a rebuild would be REFUSED.
+        self.a.unlink()
+        self.assertTrue(ingest_mod._unreadable_sources(self._conn()))
+        before = self._state()
+
+        rebuilt = ingest_mod._prepare_schema(self._conn())  # must not raise
+
+        self.assertFalse(rebuilt)
+        after = self._state()
+        self.assertEqual(after[0], ingest_mod.SCHEMA_VERSION)
+        self.assertEqual(after[1:4], before[1:4])
+        self.assertEqual(after[4], before[4] - 2)
+
+    def test_an_old_sqlite_with_nothing_to_drop_still_upgrades_in_place(self) -> None:
+        # #36 composed with #42(a), which is where a dead end would be built if
+        # either gate asked the wrong question. A v9 database has no `cost_usd`
+        # to drop, so the DROP COLUMN capability is irrelevant to it -- and this
+        # one also has a reaped source, so the rebuild path would REFUSE. Ask
+        # about capability rather than need here and the two correct refusals
+        # compose into no upgrade path at all.
+        self.a.unlink()
+        self.assertTrue(ingest_mod._unreadable_sources(self._conn()))
+        before = self._state()
+
+        with mock.patch.object(sqlite3, "sqlite_version", "3.34.1"):
+            rebuilt = ingest_mod._prepare_schema(self._conn())
+
+        self.assertFalse(rebuilt)
+        after = self._state()
+        self.assertEqual(after[0], ingest_mod.SCHEMA_VERSION)
+        self.assertEqual(after[1:4], before[1:4])
+        self.assertEqual(after[4], before[4] - 2)
+
+    def test_the_upgrade_installs_the_constraint_that_proves_it(self) -> None:
+        ingest_mod._prepare_schema(self._conn())
+        conn = self._conn()
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO agent_dispatches (session_id, source_path, task_id)"
+                " VALUES ('resume-c', 'nowhere.jsonl', 'task-shared')"
+            )
+        conn.rollback()
+
+    def test_the_migration_says_out_loud_what_it_discarded(self) -> None:
+        # A dedupe nobody is told about is indistinguishable from no
+        # duplicates, and this one deletes rows from a database that may be the
+        # only copy of its history.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ingest_mod._prepare_schema(self._conn())
+        note = out.getvalue()
+        self.assertIn("task_id", note)
+        # Both counts, because "2 discarded" and "2 of them divergent" are
+        # different facts and the operator has to be able to tell them apart.
+        self.assertIn("2 duplicate dispatch row(s) discarded", note)
+        self.assertIn("does not): 2", note)
+
+    def test_a_database_with_no_duplicates_says_nothing(self) -> None:
+        # The other half: no message where there is nothing to report, so the
+        # message means something when it appears.
+        ingest_mod._prepare_schema(self._conn())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ingest_mod._prepare_schema(self._conn())
+        self.assertEqual(out.getvalue(), "")
 
 
 if __name__ == "__main__":
