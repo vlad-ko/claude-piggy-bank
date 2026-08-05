@@ -1,7 +1,8 @@
 # Versioning
 
 CPB follows [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html),
-and is at **1.0.0**.
+and is at **1.1.0** (checked against `cpb.VERSION` on 2026-08-05; that constant
+is the authority and this line has lagged a release before).
 
 `cpb.VERSION` is the source of truth; `.claude-plugin/plugin.json` repeats it
 as a literal because Claude Code's plugin loader reads that JSON without
@@ -191,6 +192,6 @@ should show its own corrections rather than quietly restate them — and because
 a number's history is more useful to a reader beside the number than in a file
 of one-line entries.
 
-Pre-release identifiers (`1.1.0-rc.1`) are available if a change ever needs
+Pre-release identifiers (`1.2.0-rc.1`) are available if a change ever needs
 soak time, and carry SemVer's ordinary meaning: lower precedence than the
 release they precede, and no compatibility promise of their own.

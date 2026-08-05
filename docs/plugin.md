@@ -39,6 +39,53 @@ overview](https://code.claude.com/docs/en/plugins-reference#plugin-directory-str
 checked 2026-08-05. `tests/test_plugin_manifest.py` asserts it, because "silently
 never loaded" is not a failure anyone notices.)
 
+## What the plugin may ask the model to do
+
+Three of those four files are code and configuration. The fourth,
+`commands/cpb.md`, is a **prompt** — that is what a command file is — so it is
+the one place in the plugin where a model is asked to do anything at all, and
+the project's third constraint had to say precisely how far that reaches.
+
+**The line:** a model may read a **finished** measurement and explain it; it may
+never produce, compute, estimate or fill in a figure. Stated positively, not as
+an exception, so there is nothing to reason outward from. `/cpb` does not
+produce measurement, it produces guidance.
+
+| surface | model | why |
+|---|---|---|
+| `ingest.py`, `serve.py`, `index.html` | **none, ever** | every figure is SQL, arithmetic or JSON parsing; the report runs free and offline |
+| `hooks/cpb_ingest_hook.py` | **none, ever** | it spawns one `ingest.py --transcript` and exits; no hook handler is of type `prompt` or `agent`, and `tests/test_plugin_manifest.py` asserts that |
+| `commands/cpb.md` | **yes, bounded** | it runs in a session the user is already paying for, and summarises figures the report has already computed |
+
+The reason the line sits exactly there: a model asked for a number it was not
+given will produce a fluent, plausible one. That is the project's *absence is
+never rendered as a value* failure arriving in better prose — no `Optional[int]`
+catches it, and no reader can see the error. A summary of a computed figure has
+a source; a figure a model arrived at has none.
+
+Two things this is **not**:
+
+- **Not a restriction Claude Code imposes.** The plugin reference places no
+  limit on what a command may ask the model to do; commands are prompts by
+  design. (External: <https://code.claude.com/docs/en/plugins-reference> — the
+  revision `tests/test_plugin_manifest.py` records as checked 2026-08-05. It is
+  *silent* on the question rather than permissive about it, which is weaker
+  evidence than a positive statement, and it was not re-fetched when this
+  section was written.) The constraint is CPB's own.
+- **Not a claim that `/cpb` is free.** Ingest and the report are free and
+  offline, absolutely and unchanged. `/cpb` spends tokens in a session already
+  being paid for; Claude Code surfaces that as a per-plugin *context cost* in
+  the `/plugin` panel. (Product-owner report, 2026-08-05, **unverified** — not
+  checked against the Claude Code documentation here.) Those are two claims
+  with two scopes and the older single sentence, "running CPB costs nothing",
+  collapsed them.
+
+**And `/cpb` never becomes the only path to a number**
+([#79](https://github.com/vlad-ko/claude-piggy-bank/issues/79)): it summarises,
+then always links to the report. Two runs of a model produce two different
+summaries, and a measurement has to be reproducible where a conversation does
+not — so the page stays the artifact, and the summary is a way into it.
+
 ## Why hooks, and why these three
 
 Plugin-shipped hooks in `hooks/hooks.json` activate when the plugin is enabled.
