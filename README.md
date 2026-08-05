@@ -366,11 +366,15 @@ A database written before CPB recorded ingest times (schema v6 and earlier)
 reads **"Last ingest: not recorded"**. That is an *unknown* age, not an age of
 zero and not a permanent staleness warning — run ingest once and it starts
 recording. Upgrading an older database does not re-parse anything: every hop
-from v6 to the current shape is applied in place and keeps every row — the
-run-stamp table is added, the retired cost column is dropped, and the
-format-census table is added. (Dropping a column needs SQLite 3.35+, which CPB
-detects at runtime; on an older library it falls back to a full rebuild, which
-still refuses outright if any tracked source has already been reaped.)
+from v6 to the current shape is applied in place, and **no measurement is lost
+on any of them** — the run-stamp table is added, the retired cost column is
+dropped, the format-census table is added, duplicate dispatch rows are resolved
+to one row per dispatch (a dispatch recorded by two transcripts is one
+dispatch, and the discarded rows are counted out loud), and the cache-miss
+diagnostic columns are added empty, because no row written before CPB read them
+ever measured one. (Dropping a column needs SQLite 3.35+, which CPB detects at
+runtime; on an older library it falls back to a full rebuild, which still
+refuses outright if any tracked source has already been reaped.)
 
 There is no automatic refresh yet — refreshing means running ingest again.
 Scheduling that from inside `serve.py` is [issue #20](https://github.com/vlad-ko/claude-piggy-bank/issues/20)'s
@@ -621,7 +625,9 @@ Longer-form reference lives in [`docs/`](docs/), indexed by
   it was checked. Thinking is billed as output and is invisible in transcript
   content; whether it is re-billed as input on later turns depends on the
   model; cache writes carry a markup and the cacheable minimum is a per-model
-  lookup, not a constant.
+  lookup, not a constant; and the context window every utilisation figure
+  divides by is per model too — 1M on the current Opus, Sonnet and Fable
+  families against 200K on Haiku 4.5.
 - [Versioning](docs/versioning.md) — what the version number promises: the
   three surfaces SemVer governs here, why the database schema is excluded and
   the condition that exclusion rests on, and which part to bump.
