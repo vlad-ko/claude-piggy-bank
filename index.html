@@ -649,6 +649,16 @@
            different findings with different remedies, and nothing on this page
            showed the second.
 
+           THE SENTENCE OVER IT IS DERIVED, NOT WRITTEN HERE. This band shipped
+           in review with the heading "And it only ever grows.", which was true
+           of the figures above and false of the SAME DATABASE three hours
+           later: 277,945 -> 837,645 -> 297,343 -> 430,832, a sawtooth, because
+           the session compacted in between. A heading that states a trend the
+           numbers do not have is a wrong figure made of words -- and worse than
+           a wrong number, because nothing here guards prose. So the verdict is
+           `shape`, the sentence is `shape_statement`, and both come off
+           `/api/summary` like every other measurement on this page.
+
            NOT A SECOND CHART. Four points do not earn a canvas, and a canvas
            would be a panel (constraint 4) -- so the curve is four rows with a
            proportional track, drawn from the payload's own medians.
@@ -658,13 +668,36 @@
            from a bar this page decided not to draw, and a bar drawn at zero
            would show the context COLLAPSING in a quarter that was merely idle.
            That is `timeseries()`'s null `avg_context` rule, in pixels. -->
-      <span class="context-line"><strong>And it only ever grows.</strong>
+      <span class="context-line">
+        <strong x-text="summary.context.growth.shape.toUpperCase()"></strong> &mdash;
+        <strong x-text="summary.context.growth.shape_statement"></strong>
         Typical context in your
         <strong x-text="summary.context.growth.scope"></strong>, over
         <span x-text="fmtCount(summary.context.growth.calls)"></span> reply/replies
         from <span x-text="fmtTs(summary.context.growth.first_ts)"></span> to
         <span x-text="fmtTs(summary.context.growth.last_ts)"></span>. The sample is
         <span x-text="summary.context.growth.sample_is"></span>.
+        <!-- The evidence the verdict is checked against, and the reason it is
+             rendered for every shape rather than only for `rose-then-fell`: it
+             is a true statement about any curve that has a sample at all, and a
+             reader auditing "it peaked in the quarter named below" needs the
+             quarter named. Null when no quarter carries a median -- an absence,
+             never Q0. -->
+        <template x-if="summary.context.growth.peak_quarter !== null"><span>
+          The largest typical quarter is
+          <strong>Q<span x-text="fmtCount(summary.context.growth.peak_quarter)"></span></strong>.
+        </span></template>
+        <!-- The ONE judged number in this block, in its own voice and with its
+             own date -- the medians beside it are measurements. Marked with the
+             same class the band boundaries carry, because it is the same kind
+             of claim: a cut point this project chose and Anthropic publishes
+             nothing about. It sits WITH the verdict rather than behind the
+             disclosure below, because a judgment whose conclusion is the
+             panel's heading must not be further from the reader than the
+             heading is. -->
+        <span class="context-line context-judged">Shape threshold
+          (<span x-text="summary.context.growth.shape_as_of"></span>):
+          <span x-text="summary.context.growth.shape_provenance"></span></span>
         <!-- A corpus too small to quarter says so rather than drawing four
              bars from three points. The floor is DERIVED (see
              `GROWTH_MIN_CALLS`), and it is stated so the reader can see how

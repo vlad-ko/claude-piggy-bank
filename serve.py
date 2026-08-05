@@ -416,6 +416,102 @@ GROWTH_QUARTER_NO_CALLS = (
     "no measured main-thread call fell in this quarter of the period"
 )
 
+# ---------------------------------------------------------------------------
+# THE SHAPE OF THE CURVE, DERIVED -- because the sentence over it was AUTHORED.
+# ---------------------------------------------------------------------------
+#
+# The panel shipped in review headed "And it only ever grows." That sentence was
+# true of the corpus it was written against and false three hours later, and the
+# defect is worth stating plainly because it is this repository's own rule
+# arriving by a route none of its guards watch:
+#
+#   * measured 2026-08-05 in the morning, main thread: 97,436 -> 333,610 ->
+#     514,413 -> 906,301, monotonic;
+#   * measured 2026-08-05 in the afternoon over the same database, 559 calls:
+#     277,945 -> 837,645 -> 297,343 -> 430,832. It climbs, drops by two thirds,
+#     and rises again. The session compacted in between.
+#
+# A HEADING THAT STATES A TREND THE NUMBERS DO NOT HAVE IS A WRONG FIGURE MADE
+# OF WORDS, and it is worse than a wrong number: `Optional[int]` guards a
+# number, and nothing whatever guards prose. So the sentence is derived from the
+# quarters, every time, like every other figure here.
+#
+# The taxonomy is EXHAUSTIVE over the sequence, and its default is refusal:
+# where the movement fits none of the named shapes the panel says so rather than
+# picking the reading that sounds most like a finding.
+GROWTH_SHAPE_UNMEASURABLE = "unmeasurable"
+GROWTH_SHAPE_FLAT = "flat"
+GROWTH_SHAPE_RISING = "rising"
+GROWTH_SHAPE_FALLING = "falling"
+GROWTH_SHAPE_ROSE_THEN_FELL = "rose-then-fell"
+GROWTH_SHAPE_MIXED = "no-discernible-trend"
+GROWTH_SHAPES = (
+    GROWTH_SHAPE_UNMEASURABLE,
+    GROWTH_SHAPE_FLAT,
+    GROWTH_SHAPE_RISING,
+    GROWTH_SHAPE_FALLING,
+    GROWTH_SHAPE_ROSE_THEN_FELL,
+    GROWTH_SHAPE_MIXED,
+)
+
+# What counts as a CHANGE, as a fraction of the earlier quarter. This is the
+# one JUDGED number in the block and it carries its own provenance below --
+# every other figure here is a median of measured calls.
+GROWTH_MATERIAL_CHANGE = 0.25
+GROWTH_SHAPE_AS_OF = "2026-08-05"
+GROWTH_SHAPE_PROVENANCE = (
+    "Product-owner judgment: a quarter counts as having moved only if the "
+    "typical reply changed by at least "
+    f"{GROWTH_MATERIAL_CHANGE:.0%} of the previous quarter's. Anthropic "
+    "publishes nothing about this and it is derived from no measurement -- it "
+    "is where this project judged a change worth a sentence. Set higher, every "
+    "period reads as flat; set lower, ordinary variation reads as a trend. It "
+    "is stated with its date so the verdict can be weighed against it rather "
+    "than taken on trust."
+)
+
+# One sentence per shape, spelled ONCE and carried in the payload -- so the
+# claim and the arithmetic that produced it live in the same file, and the page
+# cannot author a seventh reading. No sentence here interpolates a figure: the
+# four quarters are rendered directly under it, and a sentence quoting numbers
+# would be a second copy of them.
+GROWTH_SHAPE_STATEMENTS = {
+    GROWTH_SHAPE_UNMEASURABLE: (
+        "No shape is claimed. This period does not carry two quarters that can "
+        "be compared, so whether the typical reply grew, shrank or held is "
+        "UNKNOWN -- not flat, and not none."
+    ),
+    GROWTH_SHAPE_FLAT: (
+        "The typical reply HELD STEADY across this period: no quarter differs "
+        "from the one before it by enough to count as a change. Nothing here "
+        "is accumulating, and nothing here needs acting on."
+    ),
+    GROWTH_SHAPE_RISING: (
+        "The typical reply GREW across this period: every change large enough "
+        "to count was upward. This is context accumulating -- the session is "
+        "re-reading more of its own history each time and never shedding it."
+    ),
+    GROWTH_SHAPE_FALLING: (
+        "The typical reply SHRANK across this period: every change large "
+        "enough to count was downward. There is nothing to act on here -- "
+        "whatever was keeping the context down was working."
+    ),
+    GROWTH_SHAPE_ROSE_THEN_FELL: (
+        "The typical reply CLIMBED AND THEN DROPPED: it peaked in the quarter "
+        "named below, and the last measured quarter sits well under that peak. "
+        "A fall this size is what a context RESET looks like -- a compaction, "
+        "a new session, or a change of subject -- but this report measures the "
+        "drop and never its cause, so which of those it was is not something "
+        "these figures can say."
+    ),
+    GROWTH_SHAPE_MIXED: (
+        "NO TREND IS CLAIMED: the typical reply moved materially in BOTH "
+        "directions across this period and settles into none of the shapes "
+        "this build can name. Read the four quarters themselves rather than a "
+        "summary of them."
+    ),
+}
+
 # #78: half the window, as a FRACTION of it -- the point
 # `METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW` counts from. Named rather than
 # written `0.5` inline in the comprehension below, because it is the same
@@ -1731,6 +1827,7 @@ class Api:
                 "median_utilisation": nearest_rank(fractions, MEDIAN_PERCENTILE),
                 "no_sample_reason": None if bucket else GROWTH_QUARTER_NO_CALLS,
             })
+        shape, peak_quarter = cls._growth_shape(quarters, refused)
         return {
             # WHICH SCOPE, HOW MANY REPLIES, OVER WHAT PERIOD -- the three
             # things an aggregate owes the reader about the set it ranges over.
@@ -1741,8 +1838,95 @@ class Api:
             "last_ts": last_ts,
             "minimum_calls": GROWTH_MIN_CALLS,
             "refused_reason": refused,
+            # The SENTENCE over the curve, derived from the curve. See
+            # `_growth_shape()` for why this is a field rather than a heading.
+            "shape": shape,
+            "shape_statement": GROWTH_SHAPE_STATEMENTS[shape],
+            # The judged half, with its own date, in the shape `band_provenance`
+            # established: the medians are measurements and this threshold is
+            # not, so they cross the API as separate fields and the page marks
+            # them as separate voices.
+            "shape_as_of": GROWTH_SHAPE_AS_OF,
+            "shape_provenance": GROWTH_SHAPE_PROVENANCE,
+            "peak_quarter": peak_quarter,
             "quarters": quarters,
         }
+
+    @staticmethod
+    def _growth_shape(
+        quarters: list[dict[str, Any]], refused: Optional[str]
+    ) -> tuple[str, Optional[int]]:
+        """Which of `GROWTH_SHAPES` this curve is, and where its peak sits.
+
+        **A QUARTER WITH NO SAMPLE DOES NOT PARTICIPATE.** The sequence is the
+        quarters that have a median, in order, and an empty one is SKIPPED
+        rather than carried in as a 0 -- which would turn every idle fortnight
+        into a collapse and then into a "rose then fell". This is the same rule
+        the null median beside it already follows, one level up: absence is not
+        a value, including when it is a value in a trend.
+
+        **A REFUSED CURVE HAS NO SHAPE.** If the sample cannot support a trend
+        (`refused_reason`), claiming one from it is exactly the over-claim the
+        refusal exists to prevent, so it reports `unmeasurable` and says so.
+
+        **THE DEFAULT IS REFUSAL.** Movement that fits none of the named shapes
+        is `no-discernible-trend`, never the nearest-sounding finding: this
+        block's whole reason for existing is that "it only ever grows" was
+        picked because it read well and stopped being true the same afternoon.
+
+        The branches are exhaustive over `(any material rise, any material
+        fall)`:
+
+          * neither -- `flat`;
+          * rises only -- `rising`. Not "monotonic": a dip too small to count
+            is allowed, which is why the sentence says "every change large
+            enough to count" rather than "every change";
+          * falls only -- `falling`;
+          * both -- the interesting one. It is `rose-then-fell` only if the
+            peak is genuinely between the ends, i.e. the climb from the first
+            sampled quarter to the peak AND the drop from the peak to the last
+            are both material. That test excludes a peak at either end by
+            construction (the change to itself is 0), so a curve that sagged in
+            the middle and recovered is `no-discernible-trend`, not a fall.
+
+        `peak_quarter` is the quarter NUMBER holding the largest median, or
+        None where no quarter has one. It is published for every shape because
+        it is true for every shape, and it is the evidence a reader checks
+        `rose-then-fell` against.
+        """
+        sampled = [
+            (q["quarter"], q["median_context"])
+            for q in quarters
+            if q["median_context"] is not None
+        ]
+        peak_quarter = (
+            max(sampled, key=lambda pair: pair[1])[0] if sampled else None
+        )
+        if refused is not None or len(sampled) < 2:
+            return GROWTH_SHAPE_UNMEASURABLE, peak_quarter
+        medians = [median for _quarter, median in sampled]
+        # `median_context` is at least `MEASURED_CONTEXT_MIN`, so the
+        # denominator cannot be zero; the guard states that rather than relying
+        # on it, because a future change to what counts as measured would
+        # otherwise turn this into a ZeroDivisionError inside a summary.
+        steps = [
+            (later - earlier) / earlier if earlier else 0.0
+            for earlier, later in zip(medians, medians[1:])
+        ]
+        rose = any(step >= GROWTH_MATERIAL_CHANGE for step in steps)
+        fell = any(step <= -GROWTH_MATERIAL_CHANGE for step in steps)
+        if not rose and not fell:
+            return GROWTH_SHAPE_FLAT, peak_quarter
+        if rose and not fell:
+            return GROWTH_SHAPE_RISING, peak_quarter
+        if fell and not rose:
+            return GROWTH_SHAPE_FALLING, peak_quarter
+        peak = max(medians)
+        climb = (peak - medians[0]) / medians[0] if medians[0] else 0.0
+        drop = (medians[-1] - peak) / peak if peak else 0.0
+        if climb >= GROWTH_MATERIAL_CHANGE and drop <= -GROWTH_MATERIAL_CHANGE:
+            return GROWTH_SHAPE_ROSE_THEN_FELL, peak_quarter
+        return GROWTH_SHAPE_MIXED, peak_quarter
 
     @staticmethod
     def _utilisation_bands(

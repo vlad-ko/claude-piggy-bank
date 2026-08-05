@@ -88,6 +88,7 @@ from serve import (  # noqa: E402
     CHECK_RECORDS_PARSED,
     CHECK_WITHIN_WINDOW,
     CONTEXT_SAMPLE,
+    GROWTH_MATERIAL_CHANGE,
     GROWTH_MIN_CALLS,
     GROWTH_MIN_CALLS_PER_QUARTER,
     GROWTH_QUARTERS,
@@ -95,6 +96,15 @@ from serve import (  # noqa: E402
     GROWTH_REFUSED_NO_SPAN,
     GROWTH_REFUSED_TOO_FEW,
     GROWTH_SCOPE,
+    GROWTH_SHAPES,
+    GROWTH_SHAPE_FALLING,
+    GROWTH_SHAPE_FLAT,
+    GROWTH_SHAPE_MIXED,
+    GROWTH_SHAPE_PROVENANCE,
+    GROWTH_SHAPE_RISING,
+    GROWTH_SHAPE_ROSE_THEN_FELL,
+    GROWTH_SHAPE_STATEMENTS,
+    GROWTH_SHAPE_UNMEASURABLE,
     HEALTH_CHECKS,
     HEALTH_FAILED,
     HEALTH_OK,
@@ -7610,7 +7620,9 @@ HG_BLIND_DAY = "2026-07-03"       # a call carrying no prompt accounting
 HG_UNKNOWN_DAY = "2026-07-04"     # a call on a model with no documented window
 HG_OVER_DAY = "2026-07-05"        # a call measuring past its own window
 HG_INSTANT_DAY = "2026-07-06"     # every main-thread call at one instant
-HG_LATE_DAY = "2026-07-20"        # far enough out to leave two quarters empty
+HG_FALLING_DAY = "2026-07-07"     # the typical reply SHRANK across the day
+HG_SAWTOOTH_DAY = "2026-07-08"    # it climbed, then dropped by two thirds
+HG_LATE_DAY = "2026-07-20"        # far enough out to leave a quarter empty
 
 HG_MAIN = SOURCE_MAIN
 HG_SUB = SOURCE_SUBAGENT
@@ -7632,6 +7644,20 @@ HG_QUARTER_UTILISATIONS = [0.11, 0.31, 0.51, 0.91]
 # the window -- so a pooled or mis-scoped curve is red in shape as well as in
 # value.
 HG_FALLING = [240_000 - 10_000 * n for n in range(16)]
+# A main thread whose typical reply SHRANK, so a shape verdict hard-coded to
+# "rising" -- the sentence this panel shipped with in review -- is red.
+HG_SHRINKING = [900_000 - 50_000 * n for n in range(16)]
+# THE SHAPE THE AUTHORED HEADING GOT WRONG, in the proportions the coordinator
+# measured on the real database (277,945 -> 837,645 -> 297,343 -> 430,832): it
+# climbs, drops by roughly two thirds, and rises again. A session that
+# compacted. Four per quarter, the quarter's own four ordered so the median is
+# neither its first nor its last call.
+HG_SAWTOOTH = [
+    270_000, 300_000, 280_000, 290_000,
+    800_000, 860_000, 830_000, 840_000,
+    290_000, 320_000, 300_000, 310_000,
+    420_000, 450_000, 430_000, 440_000,
+]
 
 # (day, minute, second, kind, model, context)
 HG_CALLS: list[tuple[str, int, int, str, str, int]] = [
@@ -7657,6 +7683,15 @@ HG_CALLS: list[tuple[str, int, int, str, str, int]] = [
     # Twelve calls -- past the floor -- sharing one instant, so the period they
     # span is a point.
     *[(HG_INSTANT_DAY, 0, 0, HG_MAIN, HG_OPUS_1M, 200_000 + n) for n in range(12)],
+    # A day whose typical reply shrank, and a day it climbed then dropped.
+    *[
+        (HG_FALLING_DAY, n, 0, HG_MAIN, HG_OPUS_1M, size)
+        for n, size in enumerate(HG_SHRINKING)
+    ],
+    *[
+        (HG_SAWTOOTH_DAY, n, 0, HG_MAIN, HG_OPUS_1M, size)
+        for n, size in enumerate(HG_SAWTOOTH)
+    ],
     # The far end of the wide window: eight banded calls and four whose model
     # has no window, so the quarter's two medians range over two sets.
     *[(HG_LATE_DAY, n, 0, HG_MAIN, HG_OPUS_1M, 600_000 + 1_000 * n) for n in range(8)],
@@ -8282,6 +8317,159 @@ class GrowthCurveTest(HealthGrowthCorpusTest):
         self.assertNotEqual(nearest_rank(sample, 50), min(sample))
         self.assertNotEqual(nearest_rank(sample, 50), max(sample))
 
+    # --- the sentence over the curve is DERIVED, not authored ---
+
+    def test_a_rising_corpus_is_reported_as_rising(self) -> None:
+        growth = self.growth(HG_CLEAN_DAY)
+        self.assertEqual(growth["shape"], GROWTH_SHAPE_RISING)
+        self.assertEqual(
+            growth["shape_statement"], GROWTH_SHAPE_STATEMENTS[GROWTH_SHAPE_RISING]
+        )
+        self.assertEqual(growth["peak_quarter"], GROWTH_QUARTERS)
+
+    def test_a_falling_corpus_is_never_reported_as_rising(self) -> None:
+        # THE defect this block exists for. The panel shipped in review with
+        # "And it only ever grows." written into the markup, which was true of
+        # the corpus it was written against and false of the same database
+        # three hours later.
+        growth = self.growth(HG_FALLING_DAY)
+        self.assertEqual(growth["shape"], GROWTH_SHAPE_FALLING)
+        self.assertNotEqual(growth["shape"], GROWTH_SHAPE_RISING)
+        self.assertNotIn("GREW", growth["shape_statement"])
+        self.assertEqual(growth["peak_quarter"], 1)
+
+    def test_a_sawtooth_corpus_reports_that_it_climbed_and_then_dropped(self) -> None:
+        # The interesting case, in the proportions measured on the real
+        # database: 277,945 -> 837,645 -> 297,343 -> 430,832. A large drop is
+        # very likely the user FIXING the problem this panel is about, and
+        # reporting it as growth would tell them their successful intervention
+        # was a failure.
+        growth = self.growth(HG_SAWTOOTH_DAY)
+        self.assertEqual(growth["shape"], GROWTH_SHAPE_ROSE_THEN_FELL)
+        self.assertEqual(growth["peak_quarter"], 2)
+        medians = [q["median_context"] for q in growth["quarters"]]
+        self.assertGreater(medians[1], medians[0])
+        self.assertLess(medians[2], medians[1])
+        self.assertLess(medians[-1], medians[1], "the fixture is no longer a sawtooth")
+
+    def test_a_drop_is_never_asserted_to_be_a_compaction(self) -> None:
+        # CPB cannot see a compaction event; it sees a drop. Naming the likely
+        # cause is useful and asserting it would be a figure nobody measured --
+        # so the sentence names it as one possibility among several and says in
+        # as many words that the cause is not something these figures carry.
+        statement = GROWTH_SHAPE_STATEMENTS[GROWTH_SHAPE_ROSE_THEN_FELL]
+        self.assertIn("compaction", statement)
+        self.assertIn("measures the drop and never its cause", statement)
+        for asserted in ("was compacted", "you compacted", "a compaction happened"):
+            with self.subTest(claim=asserted):
+                self.assertNotIn(asserted, statement)
+
+    def test_a_refused_curve_claims_no_shape_at_all(self) -> None:
+        # Claiming a trend from a sample that cannot support one is exactly the
+        # over-claim `refused_reason` exists to prevent.
+        for day in (HG_UNKNOWN_DAY, HG_INSTANT_DAY):
+            with self.subTest(day=day):
+                growth = self.growth(day)
+                self.assertIsNotNone(growth["refused_reason"])
+                self.assertEqual(growth["shape"], GROWTH_SHAPE_UNMEASURABLE)
+
+    def test_every_shape_has_its_own_sentence_and_no_two_share_one(self) -> None:
+        self.assertEqual(set(GROWTH_SHAPE_STATEMENTS), set(GROWTH_SHAPES))
+        self.assertEqual(len(set(GROWTH_SHAPE_STATEMENTS.values())), len(GROWTH_SHAPES))
+        for shape, statement in GROWTH_SHAPE_STATEMENTS.items():
+            with self.subTest(shape=shape):
+                self.assertGreater(len(statement), 60)
+
+    def test_the_threshold_is_carried_as_a_judgment_with_its_own_date(self) -> None:
+        # The one judged number in the block. The medians beside it are
+        # measurements, so they cross the API as separate fields -- the shape
+        # `band_provenance` established, one panel over.
+        growth = self.growth(HG_CLEAN_DAY)
+        self.assertEqual(growth["shape_provenance"], GROWTH_SHAPE_PROVENANCE)
+        self.assertRegex(growth["shape_as_of"], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertIn("judgment", GROWTH_SHAPE_PROVENANCE)
+        # The sentence quotes the threshold, so it is BUILT from the constant
+        # rather than repeating it -- two spellings of one boundary is how a
+        # provenance comes to describe a threshold nobody uses.
+        self.assertIn(f"{GROWTH_MATERIAL_CHANGE:.0%}", GROWTH_SHAPE_PROVENANCE)
+
+    # --- the shape rules themselves, exhaustively ---
+
+    # Every branch of `_growth_shape`, as medians -> shape. Named here rather
+    # than driven from corpora because the taxonomy has six outcomes and
+    # building six transcript corpora would test the ingester, not the rule.
+    # `HG_SAWTOOTH_DAY` and `HG_FALLING_DAY` carry the two that matter most
+    # through the real ingest path as well.
+    SHAPES = (
+        ([100, 200, 300, 400], GROWTH_SHAPE_RISING),
+        ([100, 100, 100, 100], GROWTH_SHAPE_FLAT),
+        # Within the threshold in both directions: movement, but not a change.
+        ([100, 110, 95, 105], GROWTH_SHAPE_FLAT),
+        ([400, 300, 200, 100], GROWTH_SHAPE_FALLING),
+        ([100, 800, 300, 400], GROWTH_SHAPE_ROSE_THEN_FELL),
+        # A dip too small to count does not demote a clear climb.
+        ([100, 200, 195, 400], GROWTH_SHAPE_RISING),
+        # Sagged and recovered: the peak is at the END, so this is not a fall
+        # and it is not a rise either. Refusal, not the nearest finding.
+        ([400, 100, 200, 900], GROWTH_SHAPE_MIXED),
+        # Fell then rose back to where it started: no trend, and emphatically
+        # not "rose then fell" read backwards.
+        ([400, 100, 150, 400], GROWTH_SHAPE_MIXED),
+        ([100], GROWTH_SHAPE_UNMEASURABLE),
+        ([], GROWTH_SHAPE_UNMEASURABLE),
+    )
+
+    @staticmethod
+    def quarters_of(medians) -> list[dict]:
+        """`medians` as quarter rows; `None` is a quarter with no sample."""
+        return [
+            {
+                "quarter": i + 1,
+                "calls": 0 if median is None else 4,
+                "median_context": median,
+            }
+            for i, median in enumerate(medians)
+        ]
+
+    def test_each_named_shape_is_derived_from_the_sequence(self) -> None:
+        for medians, expected in self.SHAPES:
+            with self.subTest(medians=medians):
+                shape, _peak = Api._growth_shape(self.quarters_of(medians), None)
+                self.assertEqual(shape, expected)
+
+    def test_a_quarter_with_no_sample_is_skipped_rather_than_counted_as_zero(
+        self,
+    ) -> None:
+        # THE rule this panel turns on, applied to the trend rather than to the
+        # bar. Carried in as a 0 the empty quarter makes every idle fortnight a
+        # collapse, and a rising curve with a gap in it reports "rose then
+        # fell" -- a finding manufactured entirely out of an absence.
+        with_gap = [100, None, 300, 400]
+        self.assertEqual(
+            Api._growth_shape(self.quarters_of(with_gap), None)[0],
+            GROWTH_SHAPE_RISING,
+        )
+        as_zero = [100, 0, 300, 400]
+        self.assertNotEqual(
+            Api._growth_shape(self.quarters_of(as_zero), None)[0],
+            GROWTH_SHAPE_RISING,
+            "the fixture no longer distinguishes a skipped quarter from a zero",
+        )
+
+    def test_the_peak_names_a_quarter_that_has_a_median(self) -> None:
+        shape, peak = Api._growth_shape(self.quarters_of([100, None, 800, 400]), None)
+        self.assertEqual(peak, 3)
+        self.assertEqual(shape, GROWTH_SHAPE_ROSE_THEN_FELL)
+        self.assertIsNone(Api._growth_shape(self.quarters_of([None, None]), None)[1])
+
+    def test_a_refusal_overrides_every_shape_the_sequence_would_have(self) -> None:
+        for medians, _expected in self.SHAPES:
+            with self.subTest(medians=medians):
+                self.assertEqual(
+                    Api._growth_shape(self.quarters_of(medians), "a reason")[0],
+                    GROWTH_SHAPE_UNMEASURABLE,
+                )
+
     def test_an_empty_scope_has_no_period_rather_than_a_zero_one(self) -> None:
         growth = self.growth("2026-07-10")
         self.assertEqual(growth["calls"], 0)
@@ -8463,6 +8651,54 @@ class GrowthCurveIsBoundTest(unittest.TestCase):
         for field in ("refused_reason", "minimum_calls"):
             with self.subTest(field=field):
                 self.assertIn(f"summary.context.growth.{field}", self.band)
+
+    def test_the_sentence_over_the_curve_is_derived_and_not_written_here(self) -> None:
+        # THE regression this test exists for, and it shipped once: the band
+        # was headed "And it only ever grows." -- a trend claim written into
+        # the markup, true of the corpus it was written against and false of
+        # the SAME DATABASE three hours later, because the session compacted.
+        #
+        # A heading that states a trend the numbers do not have is a wrong
+        # figure made of words, and no formatter guards prose. So the verdict
+        # and its sentence both come off the payload, and the phrase that was
+        # wrong may not reappear anywhere in the render layer.
+        for field in ("shape", "shape_statement", "peak_quarter"):
+            with self.subTest(field=field):
+                self.assertIn(f"summary.context.growth.{field}", self.band)
+        for authored in ("only ever grows", "it only ever", "never sheds"):
+            with self.subTest(claim=authored):
+                self.assertNotIn(authored, self.html)
+
+    def test_the_page_names_no_shape_of_its_own(self) -> None:
+        # Six shapes, six sentences, one owner. A page-side map from `shape` to
+        # prose would be a seventh reading with no date and no provenance --
+        # `bandRange`'s rule ("the page invents no band of its own") applied to
+        # a verdict rather than to a boundary.
+        for shape in GROWTH_SHAPES:
+            with self.subTest(shape=shape):
+                self.assertNotIn(f'"{shape}"', self.html)
+                self.assertNotIn(f"'{shape}'", self.html)
+        for statement in GROWTH_SHAPE_STATEMENTS.values():
+            with self.subTest(statement=statement[:32]):
+                self.assertNotIn(statement, self.html)
+
+    def test_the_judged_threshold_keeps_its_own_voice_and_date(self) -> None:
+        # The medians are measurements and the threshold is not, so the page
+        # must not present the second in the first's voice -- `band_provenance`'s
+        # rule, one panel over. It sits WITH the verdict rather than behind the
+        # disclosure, because a judgment whose conclusion is the heading must
+        # not be further from the reader than the heading is.
+        judged = re.search(
+            r'<span class="([^"]*context-judged[^"]*)"[^>]*>\s*Shape threshold',
+            self.band,
+        )
+        self.assertIsNotNone(
+            judged, "the shape threshold is not marked as a judgment"
+        )
+        self.assertIn("summary.context.growth.shape_provenance", self.band)
+        self.assertIn("summary.context.growth.shape_as_of", self.band)
+        disclosure = html_element(self.raw, 'class="disclosure"')
+        self.assertNotIn("shape_provenance", disclosure)
 
     def test_the_answer_sentence_precedes_the_meters_it_is_evidenced_by(self) -> None:
         # #65 asks for the ANSWER above the meters. Order is the whole
