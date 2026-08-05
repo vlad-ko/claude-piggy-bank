@@ -27,6 +27,7 @@ by total tokens and say so -- see `RANKED_BY`.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import sqlite3
 import time
@@ -38,6 +39,15 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
+from context_window import (
+    BAND_PROVENANCE,
+    BANDS,
+    BANDS_AS_OF,
+    WINDOW_PROVENANCE,
+    WINDOWS_AS_OF,
+    band_for,
+    window_for_model,
+)
 from ingest import (
     INGEST_RUNS_TABLE,
     SOURCE_MAIN,
@@ -67,6 +77,22 @@ RANKED_BY = "total tokens"
 # carries these columns, so the expression is unambiguous in the joined query
 # too, and one spelling cannot drift from another.
 TOTAL_TOKENS_SQL = "input_tokens + cache_read + cache_write + output_tokens"
+
+# #31: the set every figure in the `context` block ranges over, named ONCE and
+# carried in the payload as `sample_is` -- the same tie `RANKED_BY` is for the
+# dispatch ranking. "Calls in this window" and "calls in this window whose
+# context was measured" are different sets, and the second is the one the
+# median describes.
+CONTEXT_SAMPLE = "calls with a measured context size"
+# The spread published beside the median. Six points, because the shape is
+# heavily right-skewed and three would hide the tail: measured 2026-08-05 over
+# the reference corpus, p10 77,128 / p25 105,701 / p50 155,330 / p75 261,709 /
+# p90 583,748 / p99 958,151 -- the last pressed against a 1M window.
+PERCENTILES = (10, 25, 50, 75, 90, 99)
+# The headline is the median, and the median IS this percentile -- computed
+# once and published in both places, so the card and the spread beside it
+# cannot disagree.
+MEDIAN_PERCENTILE = 50
 
 # #4966: an aggregate must NAME the set it ranges over. `source_kind` in the
 # DB is the ingester's vocabulary ('main'/'subagent'); these are the labels
@@ -270,6 +296,31 @@ def staleness_verdict(
     if age < 0:
         return None, STALE_UNKNOWN_RUN_IN_FUTURE
     return age > STALE_AFTER_SECONDS, None
+
+
+def nearest_rank(sorted_values: list[int], percentile: int) -> Optional[int]:
+    """The `percentile`-th value of an ASCENDING sample, or None if it is empty.
+
+    Nearest rank, so every published percentile is a value some call actually
+    carried. The interpolating definition would report a median halfway
+    between two calls -- a number no call had, which on an even sample can sit
+    on the far side of a band boundary from both of its neighbours.
+
+    Empty in, None out: an empty window has no median, and 0 would read as a
+    window full of tiny calls (CLAUDE.md, "absence is never rendered as a
+    value").
+
+    Integer arithmetic throughout. `ceil(p / 100 * n)` in floating point is a
+    rounding accident waiting to shift an index by one at exactly the round
+    percentiles this function is called with.
+    """
+    n = len(sorted_values)
+    if n == 0:
+        return None
+    index = (percentile * n + 99) // 100 - 1  # ceil(p*n/100) - 1
+    return sorted_values[max(0, min(index, n - 1))]
+
+
 def project_of(source_path: str, source_kind: str) -> Optional[str]:
     """Which PROJECT a stored source path belongs to, or None if it cannot say.
 
@@ -636,6 +687,152 @@ class Api:
             "projects": self._projects(start, end),
         }
 
+    def _context(self, start: float, end: float) -> dict[str, Any]:
+        """How big the window's calls were, and how much of the model's limit
+        they used (#31).
+
+        Two changes to one figure, for two independent reasons.
+
+        **The median replaces the mean as the headline.** `AVG(context_size)`
+        describes the tail's pull on an average, not a typical call: measured
+        2026-08-05 over the reference corpus, mean 237,153 against median
+        155,255 -- 1.53x -- with only 28.7% of calls above the mean. A card
+        that 71.3% of calls fall below is not describing them. The mean stays
+        in the payload beside `mean_over_median` and `share_above_mean`, which
+        is the only thing it is good for here: it is EVIDENCE OF THE SKEW, and
+        it is no longer the headline.
+
+        **The bands give the figure a referent.** `context_size / window`
+        against the model's own documented window (`context_window.py`), which
+        is a hard published limit rather than an invented "healthy size". Where
+        the boundaries sit is a dated product-owner judgment and says so; the
+        window is documented and says so separately. Both provenances cross the
+        API so the page can never present one as the other.
+
+        **Zero-context rows are counted, never sampled or banded.** A row whose
+        `input + cache_write + cache_read` is 0 carries no prompt accounting at
+        all -- the population #25 is about, and whether those are genuinely
+        zero-usage records or a lost `usage` block is still unanswered. Either
+        way 0 is not a measurement of a context, so it stays out of the median,
+        out of the mean and out of the bands, and is counted in
+        `unmeasured_calls` instead. Banded, it would file as the most frugal
+        call in the corpus; averaged in, it drags the figure down by exactly
+        the proportion of rows nobody measured. `summary()`'s `avg_context`
+        still ranges over every row and is left alone here -- #25 owns those
+        four call sites; the difference between it and `mean` is that defect,
+        visible.
+
+        **An unknown model keeps its context and loses its utilisation.** Its
+        size was measured, so it belongs in the distribution; its window is not
+        something this tool knows, so it is counted in `unknown_model_calls`
+        and NAMED in `unknown_models` rather than banded against a guess.
+        `banded_calls` is therefore the denominator of every band share, and it
+        is published beside them: bands + unknown + unmeasured is the window's
+        whole call count, which `tests/test_serve.py` asserts against the
+        summary card.
+
+        One pass over the window's `(model, context_size)` pairs, banded in
+        Python rather than in SQL, because the window lookup is a longest-prefix
+        match no `GROUP BY` can express. Measured 2026-08-05 on a synthetic
+        600k-call / 3,000-source database of the shape `_projects()` cites
+        (macOS, warm cache, best of 5): 470 ms, inside a `summary()` of 2.8 s.
+        The two shortcuts below are worth 480 ms of that -- the same loop costs
+        950 ms with a `sqlite3.Row` built per row and an unmemoised lookup --
+        and neither changes an answer.
+        """
+        sizes: list[int] = []
+        banded = {key: 0 for key, *_ in BANDS}
+        unknown_models: set[str] = set()
+        unknown_model_calls = 0
+        unmeasured_calls = 0
+        over_window_calls = 0
+        # Windows per model id, resolved once. A window holds a handful of
+        # distinct ids and hundreds of thousands of calls, and the lookup walks
+        # the whole table per call otherwise. Misses are cached too -- an
+        # unknown model is the case that would otherwise pay full price on
+        # every row.
+        windows: dict[str, Optional[int]] = {}
+        # A cursor with the connection's `sqlite3.Row` factory turned OFF: this
+        # loop reads two columns positionally, and building a mapping per row
+        # is the single largest cost in the block at corpus scale.
+        cursor = self.conn.cursor()
+        cursor.row_factory = None
+        for model, size in cursor.execute(
+            "SELECT model, context_size FROM api_calls WHERE ts >= ? AND ts < ?",
+            (start, end),
+        ):
+            if size <= 0:
+                # <= rather than == on purpose: a negative context is not
+                # reachable from summed token counts, so if one ever appears it
+                # is a broken row, and the one thing it must not do is band as
+                # the most frugal call on the report.
+                unmeasured_calls += 1
+                continue
+            sizes.append(size)
+            if model not in windows:
+                windows[model] = window_for_model(model)
+            window = windows[model]
+            if window is None:
+                unknown_model_calls += 1
+                unknown_models.add(model)
+                continue
+            fraction = size / window
+            if fraction > 1.0:
+                # The loud half of this feature's safety story: a window this
+                # table has let go stale shows up as calls over 100% of it,
+                # which is absurd on its face -- but only if someone counts it.
+                over_window_calls += 1
+            banded[band_for(fraction)] += 1
+        sizes.sort()
+        percentiles = {f"p{p}": nearest_rank(sizes, p) for p in PERCENTILES}
+        median = percentiles[f"p{MEDIAN_PERCENTILE}"]
+        mean = (sum(sizes) / len(sizes)) if sizes else None
+        # Strictly greater: a call AT the mean has not exceeded it.
+        calls_above_mean = (
+            len(sizes) - bisect.bisect_right(sizes, mean) if mean is not None else None
+        )
+        banded_calls = sum(banded.values())
+        return {
+            "sample_is": CONTEXT_SAMPLE,
+            "sample_calls": len(sizes),
+            "unmeasured_calls": unmeasured_calls,
+            "median": median,
+            "percentiles": percentiles,
+            "mean": mean,
+            # Null rather than 1.0 on an empty sample, and guarded against a
+            # zero median that the sample cannot produce today but a future
+            # change to what counts as measured could.
+            "mean_over_median": (
+                (mean / median) if (mean is not None and median) else None
+            ),
+            "calls_above_mean": calls_above_mean,
+            "share_above_mean": (
+                calls_above_mean / len(sizes) if calls_above_mean is not None else None
+            ),
+            "utilisation": {
+                "windows_as_of": WINDOWS_AS_OF,
+                "window_provenance": WINDOW_PROVENANCE,
+                "bands_as_of": BANDS_AS_OF,
+                "band_provenance": BAND_PROVENANCE,
+                "banded_calls": banded_calls,
+                "bands": [
+                    {
+                        "band": key,
+                        "label": label,
+                        "lower": lower,
+                        "upper": upper,
+                        "calls": banded[key],
+                        # A share of an empty set is not 0% (rule #12).
+                        "share": (banded[key] / banded_calls) if banded_calls else None,
+                    }
+                    for key, label, lower, upper in BANDS
+                ],
+                "unknown_model_calls": unknown_model_calls,
+                "unknown_models": sorted(unknown_models),
+                "over_window_calls": over_window_calls,
+            },
+        }
+
     def models(self, start: float, end: float) -> list[dict[str, Any]]:
         """Per-model token usage, split by scope -- the same model used by the
         main thread and by a subagent is TWO rows, never one merged figure."""
@@ -786,6 +983,7 @@ class Api:
         return {
             **dict(row),
             "ingest": self._ingest_health(),
+            "context": self._context(start, end),
             "scope": self._scope(start, end),
             "durability": self._durability(start, end),
             "models": self.models(start, end),
