@@ -47,6 +47,12 @@
      that carries a caveat, and on the row whose figures are UNMEASURED. */
   .toggle-note { font-weight:normal; color:var(--muted); font-size:12px; }
   .panel-note { display:block; }
+  /* #31's annotation on the context card. `context-judged` marks the ONE claim
+     in this band that is a product-owner judgment rather than a documented
+     fact; it must not look like the sentence above it. */
+  .context-line { display:block; margin-top:5px; }
+  .context-judged { font-style:italic; border-left:3px solid #818cf8; padding-left:8px; }
+  .util-band { display:inline-block; margin:0 16px 0 0; }
   tbody tr.unmeasured { color:var(--muted); }
   .chartbox { position:relative; height:340px; }
   #detail .close { float:right; cursor:pointer; color:var(--muted); background:none; border:none; font:inherit; padding:0; }
@@ -226,6 +232,93 @@
         <template x-if="c.note"><div class="note" x-text="c.note"></div></template>
       </div>
     </template>
+  </div>
+
+  <!-- #31: the REFERENT for the context card above. "Avg context/call 266.6k"
+       is a fact with no scale: nothing said whether that is a lot. This band
+       annotates the card it sits under rather than adding a panel (CLAUDE.md
+       constraint 4) -- the median displaced the mean in the card itself, and
+       what is left here is the evidence for that displacement, the spread, and
+       the utilisation the median is measured against.
+
+       TWO PROVENANCES, NEVER MERGED. The denominator is Anthropic's DOCUMENTED
+       context window. Where the band boundaries sit is a dated PRODUCT-OWNER
+       JUDGMENT that Anthropic publishes nothing about. They are rendered as two
+       separate statements, each led by what kind of claim it is and the judged
+       one visually marked, because presenting the second in the first's voice
+       would borrow an authority this project has not earned -- which is the
+       whole reason the API carries them as two fields with two dates. -->
+  <div class="note-band" id="context-note">
+    <template x-if="!summary"><span>Loading context&hellip;</span></template>
+    <template x-if="summary && !summary.context.sample_calls"><span>
+      <strong>Context: no measured sample.</strong> No call in this period carried a
+      measured context size, so there is no median and no utilisation to report.
+      <span x-text="fmtCount(summary.context.unmeasured_calls)"></span> call(s) carry no
+      context accounting at all &mdash; UNMEASURED, not zero.
+    </span></template>
+    <template x-if="summary && summary.context.sample_calls"><span>
+      <!-- Why the card leads with a median. The mean is kept because it is
+           EVIDENCE OF THE SKEW and nothing else: a figure most calls fall below
+           is not describing them. -->
+      <strong>Median, not mean.</strong> The mean over the same sample is
+      <span x-text="fmtTok(summary.context.mean)"></span>,
+      <span x-text="fmtRatio(summary.context.mean_over_median)"></span> the median, and only
+      <span x-text="fmtPct(summary.context.share_above_mean)"></span> of measured calls
+      (<span x-text="fmtCount(summary.context.calls_above_mean)"></span> of
+      <span x-text="fmtCount(summary.context.sample_calls)"></span>) sit above it, so it
+      describes the tail rather than a typical call. The legacy
+      <em>Avg context/call</em> divides the same tokens across EVERY row, including
+      those with no context accounting, and reads
+      <span x-text="fmtTokRounded(summary.avg_context)"></span>: a different figure over a
+      different set, not a rounding difference.
+
+      <span class="context-line">Spread: <span x-text="contextSpread"></span></span>
+
+      <span class="context-line">Against each model's own documented window, over
+        <span x-text="fmtCount(summary.context.utilisation.banded_calls)"></span> banded
+        call(s):</span>
+      <span class="context-line">
+        <!-- Ordered high to low by the API, so the template neither sorts nor
+             labels: the verdicts on the top two bands are the data layer's
+             words, and only those two carry one because only those two were
+             judged. -->
+        <template x-for="(b, i) in summary.context.utilisation.bands" :key="i">
+          <!-- The trailing space is load-bearing: the chips are inline-block,
+               so they read correctly on screen either way, but without it the
+               page's text -- copied, or read aloud -- runs one band's share
+               into the next band's label. -->
+          <span class="util-band"><span x-text="b.label"></span>:
+            <strong x-text="fmtCount(b.calls)"></strong>
+            (<span x-text="fmtPct(b.share)"></span>) </span>
+        </template>
+      </span>
+
+      <template x-if="summary.context.utilisation.unknown_model_calls"><span class="context-line">
+        <strong><span x-text="fmtCount(summary.context.utilisation.unknown_model_calls)"></span>
+        call(s)</strong> ran on a model this build has no documented window for
+        (<span x-text="summary.context.utilisation.unknown_models.join(', ')"></span>), so
+        their utilisation is <strong>UNKNOWN, not low</strong> &mdash; their context is
+        counted in the spread above and they are banded nowhere.
+      </span></template>
+      <template x-if="summary.context.utilisation.over_window_calls"><span class="context-line">
+        <strong>INCONCLUSIVE:</strong>
+        <span x-text="fmtCount(summary.context.utilisation.over_window_calls)"></span> call(s)
+        measure ABOVE 100% of their model's window. That is impossible unless this
+        build's window table has gone stale, so treat the bands as suspect rather
+        than the calls as extraordinary.
+      </span></template>
+      <template x-if="summary.context.unmeasured_calls"><span class="context-line">
+        <span x-text="fmtCount(summary.context.unmeasured_calls)"></span> call(s) in this
+        period carry no context accounting at all. They are counted here and kept out
+        of the median, the mean and the bands &mdash; 0 is not a measurement of a
+        context, and banded it would file as the most frugal call on the report.
+      </span></template>
+
+      <span class="context-line">Denominator:
+        <span x-text="summary.context.utilisation.window_provenance"></span></span>
+      <span class="context-line context-judged">Boundaries:
+        <span x-text="summary.context.utilisation.band_provenance"></span></span>
+    </span></template>
   </div>
 
   <div class="panel">
@@ -480,6 +573,22 @@ function fmtCount(n) {
 function orDash(v) {
   return v ?? "—";
 }
+function fmtPct(x) {
+  // A share of an empty set is not 0% (#31 returns null for exactly that), and
+  // "0% of calls are in this band" is a measurement nobody made.
+  if (x === null || x === undefined) return "—";
+  return (x * 100).toFixed(1) + "%";
+}
+function fmtRatio(x) {
+  if (x === null || x === undefined) return "—";
+  return x.toFixed(2) + "×";
+}
+function fmtTokRounded(n) {
+  // The guard comes BEFORE the rounding on purpose: `Math.round(null)` is 0,
+  // so rounding first turns a window that measured nothing into a measured 0.
+  if (n === null || n === undefined) return "—";
+  return fmtTok(Math.round(n));
+}
 function fmtTs(ts) {
   if (ts === null || ts === undefined) return "—";
   return new Date(ts * 1000).toLocaleString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
@@ -597,8 +706,34 @@ function report() {
           note: `${this.summary.scope.main_thread.calls.toLocaleString()} main-thread + `
             + `${this.summary.scope.subagent.calls.toLocaleString()} subagent`,
         },
-        { label: "Avg context/call", value: noData ? "—" : fmtTok(Math.round(this.summary.avg_context)) },
+        // #31: the MEDIAN is the headline, and it displaced the mean rather
+        // than joining it. `AVG(context_size)` describes the tail's pull on an
+        // average, not a typical call -- measured on the reference corpus, mean
+        // 237,304 against median 155,333, with only 28.6% of calls above the
+        // mean. A card that 71.4% of calls fall below is not describing them.
+        // The mean survives in the band below as evidence of that skew, which
+        // is the only thing it is good for here.
+        {
+          label: "Median context/call",
+          value: fmtTok(this.summary.context.median),
+          note: `${fmtCount(this.summary.context.sample_calls)} `
+            + `${this.summary.context.sample_is}`,
+        },
       ];
+    },
+
+    // Ordered by the percentile IN THE KEY rather than by the payload's key
+    // order, so a reordered dict upstream cannot silently re-label the spread.
+    get contextPercentiles() {
+      return Object.entries(this.summary.context.percentiles)
+        .map(([key, value]) => ({ key, value, at: Number(key.slice(1)) }))
+        .sort((a, b) => a.at - b.at);
+    },
+
+    get contextSpread() {
+      return this.contextPercentiles
+        .map(p => `${p.key} ${fmtTok(p.value)}`)
+        .join(" · ");
     },
 
     // The two project sentences are composed in JS and bound with `x-text`

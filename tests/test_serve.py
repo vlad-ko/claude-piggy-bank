@@ -1915,20 +1915,20 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
     and `s.output` all along. A stale exemption is how an allowlist rots into a
     rubber stamp, so a field that IS rendered may no longer be listed here --
     `test_the_allowlist_cannot_exempt_a_field_that_is_rendered` pins that.
+
+    #31's `context` was the fifth entry, and it is the allowlist working as
+    designed rather than rotting: its data layer landed first, on purpose,
+    declaring the field as one OWED a consumer because wiring it into the
+    string-concatenating `renderSummary` this change deletes would have been
+    written to be thrown away. This change is the consumer it was waiting for,
+    so the entry is gone and `ContextReferentIsBoundTest` says what was decided
+    instead -- which is the stronger record. An allowlist entry can only say
+    that somebody thought about it.
     """
 
     # Fields `/api/summary` computes that the page deliberately does not show.
     # An entry must name the reason. Empty is the healthy state.
-    NOT_RENDERED: dict[str, str] = {
-        # #31's data layer, landing ahead of its view DELIBERATELY. The block is
-        # built to be bound declaratively -- named scalars and one ordered list
-        # of bands, no arithmetic left for the template -- so wiring it into the
-        # string-concatenating `renderSummary` that this commit deletes would
-        # have been written to be deleted. This entry is the declaration the
-        # allowlist exists to force: it must BECOME a rendered field, not stay
-        # here, and the next commit is the one that owes it.
-        "context": "payload for #31; bound by the view in the #8 rewrite",
-    }
+    NOT_RENDERED: dict[str, str] = {}
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -3580,6 +3580,14 @@ class AbsenceIsNeverRenderedAsAValueTest(unittest.TestCase):
         "function fmtCount(": "toLocaleString",
         "function fmtTs(": "new Date",
         "function fmtAge(": "fmtSpan",
+        # #31's three. `fmtPct` is the one the band shares run through, and
+        # `share` is null -- never 0 -- for a band over an empty set: "0.0% of
+        # calls are in this band" is a measurement nobody made.
+        "function fmtPct(": "* 100",
+        "function fmtRatio(": "toFixed",
+        # And the sharpest of them: `Math.round(null)` is 0, so rounding before
+        # checking turns a window that measured nothing into a measured zero.
+        "function fmtTokRounded(": "Math.round",
     }
 
     def test_each_formatter_answers_absence_before_it_computes(self) -> None:
@@ -3612,6 +3620,190 @@ class AbsenceIsNeverRenderedAsAValueTest(unittest.TestCase):
         # `orDash` is the non-numeric half: an unmeasured dispatch has no model
         # name, and an empty cell reads as "no model" rather than "not known".
         self.assertIn('return v ?? "—";', js_function_body(self.html, "function orDash("))
+
+
+class ContextReferentIsBoundTest(unittest.TestCase):
+    """#31's `context` block reaches the reader, and keeps its two voices (#8).
+
+    The data layer landed first, deliberately, with `context` declared in
+    `SummaryPayloadIsWiredTest.NOT_RENDERED` as a field OWED a consumer. This
+    is the change that owes it, so the entry is gone and these tests are what
+    replace it -- an allowlist entry says "someone decided"; these say what was
+    decided.
+
+    The half that is not about wiring at all is the PROVENANCE. The denominator
+    is Anthropic's documented context window. Where the band boundaries sit is
+    a dated product-owner judgment about which Anthropic publishes nothing. The
+    API carries them as two fields with two dates precisely so the page cannot
+    present the second in the first's voice, and a page that merged them would
+    borrow an authority this project has not earned -- undoing the care the
+    data layer took, invisibly, because the merged sentence still reads true.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+        cls.band = html_element(cls.raw, 'id="context-note"')
+        cls.cards = js_function_body(cls.html, "get cards(")
+
+    # --- the median displaced the mean, rather than joining it ---
+
+    def test_the_card_leads_with_the_median(self) -> None:
+        self.assertIn("summary.context.median", self.cards)
+        self.assertIn("Median context/call", self.cards)
+
+    def test_the_mean_is_no_longer_a_headline_card(self) -> None:
+        # "Displaced", not "added beside". A mean 1.5x its median, which 71% of
+        # calls fall below, is not a card -- it is evidence of skew, and it
+        # belongs where the skew is being argued.
+        self.assertNotIn("Avg context/call", self.cards)
+        self.assertNotIn("context.mean", self.cards)
+        self.assertIn("summary.context.mean", self.band)
+
+    def test_the_legacy_average_is_still_shown_and_still_disagrees(self) -> None:
+        # #25 made visible, and it must STAY visible: `avg_context` divides the
+        # same tokens across every row including those with no context
+        # accounting, so it is a different figure over a different set. The
+        # page says that rather than quietly picking one.
+        self.assertIn("summary.avg_context", self.band)
+        self.assertNotIn("summary.avg_context", self.cards)
+        for word in ("legacy", "different set"):
+            with self.subTest(word=word):
+                self.assertIn(word, self.band)
+
+    def test_the_legacy_average_cannot_round_an_absence_into_a_zero(self) -> None:
+        # `Math.round(null)` is 0. The card used to be guarded by a `noData`
+        # flag computed elsewhere; the formatter now refuses on its own, so the
+        # guard cannot be left behind when the binding moves.
+        self.assertRegex(self.band, r"fmtTokRounded\(summary\.avg_context\)")
+        self.assertNotRegex(self.band, r"Math\.round\(summary\.avg_context\)")
+
+    # --- the two provenances ---
+
+    def test_both_provenances_are_rendered(self) -> None:
+        for field in ("window_provenance", "band_provenance"):
+            with self.subTest(field=field):
+                self.assertIn(f"utilisation.{field}", self.band)
+
+    def test_no_single_binding_carries_both_provenances(self) -> None:
+        # The failure mode is one sentence built from the two, which reads as
+        # though Anthropic published the boundaries.
+        for expr in re.findall(r'x-text="([^"]+)"', self.band):
+            with self.subTest(expr=expr):
+                self.assertFalse(
+                    "window_provenance" in expr and "band_provenance" in expr,
+                    "one binding renders both provenances as a single claim",
+                )
+
+    def test_the_two_provenances_sit_in_separately_marked_elements(self) -> None:
+        # Rendered apart is not enough -- they must LOOK like different kinds
+        # of claim. The judged one carries a marker class the documented one
+        # does not, and that class has a rule of its own in the stylesheet.
+        judged = re.search(
+            r'<span class="([^"]*context-judged[^"]*)"[^>]*>\s*Boundaries:', self.band
+        )
+        self.assertIsNotNone(
+            judged, "the judged boundaries are not visually distinguished"
+        )
+        documented = re.search(r'<span class="([^"]*)"[^>]*>\s*Denominator:', self.band)
+        self.assertIsNotNone(documented, "the documented denominator is not led as one")
+        self.assertNotIn(
+            "context-judged",
+            documented.group(1),
+            "the documented window is marked as a judgment",
+        )
+        self.assertRegex(self.html, r"\.context-judged\s*\{[^}]+\}")
+
+    def test_each_provenance_is_led_by_what_kind_of_claim_it_is(self) -> None:
+        # A reader skimming must be able to tell which is which without
+        # parsing either sentence.
+        denominator = self.band.index("Denominator:")
+        boundaries = self.band.index("Boundaries:")
+        self.assertLess(
+            denominator,
+            self.band.index("window_provenance"),
+            "the documented window's lead does not precede it",
+        )
+        self.assertLess(
+            boundaries,
+            self.band.index("band_provenance"),
+            "the judged boundaries' lead does not precede them",
+        )
+
+    # --- the bands ---
+
+    def test_the_bands_are_iterated_from_the_payload(self) -> None:
+        # Structural, like every other row payload on this page: the page
+        # cannot show a band the API did not send, and cannot omit one it did.
+        loop = re.search(r'<template x-for="([^"]+)"', self.band)
+        self.assertIsNotNone(loop, "the bands are built some other way")
+        self.assertIn("summary.context.utilisation.bands", loop.group(1))
+
+    def test_the_page_invents_no_band_of_its_own(self) -> None:
+        # Boundaries, labels and verdicts all belong to `context_window.py`,
+        # which is where the judgment is dated. A copy here would be a second
+        # place to change and a second thing to forget -- and only one of the
+        # two would carry `BANDS_AS_OF`.
+        for key, label, lower, _upper in BANDS:
+            with self.subTest(band=key):
+                self.assertNotIn(key, self.html)
+                self.assertNotIn(label, self.html)
+                self.assertNotIn(f"{lower}", self.band)
+
+    def test_a_band_share_of_nothing_is_not_a_share_of_zero(self) -> None:
+        # `share` is null for every band when nothing was banded. Rendered as
+        # "0.0%" that reads as a measured absence of calls in each band, which
+        # is the exact substitution this repository refuses.
+        self.assertIn("fmtPct(b.share)", self.band)
+        self.assertNotRegex(self.band, r"b\.share\s*\*")
+
+    def test_the_shares_name_the_set_they_are_shares_of(self) -> None:
+        # An aggregate must name the set it ranges over: bands are shares of
+        # the BANDED calls, which is neither the sample nor the window's calls.
+        self.assertIn("utilisation.banded_calls", self.band)
+
+    # --- the absences the block is careful about ---
+
+    def test_an_unwindowed_model_is_named_not_merely_counted(self) -> None:
+        # "3 calls could not be banded" is unactionable; naming the model tells
+        # the reader whether the table is stale or the id is exotic.
+        self.assertIn("utilisation.unknown_model_calls", self.band)
+        self.assertIn("utilisation.unknown_models", self.band)
+        self.assertIn("UNKNOWN, not low", self.band)
+
+    def test_calls_over_their_own_window_are_surfaced_as_inconclusive(self) -> None:
+        # The loud half of the hand-maintained table's safety story: a stale
+        # window shows up as utilisation above 100%, and it is only a safety
+        # story if the page says so.
+        self.assertIn("utilisation.over_window_calls", self.band)
+        self.assertIn("INCONCLUSIVE", self.band)
+
+    def test_a_call_with_no_context_accounting_is_counted_not_banded(self) -> None:
+        self.assertIn("context.unmeasured_calls", self.band)
+
+    def test_an_empty_sample_says_so_instead_of_printing_dashes(self) -> None:
+        # A window with no measured context renders one sentence, not a median
+        # of "—" beside four bands of "—": a screen of dashes reads as breakage
+        # rather than as the honest absence it is.
+        self.assertRegex(self.band, r'x-if="summary && !summary\.context\.sample_calls"')
+        self.assertRegex(self.band, r'x-if="summary && summary\.context\.sample_calls"')
+
+    def test_the_sample_names_itself_from_the_api(self) -> None:
+        # `sample_is` exists so the page does not invent its own words for what
+        # was counted. An aggregate must name the set it ranges over, and the
+        # set is named once, server-side.
+        self.assertIn("context.sample_is", self.cards)
+
+    def test_the_annotation_adds_no_panel(self) -> None:
+        # CLAUDE.md constraint 4. This earned its space by DISPLACING the mean
+        # in the card above it; it may not also append a surface. It reuses the
+        # `note-band` component the scope note already uses, and adds no table.
+        self.assertRegex(self.raw, r'<div class="note-band" id="context-note">')
+        self.assertNotIn("<table", self.band)
+        self.assertEqual(self.html.count('class="panel"'), 6, "a panel was added")
 
 
 if __name__ == "__main__":
