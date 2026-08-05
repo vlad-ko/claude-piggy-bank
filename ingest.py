@@ -312,7 +312,7 @@ SCHEMA_VERSION = 11
 
 # Versions whose difference from the current shape can be applied WITHOUT
 # losing a measurement, so they upgrade in place instead of being dropped and
-# rebuilt. Four such hops exist, and a v6 database makes all four at once:
+# rebuilt. Five such hops exist, and a v6 database makes all five at once:
 #
 #   v6 -> v7  ADDS `ingest_runs`, supplied by `CREATE TABLE IF NOT EXISTS`.
 #   v7 -> v8  DROPS `api_calls.cost_usd` (#30), applied by `ALTER TABLE ...

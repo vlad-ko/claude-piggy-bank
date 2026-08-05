@@ -53,7 +53,7 @@ from typing import NamedTuple, Optional, Sequence
 # NOT governed is SCHEMA_VERSION, so long as an existing database upgrades
 # without data loss and without a refusal; the migration machinery in
 # `ingest.py`, not this number, is what carries that guarantee.
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 PROG = "cpb"
 
