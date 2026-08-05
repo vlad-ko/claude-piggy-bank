@@ -187,7 +187,92 @@
   ol.next li { margin-bottom:8px; }
   ol.next li:last-child { margin-bottom:0; }
   ol.next .why { color:var(--muted); font-size:12.5px; display:block; }
-  /* #70's two views, and the affordance between them. Named classes, never an
+  /* #89's SUMMARY LEVEL. Two idioms, both named, neither an inline style
+     string: the four-dot status strip, and the knob row.
+
+     THE STRIP IS STATUS, NOT CONTENT -- one line, four questions, a coloured
+     dot and two or three words each. The four states come from the API
+     (`serve.STRIP_*`) and only the colours are this page's; `dot-unknown` is a
+     colour of its own rather than a paler `dot-watch`, because "we could not
+     check" and "we checked and it is middling" are different claims and a dot
+     is read before any word beside it. */
+  /* THE SUMMARY LEVEL'S OWN SURFACE. Not `.panel`, which is the raw-data
+     view's, and not `.q`, which is the question card: three levels that looked
+     alike would be three levels the reader cannot tell apart, and the level
+     distinction is the whole of #70 and #89. */
+  .board { background:var(--card); border:1px solid var(--line); border-radius:11px;
+           padding:15px 17px 8px; margin-bottom:14px; }
+  .board > h2 { font-size:15px; margin:0 0 3px; letter-spacing:-.01em; }
+  .strip { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line);
+           border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-bottom:16px; }
+  .st { background:var(--card); padding:11px 13px; display:flex; align-items:center; gap:9px; }
+  .dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
+  .dot-good { background:var(--ok); }
+  .dot-watch { background:var(--amber); }
+  .dot-bad { background:var(--red); }
+  /* Neither green nor amber: an unestablished answer must not borrow either
+     verdict's look. Same direction as `HEALTH_TONE_UNRECOGNISED`. */
+  .dot-unknown { background:var(--neutral); }
+  .stq { font-size:11px; color:var(--muted); }
+  .sta { font-size:13px; font-weight:650; margin-top:1px; }
+
+  /* THE KNOB ROW: gauge, imperative, why, figure. A knob that does not apply
+     is DIMMED, not hidden -- seeing that five knobs exist and three are
+     already fine is information, and it is what stops this page becoming a
+     list of complaints. `.off` is opacity alone, so every word stays on
+     screen and selectable. */
+  .knob { display:grid; grid-template-columns:60px 1fr 150px; gap:14px; align-items:center;
+          padding:13px 0; border-top:1px solid var(--line); }
+  .knob:first-of-type { border-top:0; }
+  .knob.off { opacity:.55; }
+  .gauge { width:60px; height:40px; flex:0 0 auto; }
+  /* The dial's parts, coloured by CLASS so no severity, provenance kind or
+     colour is spelled at a binding. `gauge-track` is the sweep the arcs are
+     drawn over -- it is the DIAL, never a reading, so it is the same neutral
+     whether or not anything was measured. */
+  .gauge path { fill:none; stroke-linecap:round; }
+  .gauge-track { stroke:var(--line); stroke-width:7; }
+  .arc-ok { stroke:var(--ok-bg); stroke-width:7; }
+  .arc-watch { stroke:var(--amber-bg); stroke-width:7; }
+  .arc-act { stroke:var(--red-bg); stroke-width:7; }
+  /* An arc whose severity this build has no colour for is still VISIBLE, never
+     the track's own colour: an uncoloured segment would be a range rendered as
+     an absence. Same direction as `BAND_TONE_UNRECOGNISED`. */
+  .arc-extra { stroke:var(--extra-bg); stroke-width:7; }
+  /* One tick per cut point, in the voice of the boundary's own provenance. A
+     judged line and a documented one must not look alike on the dial for the
+     same reason they must not read alike in the table. */
+     Each sets `color` as well as `stroke`, because the same class marks the
+     tick on the dial AND the words beside it: one voice, one place. */
+  .tick-cited { stroke:#0f766e; color:#0f766e; stroke-width:2; }
+  .tick-judged { stroke:#818cf8; color:#4338ca; stroke-width:2; font-style:italic; }
+  .tick-structural { stroke:#9ca3af; color:#6b7280; stroke-width:2; }
+  /* The needle starts at the pivot and its round cap IS the hub, so a dial
+     with no reading has no pivot either -- a lone hub at the centre of an
+     empty dial still reads as an instrument pointing at something. */
+  .needle { stroke:var(--ink); stroke-width:3; }
+  .kh { font-size:14px; font-weight:650; letter-spacing:-.01em; }
+  .kh .tag { font-size:10px; font-weight:700; letter-spacing:.05em; padding:1px 5px;
+             border-radius:3px; margin-right:7px; vertical-align:1px; }
+  .tag-now { background:#fee2e2; color:var(--red); }
+  .tag-soon { background:#fef3c7; color:var(--amber); }
+  .tag-fine { background:#ecfdf5; color:var(--ok); }
+  /* An unmeasured knob's tag: neither an urgency nor a clean bill of health. */
+  .tag-none { background:#eef2ff; color:var(--neutral); }
+  .kw { font-size:12px; color:var(--muted); margin-top:3px; }
+  .kmarks { margin-top:4px; font-size:11px; color:var(--muted); }
+  .kmark { margin-right:10px; }
+  .kmark-kind { font-size:10px; letter-spacing:.03em; }
+  .kfig { text-align:right; }
+  .kfig .n { font-size:20px; font-weight:650; letter-spacing:-.02em; line-height:1.15; }
+  .kfig .aim { font-size:11px; margin-top:3px; }
+  .kfig .none { font-size:11px; color:var(--muted); margin-top:3px; }
+  /* An OBSERVATION, and visibly not a knob: no tag, no gauge, no target and no
+     arrow. The owner's decision is that model tier is a real measurement and
+     not advice, so it must not be able to be mistaken for a row above it. */
+  .observation { font-size:13px; }
+  .obs-note { display:block; color:var(--muted); font-size:12px; margin-top:4px; }
+  /* #70's views, and the affordance between them. Named classes, never an
      inline style string: the tab, the period line, the drill-down and the
      filter notice are each a repeated pattern, and this page's rule is that a
      repeated pattern gets a name. */
@@ -262,15 +347,27 @@
        ONCE below, in neither section; no summary path may be bound in both
        sections; and the one figure they genuinely share, the period, is a
        single getter. tests/test_serve.py's ReportViewSplitTest is the check. -->
+  <!-- #89 MADE IT THREE, and the tabs are ITERATED rather than written out.
+       One button per member of `VIEWS`, labelled from `VIEW_LABELS`, so a
+       fourth level could not be added without a tab appearing for it and a
+       level cannot lose its way in or its way back.
+
+       WHY THE URL KEY AND THE LABEL DIFFER FOR TWO OF THE THREE. `#view=
+       overview` and `#view=details` are what #70 shipped and what anyone who
+       bookmarked this report has. Re-using `details` for the middle level
+       would leave those links resolving to a DIFFERENT page from the one they
+       named -- a stable name over a changed meaning, which `docs/
+       versioning.md` calls the worst kind of break because nothing fails
+       loudly. So the keys stay put and the labels say what the levels are;
+       `VIEW_LABELS` is the one place the two are joined. -->
   <nav class="tabs" id="view-tabs">
-    <button type="button" :class="{ on: view === 'overview' }"
-            :aria-current="view === 'overview' ? 'page' : false"
-            @click="setView('overview')">Overview</button>
-    <button type="button" :class="{ on: view === 'details' }"
-            :aria-current="view === 'details' ? 'page' : false"
-            @click="setView('details')">Details &amp; raw data</button>
-    <span class="hint">Same numbers, two levels &mdash; the detail view holds every
-      panel this report has ever had.</span>
+    <template x-for="v in views" :key="v">
+      <button type="button" :class="{ on: view === v }"
+              :aria-current="view === v ? 'page' : false"
+              @click="setView(v)" x-text="viewLabel(v)"></button>
+    </template>
+    <span class="hint">Same numbers, three levels &mdash; what to do, why, and
+      every panel this report has ever had.</span>
   </nav>
 
   <!-- ONE banner element, three things that can want it: a failed load, the
@@ -498,6 +595,212 @@
        each other, so no card can assert a shape at rest while the judgment
        that produced it sits behind a click.
        =================================================================== -->
+  <!-- ===================================================================
+       LEVEL 1: THE SUMMARY (#89). Gauges and knobs, one screen, minimal text.
+
+       THREE LEVELS OVER ONE PAYLOAD. #70 split the report into an overview and
+       the raw data; #89 puts a level above both, because the overview answers
+       "why?" and the question most readers arrive with is "what do I do?".
+       The four question cards are still there, one click down, with every
+       figure they had; nothing was removed at any level.
+
+       THE GAUGE NEEDS NO NEW JUDGMENT, AND THIS IS THE WHOLE POINT. A
+       prototype of this screen invented its targets ("aim under 1.5x"). This
+       one cannot: `recommendations.py` already carries, per metric, an ordered
+       set of ranges with severities and PER-BOUNDARY provenance, and the gauge
+       is a drawing of that table. The coloured arcs are its ranges, the ticks
+       are its boundaries in their own voices, the target is the edge of its
+       healthy range, and the needle is this window's reading. NO THRESHOLD IS
+       AUTHORED IN THIS FILE -- `serve.py` sends the positions and
+       tests/test_serve.py fails if any of the table's numbers appears in this
+       page as a literal. A threshold typed here would be a threshold with no
+       date, no provenance and nothing to redline, and the page and the advice
+       would become two enumerations free to disagree.
+
+       AN UNMEASURED METRIC GETS NO NEEDLE. Not a needle at zero: for four of
+       the five metrics zero is the WORST reading there is, so absence drawn at
+       rest would be this repository's central rule failing in a new visual
+       form. The dial is still drawn -- the table's shape exists whether or not
+       this window has a sample -- and the row says in the API's own words that
+       there is no reading.
+
+       A KNOB THAT DOES NOT APPLY IS DIMMED, NOT HIDDEN. Seeing that five knobs
+       exist and three are already fine is itself the finding, and it is what
+       keeps a page of advice from becoming a page of complaints.
+       =================================================================== -->
+  <section id="view-summary" x-cloak x-show="view === 'summary'">
+
+    <!-- The window every figure below covers, through the one getter that
+         composes it. A caption, not a panel -- the same decision `#overview-
+         period` and `#details-period` record. -->
+    <div class="period" id="summary-period">Covering <strong x-text="periodLabel"></strong>.
+      <button type="button" class="drill" @click="setView('overview')">Why? The four
+        questions behind this &rarr;</button>
+    </div>
+
+    <!-- THE STATUS STRIP: four questions, one line, status rather than
+         content. Every dot's state, question and answer is the API's
+         (`serve.STRIP_*`), composed there off the SAME `health`, `context` and
+         table readings the cards below and one level down render -- so a dot
+         cannot disagree with the card it summarises. Iterated, so a fifth
+         question added server-side reaches this strip by construction.
+
+         The colours are this page's, keyed on the API's four states through
+         `STRIP_DOT_TONE`; the state's own answer is rendered in words beside
+         it, so no verdict here is carried by colour alone. -->
+    <div class="strip" id="status-strip" x-cloak x-show="summary">
+      <template x-for="d in (summary ? summary.status.dots : [])" :key="d.key">
+        <div class="st">
+          <span class="dot" :class="dotTone(d.state)"></span>
+          <div>
+            <div class="stq" x-text="d.question"></div>
+            <div class="sta" x-text="d.answer"></div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- THE KNOBS. One row per metric in the dated table, in the table's own
+         ranked order -- worst first, then the ones with no sample. The page
+         does not rank, filter or threshold anything: `knobs` is the API's own
+         list and this template iterates it whole, so a healthy reading and an
+         unmeasured one both reach the screen and are told apart by what they
+         say rather than by one of them being absent. -->
+    <section class="board" id="knobs-note">
+      <h2>What you can change today</h2>
+      <div class="body">Worst first, in the order the dated table below ranks them.
+        Each row is a thing you do; a row with nothing to turn is dimmed, not hidden.</div>
+
+      <template x-for="k in (summary ? summary.recommendations.knobs : [])" :key="k.metric">
+        <div class="knob" :class="{ off: !k.directive }">
+          <!-- THE DIAL. Every `d` here is composed by `arcPathsFor`,
+               `tickPathsFor` and `needlePath` from POSITIONS the API sent; the
+               only numbers in this file are the viewBox's own geometry.
+
+               ONE PATH PER TONE, NOT ONE PER SEGMENT, and that is a parser
+               constraint rather than a preference: inside `<svg>` the HTML
+               parser is in foreign content, where `<template>` is an
+               SVG-namespaced element with no `.content` -- so an `x-for` here
+               would be a loop Alpine cannot run. Each `<path>` therefore
+               carries every subpath of its own tone at once, which SVG's `d`
+               takes natively. The `arc-extra` path is the load-bearing one: a
+               severity this build has no colour for still lands on a VISIBLE
+               path rather than being filtered off the dial, which is
+               `BAND_TONE_UNRECOGNISED`'s rule in a second drawing.
+
+               NO NEEDLE WHERE THERE IS NO READING. `needlePath(null)` is the
+               empty string, which draws nothing at all -- not a needle resting
+               at the left of the dial, which for four of these five metrics is
+               the worst reading there is. -->
+          <svg class="gauge" viewBox="0 0 60 40" aria-hidden="true">
+            <path class="gauge-track" :d="arcPath(0, 1)"></path>
+            <path class="arc-ok" :d="arcPathsFor(k.gauge.segments, 'arc-ok')"></path>
+            <path class="arc-watch" :d="arcPathsFor(k.gauge.segments, 'arc-watch')"></path>
+            <path class="arc-act" :d="arcPathsFor(k.gauge.segments, 'arc-act')"></path>
+            <path class="arc-extra" :d="arcPathsFor(k.gauge.segments, 'arc-extra')"></path>
+            <path class="tick-cited" :d="tickPathsFor(k.gauge.boundaries, 'tick-cited')"></path>
+            <path class="tick-judged" :d="tickPathsFor(k.gauge.boundaries, 'tick-judged')"></path>
+            <path class="tick-structural" :d="tickPathsFor(k.gauge.boundaries, 'tick-structural')"></path>
+            <path class="needle" :d="needlePath(k.gauge.needle)"></path>
+          </svg>
+
+          <div>
+            <!-- THE IMPERATIVE. `lever.directive` is the module's own
+                 action-oriented phrase, built from a closed registry, so this
+                 page can state a move that does not exist in the table only by
+                 the module inventing it first. A row with no lever says what
+                 it is instead of leaving a gap where the others have a verb. -->
+            <div class="kh">
+              <span class="tag" :class="urgencyClass(k.severity)"
+                    x-text="urgencyTag(k.severity)"></span>
+              <template x-if="k.directive"><span x-text="k.directive"></span></template>
+              <template x-if="!k.directive && k.severity"><span>Nothing to turn here</span></template>
+              <template x-if="!k.severity"><span>No reading in this period</span></template>
+            </div>
+            <!-- WHY, in the table's own words: the metric's `measurement`
+                 names exactly what was divided by what, which is the thing a
+                 reader checks the figure against. A sentence written here
+                 would be a claim nothing can check. -->
+            <div class="kw" x-text="k.measurement"></div>
+            <!-- WHERE THE LINES ARE, each in its own voice and each carrying
+                 its own statement. The kind is rendered as a WORD, not only as
+                 a colour: a judged cut point must never be readable as a
+                 documented one. -->
+            <div class="kmarks">
+              <!-- The metric's KEY, which is the one string that ties this
+                   dial to the full reading, its ranges and both of its
+                   provenances one level down. -->
+              <span class="kmark mono" x-text="k.metric"></span>
+              <template x-for="(b, i) in k.gauge.boundaries" :key="i">
+                <span class="kmark" :class="tickVoice(b.kind)"
+                      :title="b.statement">at <span x-text="fmtMetric(b.value)"></span>
+                  <span class="kmark-kind" x-text="b.kind"></span></span>
+              </template>
+            </div>
+          </div>
+
+          <!-- THE FIGURE, AND THE DIRECTION TO MOVE. `fmtMetric` renders a
+               null as the em-dash this page reserves for "nobody measured", so
+               a missing reading can never print like a measured zero. -->
+          <div class="kfig">
+            <div class="n" x-text="fmtMetric(k.value)"></div>
+            <template x-for="(b, i) in targetsOf(k.gauge)" :key="i">
+              <div class="aim" :class="tickVoice(b.kind)">
+                <span x-text="aimWord(k.gauge.worse_when)"></span>
+                <strong x-text="fmtMetric(b.value)"></strong></div>
+            </template>
+            <template x-if="k.value === null">
+              <div class="none" x-text="summary.recommendations.unmeasured_note"></div>
+            </template>
+          </div>
+        </div>
+      </template>
+
+      <details class="disclosure" id="knobs-provenance">
+        <summary>Where these lines are drawn, and what they are not</summary>
+        <span class="context-line">Every arc, tick and target above is a range in
+          one dated table, decided
+          <strong x-text="summary ? summary.recommendations.as_of : ''"></strong>.
+          Each range gets an equal share of the dial, the needle sits where this
+          window's reading falls, and a dial with no needle is a reading nobody
+          took. Nothing on this page decides where a line goes.</span>
+        <span class="context-line context-judged">Table:
+          <span x-text="summary ? summary.recommendations.provenance : ''"></span></span>
+      </details>
+    </section>
+
+    <!-- WORTH KNOWING, AND DELIBERATELY NOT A KNOB (#89, owner decision).
+
+         Model tier is a real measurement and plausibly the largest lever here.
+         It is NOT advice: routing work to a weaker model to save tokens can
+         cost more in rework than it saves, and CPB measures tokens and cannot
+         see rework. So this panel has no urgency tag, no gauge, no target and
+         no arrow -- there is nothing on it that says which way is better --
+         and it is a separate panel with a heading that says so, rather than a
+         dimmed row among things the reader IS being told to change. -->
+    <section class="board" id="observations-note">
+      <h2>Worth knowing &mdash; not something to change</h2>
+      <template x-if="summary && summary.model_mix.busiest"><div class="observation">
+        <strong x-text="fmtCount(summary.model_mix.busiest.calls)"></strong> of
+        <strong x-text="fmtCount(summary.model_mix.sample_calls)"></strong> API calls
+        ran on <span class="mono" x-text="orDash(summary.model_mix.busiest.model)"></span>,
+        with <span x-text="fmtCount(summary.model_mix.models)"></span> model(s) named
+        in all.
+        <span class="obs-note">Over <span x-text="summary.model_mix.sample_is"></span>.
+          Stated, not recommended: this report counts tokens and cannot see whether
+          a cheaper model would have needed more attempts, so there is no target
+          here and no direction to move.</span>
+      </div></template>
+      <template x-if="summary && !summary.model_mix.busiest"><div class="observation">
+        No call in this period named a model, so there is no mix to report &mdash;
+        unmeasured, not zero.
+        <span class="obs-note">Over <span x-text="summary.model_mix.sample_is"></span>,
+          of which this window holds
+          <span x-text="fmtCount(summary.model_mix.sample_calls)"></span>.</span>
+      </div></template>
+    </section>
+  </section>
+
   <section id="view-overview" x-cloak x-show="view === 'overview'">
 
     <!-- The period every figure below covers, NAMED. The time picker lives in
@@ -511,6 +814,8 @@
          `#details-period` was never counted as one either, and #88 removed the
          asymmetry rather than exploiting it. -->
     <div class="period" id="overview-period">Covering <strong x-text="periodLabel"></strong>.
+      <button type="button" class="drill" @click="setView('summary')">&larr; Back to
+        the summary</button>
       <button type="button" class="drill" @click="setView('details')">Change the
         period, or see every number behind this &rarr;</button>
     </div>
@@ -567,24 +872,16 @@
         call(s) carry no context accounting at all &mdash; UNMEASURED, not zero.</div>
     </div></template>
     <template x-if="summary && summary.context.sample_calls"><div>
+      <!-- #89 TRIMMED THIS CARD TO ONE SENTENCE. The answer is now the API's
+           statement and nothing else; the scope that makes it so, and the
+           three counts that qualify it, moved into the disclosure below -- one
+           expansion down, not deleted. What did NOT move is the ranking key
+           and the two dates: a ranking whose key is one click away has not
+           named its key, and a judged boundary whose conclusion is visible has
+           to be visible with it. -->
       <div class="answer"><span class="tag" :class="contextTone"
              x-text="summary.context.utilisation.answer.verdict.toUpperCase()"></span>
         <span x-text="summary.context.utilisation.answer.statement"></span>
-        <!-- WHAT MAKES IT SO, and it is the ranking's own winner with the
-             VALUE of the key it was ranked by. A yes that named no scope would
-             leave the reader nowhere to go, and a no with no figure beside it
-             would be a claim with no evidence on a card whose evidence is
-             collapsed. Both figures come off the winning row server-side, so
-             this line and the meter below it cannot be two derivations of one
-             number. Absent when no scope ranked -- there is no winner to name,
-             and the verdict above already says so. -->
-        <template x-if="summary.context.utilisation.worst_scope !== null"><span>
-          Highest scope:
-          <strong x-text="summary.context.utilisation.worst_scope"></strong>,
-          <strong x-text="fmtPct(summary.context.utilisation.worst_scope_over_half_window_share)"></strong>
-          (<span x-text="fmtCount(summary.context.utilisation.worst_scope_over_half_window_calls)"></span>)
-          of its banded calls at or above half the window.
-        </span></template>
       </div>
       <div class="answer-key">Ranked by
         <span x-text="summary.context.utilisation.worst_scope_ranked_by"></span>.
@@ -601,7 +898,12 @@
            and each is a health check of its own one card up, which is where a
            call measuring past its own window is reported as the FAILURE it is.
            Silent on a clean corpus: a notice that never varies is one nobody
-           reads. -->
+           reads.
+
+           #89 LEFT THIS WHERE IT IS. The trim moves supporting prose, not the
+           statement that part of the period could not be read at all: an
+           absence behind a click is an absence the reader can act on the
+           figures without ever seeing. -->
       <template x-if="summary.context.utilisation.unmeasured_calls
                       || summary.context.utilisation.unknown_model_calls
                       || summary.context.utilisation.over_window_calls"><div class="answer-key">
@@ -611,9 +913,7 @@
         <span x-text="fmtCount(summary.context.utilisation.unknown_model_calls)"></span>
         on a model with no documented window,
         <span x-text="fmtCount(summary.context.utilisation.over_window_calls)"></span>
-        measuring above 100% of theirs. The first two are UNKNOWN rather than
-        low; the third is impossible, so treat the bands as suspect rather than
-        those calls as extraordinary.</div></template>
+        measuring above 100% of theirs.</div></template>
 
       <!-- THE EVIDENCE. One disclosure, and `contextOpen` decides only its
            DEFAULT: a proven YES opens the meters, because a problem must never
@@ -621,9 +921,36 @@
            state collapses because it has already stated itself above -- with
            its counts -- and none of them is a thing to act on. An absence that
            forced this open would hold it open for ever on any corpus that
-           carries one, which is the defect `HEALTH_OPEN` records. -->
+           carries one, which is the defect `HEALTH_OPEN` records.
+
+           #89 MOVED TWO THINGS IN HERE, both of them supporting prose rather
+           than the answer: the scope the ranking won on, and the three counts
+           the answer could not range over. Neither was deleted, and neither
+           lost a figure -- a proven YES opens this by default, so on the one
+           state where they matter most they are on screen without a click. -->
       <details class="disclosure" id="context-detail" :open="contextOpen">
         <summary>The meters, the growth curve, and how all of it is computed</summary>
+
+        <!-- WHAT MAKES THE ANSWER SO, and it is the ranking's own winner with
+             the VALUE of the key it was ranked by. Both figures come off the
+             winning row server-side, so this line and the meters below it
+             cannot be two derivations of one number. Absent when no scope
+             ranked -- there is no winner to name, and the verdict above
+             already says so. -->
+        <template x-if="summary.context.utilisation.worst_scope !== null">
+          <span class="context-line">Highest scope:
+            <strong x-text="summary.context.utilisation.worst_scope"></strong>,
+            <strong x-text="fmtPct(summary.context.utilisation.worst_scope_over_half_window_share)"></strong>
+            (<span x-text="fmtCount(summary.context.utilisation.worst_scope_over_half_window_calls)"></span>)
+            of its banded calls at or above half the window.</span>
+        </template>
+
+        <!-- The prose that qualified those three counts, one expansion down
+             rather than three lines into the resting card. The COUNTS stay
+             above; what moved is the sentence explaining what they mean. -->
+        <span class="context-line">Of the counts above, the first two are
+          UNKNOWN rather than low; the third is impossible, so treat the bands
+          as suspect rather than those calls as extraordinary.</span>
 
         <!-- #61: SCOPED FIRST, POOLED SECOND.
 
@@ -1734,6 +2061,143 @@ const PROVENANCE_VOICE = {
 function provenanceVoice(p) {
   return PROVENANCE_VOICE[p.kind] ?? PROVENANCE_VOICE.judged;
 }
+// ---------------------------------------------------------------------------
+// #89: THE GAUGE. Geometry only -- not one threshold, not one boundary.
+//
+// The dial's shape is the only thing decided here: where a semicircle starts,
+// how long the needle is, how far a tick pokes through the arc. Everything the
+// gauge MEANS -- which range an arc covers, where a cut point sits, what the
+// reader should aim for, where the needle points -- arrives on the payload as
+// a position in [0, 1], computed by `serve.Api._gauge()` from
+// `recommendations.METRICS`. A number from that table typed into this file
+// would be a threshold with no date and no provenance, and the page and the
+// advice would become two enumerations free to disagree; the suite fails on
+// any of the table's boundaries appearing here as a literal.
+// ---------------------------------------------------------------------------
+const GAUGE = { cx: 30, cy: 34, r: 24, needle: 18, tickInner: 20, tickOuter: 28 };
+
+// A point on the sweep: `t` runs 0 (left) to 1 (right) over a half turn.
+// CLAMPED, because a position outside the dial would silently draw a needle
+// somewhere the arithmetic never put it -- and the API's positions are
+// fractions of a range by construction, so a value outside [0, 1] is a bug to
+// pin against the edge and see, not one to extrapolate.
+function gaugePoint(t, radius) {
+  const angle = Math.PI * (1 + Math.min(1, Math.max(0, t)));
+  return [
+    (GAUGE.cx + radius * Math.cos(angle)).toFixed(2),
+    (GAUGE.cy + radius * Math.sin(angle)).toFixed(2),
+  ];
+}
+function arcPath(start, end) {
+  const from = gaugePoint(start, GAUGE.r);
+  const to = gaugePoint(end, GAUGE.r);
+  return `M${from[0]} ${from[1]} A${GAUGE.r} ${GAUGE.r} 0 0 1 ${to[0]} ${to[1]}`;
+}
+// ABSENCE FIRST, as everywhere on this page. A metric with no sample has no
+// needle at all -- never one resting at the left of the dial, which for four
+// of the five metrics is the WORST reading there is. The template guards this
+// too; the guard is here as well so the rule survives a second call site.
+function needlePath(t) {
+  if (t === null || t === undefined) return "";
+  const point = gaugePoint(t, GAUGE.needle);
+  return `M${GAUGE.cx} ${GAUGE.cy} L${point[0]} ${point[1]}`;
+}
+function tickPath(t) {
+  const inner = gaugePoint(t, GAUGE.tickInner);
+  const outer = gaugePoint(t, GAUGE.tickOuter);
+  return `M${inner[0]} ${inner[1]} L${outer[0]} ${outer[1]}`;
+}
+// EVERY SUBPATH OF ONE TONE, IN ONE `d`. The dial cannot hold an `x-for`: a
+// `<template>` inside `<svg>` is parsed as an SVG-namespaced element with no
+// `.content`, so Alpine has nothing to clone. One element per TONE instead,
+// each drawing whichever segments or boundaries resolve to it -- which keeps
+// the fallback tones real elements rather than filters, so a severity or a
+// provenance kind this build has never seen is still drawn.
+function arcPathsFor(segments, tone) {
+  return segments
+    .filter(s => arcTone(s.severity) === tone)
+    .map(s => arcPath(s.start, s.end))
+    .join(" ");
+}
+function tickPathsFor(boundaries, tone) {
+  return boundaries
+    .filter(b => tickVoice(b.kind) === tone)
+    .map(b => tickPath(b.position))
+    .join(" ");
+}
+// The boundary the reader is aiming for, as a list of NOUGHT OR ONE. A list so
+// the template can bind it without inventing a variable, and nought when the
+// table has no healthy range for this metric: there is then nothing to aim
+// for, and the row says nothing rather than pointing at whichever edge came
+// first.
+function targetsOf(gauge) {
+  return gauge.boundaries.filter(b => b.is_target);
+}
+
+// One colour per SEVERITY, one label per severity, one voice per PROVENANCE
+// KIND, and one tone per strip STATE -- four tables, for the reason
+// `HEALTH_TONE` and `PROVENANCE_VOICE` are tables: a chain of ifs could quietly
+// return the same class for two states, and a test can assert these cover the
+// API's vocabularies exactly.
+//
+// Every fallback runs the same direction as the rest of this page: an
+// unrecognised value takes the LOUDEST treatment, never the reassuring one and
+// never no treatment at all. A severity this build has never seen is exactly
+// the one that must not draw as a healthy arc.
+const SEVERITY_ARC = { ok: "arc-ok", watch: "arc-watch", act: "arc-act" };
+const SEVERITY_ARC_UNRECOGNISED = "arc-extra";
+function arcTone(severity) {
+  return SEVERITY_ARC[severity] ?? SEVERITY_ARC_UNRECOGNISED;
+}
+// The urgency tag: the severity as something to DO about it, which is what a
+// summary is for. `null` is not an unrecognised severity -- it is the API
+// saying this metric has no reading -- so it gets its own label and its own
+// neutral tone rather than the loud fallback, and the row says the same thing
+// in the API's own words beside the figure.
+const URGENCY_TAG = { ok: "FINE", watch: "WATCH", act: "DO NOW" };
+const URGENCY_TAG_UNRECOGNISED = "DO NOW";
+const URGENCY_TAG_UNMEASURED = "NO READING";
+const URGENCY_CLASS = { ok: "tag-fine", watch: "tag-soon", act: "tag-now" };
+const URGENCY_CLASS_UNRECOGNISED = "tag-now";
+const URGENCY_CLASS_UNMEASURED = "tag-none";
+function urgencyTag(severity) {
+  if (severity === null || severity === undefined) return URGENCY_TAG_UNMEASURED;
+  return URGENCY_TAG[severity] ?? URGENCY_TAG_UNRECOGNISED;
+}
+function urgencyClass(severity) {
+  if (severity === null || severity === undefined) return URGENCY_CLASS_UNMEASURED;
+  return URGENCY_CLASS[severity] ?? URGENCY_CLASS_UNRECOGNISED;
+}
+// WHICH WAY IS BETTER, read off the metric's own `worse_when`. The page never
+// decides it: two of these five metrics are worse when LOWER, and a page that
+// assumed one direction would draw an arrow pointing away from the advice.
+const AIM_WORDS = { higher: "↓ aim under", lower: "↑ aim above" };
+const AIM_WORD_UNRECOGNISED = "target";
+function aimWord(worseWhen) {
+  return AIM_WORDS[worseWhen] ?? AIM_WORD_UNRECOGNISED;
+}
+// The dial's own copy of `PROVENANCE_VOICE`, in stroke rather than in a border,
+// falling back to JUDGED for the same reason: a boundary this page cannot
+// classify is exactly the one that must not read as documented.
+const TICK_VOICE = {
+  cited: "tick-cited",
+  judged: "tick-judged",
+  structural: "tick-structural",
+};
+function tickVoice(kind) {
+  return TICK_VOICE[kind] ?? TICK_VOICE.judged;
+}
+const STRIP_DOT_TONE = {
+  good: "dot-good",
+  watch: "dot-watch",
+  bad: "dot-bad",
+  unknown: "dot-unknown",
+};
+const STRIP_DOT_TONE_UNRECOGNISED = "dot-bad";
+function dotTone(state) {
+  return STRIP_DOT_TONE[state] ?? STRIP_DOT_TONE_UNRECOGNISED;
+}
+
 function fmtTokRounded(n) {
   // The guard comes BEFORE the rounding on purpose: `Math.round(null)` is 0,
   // so rounding first turns a window that measured nothing into a measured 0.
@@ -1991,11 +2455,20 @@ const SUBAGENT_STATUS = {
 // it, so this adds no handler, no parameter to validate and no request.
 // ---------------------------------------------------------------------------
 
-const VIEWS = ["overview", "details"];
+// #89 made it THREE, in altitude order: what to do, why, and everything.
+const VIEWS = ["summary", "overview", "details"];
+// The LABEL each one wears. It is a TABLE and not a string in the markup
+// because the key and the label deliberately differ for two of the three: the
+// keys are the ones #70 shipped, which is what a bookmark carries, and giving
+// `details` a new meaning would resolve an existing link to a page it never
+// named -- `docs/versioning.md`'s worst kind of break, because nothing about
+// it fails loudly. So the URL keeps its names and the reader gets theirs.
+const VIEW_LABELS = { summary: "Summary", overview: "Details", details: "Raw data" };
 // The LANDING view. The owner's decision, and the one thing about this split
-// that is not a preference: the overview answers the question most people
-// arrive with, and the reader who wants raw data knows that they do.
-const DEFAULT_VIEW = "overview";
+// that is not a preference: the summary answers the question most people
+// arrive with -- what do I do? -- and the reader who wants the reasoning or
+// the raw data knows that they do.
+const DEFAULT_VIEW = "summary";
 const DEFAULT_RANGE_DAYS = 7;
 // The range presets the picker offers, as the URL spells them. Anything else
 // in `range=` is not a preset and is ignored in favour of an explicit
@@ -2138,6 +2611,18 @@ function report() {
       if (this.filters.scope) p.set("scope", this.filters.scope);
       if (this.filters.models) p.set("models", this.filters.models.join(","));
       history.replaceState(null, "", "#" + p.toString());
+    },
+
+    // #89: the tabs are ITERATED over these, so every view this page can show
+    // has a way in and a way back, and a fourth could not be added without
+    // one. A label this build has no entry for falls back to the view's own
+    // key -- the honest thing a page can say about a state it has.
+    get views() {
+      return VIEWS;
+    },
+
+    viewLabel(view) {
+      return VIEW_LABELS[view] ?? view;
     },
 
     setView(view) {

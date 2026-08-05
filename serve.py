@@ -42,7 +42,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path, PurePath
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -76,12 +76,20 @@ from recommendations import (
     RANKING_PROVENANCE,
     RECOMMENDATION_PROVENANCE,
     RECOMMENDATIONS_AS_OF,
+    SEVERITY_ACT,
+    SEVERITY_OK,
+    SEVERITY_RANK,
+    SEVERITY_WATCH,
     UNMEASURED_NOTE,
+    WORSE_WHEN_HIGHER,
     Assessment,
+    Assessments,
     Lever,
+    Metric,
     Provenance,
     assess_all,
     cache_write_repayment,
+    depth_in_band,
 )
 EASTERN = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
@@ -145,6 +153,95 @@ def _refuse_unwired_metrics(declared: frozenset[str], table: frozenset[str]) -> 
 
 
 _refuse_unwired_metrics(RECOMMENDED_METRICS, frozenset(METRICS))
+
+# --------------------------------------------------------------------------
+# #89: the summary level -- the four-dot status strip and the knob rows.
+#
+# Three levels over ONE payload: the summary (what do I do?), the four question
+# cards (why?), and the raw data (show me everything). Everything this block
+# adds is a READING of something already computed for the other two levels --
+# `health`, `context`, and the `recommendations` table -- never a second
+# derivation of it. That is why `_status()` takes those three blocks as
+# arguments, exactly as `_health()` and `_recommendations()` take `context`: a
+# strip that ran its own queries would be a second opinion on the numbers it
+# summarises, and a summary that disagreed with the level below it is the one
+# defect a three-level page makes easy.
+#
+# NO THRESHOLD IS AUTHORED HERE OR IN THE PAGE. Every number a gauge draws --
+# where an arc starts and stops, where a tick sits, what the reader should aim
+# for -- is a boundary in `recommendations.METRICS`, carried across with the
+# provenance that boundary already has. The one thing added is GEOMETRY: which
+# fraction of a semicircular sweep a value sits at, which is arithmetic over
+# the table's own ordered ranges.
+# --------------------------------------------------------------------------
+
+# Which metrics the summary's cache dot ranges over. A SECOND enumeration of a
+# subset of one set, so it gets `RECOMMENDED_METRICS`' treatment rather than
+# its own habits: checked against the wired set AT IMPORT, because a cache
+# metric added to the table and not named here would leave the dot reporting
+# "working" over a reading it never looked at -- the milder of two true
+# statements, chosen by an omission.
+#
+# It carries NO number. Which metrics measure the cache is a statement about
+# what was divided by what; where a cache reading stops being healthy is the
+# table's, and this set never decides it.
+CACHE_METRICS = frozenset(
+    {
+        METRIC_CACHE_READS_PER_WRITE,
+        METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+        METRIC_CACHE_WRITE_ONLY_SHARE,
+    }
+)
+
+
+def _refuse_ungrouped_cache_metrics(
+    cache: frozenset[str], wired: frozenset[str]
+) -> None:
+    """Refuse to import if the cache group names a metric nothing computes."""
+    stray = sorted(cache - wired)
+    if stray:
+        raise RuntimeError(
+            f"serve.CACHE_METRICS names {stray}, which serve.RECOMMENDED_METRICS "
+            "does not: a dot cannot report on a reading nothing measures."
+        )
+
+
+_refuse_ungrouped_cache_metrics(CACHE_METRICS, RECOMMENDED_METRICS)
+
+
+def _refuse_unhandled_states(
+    what: str, handled: Iterable[str], declared: Iterable[str]
+) -> None:
+    """Refuse to import unless a state table covers its vocabulary exactly.
+
+    Both directions. A state with no entry is the one a `.get()` default would
+    render as whichever verdict was convenient; an entry for a state that no
+    longer exists is a translation nothing can reach, and it makes the table
+    look more complete than it is.
+    """
+    handled, declared = frozenset(handled), frozenset(declared)
+    if handled != declared:
+        raise RuntimeError(
+            f"{what} does not cover its states exactly: unhandled "
+            f"{sorted(declared - handled)}, unknown {sorted(handled - declared)}"
+        )
+
+
+# What the model-mix observation ranges over, named ONCE and carried in the
+# payload -- `CONTEXT_SAMPLE`'s rule for a figure that is not a recommendation.
+#
+# IT IS AN OBSERVATION AND NOT ADVICE, and the distinction is an owner
+# decision rather than a presentation choice: routing work to a weaker model to
+# save tokens can cost more in rework than it saves, and CPB measures tokens,
+# not rework. So this block carries no severity, no lever, no target and no
+# direction -- there is nothing here that could be turned into a knob by a
+# later change without somebody deciding to -- and it is deliberately NOT a
+# member of `recommendations.METRICS`, whose entries all carry exactly those
+# things.
+MODEL_MIX_SAMPLE = (
+    "API calls in this window, both scopes, grouped by the model each one "
+    "names -- one row per model, not per model and scope"
+)
 
 # What the "top dispatches" ranking orders by, named ONCE (#30). The panel
 # was headed "by spend" for its whole life while `agents()` ordered by
@@ -458,6 +555,84 @@ CONTEXT_ANSWER_STATEMENTS = {
         "a zero."
     ),
 }
+
+
+# The strip's own four states. THREE vocabularies reach this line -- the health
+# verdict's, the context answer's and the table's severities -- and each is
+# translated into these rather than rendered raw, so the four dots can be read
+# in one glance without the reader learning three sets of words.
+#
+# `STRIP_UNKNOWN` is the load-bearing member and is NOT a fourth shade of
+# `STRIP_WATCH`: "we could not check" and "we checked and it is middling" are
+# different claims, and collapsing them is the substitution this repository
+# refuses everywhere else. A dot with no measurement behind it must never wear
+# the colour of one that has.
+STRIP_GOOD = "good"
+STRIP_WATCH = "watch"
+STRIP_BAD = "bad"
+STRIP_UNKNOWN = "unknown"
+# Worst first, so "the worst state any reading reached" is a lookup rather than
+# a comparison somebody writes out. `STRIP_UNKNOWN` sits between `watch` and
+# `good` for the same reason `HEALTH_ORDER` puts `unchecked` there: an
+# unestablished answer may weaken a clean one and may never soften a bad one.
+STRIP_ORDER = (STRIP_BAD, STRIP_WATCH, STRIP_UNKNOWN, STRIP_GOOD)
+
+# One entry per state of each vocabulary, checked EXHAUSTIVE at import. A state
+# added upstream with no entry here would otherwise reach `KeyError` at request
+# time -- a 500 over the whole payload -- or, worse, a `.get(..., default)`
+# that quietly rendered a new failure state as a clean dot.
+STRIP_FROM_HEALTH: dict[str, tuple[str, str]] = {
+    HEALTH_OK: (STRIP_GOOD, "Nothing broken"),
+    HEALTH_UNCHECKED: (STRIP_UNKNOWN, "Not fully checked"),
+    HEALTH_FAILED: (STRIP_BAD, "Something is broken"),
+}
+STRIP_FROM_CONTEXT: dict[str, tuple[str, str]] = {
+    CONTEXT_ANSWER_YES: (STRIP_BAD, "Yes"),
+    CONTEXT_ANSWER_NO: (STRIP_GOOD, "No"),
+    CONTEXT_ANSWER_INCONCLUSIVE: (STRIP_UNKNOWN, "Not established"),
+    CONTEXT_ANSWER_UNKNOWN: (STRIP_UNKNOWN, "Unknown"),
+    CONTEXT_ANSWER_NO_SAMPLE: (STRIP_UNKNOWN, "No sample"),
+}
+STRIP_FROM_SEVERITY: dict[str, tuple[str, str]] = {
+    SEVERITY_OK: (STRIP_GOOD, "Repaying"),
+    SEVERITY_WATCH: (STRIP_WATCH, "Watch"),
+    SEVERITY_ACT: (STRIP_BAD, "Not repaying"),
+}
+# What the cache dot says when not one of its metrics has a sample. Named
+# rather than defaulted, because "no cache reading in this window" is a
+# statement and an empty dot is not.
+STRIP_CACHE_UNMEASURED = "Not measured"
+
+# The four questions, in the order they are read. Chosen so the strip runs from
+# "is it broken" to "is the discount working": a reader who stops after one dot
+# has stopped on the one that would invalidate the rest.
+STRIP_DOT_BROKEN = "broken"
+STRIP_DOT_CONTEXT = "context"
+STRIP_DOT_KNOBS = "knobs"
+STRIP_DOT_CACHE = "cache"
+STRIP_QUESTIONS: dict[str, str] = {
+    STRIP_DOT_BROKEN: "Anything broken?",
+    STRIP_DOT_CONTEXT: "Wasting context?",
+    STRIP_DOT_KNOBS: "Knobs worth turning",
+    STRIP_DOT_CACHE: "Cache health",
+}
+STRIP_DOTS = (
+    STRIP_DOT_BROKEN,
+    STRIP_DOT_CONTEXT,
+    STRIP_DOT_KNOBS,
+    STRIP_DOT_CACHE,
+)
+_refuse_unhandled_states("STRIP_FROM_HEALTH", STRIP_FROM_HEALTH, HEALTH_ORDER)
+_refuse_unhandled_states(
+    "STRIP_FROM_CONTEXT", STRIP_FROM_CONTEXT, CONTEXT_ANSWER_STATES
+)
+_refuse_unhandled_states("STRIP_FROM_SEVERITY", STRIP_FROM_SEVERITY, SEVERITY_RANK)
+_refuse_unhandled_states("STRIP_QUESTIONS", STRIP_QUESTIONS, STRIP_DOTS)
+_refuse_unhandled_states(
+    "STRIP_ORDER",
+    STRIP_ORDER,
+    {STRIP_GOOD, STRIP_WATCH, STRIP_BAD, STRIP_UNKNOWN},
+)
 
 # #65: the growth curve. THE finding that makes the context figures actionable
 # -- typical main-session context across the four quarters of its own life,
@@ -2249,6 +2424,12 @@ class Api:
             "ranking_provenance": RANKING_PROVENANCE,
             "unmeasured_note": UNMEASURED_NOTE,
             "ranked": [self._assessment_payload(a) for a in assessed.ranked],
+            # #89's summary level, in the SAME order and off the SAME
+            # `Assessment` objects the diagnosis one level down reads. One row
+            # per metric, measured or not, so "four knobs exist and two are
+            # already fine" is a thing the page can show rather than infer from
+            # a list that dropped the healthy ones.
+            "knobs": self._knobs(assessed),
             # A MAPPING, metric -> what would have been measured, not a list of
             # rows: an unmeasured metric has no reading, no severity and no
             # advice, so there are no columns to tabulate. `UNMEASURED_NOTE`
@@ -2409,6 +2590,325 @@ class Api:
         if main is None or not subagent:
             return None
         return main / subagent
+
+    # ----------------------------------------------------------------------
+    # #89: the same table, drawn -- the summary level's knobs and gauges
+    # ----------------------------------------------------------------------
+
+    @classmethod
+    def _knobs(cls, assessed: Assessments) -> list[dict[str, Any]]:
+        """One row per metric, worst first, then the ones with no sample.
+
+        THE ORDER IS THE TABLE'S. `assessed.ranked` is already sorted by
+        `recommendations.rank()` -- severity, then depth into the severity
+        band, then key -- and nothing here re-sorts it. A second ordering in
+        this file would be a second judgment about which lever matters most,
+        undated and with no provenance, which is `RANKING_PROVENANCE`'s whole
+        subject.
+
+        THE UNMEASURED ONES ARE ROWS, not an omission. A knob whose reading has
+        no sample still exists, and the summary shows it dimmed with an empty
+        gauge: seeing that four knobs exist and two are already fine is what
+        stops the page becoming a list of complaints, and a metric that simply
+        vanished would be indistinguishable from a healthy one -- the defect
+        the table's explicit healthy entry exists to prevent, at the level
+        where it is hardest to see.
+
+        EVERY FIGURE IS READ OFF THE SAME `Assessment` THE LEVEL BELOW READS.
+        Not recomputed, not re-derived: `_assessment_payload()` and this method
+        are two renderings of one object, so the summary and the diagnosis
+        cannot disagree about a value, a severity or a directive. That is the
+        `RANKED_BY` discipline applied to a page split into levels, and
+        tests/test_serve.py asserts the two agree field by field.
+        """
+        rows = [
+            {
+                "metric": a.metric,
+                "measurement": a.measurement,
+                "value": a.value,
+                "severity": a.severity,
+                # The module's own action-oriented phrase, composed from a
+                # closed registry inside `Lever`. Never assembled here: a
+                # directive built in this file from `action` and `target` would
+                # route around the guard that makes "reduce your cache reads"
+                # unrepresentable rather than merely absent.
+                "directive": None if a.lever is None else a.lever.directive,
+                "gauge": cls._gauge(METRICS[a.metric], a.value),
+            }
+            for a in assessed.ranked
+        ]
+        rows.extend(
+            {
+                "metric": key,
+                "measurement": METRICS[key].measurement,
+                # THREE NULLS, and none of them a zero. No reading, no
+                # severity, nothing to do -- the gauge below carries no needle
+                # for the same reason, and `unmeasured_note` beside it says so
+                # in words.
+                "value": None,
+                "severity": None,
+                "directive": None,
+                "gauge": cls._gauge(METRICS[key], None),
+            }
+            for key in assessed.unmeasured
+        )
+        return rows
+
+    @classmethod
+    def _gauge(cls, metric: Metric, value: Optional[float]) -> dict[str, Any]:
+        """A metric's ranges as a drawable sweep. NO NUMBER ORIGINATES HERE.
+
+        The gauge is a VISUALISATION OF THE TABLE and needs no new judgment:
+        the coloured arcs are the metric's own ranges with their own
+        severities, the ticks are its own boundaries carrying their own
+        per-boundary provenance, the target is the edge of its own healthy
+        range, and the needle is this window's measured value. A boundary
+        authored in this method, or in `index.html`, would be a threshold with
+        no date, no provenance and nothing to redline -- the alternative
+        `recommendations.py` was written to replace, reappearing in the layer
+        that draws it.
+
+        WHAT IS ADDED IS GEOMETRY, WHICH IS NOT A JUDGMENT. Each range gets an
+        equal share of the sweep -- `1 / len(ranges)` -- and a value sits at
+        the fraction of the way through its own range. Equal shares rather than
+        a linear value axis because a linear one would need a maximum, and no
+        metric here has one: the top range of every metric is unbounded on
+        purpose, and inventing a ceiling to draw against is exactly the
+        `depth_in_band()` refusal one module over.
+
+        POSITION IS ALONG THE VALUE AXIS, NEVER ALONG HARM. `depth_in_band()`
+        is called with `WORSE_WHEN_HIGHER` for every metric, which here means
+        "further right", not "worse" -- it is the function's own left-to-right
+        reading, and it carries the rule that an unbounded band is measured by
+        the reciprocal of its entry boundary rather than against a made-up
+        ceiling. Which end is the good one is a separate published field,
+        `worse_when`, read straight off the metric.
+
+        `needle` is None -- never 0.0 -- for a metric with no sample. A needle
+        resting at the left of the dial is a reading of zero, which for four of
+        the five metrics here is the WORST possible one; drawing absence there
+        would be this repository's central rule failing in a new visual form.
+        """
+        ranges = metric.ranges
+        span = len(ranges)
+        target = cls._healthy_edge_index(metric)
+        return {
+            # Which direction the reader should want to move, from the table.
+            "worse_when": metric.worse_when,
+            "segments": [
+                {
+                    "severity": entry.recommendation.severity,
+                    "start": i / span,
+                    "end": (i + 1) / span,
+                }
+                for i, entry in enumerate(ranges)
+            ],
+            # The CUT POINTS, one per internal boundary. The first range's
+            # lower edge is not one of them: it is the domain floor -- a share
+            # cannot be negative -- so it is where the dial starts rather than
+            # a line anybody drew. Each carries the KIND and the STATEMENT of
+            # its own provenance, so a judged cut point and a documented one
+            # are distinguishable on the dial itself and not only in a table
+            # one level down (#31's `band_provenance` rule, at #78's grain).
+            "boundaries": [
+                {
+                    "value": entry.lower.value,
+                    "position": i / span,
+                    "kind": entry.lower.provenance.kind,
+                    "statement": entry.lower.provenance.statement,
+                    # The one the reader is aiming for: the edge of the healthy
+                    # range, which already exists and is already provenanced.
+                    "is_target": i == target,
+                }
+                for i, entry in enumerate(ranges)
+                if i > 0
+            ],
+            "needle": None if value is None else cls._gauge_position(metric, value),
+        }
+
+    @staticmethod
+    def _healthy_edge_index(metric: Metric) -> Optional[int]:
+        """Which boundary the healthy range ends at, by index into `ranges`.
+
+        Derived from the table, twice over: which ranges are healthy is the
+        entries' own severity, and which of the healthy run's two edges faces
+        the harm is the metric's own `worse_when`. Nothing here decides where
+        the number is.
+
+        None when no range is healthy at all. No metric is shaped that way
+        today, and the honest answer if one ever is would be that there is
+        nothing to aim for -- not a target picked from whichever end came
+        first.
+        """
+        healthy = [
+            i
+            for i, entry in enumerate(metric.ranges)
+            if entry.recommendation.severity == SEVERITY_OK
+        ]
+        if not healthy:
+            return None
+        # `ranges` is ordered low to high, so the boundary between the healthy
+        # run and its neighbour is above the run where higher is worse and
+        # below it where lower is. Boundary `i` IS `ranges[i].lower`, and
+        # adjacent ranges share one `Boundary` object, so either spelling names
+        # the same number with the same provenance.
+        if metric.worse_when == WORSE_WHEN_HIGHER:
+            return healthy[-1] + 1
+        return healthy[0]
+
+    @staticmethod
+    def _gauge_position(metric: Metric, value: float) -> float:
+        """Where `value` sits along the sweep, in [0, 1].
+
+        `range_for()` decides which range, so the drawing and the advice agree
+        by construction: the needle cannot land under an arc the table would
+        not have put it under.
+        """
+        span = len(metric.ranges)
+        entry = metric.range_for(value)
+        index = next(i for i, r in enumerate(metric.ranges) if r is entry)
+        within = depth_in_band(
+            value,
+            entry.lower.value,
+            None if entry.upper is None else entry.upper.value,
+            WORSE_WHEN_HIGHER,
+        )
+        return (index + within) / span
+
+    # ----------------------------------------------------------------------
+    # #89: the four-dot status strip
+    # ----------------------------------------------------------------------
+
+    @classmethod
+    def _status(
+        cls,
+        health: dict[str, Any],
+        context: dict[str, Any],
+        recommendations: dict[str, Any],
+    ) -> dict[str, Any]:
+        """The summary's one-line strip: four questions, four states.
+
+        STATUS, NOT CONTENT. Each dot says which of four states its question is
+        in and answers it in two or three words; everything that makes the
+        answer true is one level down, on the card that already states it.
+
+        EVERY ANSWER IS READ, NEVER RE-DERIVED. The three blocks arrive as
+        arguments -- the same objects the rest of the payload carries -- so a
+        dot cannot disagree with the card it summarises. A strip that ran its
+        own queries would be a fifth opinion in a payload that has spent this
+        much effort having one.
+        """
+        health_state, health_answer = STRIP_FROM_HEALTH[health["verdict"]]
+        utilisation = context["utilisation"]
+        context_verdict = utilisation["answer"]["verdict"]
+        context_state, context_answer = STRIP_FROM_CONTEXT[context_verdict]
+        # WHICH SCOPE, where there is a proven one and only there. The worst
+        # scope is the ranking's own winner, off the same tally question 2
+        # ranks on; where the answer is not a proven yes there is no winner to
+        # name and the verdict already says so.
+        if context_verdict == CONTEXT_ANSWER_YES and utilisation["worst_scope"]:
+            context_answer = f"{context_answer} — {utilisation['worst_scope']}"
+        knobs = recommendations["knobs"]
+        turnable = [k for k in knobs if k["directive"]]
+        knob_state, _ = cls._worst_strip_state(
+            [k["severity"] for k in knobs if k["severity"] is not None]
+        )
+        cache = [k["severity"] for k in knobs if k["metric"] in CACHE_METRICS]
+        cache_state, cache_answer = cls._worst_strip_state(
+            [severity for severity in cache if severity is not None]
+        )
+        answers = {
+            STRIP_DOT_BROKEN: (health_state, health_answer),
+            STRIP_DOT_CONTEXT: (context_state, context_answer),
+            # A COUNT, not a verdict in words: "2 of 5" says both how many
+            # knobs are worth turning and how many exist, and the second half
+            # is what stops a page of two rows reading as a page of two
+            # problems.
+            STRIP_DOT_KNOBS: (
+                knob_state,
+                f"{len(turnable)} of {len(knobs)}",
+            ),
+            STRIP_DOT_CACHE: (
+                cache_state,
+                cache_answer if cache_state != STRIP_UNKNOWN
+                else STRIP_CACHE_UNMEASURED,
+            ),
+        }
+        return {
+            "dots": [
+                {
+                    "key": key,
+                    "question": STRIP_QUESTIONS[key],
+                    "state": answers[key][0],
+                    "answer": answers[key][1],
+                }
+                for key in STRIP_DOTS
+            ]
+        }
+
+    @staticmethod
+    def _worst_strip_state(severities: list[str]) -> tuple[str, str]:
+        """The worst of a run of table severities, as a strip state.
+
+        NO SEVERITY ORDERING IS SPELLED HERE. `SEVERITY_RANK` is the module's
+        own explicit ordering -- not alphabetical and not declaration order --
+        and this reads it.
+
+        An EMPTY run is `STRIP_UNKNOWN`, never `STRIP_GOOD`. No reading is not
+        a clean reading, and a dot that went green because nothing was measured
+        is the exact failure this project is arranged against.
+        """
+        if not severities:
+            return STRIP_UNKNOWN, STRIP_CACHE_UNMEASURED
+        worst = max(severities, key=lambda s: SEVERITY_RANK[s])
+        return STRIP_FROM_SEVERITY[worst]
+
+    # ----------------------------------------------------------------------
+    # #89: the model mix -- an observation, and deliberately not advice
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _model_mix(models: list[dict[str, Any]]) -> dict[str, Any]:
+        """Which model this window's calls actually ran on.
+
+        WHY THIS IS NOT A RECOMMENDATION, and why it is not in the table. It is
+        a real measurement and plausibly the largest single lever on the page:
+        measured 2026-08-05 on this project's own corpus, 3,489 subagent
+        replies ran on Opus against 5 on Haiku. It is nonetheless NOT advice,
+        by owner decision -- routing work to a weaker model to save tokens can
+        cost more in rework than it saves, and CPB measures tokens and cannot
+        see rework. There is therefore no severity to give it, no lever to pull
+        and no direction to move, and `recommendations.assess_all()` would
+        rightly refuse a metric with none of those. So it is stated, never
+        prescribed, and it is read off `models` -- the breakdown the payload
+        already carries -- rather than measured again.
+
+        It names no tier and ranks no model against another. "The top tier" is
+        a claim about Anthropic's line-up that this project has not checked and
+        would have to date; the busiest model's own NAME is a measurement, and
+        the reader knows what they asked for.
+
+        `busiest` is None -- never a row of zeroes -- when the window holds no
+        call. `model` inside it may itself be None, which is a call whose model
+        the transcript never recorded: unmeasured, and rendered as such.
+        """
+        by_model: dict[Optional[str], int] = defaultdict(int)
+        for row in models:
+            by_model[row["model"]] += row["calls"]
+        busiest = None
+        if by_model:
+            # Deterministic beyond the count, so two models tied on calls do
+            # not swap places between requests over one unchanged database.
+            model, calls = sorted(
+                by_model.items(), key=lambda kv: (-kv[1], kv[0] or "")
+            )[0]
+            busiest = {"model": model, "calls": calls}
+        return {
+            "sample_is": MODEL_MIX_SAMPLE,
+            "sample_calls": sum(by_model.values()),
+            "models": len(by_model),
+            "busiest": busiest,
+        }
 
     @classmethod
     def _assessment_payload(cls, assessment: Assessment) -> dict[str, Any]:
@@ -2670,6 +3170,9 @@ class Api:
         ).fetchone()
         context = self._context(start, end)
         ingest = self._ingest_health()
+        health = self._health(ingest, context)
+        models = self.models(start, end)
+        recommendations = self._recommendations(start, end, context)
         return {
             **dict(row),
             "ingest": ingest,
@@ -2679,12 +3182,20 @@ class Api:
             # for the same reason `_recommendations()` takes `context`: a
             # verdict that ran its own queries would be a second opinion on the
             # very numbers it qualifies.
-            "health": self._health(ingest, context),
+            "health": health,
             "context": context,
             "scope": self._scope(start, end),
             "durability": self._durability(start, end),
-            "models": self.models(start, end),
-            "recommendations": self._recommendations(start, end, context),
+            "models": models,
+            "recommendations": recommendations,
+            # #89's summary level. Both blocks are READINGS of what is already
+            # in this dict -- the strip of `health`, `context` and the table's
+            # own knobs; the mix of `models` -- so the level that says what to
+            # do and the levels that say why cannot report different numbers.
+            # `models` and `recommendations` are computed into locals above for
+            # exactly that reason: calling them twice would be two samples.
+            "status": self._status(health, context, recommendations),
+            "model_mix": self._model_mix(models),
         }
 
     def timeseries(self, start: float, end: float, by: str) -> dict[str, Any]:
