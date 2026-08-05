@@ -64,14 +64,107 @@ that measurement should be inspectable, including when it is wrong.
 
 ## Install
 
+CPB ships as a **Claude Code plugin**. Enabling it activates three hooks that
+ingest each transcript as it is written, so the report stays current without
+anyone remembering to run anything.
+
+There is no marketplace yet, so install by cloning into your personal skills
+directory. Claude Code loads any folder there that contains a
+`.claude-plugin/plugin.json` as a plugin on the next session — no install step,
+no copy into a cache:
+
 ```bash
-git clone https://github.com/vlad-ko/claude-piggy-bank.git
-cd claude-piggy-bank
+git clone https://github.com/vlad-ko/claude-piggy-bank.git \
+  ~/.claude/skills/claude-piggy-bank
 ```
 
-That is the install. There are no dependencies.
+Restart Claude Code and it loads as `claude-piggy-bank@skills-dir`.
+
+To try it without installing anything — for development, or to read the code
+before trusting it with your history:
+
+```bash
+git clone https://github.com/vlad-ko/claude-piggy-bank.git
+claude --plugin-dir ./claude-piggy-bank
+```
+
+Either way there are no dependencies: the plugin *is* this repository, the hooks
+run the same `ingest.py` you would run by hand, and nothing is compiled or
+fetched.
+
+### What the hooks do
+
+Enabling the plugin activates three triggers. **No edit to any
+`.claude/settings.json` is needed.**
+
+| trigger | when it fires | what it ingests |
+|---|---|---|
+| `SubagentStop` | a subagent finishes | that subagent's own transcript |
+| `Stop` | Claude finishes a response | the session transcript, per turn |
+| `SessionEnd` | the session ends | the session transcript, best-effort |
+
+Each one spawns `ingest.py` for **exactly one file** — no directory scans, no
+network, no model. `SubagentStop` is the one that earns its place: subagent
+transcripts are reaped, and on the reference corpus 211 subagent runs are
+already permanently unmeasurable while subagents are ~78% of all API calls.
+Ingesting the moment a subagent finishes is the difference between capturing
+that spend and losing it.
+
+If an ingest fails, the hook says so in one line in your transcript and appends
+it to `cpb-hook.log` beside the database — and then **gets out of the way**. It
+never blocks a turn, never stops a subagent, and never reports success for work
+it did not do. The reasoning, and the plugin design generally, is in
+[`docs/plugin.md`](docs/plugin.md).
+
+### Where the plugin keeps your database
+
+`${CLAUDE_PLUGIN_DATA}/usage.db` — a directory that survives plugin updates.
+Set `CPB_DB` yourself to override it; the hooks will not touch a value you have
+chosen.
+
+`/cpb` opens that database for you. If you run the server by hand instead, pass
+it explicitly — `serve.py` reads only `--db`, not `CPB_DB`, so without the flag
+it opens its own default and shows you an empty report rather than an error:
+
+```bash
+python3 serve.py --db ~/.claude/plugins/data/<plugin-id>/usage.db
+```
+
+### Upgrade
+
+```bash
+git -C ~/.claude/skills/claude-piggy-bank pull
+```
+
+Then `/reload-plugins`, or restart — hook changes are not picked up mid-session.
+Your database is not in the plugin directory, so an upgrade cannot disturb it.
+
+### Uninstall
+
+Delete the folder; nothing was installed from a marketplace, so there is no
+uninstall step. To stop loading it without deleting:
+
+```bash
+claude plugin disable claude-piggy-bank@skills-dir
+```
+
+**Back up the database first.** It is not in the folder you are deleting, but
+if you ever install from a marketplace instead, `claude plugin uninstall`
+deletes the plugin's data directory by default unless you pass `--keep-data` —
+and past Claude Code's ~30-day transcript retention that database is the only
+copy of your history. See
+[Transcripts expire](#transcripts-expire--back-up-the-database).
 
 ## Use
+
+From inside Claude Code, once the plugin is enabled:
+
+```
+/cpb
+```
+
+That starts the report server and gives you the URL. Everything below works the
+same from a plain checkout, with or without the plugin.
 
 ```bash
 # Ingest your transcripts (idempotent and incremental — run any time)

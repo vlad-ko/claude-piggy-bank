@@ -1,0 +1,43 @@
+{
+  "hooks": {
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/cpb_ingest_hook.py"],
+            "timeout": 30,
+            "statusMessage": "Recording subagent spend (Claude Piggy Bank)"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/cpb_ingest_hook.py"],
+            "timeout": 30,
+            "statusMessage": "Recording token spend (Claude Piggy Bank)"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/cpb_ingest_hook.py"],
+            "timeout": 5,
+            "statusMessage": "Recording token spend (Claude Piggy Bank)"
+          }
+        ]
+      }
+    ]
+  }
+}

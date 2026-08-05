@@ -9,6 +9,7 @@ below is an orphan and should be either linked or removed.
 | document | what it is for |
 |---|---|
 | [Claude API token accounting](claude-api-token-accounting.md) | The API accounting facts CPB's detectors rest on — thinking billed as output, per-model thinking preservation, the cache-miss taxonomy, cache pricing multipliers and minimums, task budgets. Each fact carries its source URL and the date it was checked. |
+| [The Claude Code plugin](plugin.md) | Why the plugin packaging looks the way it does: which three hooks fire and why `SubagentStop` is the load-bearing one, why every timeout is explicit, where the database lives and when the hook refuses to decide, and how failing loudly is reconciled with never interrupting a session. Each specification claim carries its source URL and the date it was checked. |
 
 ## What a document here has to carry
 
