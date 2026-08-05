@@ -5,6 +5,36 @@ load-bearing rather than stylistic — those are worth reading before you open a
 PR, because a change that breaks one of them will get pushback even if the code
 is good.
 
+## Getting oriented
+
+Four modules, one direction of flow:
+
+```
+ingest.py  transcripts -> SQLite
+serve.py   SQLite -> JSON        context_window.py is a leaf serve.py reads
+index.html JSON -> charts
+cpb.py     the entry point over ingest and serve
+```
+
+`cpb.py` composes the two scripts rather than replacing them: each keeps its own
+`argparse` parser, so a flag has one definition and one help text, and
+`python3 ingest.py` keeps working for anyone with it in a script.
+
+```bash
+python3 cpb.py ingest        # read this project's own transcripts
+python3 cpb.py serve         # http://127.0.0.1:8377/
+python3 cpb.py --version
+```
+
+Nothing is installed onto your system: `cpb.py` is a file in the checkout that
+you run with `python3`.
+
+The repository is also the Claude Code plugin — same code path, no packaging
+step. If you are changing anything under `.claude-plugin/`, `hooks/` or
+`commands/`, read [`docs/plugin.md`](docs/plugin.md) first: every value in those
+JSON files turns on a documented property of the plugin system, and JSON cannot
+carry the comment explaining which.
+
 ## The four constraints
 
 **1. Standard library only.** Python 3.10+, no pip installs, no Node, no build
@@ -13,15 +43,40 @@ run. If you need a dependency, open an issue and make the case first.
 
 This one is enforced rather than trusted: the `stdlib-only` CI job parses every
 shipped module and fails if any import resolves outside `sys.stdlib_module_names`
-or this repo, and rejects dependency manifests outright. Before it existed, a
-single `import requests` would have been caught only by a reviewer who happened
-to know the rule.
+or this repo. Before it existed, a single `import requests` would have been
+caught only by a reviewer who happened to know the rule.
+
+A second job checks *intent*, which the import scanner cannot see: a **declared**
+dependency is someone planning an install step, even before the import lands. It
+runs in two deliberate tiers, and it was **narrowed** — it used to reject any
+manifest by filename, which failed a `pyproject.toml` containing
+`dependencies = []`, a file that declares exactly the thing the rule wants.
+
+| tier | files | rule |
+|---|---|---|
+| rejected on sight | `requirements*.txt`, `Pipfile`, `poetry.lock`, `uv.lock`, `package.json` and the npm lockfiles, `setup.py`, `setup.cfg` | they exist only to drive an installer, so a dependency-free one is a file with no purpose; the npm manifests additionally imply a Node runtime, which is ruled out outright |
+| inspected | `pyproject.toml` | parsed with `tomllib`; passes **iff** it declares no runtime, optional or grouped dependency |
+
+`build-system.requires` is not counted — a build frontend provisions it in an
+isolated environment that is discarded, and anything smuggled in that way would
+still have to be imported to matter, where the first job catches it.
+`dynamic = ["dependencies"]` **fails**: it moves the declaration somewhere the
+check cannot read, and a check that cannot see its answer must refuse rather
+than report a clean one. That is this repository's central rule applied to its
+own CI.
+
+Adding such a file is still a reviewed decision. The narrowing only stopped it
+from being an automatic build break — open an issue and make the case first.
 
 **2. Nothing leaves the machine.** No network calls, no telemetry, no CDN
 references. This page renders your own prompts, file paths and source code —
 a third-party script executing in it is a supply-chain and privacy surface, not
-just an availability one. Vendor assets into `vendor/`, as the chart library
-already is.
+just an availability one. Vendor assets into `vendor/`, as **both** browser
+libraries already are — Chart.js for the plot and Alpine.js for the bindings.
+`vendor/README.md` records each one's version, origin and SHA-256; the suite
+re-checks those digests and that neither bundle contains a way to reach the
+network, so a vendored upgrade is a deliberate change to that file rather than a
+silent one.
 
 **3. No model in the loop.** Every detector is SQL, arithmetic, or JSON
 parsing. Adding an API call would break both the offline guarantee and the
@@ -54,12 +109,48 @@ block records `None`. Recording `0` would make a composition table report
 "thinking: 0.0%" — stating that thinking costs nothing, which is false, and
 which no reader would question because it looks like a measurement.
 
+## No dollar figures
+
+CPB reports measured tokens and never converts them into money. It used to:
+list-rate arithmetic over a hand-maintained table that modelled no subscription
+accounting, discount or overage, went stale twice, and diverged from real spend
+by more than 2.5x. A precise-looking number wrong by a factor of two is worse
+than no number, because the reader cannot see the error — so the estimate was
+removed outright rather than qualified, schema column, module and all.
+
+Do not reintroduce a cost estimate, a "relative cost index", or any other
+money-shaped field. Panels that used to rank "by spend" rank by **total tokens**,
+say so in the heading, and show the model beside each row so the reader weighs
+the tiers themselves. A test asserts that no shipped module so much as mentions
+the deleted rate table, and that guard is worth keeping total.
+
+The counter-example worth understanding is `context_window.py`, which *is* a
+hand-maintained table and is allowed. Its output is a **denominator**
+(`context_size / window`, where the window is Anthropic's published hard limit),
+so nothing is asserted beyond the division — and a stale window fails **loudly**,
+as calls measuring over 100% of it, where a stale rate failed silently in a
+plausible dollar figure. That asymmetry is the whole argument; a new table needs
+the same one.
+
 ## Measurements need provenance
 
 If you add or change a number, say where it came from and when it was checked.
 Facts about the Claude API in particular are **model-dependent** and change —
 state which models a claim covers rather than presenting it as universal, and
 cite the source.
+
+**Two provenance classes, never merged.** *Documented* means cited to an
+official source on a date. *Measured here* means counted first-hand, with the
+corpus and the scan date. A measurement of what a client writes locally is not a
+statement about what the API guarantees, and presenting a judgment in a
+documented fact's voice borrows an authority this project has not earned.
+
+That rule is load-bearing, not stylistic. The report's context bands carry two
+dates and two provenance strings across the API for exactly this reason: the
+window is documented (`WINDOWS_AS_OF`), while where the band boundaries sit is a
+product-owner judgment Anthropic publishes nothing about (`BANDS_AS_OF`). They
+are free to drift apart and must be able to. Merging them into one date would
+claim that re-checking the published window had re-decided where 50% sits.
 
 If you cannot verify something first-hand, say so in the code rather than
 asserting it. There is precedent in `transcript_slug()`: the Windows encoding
@@ -71,6 +162,22 @@ asserted separately. Two facts with different confidence, two tests.
 
 ```bash
 python3 -m unittest discover tests -v
+```
+
+Most modules also take the dotted form for one class:
+
+```bash
+python3 -m unittest tests.test_ingest.StreamedRecordDedupeTest -v
+```
+
+**`test_serve` is the exception.** It does `from test_ingest import
+build_corpus`, a top-level import that resolves only with `tests/` itself on
+`sys.path`, so the dotted form fails with `ModuleNotFoundError: No module named
+'test_ingest'` before running anything. Select within it through `discover`:
+
+```bash
+python3 -m unittest discover -s tests -p test_serve.py -k ScopeLabellingTest -v
+python3 -m unittest discover -s tests -p test_serve.py -k test_<name> -v
 ```
 
 - Assert the **state change**, not that something succeeded.

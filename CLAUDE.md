@@ -16,20 +16,46 @@ number was once wrong in a way that looked right.
 ## Commands
 
 ```bash
-python3 ingest.py                          # ingest this project's own transcripts (idempotent, incremental)
-python3 ingest.py --projects-dir ~/.claude/projects/<name>   # ingest a different project
-python3 ingest.py --prune-missing          # DELETE rows for sources gone from disk (see Durability)
-python3 serve.py                           # report at http://127.0.0.1:8377/
-python3 serve.py --port 9000 --db path.db
+python3 cpb.py ingest                      # ingest this project's own transcripts (idempotent, incremental)
+python3 cpb.py serve                       # report at http://127.0.0.1:8377/
+python3 cpb.py --version                   # `cpb <VERSION>` -- the build that produced a number
+python3 cpb.py --help                      # the command list, generated from COMMANDS
 
-python3 -m unittest discover tests -v                        # full suite
-python3 -m unittest tests.test_ingest.StreamedRecordDedupeTest -v         # one class
-python3 -m unittest tests.test_serve.ScopeLabellingTest.test_<name> -v    # one test
+python3 ingest.py --projects-dir ~/.claude/projects/<name>   # ingest a different project
+python3 ingest.py --transcript ~/.claude/projects/<name>/<session-id>.jsonl  # exactly one file
+python3 ingest.py --prune-missing          # DELETE rows for sources gone from disk (see Durability)
+python3 serve.py --port 9000 --db path.db
 ```
 
-Both entry points default `--db` to `db/usage.db` (gitignored). `serve.py`
-exits rather than starting if that DB is absent. Tests insert the repo root on
-`sys.path` themselves, so run them from anywhere with `python3 -m unittest`.
+`cpb.py` (#21) is the entry point; it **composes** the two scripts rather than
+replacing them. Each keeps its own `argparse` parser, so every flag has one
+definition and one help text, everything after the subcommand belongs to the
+subcommand (`cpb.py ingest --help`), and `python3 ingest.py` keeps working for
+anyone who has it in a script. `_exit_status()` reproduces CPython's own
+`SystemExit` handling, because a wrapper that returned 0 over a refusal would
+report a run that measured nothing as a run that measured zero. `VERSION` lives
+in `cpb.py`; `.claude-plugin/plugin.json` repeats it as a literal because the
+plugin loader reads that JSON without running Python, and `tests/test_cpb.py`
+pins the two equal.
+
+Both scripts default `--db` to `db/usage.db` (gitignored); `ingest.py` also
+reads `CPB_DB`, `serve.py` deliberately does not (pass `--db "$CPB_DB"`).
+`serve.py` exits rather than starting if the DB is absent.
+
+```bash
+python3 -m unittest discover tests -v                        # full suite
+python3 -m unittest tests.test_ingest.StreamedRecordDedupeTest -v         # one class
+python3 -m unittest discover -s tests -p test_serve.py -k ScopeLabellingTest -v   # one class in test_serve
+python3 -m unittest discover -s tests -p test_serve.py -k test_<name> -v          # one test in test_serve
+```
+
+Most modules take the dotted `tests.<module>.<Class>` form. **`test_serve` does
+not**: `tests/test_serve.py:38` does `from test_ingest import build_corpus`, a
+top-level import that resolves only with `tests/` itself on `sys.path` — which
+`discover -s tests` arranges and `-m unittest tests.test_serve...` does not, so
+the dotted form dies with `ModuleNotFoundError: No module named 'test_ingest'`
+before running anything. Use `discover -p test_serve.py -k` for that module.
+Tests insert the repo root on `sys.path` themselves, so run them from anywhere.
 
 ## Four load-bearing constraints
 
@@ -38,13 +64,24 @@ even if the code is good.
 
 1. **Standard library only**, Python 3.10+. No pip, no Node, no build step. The
    `stdlib-only` CI job ASTs every shipped module and fails on any import that
-   is neither `sys.stdlib_module_names` nor local, and fails outright if a
-   `requirements*.txt` / `pyproject.toml` / `setup.py` / `package.json` /
-   `Pipfile` appears. Adding any of those files breaks the build by design.
+   is neither `sys.stdlib_module_names` nor local. A second job tests **intent**
+   in two tiers, **narrowed by #50** from the older "no manifest may exist":
+   `requirements*.txt`, `Pipfile`, the lockfiles, `package.json`, `setup.py` and
+   `setup.cfg` are rejected **on sight** — they exist only to drive an installer,
+   so declaring nothing in one is a file with no purpose. `pyproject.toml` is
+   **inspected** with `tomllib` and passes iff it declares no runtime, optional
+   or grouped dependency; `build-system.requires` is not counted, and
+   `dynamic = ["dependencies"]` fails because a check that cannot see its answer
+   must refuse rather than report a clean one. Adding such a file is still a
+   reviewed decision — it is no longer an automatic build break.
 2. **Nothing leaves the machine.** No network calls, no telemetry, no CDN. The
    page renders the user's own prompts, paths and source code, so a third-party
    script in it is a privacy and supply-chain surface. Vendor assets into
-   `vendor/` (Chart.js already is, served through a path-escape-checked handler).
+   `vendor/`, as **both** browser libraries already are — Chart.js for the plot
+   and Alpine.js for the bindings — served through a path-escape-checked
+   handler. `vendor/README.md` records each one's version, origin and SHA-256,
+   and the suite re-checks those digests and that neither bundle can reach the
+   network.
 3. **No model in the loop.** Every figure is SQL, arithmetic or JSON parsing.
    Running CPB must stay free.
 4. **Do not overwhelm the UI.** A new detector earns space by displacing or
@@ -95,8 +132,20 @@ total tokens and show the model so the reader weighs the tiers themselves.
 
 ## Architecture
 
-Two modules, one direction of flow: `ingest.py` (transcripts → SQLite) →
+Four modules, one direction of flow: `ingest.py` (transcripts → SQLite) →
 `db/usage.db` → `serve.py` (SQLite → JSON) → `index.html` (JSON → charts).
+`cpb.py` is the entry point above ingest and serve, importing whichever
+subcommand is asked for and nothing else. `context_window.py` is a leaf that
+only `serve.py` reads.
+
+**Packaging.** The repository *is* the Claude Code plugin — same code path, no
+build step. `.claude-plugin/plugin.json` is the manifest; `hooks/hooks.json`
+declares three triggers (`SubagentStop`, `Stop`, `SessionEnd`) that each run
+`hooks/cpb_ingest_hook.py`, which spawns `ingest.py --transcript` for **exactly
+one file**; `commands/cpb.md` is the `/cpb` command. `${CLAUDE_PLUGIN_DATA}`
+holds the database because `${CLAUDE_PLUGIN_ROOT}` is replaced on every update
+and the DB is not regenerable. The reasoning, with its sources, is in
+`docs/plugin.md` — read it before changing any of those files.
 
 **Sources.** Two globs are data — `<project>/<session>.jsonl` (main thread) and
 `<project>/<session>/subagents/agent-<id>.jsonl` (subagents). A third path, the
@@ -130,12 +179,37 @@ response that never happened — and the ambiguity is counted (a *different* set
 from the 108 above, and re-measure before quoting any of these). Records with no
 `message.id` each stay their own call; `NULL` is not a shared key.
 
-**Schema** (`SCHEMA_VERSION`, `PRAGMA user_version`): `sessions`, `turns`,
+**Schema** (`SCHEMA_VERSION = 9`, `PRAGMA user_version`): `sessions`, `turns`,
 `api_calls`, `agent_dispatches`, `subagent_runs`, `task_index_sessions`,
-`ingest_state`. Ingest is incremental per file, keyed on size+mtime in
-`ingest_state`; re-ingesting a changed file deletes its rows by `source_path`
-first, so every hot path has a `source_path` index. `task_index_sessions`
-distinguishes "scanned, dispatched nothing" (a real zero) from "never scanned".
+`ingest_state`, `ingest_runs`, `source_shape`. Ingest is incremental per file,
+keyed on size+mtime in `ingest_state`; re-ingesting a changed file deletes its
+rows by `source_path` first, so every hot path has a `source_path` index.
+`task_index_sessions` distinguishes "scanned, dispatched nothing" (a real zero)
+from "never scanned".
+
+**`source_shape` censuses the format** (#15), per source file, because the
+transcript format is internal to Claude Code and documented to change between
+releases. It counts the Claude Code `version` each figure's records came from,
+any record `type` never seen before, any new `usage` key, and any of the four
+token keys going *missing* — an absent key reads as a real `0`, which is right
+for a token class that did not occur and silently catastrophic if a release
+renames `output_tokens`. A row there is a positive observation, so a source
+with **no** rows has not been censused rather than been found clean.
+
+**The `context` block in `/api/summary`** (#31) is where two rules meet.
+`context_window.py` holds a per-model window table dated `WINDOWS_AS_OF` —
+readmitted after #30 deleted the rate table because its output is a
+**denominator**, not an invented figure, and because a stale window fails
+*loudly* (utilisation above 100%, counted in `over_window_calls`) where a stale
+rate failed silently. The median displaced the mean as the headline card, the
+mean staying only as evidence of the skew (`mean_over_median`,
+`share_above_mean`). **Two provenances that must never merge:** the window is
+documented and cited (`window_provenance`, `WINDOWS_AS_OF`); where the band
+boundaries sit is a dated product-owner judgment Anthropic publishes nothing
+about (`band_provenance`, `BANDS_AS_OF`). They cross the API as two fields with
+two dates so the page can never present the judged one in the documented one's
+voice. An unknown model keeps its context and loses its utilisation; a
+zero-context row is `unmeasured_calls`, never banded as the most frugal call.
 
 **Serve** is `http.server` + `sqlite3`, bound to loopback, with a Host-header
 check against DNS rebinding. Routes: `/api/summary`, `/api/timeseries`,
@@ -161,12 +235,18 @@ Consequences encoded in the code, which must be preserved:
 - Which is why a schema change that deletes no row must not go through that
   rebuild: on any corpus past the retention window the guard would refuse a
   change that risks nothing, and an untrue refusal is the same class of defect
-  as an untrue number. `IN_PLACE_UPGRADE_FROM` lists the versions whose delta
-  is row-preserving (v6 adds `ingest_runs`; v7 drops `api_calls.cost_usd` via
+  as an untrue number. `IN_PLACE_UPGRADE_FROM` (currently `{6, 7, 8}`) lists
+  the versions whose delta to the **current** shape is row-preserving. Three
+  hops exist, and a v6 database makes all three at once: v6→v7 adds
+  `ingest_runs`; v7→v8 drops `api_calls.cost_usd` (#30) via
   `ALTER TABLE ... DROP COLUMN`, gated on a **runtime** check of
-  `sqlite3.sqlite_version` ≥ 3.35). It is re-decided at every bump, never
-  extended by habit, and the sub-3.35 fallback goes through the rebuild path
-  **including** the guard — never around it.
+  `sqlite3.sqlite_version` ≥ 3.35; and v8→v9 adds `source_shape` (#15). It is
+  re-decided at every bump against the current shape, never extended by habit,
+  and the sub-3.35 fallback goes through the rebuild path **including** the
+  guard — never around it. A table may be created from nothing by this path
+  only if it is in `IN_PLACE_CREATABLE_TABLES` — only, that is, if an **empty**
+  one is a true statement (#35). `CREATE TABLE IF NOT EXISTS` would otherwise
+  silently grant that to every table, including `turns`, where empty is a lie.
 - Windows containing archived sources are flagged in the report banner: totals
   are complete but no longer reproducible by re-ingesting.
 

@@ -4,9 +4,16 @@ CPB ships as a Claude Code plugin so that ingest happens **when the transcript
 is written**, rather than whenever someone remembers to run `ingest.py`. The
 plugin is the repository: `.claude-plugin/plugin.json` sits at the repository
 root and the hooks invoke the same `ingest.py` and `serve.py` a manual user
-runs. There is no second code path and no packaging step — adding one would
-mean adding a dependency manifest, which the `stdlib-only` CI job fails on by
-design.
+runs. There is no second code path and no packaging step.
+
+Nor is one needed. A packaging step would exist to install dependencies, and
+CPB has none — the `stdlib-only` CI job resolves every import in every shipped
+module against `sys.stdlib_module_names` on an interpreter with nothing
+installed. (A second job rejects manifests that *declare* a dependency. Since
+[#50](https://github.com/vlad-ko/claude-piggy-bank/issues/50) it inspects
+`pyproject.toml` rather than banning it by filename, so packaging is a reviewed
+decision rather than an automatic build break — but nothing about the plugin
+requires it.)
 
 This document records *why* the packaging looks the way it does. The JSON files
 cannot carry comments, and every value in them turns on a documented property of
