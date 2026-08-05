@@ -111,13 +111,24 @@ a list of real candidates rather than reporting an empty run.
 **One API call = one `message.id`.** `_dedupe_calls()` is the correctness core.
 Claude Code writes one record per streamed content block, each repeating the
 same `message.usage`, so counting records inflated aggregates 1.9–2.4x — and by
-*different* factors per scope, distorting comparisons in shape. Last record
-wins (measured: `output_tokens` is non-decreasing across an id's records, and
-only the last carries the finished total). Where records of one id disagree
-beyond `output_tokens`, one *whole* record survives — never a per-field maximum,
-which would describe an API response that never happened — and the ambiguity is
-counted. Records with no `message.id` each stay their own call; `NULL` is not a
-shared key.
+*different* factors per scope, distorting comparisons in shape. The record with
+the **greatest `output_tokens`** survives, ties going to the last (what
+`reversed()` in the `max()` is for). **Not "last wins"** — that shorthand was
+accurate only while `output_tokens` never fell across an id's records, which is
+a dated tendency rather than an invariant: 26,998 of 27,106 multi-record ids,
+99.6%, over 49 local main-thread transcripts on 2026-08-05, against 4,928 of
+4,928 when the rule was first derived on a smaller, older corpus. Both are
+samples from a corpus that grows between scans, not constants. `max` is right
+*because* it does not depend on that tendency: on the 108 ids where the
+sequence falls, a literal last-record rule picks a *smaller* `output_tokens`
+than a record already seen — 107,810 tokens understated in aggregate, 6,858 on
+one id — the same inflation defect running in reverse.
+`NonMonotonicOutputDedupeTest` pins both halves, so a "simplification" to
+`group[-1]` fails. Where records of one id disagree beyond `output_tokens`, one
+*whole* record survives — never a per-field maximum, which would describe an API
+response that never happened — and the ambiguity is counted (a *different* set
+from the 108 above, and re-measure before quoting any of these). Records with no
+`message.id` each stay their own call; `NULL` is not a shared key.
 
 **Schema** (`SCHEMA_VERSION`, `PRAGMA user_version`): `sessions`, `turns`,
 `api_calls`, `agent_dispatches`, `subagent_runs`, `task_index_sessions`,

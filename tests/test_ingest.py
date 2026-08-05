@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -1289,10 +1290,15 @@ class StreamedRecordDedupeTest(unittest.TestCase):
     inflated every aggregate 1.9-2.4x. Worse than a scale error: the factor
     differs by scope, so main-vs-subagent comparisons were distorted in SHAPE.
 
-    The resolution rule is not a guess. Across the real corpus `output_tokens`
-    is non-decreasing over the records of one id in 4,928 of 4,928 cases, and
-    only the last record carries the finished total -- so LAST WINS, and
-    first-wins would have undercounted output by ~99%.
+    The resolution rule is not a guess: the record with the GREATEST
+    `output_tokens` survives, ties going to the last. It reads like "last
+    wins" here only because this fixture's sequence rises (2 -> 2 -> 450), as
+    the real corpus almost always does -- 26,998 of 27,106 multi-record ids
+    were non-decreasing when re-measured 2026-08-05, against 4,928 of 4,928 on
+    the older corpus the rule was derived from. Almost is not always, and
+    nothing here can tell the two rules apart; NonMonotonicOutputDedupeTest
+    below is what defends the difference (#49). First-wins would have
+    undercounted output by ~99%.
     """
 
     def setUp(self) -> None:
@@ -1348,6 +1354,124 @@ class StreamedRecordDedupeTest(unittest.TestCase):
         self.assertEqual(total, 483)  # 450 + 33, never 2+2+450+33
 
 
+def _epoch(iso: str) -> float:
+    """Epoch seconds for a UTC ISO8601 stamp, computed independently of ingest."""
+    return datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp()
+
+
+class NonMonotonicOutputDedupeTest(unittest.TestCase):
+    """The GREATEST `output_tokens` survives, ties going to the LAST record (#49).
+
+    The rule is `max`, not "last wins", and the difference is load-bearing.
+    `output_tokens` rising monotonically across an id's records is a strong
+    empirical TENDENCY, not an invariant: over the local corpus of 49
+    main-thread transcripts on 2026-08-05, 26,998 of 27,106 multi-record ids
+    were non-decreasing (99.60%) and 108 were not. On those 108 a literal
+    last-record rule selects a SMALLER output than a record already seen --
+    understating finished totals by 107,810 output tokens in aggregate, up to
+    6,858 on a single id. That is #2's inflation defect running in reverse, so
+    `max` is kept and this test defends it.
+
+    The corpus is a growing sample, not a constant: the derivation in #2 found
+    4,928 of 4,928 (100%) on a smaller and older corpus, which is why "last
+    wins" was an accurate shorthand when it was written and is not one now.
+    Re-measure before quoting the ratio; better, do not depend on it -- `max`
+    does not.
+
+    Fixture design (CLAUDE.md: a fixture must not make the defect
+    undetectable). The two older dedupe fixtures are both non-decreasing
+    (`streamed-message.jsonl` 2 -> 2 -> 450; `divergent-usage.jsonl` 59 ->
+    263), so `max` and `last` select the SAME record in every one of their
+    assertions and neither can see the rule at all.
+    `non-monotonic-output.jsonl` rises then falls -- 7 -> 4000 -> 12 -- so the
+    two rules disagree by 3,988 tokens, and holds every other usage field
+    equal across the records so this pins SELECTION alone; the divergence
+    path has its own test below.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-nonmono-test-"))
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir(parents=True)
+        shutil.copy(
+            FIXTURES / "non-monotonic-output.jsonl", self.projects / "n.jsonl"
+        )
+        self.db = self.tmp / "usage.db"
+        self.summary = ingest(self.tmp / "projects", self.db)
+        self.conn = sqlite3.connect(self.db)
+        self.conn.row_factory = sqlite3.Row
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        shutil.rmtree(self.tmp)
+
+    def test_two_ids_are_two_rows(self) -> None:
+        # Guards the assertions below against passing vacuously on a row that
+        # dedupe never produced.
+        n = self.conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        self.assertEqual(n, 2, "one row per message.id: msg_peak + msg_tie")
+
+    def test_a_FALLING_sequence_keeps_the_GREATEST_output_not_the_last(self) -> None:
+        # 4000 (the peak), never 12 (the last record), 7 (the first) or 4019
+        # (the sum). All four are deliberately unequal so no two can be
+        # confused. `group[-1]` -- the "simplification" the old docs invited
+        # -- selects 12 here and fails.
+        row = self.conn.execute(
+            "SELECT output_tokens FROM api_calls WHERE message_id = 'msg_peak'"
+        ).fetchone()
+        self.assertEqual(row["output_tokens"], 4000)
+
+    def test_the_survivor_is_ONE_WHOLE_record_not_a_synthesis(self) -> None:
+        # Every field must come from the SAME record -- the peak one, at
+        # :02 -- so a future per-field maximum cannot pass. The timestamp is
+        # the discriminator: it is the only thing distinguishing the three
+        # records apart from output, and it is not part of the selection key.
+        row = self.conn.execute(
+            "SELECT ts, input_tokens, cache_read, cache_write, output_tokens"
+            " FROM api_calls WHERE message_id = 'msg_peak'"
+        ).fetchone()
+        self.assertEqual(
+            (
+                row["ts"],
+                row["input_tokens"],
+                row["cache_read"],
+                row["cache_write"],
+                row["output_tokens"],
+            ),
+            (_epoch("2026-07-18T10:00:02"), 13, 9100, 800, 4000),
+        )
+
+    def test_EQUAL_maxima_resolve_to_the_LATER_record(self) -> None:
+        # What `reversed()` is for, and otherwise silent: `max()` is stable
+        # and returns the FIRST maximum, so plain `max(group, ...)` would keep
+        # the :05 record instead of the :06 one. Ties are the COMMON case --
+        # every record before the final one repeats the same usage -- so this
+        # decides which record most rows in the DB actually are.
+        row = self.conn.execute(
+            "SELECT ts, output_tokens FROM api_calls WHERE message_id = 'msg_tie'"
+        ).fetchone()
+        self.assertEqual(row["output_tokens"], 500)
+        self.assertEqual(
+            row["ts"],
+            _epoch("2026-07-18T10:00:06"),
+            "on a tie the LAST record wins, not the first maximum",
+        )
+
+    def test_totals_use_the_peak_not_the_final_record(self) -> None:
+        total = self.conn.execute(
+            "SELECT SUM(output_tokens) FROM api_calls"
+        ).fetchone()[0]
+        self.assertEqual(total, 4500, "4000 + 500; last-wins would say 512")
+
+    def test_this_fixture_pins_SELECTION_not_divergence(self) -> None:
+        # The two are independent code paths and the fixture holds every
+        # non-output usage field equal, so a decreasing sequence alone must
+        # not trip the divergence counter. (On the real corpus the two sets
+        # coincided on 2026-08-05 -- see the class docstring -- but that is a
+        # dated observation about one corpus, not a property of the rule.)
+        self.assertEqual(self.summary["divergent_message_ids"], 0)
+
+
 class DivergentUsageTest(unittest.TestCase):
     """When records of one id disagree beyond output, pick a WHOLE record.
 
@@ -1380,7 +1504,8 @@ class DivergentUsageTest(unittest.TestCase):
         self.assertEqual(
             (row["input_tokens"], row["cache_write"], row["cache_read"], row["output_tokens"]),
             (26, 0, 238759, 263),
-            "must be the last record verbatim, never a per-field maximum",
+            "must be one record verbatim, never a per-field maximum -- here"
+            " the greatest-output record, which is also the last one",
         )
 
     def test_the_ambiguity_is_counted_and_surfaced(self) -> None:

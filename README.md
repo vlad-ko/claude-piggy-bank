@@ -41,19 +41,36 @@ versus subagent comparison was distorted in **shape**, not merely in
 magnitude: the two sides were scaled by different amounts before being read
 against each other. A conclusion, not just a scale, was wrong.
 
-Ingest now emits one row per distinct `message.id`. The resolution rule is
-measured rather than assumed: across that corpus `output_tokens` is
-non-decreasing over the records of one id in **4,928 of 4,928** cases and only
-the final record carries the finished total, so the last record wins. Taking
-the first would have under-counted output by roughly 99%.
+Ingest now emits one row per distinct `message.id`, and the surviving row is
+the record with the **greatest `output_tokens`**, ties resolving to the later
+record. Taking the first would have under-counted output by roughly 99%.
 
-Two residual cases are counted and printed rather than hidden. **109 ids**
-whose records disagreed on something other than `output_tokens` keep one whole
-real record, never a per-field maximum -- that would report a call which both
-wrote and did not write cache, a combination present in no real response.
-Records with **no** `message.id` each stay their own call; on this corpus there
-were none, but dropping them would delete real spend and grouping them would
-merge unrelated calls.
+That rule is often described as "the last record wins", and on the corpus above
+the two were the same record every time: `output_tokens` was non-decreasing
+over the records of one id in **4,928 of 4,928** cases, so the greatest record
+*was* the final one. That is a measurement, not a guarantee, and it has since
+drifted. Re-measured **2026-08-05** across 49 main-thread transcripts on one
+machine, non-decreasing holds for **26,998 of 27,106** multi-record ids
+(**99.6%**). On the **108** ids where output falls, keeping the last record
+would report a *smaller* finished total than a record already seen — 107,810
+output tokens understated in aggregate, up to 6,858 on a single id. `max` is
+kept precisely because it does not depend on the tendency holding. Both
+percentages are dated samples from a corpus that keeps growing, not constants:
+the denominator moved from 27,106 to 27,110 within ten minutes of that scan,
+because the session doing the measuring was being transcribed into it. Expect a
+different denominator, and re-measure before quoting either figure.
+
+Two residual cases are counted and printed rather than hidden. On the earlier
+corpus, **109 ids** whose records disagreed on something other than
+`output_tokens` keep one whole real record, never a per-field maximum -- that
+would report a call which both wrote and did not write cache, a combination
+present in no real response. That count ranges over a **different set** from
+the 108 above (disagreeing beyond `output_tokens`, versus `output_tokens`
+falling) on a different corpus and date; on the 2026-08-05 corpus those two
+sets happened to be the same 108 ids, which is an observation about that corpus
+rather than a property of either rule. Records with **no** `message.id` each
+stay their own call; on this corpus there were none, but dropping them would
+delete real spend and grouping them would merge unrelated calls.
 
 CPB no longer converts any of this into money — see "No dollar figures" below.
 

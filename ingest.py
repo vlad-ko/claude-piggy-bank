@@ -1330,19 +1330,39 @@ def _dedupe_calls(result: ParseResult) -> list[ApiCall]:
     error: the factor differs between main-thread and subagent transcripts, so
     comparisons between them were distorted in SHAPE, not merely in magnitude.
 
-    **Last wins, and the rule is measured rather than assumed.** Across the
-    corpus this was derived from, `output_tokens` is non-decreasing over the
-    records of a single id in 4,928 of 4,928 cases, and only the final record
-    carries the finished total -- 942 where every earlier record said 2. So
-    summing over-counts, and first-wins would have UNDER-counted output by
-    roughly 99%.
+    **The GREATEST `output_tokens` survives; ties go to the LAST record.**
+    Not "last wins" -- that shorthand described this code only because of a
+    property that no longer universally holds. Across the corpus the rule was
+    derived from, `output_tokens` was non-decreasing over the records of a
+    single id in 4,928 of 4,928 cases, only the final record carried the
+    finished total (942 where every earlier record said 2), and so the
+    greatest record and the last record were always the same one. Re-measured
+    2026-08-05 over 49 main-thread transcripts on one machine: non-decreasing
+    holds for 26,998 of 27,106 multi-record ids (99.60%) -- a strong empirical
+    TENDENCY, dated, over a corpus that grows between scans, and not an
+    invariant. Both figures are samples, not constants; re-measure before
+    quoting either.
+
+    `max` is kept because it does not depend on that tendency. On the 108 ids
+    where the sequence falls, a literal last-record rule selects a SMALLER
+    output than a record already seen -- 107,810 output tokens understated in
+    aggregate, up to 6,858 on a single id -- which is this function's own
+    inflation defect running in reverse. Summing over-counts; first-wins would
+    have UNDER-counted output by roughly 99%. `reversed()` is what makes a tie
+    resolve to the last record, and ties are the common case. Both halves are
+    pinned by tests.test_ingest.NonMonotonicOutputDedupeTest; do not
+    "simplify" the selection without reading it.
 
     **A whole record survives, never a synthesis of fields.** Where records of
     one id disagree beyond `output_tokens`, taking a per-field maximum would
     report a call that both wrote and did not write cache -- a combination
     that occurred in no real API response. One real record is kept and the
     ambiguity is COUNTED, so a corpus where it is common cannot pass as clean
-    (rule #12).
+    (rule #12). This count ranges over a DIFFERENT set from the 108 above:
+    ids that disagree beyond `output_tokens`, not ids whose `output_tokens`
+    falls. On the 2026-08-05 corpus the two sets happened to be the same 108
+    ids -- an observation about that corpus on that date, not a property of
+    either rule, and not the 109 the README reports for the older corpus.
 
     **A missing id is not a shared key.** Records without `message.id` each
     stay their own call. Dropping them would silently delete real spend, and
