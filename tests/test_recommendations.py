@@ -11,16 +11,26 @@ around the five ways it could quietly stop being that:
     boundaries themselves and their immediate float neighbours are checked;
   * HEALTHY collapsing into UNMEASURED. Both would render as no advice, and
     only one of them is a statement about the corpus;
-  * a JUDGED boundary wearing a CITATION. Two numbers in this table are
-    documented -- `1.0` and `2.0` reads per write, from TA-8 -- and if the
-    other seven shared their provenance the page would present somebody's
-    first draft in the voice of Anthropic's documentation;
+  * a JUDGED boundary wearing a CITATION. Three numbers in this table are
+    documented -- `1.0` and `2.0` reads per write and `1.0` on the TTL-aware
+    ratio, all from TA-8 -- and if the other eight shared their provenance the
+    page would present somebody's first draft in the voice of Anthropic's
+    documentation;
   * a CITATION applied past what it covers. TA-8 puts the 5-minute write's
-    break-even at one read and the 1-hour write's at two, and CPB does not
-    record which TTL a write asked for. The two cited boundaries here are
-    therefore stated as the claims that hold EITHER WAY, and the band between
-    them says out loud that it cannot be called. `CitedBoundaryMatchesTheRecord
-    Test` reads the record and fails if it stops saying what is quoted here;
+    break-even at one read and the 1-hour write's at two. The flat ratio's two
+    cited boundaries are therefore stated as the claims that hold EITHER WAY,
+    because one total over both TTLs cannot say which applied.
+    `CitedBoundaryMatchesTheRecordTest` reads the record and fails if it stops
+    saying what is quoted here;
+  * the RESOLUTION of the band those two boundaries surround going missing or
+    going wrong. Until #84 that band was declared unresolvable and a tripwire
+    here asserted the limitation itself -- that `ingest.py` named neither TTL
+    key -- so that it would go red the day the limitation lifted. It lifted.
+    `TheBandTheTripwireGuardedTest` replaces it and asserts the resolution
+    instead: that ingest reads both keys, that the two break-evens are
+    TA-8's and are unequal, that a reading inside the old band is now called
+    by the period's own TTL mix, and that an unmeasured split is still
+    unmeasured rather than assumed to be the cheaper TTL;
   * the ranking coming from the order entries were typed in, which would make
     "the biggest lever" mean "the one written first".
 
@@ -48,6 +58,7 @@ from recommendations import (  # noqa: E402
     ACTION_REDUCE,
     METRIC_CACHE_READS_PER_WRITE,
     METRIC_CACHE_WRITE_ONLY_SHARE,
+    METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
     METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,
     METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
     METRICS,
@@ -69,6 +80,7 @@ from recommendations import (  # noqa: E402
     Recommendation,
     assess,
     assess_all,
+    cache_write_repayment,
     cited,
     depth_in_band,
     judged,
@@ -79,12 +91,28 @@ from recommendations import (  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Every documented boundary in the table, so a fourth citation cannot be added
+# without being held to what the other three are held to.
+CITED_PROVENANCES = (
+    rec.UNREPAID_UNDER_EVERY_TTL,
+    rec.REPAID_UNDER_EVERY_TTL,
+    rec.REPAID_AT_ITS_OWN_TTL,
+)
+
 # This project's own corpus, measured 2026-08-05 and recorded in the issue.
 # Kept as one fixture so every test that needs "a real reading" uses the same
 # one, and so the numbers the boundaries were drafted around stay visible.
 CORPUS_2026_08_05 = {
     METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW: 0.389,
     METRIC_CACHE_READS_PER_WRITE: 55.0,
+    # `None`, and NOT a number derived from the other readings. These figures
+    # were taken before the per-TTL split was ingested (#84), so no call behind
+    # them carries one -- which is the state of every database that has not
+    # been re-ingested since, and of every transcript already past
+    # `cleanupPeriodDays`. Multiplying 55.0 by the corpus-wide 1-hour share to
+    # invent a repayment figure would be a measurement nobody took, in the
+    # fixture the rest of this file checks real measurements against.
+    METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL: None,
     METRIC_CACHE_WRITE_ONLY_SHARE: 0.007,
     METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY: 4.0,
 }
@@ -269,6 +297,18 @@ class BoundariesAreHalfOpenTest(unittest.TestCase):
         (METRIC_CACHE_READS_PER_WRITE, 9.999, SEVERITY_WATCH),
         (METRIC_CACHE_READS_PER_WRITE, 10.0, SEVERITY_OK),
         (METRIC_CACHE_READS_PER_WRITE, 1000.0, SEVERITY_OK),
+        # The resolved metric. 1.0 is break-even at whichever TTL the period's
+        # writes actually asked for, so the value either side of it is a
+        # verdict rather than a band -- the pinning that fails if the 1-hour
+        # break-even (2.0 reads per 1-hour write token) is ever moved onto this
+        # normalised scale by mistake.
+        (METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, 0.0, SEVERITY_ACT),
+        (METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, 0.999, SEVERITY_ACT),
+        (METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, 1.0, SEVERITY_WATCH),
+        (METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, 1.999, SEVERITY_WATCH),
+        (METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, 9.999, SEVERITY_WATCH),
+        (METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, 10.0, SEVERITY_OK),
+        (METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, 1000.0, SEVERITY_OK),
         (METRIC_CACHE_WRITE_ONLY_SHARE, 0.0, SEVERITY_OK),
         (METRIC_CACHE_WRITE_ONLY_SHARE, 0.019, SEVERITY_OK),
         (METRIC_CACHE_WRITE_ONLY_SHARE, 0.02, SEVERITY_WATCH),
@@ -287,10 +327,33 @@ class BoundariesAreHalfOpenTest(unittest.TestCase):
     # cited break-even. Both sides are `watch`; what changes is what the page
     # SAYS, so it is pinned on the words rather than on the severity.
     PINNED_PROSE = (
-        (METRIC_CACHE_READS_PER_WRITE, 1.0, "cannot be called either way"),
-        (METRIC_CACHE_READS_PER_WRITE, 1.999, "cannot be called either way"),
+        # The flat ratio's band. It still cannot be called FROM THIS NUMBER --
+        # one total over both TTLs -- but it no longer blames CPB for not
+        # recording the TTL, and it names the reading that does call it.
+        (
+            METRIC_CACHE_READS_PER_WRITE,
+            1.0,
+            METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+        ),
+        (
+            METRIC_CACHE_READS_PER_WRITE,
+            1.999,
+            "one flat total over both TTLs cannot say which",
+        ),
         (METRIC_CACHE_READS_PER_WRITE, 2.0, "repaid whichever TTL"),
         (METRIC_CACHE_READS_PER_WRITE, 9.999, "repaid whichever TTL"),
+        # The resolved metric says which side of break-even the period sits on
+        # and never hedges between the two TTLs.
+        (
+            METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+            0.999,
+            "not repaid at the break-even of the TTL they asked for",
+        ),
+        (
+            METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+            1.0,
+            "repaid at the break-even of the TTL it asked for",
+        ),
     )
 
     def test_each_pinned_value_gets_its_pinned_severity(self):
@@ -352,6 +415,14 @@ class BoundariesAreHalfOpenTest(unittest.TestCase):
                     SEVERITY_WATCH,
                     SEVERITY_OK,
                 ),
+                # Three ranges, not four: the resolved metric has no band to
+                # split its `watch` in two, which is what resolving the band
+                # MEANS. A fourth range here would be the hedge coming back.
+                METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL: (
+                    SEVERITY_ACT,
+                    SEVERITY_WATCH,
+                    SEVERITY_OK,
+                ),
                 METRIC_CACHE_WRITE_ONLY_SHARE: (
                     SEVERITY_OK,
                     SEVERITY_WATCH,
@@ -366,14 +437,21 @@ class BoundariesAreHalfOpenTest(unittest.TestCase):
         )
 
     def test_todays_corpus_lands_where_the_issue_says_it_does(self):
+        # `None` is a landing too, and the one this corpus takes on the
+        # resolved metric: its readings predate the split, so that metric is
+        # unmeasured rather than healthy. Asserted as `None` in the same dict
+        # as the four severities so a fixture that quietly acquired a number
+        # for it would have to say where the number came from.
         got = {
-            key: assess(key, value).severity for key, value in CORPUS_2026_08_05.items()
+            key: None if value is None else assess(key, value).severity
+            for key, value in CORPUS_2026_08_05.items()
         }
         self.assertEqual(
             got,
             {
                 METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW: SEVERITY_ACT,
                 METRIC_CACHE_READS_PER_WRITE: SEVERITY_OK,
+                METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL: None,
                 METRIC_CACHE_WRITE_ONLY_SHARE: SEVERITY_OK,
                 METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY: SEVERITY_ACT,
             },
@@ -454,9 +532,16 @@ class UnmeasuredIsNotHealthyTest(unittest.TestCase):
         values[METRIC_CACHE_READS_PER_WRITE] = None
         values[METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY] = None
         result = assess_all(values)
+        # Three, not two: the corpus fixture is already unmeasured on the
+        # resolved cache metric, which is the state of every database ingested
+        # before the per-TTL split was read.
         self.assertEqual(
             result.unmeasured,
-            (METRIC_CACHE_READS_PER_WRITE, METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY),
+            (
+                METRIC_CACHE_READS_PER_WRITE,
+                METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+                METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
+            ),
         )
         self.assertEqual(
             sorted(a.metric for a in result.ranked),
@@ -545,7 +630,10 @@ class BoundaryProvenanceTest(unittest.TestCase):
                 self.assertIsInstance(edge.provenance, Provenance)
                 self.assertTrue(edge.provenance.statement.strip())
 
-    def test_exactly_two_boundaries_in_the_whole_table_are_cited(self):
+    def test_exactly_three_boundaries_in_the_whole_table_are_cited(self):
+        # Three since #84: the flat ratio's two claims that hold whichever TTL
+        # was used, and the break-even of the ratio that weights each write by
+        # the TTL it asked for. Nothing else in the table is documented.
         cited_edges = sorted(
             (key, edge.value)
             for key, edge in self.boundaries()
@@ -556,10 +644,11 @@ class BoundaryProvenanceTest(unittest.TestCase):
             [
                 (METRIC_CACHE_READS_PER_WRITE, 1.0),
                 (METRIC_CACHE_READS_PER_WRITE, 2.0),
+                (METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, 1.0),
             ],
         )
 
-    def test_the_judged_boundaries_are_the_expected_seven(self):
+    def test_the_judged_boundaries_are_the_expected_eight(self):
         judged_edges = sorted(
             (key, edge.value)
             for key, edge in self.boundaries()
@@ -572,6 +661,7 @@ class BoundaryProvenanceTest(unittest.TestCase):
                     (METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW, 0.10),
                     (METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW, 0.25),
                     (METRIC_CACHE_READS_PER_WRITE, 10.0),
+                    (METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, 10.0),
                     (METRIC_CACHE_WRITE_ONLY_SHARE, 0.02),
                     (METRIC_CACHE_WRITE_ONLY_SHARE, 0.10),
                     (METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY, 1.5),
@@ -598,9 +688,9 @@ class BoundaryProvenanceTest(unittest.TestCase):
             set(by_kind),
             {PROVENANCE_CITED, PROVENANCE_JUDGED, PROVENANCE_STRUCTURAL},
         )
-        # Two cited boundaries, two DIFFERENT statements: they are different
-        # facts about different TTLs, not one fact used twice.
-        self.assertEqual(len(by_kind[PROVENANCE_CITED]), 2)
+        # Three cited boundaries, three DIFFERENT statements: three claims
+        # about the same two TTLs, not one fact used three times.
+        self.assertEqual(len(by_kind[PROVENANCE_CITED]), 3)
         self.assertTrue(
             by_kind[PROVENANCE_CITED].isdisjoint(by_kind[PROVENANCE_JUDGED])
         )
@@ -620,13 +710,17 @@ class BoundaryProvenanceTest(unittest.TestCase):
     def test_a_cited_boundarys_check_date_is_its_sources_not_the_tables(self):
         # Deliberately unequal: re-reading the cache documentation does not
         # re-decide where 0.25 sits, and one date for both would say it had.
-        for provenance in (rec.UNREPAID_UNDER_EVERY_TTL, rec.REPAID_UNDER_EVERY_TTL):
+        # The boundary that resolved the band carries the SAME source date as
+        # the two it sits between -- the record did not change when CPB's
+        # ability to apply it did, and dating it 2026-08-05 would say TA-8 was
+        # re-checked when only ingest.py was.
+        for provenance in CITED_PROVENANCES:
             with self.subTest(statement=provenance.statement[:30]):
                 self.assertEqual(provenance.checked, "2026-08-04")
                 self.assertNotEqual(provenance.checked, RECOMMENDATIONS_AS_OF)
 
     def test_the_cited_boundaries_state_what_they_do_and_do_not_cover(self):
-        for provenance in (rec.UNREPAID_UNDER_EVERY_TTL, rec.REPAID_UNDER_EVERY_TTL):
+        for provenance in CITED_PROVENANCES:
             with self.subTest(statement=provenance.statement[:30]):
                 self.assertIn("5-minute", provenance.covers)
                 self.assertIn("1-hour", provenance.covers)
@@ -635,31 +729,104 @@ class BoundaryProvenanceTest(unittest.TestCase):
                 # which TTL any write asked for is not recorded by CPB.
                 self.assertIn("does NOT cover", provenance.covers)
 
-    def test_each_cited_boundary_states_the_claim_that_holds_under_both_TTLs(self):
+    def test_the_flat_ratios_cited_boundaries_hold_under_both_TTLs(self):
         # The correction this table exists to survive: "one read repays the
-        # write" is true of the 5-minute write ONLY, and CPB cannot tell which
-        # TTL a write asked for. Each cited boundary must therefore be phrased
-        # as a claim about both.
+        # write" is true of the 5-minute write ONLY. The flat ratio ranges over
+        # both TTLs at once whatever ingest records, so its two boundaries must
+        # stay phrased as claims about both.
         for provenance in (rec.UNREPAID_UNDER_EVERY_TTL, rec.REPAID_UNDER_EVERY_TTL):
             with self.subTest(statement=provenance.statement[:30]):
                 self.assertIn("whichever TTL", provenance.statement)
 
-    def test_the_band_between_the_two_cited_boundaries_refuses_to_call_it(self):
-        unresolvable = assess(METRIC_CACHE_READS_PER_WRITE, 1.5).recommendation
-        self.assertIn("five-minute", unresolvable)
-        self.assertIn("one-hour", unresolvable)
-        self.assertIn("does not record which", unresolvable)
+    def test_the_resolved_boundary_claims_the_opposite_and_says_which(self):
+        # The one boundary that is NOT a claim about both at once: it holds
+        # each write to its own TTL, which is what the split made possible.
+        # "whichever TTL" here would be the hedge wearing the resolution's
+        # name.
+        statement = rec.REPAID_AT_ITS_OWN_TTL.statement
+        self.assertIn("the TTL each one asked for", statement)
+        self.assertNotIn("whichever TTL", statement)
+        self.assertIn("one read token per 5-minute write token", statement)
+        self.assertIn("two per 1-hour write token", statement)
+
+    def test_the_resolved_boundary_records_that_it_used_to_be_a_hedge(self):
+        # A boundary that is cited where it was previously a hedge has to say
+        # so, or the page shows a citation with no sign that the number it
+        # replaced was refused for a year of this table's life.
+        statement = rec.REPAID_AT_ITS_OWN_TTL.statement
+        self.assertIn("HEDGE", statement)
+        self.assertIn("unresolvable band", statement)
+        self.assertIn("#84", statement)
+        # And the reason must be the one that is true: the record did not
+        # change, the measurement did.
+        self.assertIn("Neither break-even moved", statement)
+
+    def test_the_flat_band_names_the_reading_that_now_calls_it(self):
+        # What replaced "CPB does not record which TTL": the flat number still
+        # cannot be called from itself, and the entry now says what can call
+        # it instead of blaming a limitation that has lifted.
+        band = assess(METRIC_CACHE_READS_PER_WRITE, 1.5).recommendation
+        self.assertIn("five-minute", band)
+        self.assertIn("one-hour", band)
+        self.assertIn("one flat total over both TTLs cannot say which", band)
+        self.assertIn(METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, band)
+        self.assertNotIn("does not record which", band)
+
+    def test_no_entry_still_claims_CPB_cannot_see_the_TTL_a_write_asked_for(self):
+        # The retired claim, guarded the way the limitation itself used to be.
+        # It was true until #84 and is false now, and a false sentence in a
+        # provenance is worse than a missing one -- it is the exact shape this
+        # module exists to refuse, pointing the other way.
+        for text in (
+            [rec.RECOMMENDATION_PROVENANCE]
+            + [m.measurement for m in METRICS.values()]
+            + [r.recommendation.text for m in METRICS.values() for r in m.ranges]
+            + [p.statement for p in CITED_PROVENANCES]
+            + [p.covers for p in CITED_PROVENANCES]
+        ):
+            for retired in (
+                "CPB does not record",
+                "does not record which",
+                "CPB cannot",
+                "not ingested",
+            ):
+                with self.subTest(retired=retired, text=text[:40]):
+                    self.assertNotIn(retired, text)
 
     def test_the_measured_one_hour_share_is_recorded_with_its_caveat(self):
-        # The evidence that the unresolvable band is worth having. Recorded as
-        # a share because the scan was over raw records, not deduped calls.
+        # The evidence for both decisions: that the share is a quarter is why
+        # a single 1.0 boundary would have been wrong, and that it is
+        # concentrated is why the resolution weights each corpus's own mix
+        # rather than this constant.
         self.assertGreater(rec.ONE_HOUR_WRITE_SHARE_AS_MEASURED, 0.0)
         self.assertLess(rec.ONE_HOUR_WRITE_SHARE_AS_MEASURED, 1.0)
         source = " ".join(
             (REPO_ROOT / "recommendations.py").read_text(encoding="utf-8").split()
         )
-        self.assertIn("NOT deduped by `message.id`", source)
-        self.assertIn("raw records with NO dedupe by", source)
+        # Now a per-CALL figure: the raw-record share it replaced is named as
+        # superseded rather than quietly dropped, because it is quoted in the
+        # issue this table was drafted from.
+        self.assertIn("DEDUPED by `message.id`", source)
+        self.assertIn("170,079 calls", source)
+        self.assertIn("supersedes an earlier raw-record scan", source)
+        self.assertIn("41 of the 3,021 files", source)
+
+    def test_the_flat_totals_understatement_is_recorded_with_its_direction(self):
+        # It is why the resolved metric divides by the split and never by the
+        # flat total. A count with no direction would not say which way the
+        # flat ratio is wrong, and the direction is the whole argument: an
+        # understated denominator reads HEALTHIER than the writes justify.
+        self.assertGreater(rec.FLAT_WRITE_UNDERSTATED_CALLS_AS_MEASURED, 0)
+        self.assertLess(
+            rec.FLAT_WRITE_UNDERSTATED_CALLS_AS_MEASURED,
+            rec.DEDUPED_CALLS_AS_MEASURED,
+        )
+        source = " ".join(
+            (REPO_ROOT / "recommendations.py").read_text(encoding="utf-8").split()
+        )
+        self.assertIn("the flat total UNDERSTATED the write", source)
+        self.assertIn("the reverse occurred 0 times", source.lower())
+        self.assertIn("read HIGHER, i.e. healthier", source)
 
     def test_the_table_level_provenance_is_judged_and_dated(self):
         self.assertIn(RECOMMENDATIONS_AS_OF, rec.RECOMMENDATION_PROVENANCE)
@@ -712,13 +879,184 @@ class CitedBoundaryMatchesTheRecordTest(unittest.TestCase):
             'Stating either as "repays on the second hit"', self.section
         )
 
-    def test_cpb_still_cannot_see_which_TTL_a_write_asked_for(self):
-        # The reason the band between the two cited boundaries exists. If
-        # ingest ever reads `usage.cache_creation`'s per-TTL split, this goes
-        # red and the band can be resolved instead of declared unresolvable.
-        ingest_source = (REPO_ROOT / "ingest.py").read_text(encoding="utf-8")
-        self.assertNotIn("ephemeral_5m_input_tokens", ingest_source)
-        self.assertNotIn("ephemeral_1h_input_tokens", ingest_source)
+    def test_the_record_states_the_two_break_evens_this_table_weights_by(self):
+        # The resolved boundary's arithmetic is TA-8's two break-evens in
+        # another unit. If the record ever stops working them out, the
+        # weighting below is uncited and this is where that has to be noticed.
+        self.assertIn("Break-even is the first read", self.section)
+        self.assertIn("The 1-hour write is the one that needs **two**", self.section)
+        self.assertEqual(rec.READ_TOKENS_TO_REPAY_A_5M_WRITE_TOKEN, 1.0)
+        self.assertEqual(rec.READ_TOKENS_TO_REPAY_A_1H_WRITE_TOKEN, 2.0)
+
+
+class TheBandTheTripwireGuardedTest(unittest.TestCase):
+    """The band between the two cited boundaries, and how it resolved.
+
+    THIS CLASS REPLACES A TRIPWIRE. Until #84 the test here asserted the
+    LIMITATION -- that `ingest.py` mentioned neither per-TTL key -- so that it
+    would go red the day the limitation lifted and the band could be resolved
+    rather than declared unresolvable. It lifted. A deleted tripwire that
+    asserts nothing would be worse than the hedge it stood for, so what is
+    pinned now is the resolution: the measurement it rests on, the arithmetic
+    it applies, the verdict it produces where the hedge refused one, and the
+    absences it still refuses to fill in.
+
+    Fixture discipline: every token count below is hand-built and the two TTLs
+    are given DELIBERATELY UNEQUAL values, so a swapped mapping lands on a
+    different verdict rather than the same number.
+    """
+
+    # One flat reading -- 3,000 read tokens against 2,000 written -- 1.5 reads
+    # per write, which is the middle of the old unresolvable band. The three
+    # rows differ only in which TTL those 2,000 write tokens asked for, and
+    # that alone decides the verdict. This IS the band being resolved.
+    READ_TOKENS = 3_000
+    SPLITS = (
+        # (5m write, 1h write, read tokens required, repayment, severity).
+        # Required is `5m x 1 + 1h x 2`, written out per row so the weighting
+        # is visible here rather than borrowed from the module under test.
+        (2_000, 0, 2_000, 1.5, SEVERITY_WATCH),
+        (1_500, 500, 2_500, 1.2, SEVERITY_WATCH),
+        (500, 1_500, 3_500, 0.857142857, SEVERITY_ACT),
+        (0, 2_000, 4_000, 0.75, SEVERITY_ACT),
+    )
+
+    def test_ingest_reads_the_per_TTL_split_the_resolution_rests_on(self):
+        # The premise, asserted against ingest's own constants rather than a
+        # grep of its source: the resolution is only honest if the split is
+        # actually measured per call and stored per call.
+        import ingest
+
+        self.assertEqual(ingest.CACHE_WRITE_5M_KEY, "ephemeral_5m_input_tokens")
+        self.assertEqual(ingest.CACHE_WRITE_1H_KEY, "ephemeral_1h_input_tokens")
+        self.assertNotEqual(ingest.CACHE_WRITE_5M_KEY, ingest.CACHE_WRITE_1H_KEY)
+        for column in ("cache_write_5m", "cache_write_1h"):
+            with self.subTest(column=column):
+                self.assertIn(f"    {column} INTEGER", ingest.SCHEMA)
+
+    def test_the_two_break_evens_are_unequal_which_is_the_whole_difference(self):
+        # Collapsed into one constant, this table would be back to averaging
+        # the two TTLs -- the slogan TA-8 warns against, in code.
+        self.assertNotEqual(
+            rec.READ_TOKENS_TO_REPAY_A_5M_WRITE_TOKEN,
+            rec.READ_TOKENS_TO_REPAY_A_1H_WRITE_TOKEN,
+        )
+        self.assertLess(
+            rec.READ_TOKENS_TO_REPAY_A_5M_WRITE_TOKEN,
+            rec.READ_TOKENS_TO_REPAY_A_1H_WRITE_TOKEN,
+        )
+
+    def test_one_flat_reading_in_the_old_band_gets_four_verdicts_by_TTL_mix(self):
+        # The heart of it. Every row has the same 1.5 reads per write, which
+        # the flat metric can only call `watch` and refuse to resolve; the
+        # resolved metric calls each one, and the calls DIFFER.
+        flat = assess(METRIC_CACHE_READS_PER_WRITE, 1.5)
+        self.assertEqual(flat.severity, SEVERITY_WATCH)
+        for write_5m, write_1h, required, expected, severity in self.SPLITS:
+            with self.subTest(write_5m=write_5m, write_1h=write_1h):
+                self.assertEqual(write_5m + write_1h, 2_000)
+                self.assertAlmostEqual(self.READ_TOKENS / required, expected)
+                value = cache_write_repayment(self.READ_TOKENS, write_5m, write_1h)
+                self.assertAlmostEqual(value, expected)
+                result = assess(METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, value)
+                self.assertEqual(result.severity, severity)
+        self.assertEqual(
+            {row[-1] for row in self.SPLITS},
+            {SEVERITY_WATCH, SEVERITY_ACT},
+            "a fixture where every mix produced one verdict would pin nothing",
+        )
+
+    def test_the_verdict_turns_on_which_TTL_not_on_how_much_was_written(self):
+        # An all-1-hour period needs exactly twice the reads an all-5-minute
+        # one needs. Stated as the ratio between the two, so a mutation that
+        # moved BOTH break-evens together still fails.
+        all_5m = cache_write_repayment(self.READ_TOKENS, 2_000, 0)
+        all_1h = cache_write_repayment(self.READ_TOKENS, 0, 2_000)
+        self.assertAlmostEqual(all_5m / all_1h, 2.0)
+        self.assertEqual(
+            cache_write_repayment(self.READ_TOKENS * 2, 0, 2_000),
+            all_5m,
+        )
+
+    def test_an_unmeasured_split_stays_unmeasured_rather_than_five_minute(self):
+        # The constraint a default would break: a call with no split is not a
+        # call whose writes were all the cheaper TTL, and reading it that way
+        # would report 2x writes as repaid at a read they were not.
+        for write_5m, write_1h in ((None, None), (2_000, None), (None, 2_000)):
+            with self.subTest(write_5m=write_5m, write_1h=write_1h):
+                self.assertIsNone(
+                    cache_write_repayment(self.READ_TOKENS, write_5m, write_1h)
+                )
+        self.assertIsNone(cache_write_repayment(None, 2_000, 0))
+        # And unmeasured must reach the page as unmeasured, not as healthy.
+        self.assertIsNone(assess(METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, None))
+
+    def test_a_period_that_wrote_no_measured_cache_has_no_ratio(self):
+        # A zero denominator is an unmeasured metric, not `inf` and not 0.0 --
+        # and 0.0 would be the WORST range on a metric where lower is worse,
+        # so the defaulting failure here is an invented alarm.
+        self.assertIsNone(cache_write_repayment(self.READ_TOKENS, 0, 0))
+
+    def test_a_real_zero_read_count_is_a_measurement_and_is_kept(self):
+        # The other half: a period that wrote cache and read none back is a
+        # real 0.0, must stay distinguishable from no sample, and is the
+        # worst reading this metric has rather than an absent one.
+        value = cache_write_repayment(0, 2_000, 500)
+        self.assertEqual(value, 0.0)
+        self.assertEqual(
+            assess(METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, value).severity,
+            SEVERITY_ACT,
+        )
+
+    def test_a_negative_token_count_is_refused_rather_than_divided(self):
+        for args in ((-1, 2_000, 0), (3_000, -1, 0), (3_000, 0, -1)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                cache_write_repayment(*args)
+
+    def test_the_resolved_metric_calls_it_and_never_hedges_between_the_TTLs(self):
+        # The band is gone from this metric, not merely narrowed: no entry may
+        # say it cannot decide. A re-widening that restored the hedge prose
+        # fails here even if the boundaries themselves looked untouched.
+        metric = METRICS[METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL]
+        self.assertEqual(len(metric.ranges), 3)
+        cited_edges = [
+            edge.value
+            for entry in metric.ranges
+            for edge in (entry.lower, entry.upper)
+            if edge is not None and edge.provenance.kind == PROVENANCE_CITED
+        ]
+        self.assertEqual(sorted(set(cited_edges)), [1.0])
+        for entry in metric.ranges:
+            with self.subTest(lower=entry.lower.value):
+                text = entry.recommendation.text
+                for hedge in ("cannot be called", "either way", "whichever TTL"):
+                    self.assertNotIn(hedge, text)
+
+    def test_the_flat_ratio_survived_the_resolution_and_still_has_its_band(self):
+        # It is not replaced. Every call ingested before #84 reads NULL for the
+        # split and a transcript past `cleanupPeriodDays` can never be
+        # re-ingested to fix that, so on most databases the flat ratio is the
+        # only one of the two that can be computed at all.
+        metric = METRICS[METRIC_CACHE_READS_PER_WRITE]
+        self.assertEqual(len(metric.ranges), 4)
+        self.assertEqual(
+            [entry.lower.value for entry in metric.ranges], [0.0, 1.0, 2.0, 10.0]
+        )
+        self.assertIn(
+            "cannot be called either way",
+            assess(METRIC_CACHE_READS_PER_WRITE, 1.5).recommendation,
+        )
+
+    def test_the_two_cache_metrics_are_not_the_same_measurement_twice(self):
+        # Same corpus, different sets: one ranges over every call, the other
+        # only over calls whose split was measured. A page showing both must be
+        # able to say so, so each names its own set.
+        flat = METRICS[METRIC_CACHE_READS_PER_WRITE].measurement
+        resolved = METRICS[METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL].measurement
+        self.assertNotEqual(flat, resolved)
+        self.assertIn("cache-write tokens over the period", flat)
+        self.assertIn("whose per-TTL cache-write split was measured", resolved)
+        self.assertIn("excluded from BOTH sides", resolved)
 
 
 class ProvenanceConstructorsTest(unittest.TestCase):
@@ -1052,9 +1390,9 @@ class RankingIsDerivedNotAuthoredTest(unittest.TestCase):
         )
 
     def test_todays_corpus_ranks_the_two_firing_metrics_first(self):
-        ordered = assess_all(CORPUS_2026_08_05).ranked
+        result = assess_all(CORPUS_2026_08_05)
         self.assertEqual(
-            [a.metric for a in ordered],
+            [a.metric for a in result.ranked],
             [
                 METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,  # act, depth 0.357
                 METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,  # act, depth 0.250
@@ -1062,6 +1400,10 @@ class RankingIsDerivedNotAuthoredTest(unittest.TestCase):
                 METRIC_CACHE_READS_PER_WRITE,  # ok,  depth 0.182
             ],
         )
+        # The fifth metric is absent from the ranking because it is UNMEASURED
+        # on this corpus, and is named there rather than dropped. A ranking of
+        # four over a table of five is only honest if the fifth is said.
+        self.assertEqual(result.unmeasured, (METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,))
 
     def test_the_ranking_provenance_names_what_the_order_is_made_of(self):
         self.assertIn(RECOMMENDATIONS_AS_OF, rec.RANKING_PROVENANCE)
@@ -1105,16 +1447,32 @@ class AssessmentCarriesItsEvidenceTest(unittest.TestCase):
             result.lower_provenance.statement, result.upper_provenance.statement
         )
 
+    def test_the_resolved_metric_reports_its_citation_and_its_judgment_apart(self):
+        # Its `watch` range is bounded by one of each: a documented break-even
+        # below, somebody's first draft above. The page has to be able to tell
+        # them apart without leaving the page, which is the whole reason both
+        # edges travel with the assessment.
+        result = assess(METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL, 1.5)
+        self.assertEqual(result.range_lower, 1.0)
+        self.assertEqual(result.range_upper, 10.0)
+        self.assertEqual(result.lower_provenance.kind, PROVENANCE_CITED)
+        self.assertEqual(result.upper_provenance.kind, PROVENANCE_JUDGED)
+        self.assertIsNotNone(result.lower_provenance.source)
+        self.assertIsNone(result.upper_provenance.source)
+
     def test_an_unbounded_range_reports_no_upper_edge_rather_than_a_number(self):
         result = assess(METRIC_CACHE_READS_PER_WRITE, 55.0)
         self.assertIsNone(result.range_upper)
         self.assertIsNone(result.upper_provenance)
 
     def test_every_metrics_measurement_names_what_makes_it_unmeasurable(self):
-        # Three of the four are ratios with a denominator that can be zero,
-        # and a zero denominator is an unmeasured metric, not a zero.
+        # Four of the five are ratios with a denominator that can be zero, and
+        # a zero denominator is an unmeasured metric, not a zero. The resolved
+        # cache metric has a second way of being unmeasured -- no call carrying
+        # a split at all -- and its measurement has to name that one too.
         for key in (
             METRIC_CACHE_READS_PER_WRITE,
+            METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
             METRIC_CACHE_WRITE_ONLY_SHARE,
             METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
         ):
