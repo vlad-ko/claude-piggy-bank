@@ -2021,13 +2021,15 @@ class AdditiveSchemaUpgradeTest(unittest.TestCase):
     def _downgrade_to_v6(self) -> None:
         """Put the database back in the shape v6 shipped.
 
-        Two differences from the current shape, not one: v6 had no run stamp
-        table, and it still carried the `api_calls.cost_usd` estimate. Restore
-        BOTH, or the fixture tests a hop that no real database ever made.
+        THREE differences from the current shape, not one: v6 had no run stamp
+        table and no shape census table, and it still carried the
+        `api_calls.cost_usd` estimate. Restore ALL of them, or the fixture
+        tests a hop that no real database ever made.
         """
         conn = sqlite3.connect(self.db)
         try:
             conn.execute(f"DROP TABLE {ingest_mod.INGEST_RUNS_TABLE}")
+            conn.execute(f"DROP TABLE {ingest_mod.SHAPE_TABLE}")
             conn.execute("ALTER TABLE api_calls ADD COLUMN cost_usd REAL")
             conn.execute("PRAGMA user_version = 6")
             conn.commit()
@@ -2784,7 +2786,8 @@ class CostColumnRemovalUpgradeTest(unittest.TestCase):
             conn.close()
 
     def _downgrade_to_v7(self) -> None:
-        """Restore the shape v7 shipped: `cost_usd` present and populated.
+        """Restore the shape v7 shipped: `cost_usd` present and populated, and
+        no shape census table (#15 added that at v9).
 
         The values are distinct per row and deliberately not derivable from the
         token columns, so a "migration" that silently rebuilt the table from
@@ -2795,6 +2798,7 @@ class CostColumnRemovalUpgradeTest(unittest.TestCase):
         try:
             conn.execute("ALTER TABLE api_calls ADD COLUMN cost_usd REAL")
             conn.execute("UPDATE api_calls SET cost_usd = id * 0.25 + 0.125")
+            conn.execute(f"DROP TABLE {ingest_mod.SHAPE_TABLE}")
             conn.execute("PRAGMA user_version = 7")
             conn.commit()
         finally:
@@ -2820,7 +2824,7 @@ class CostColumnRemovalUpgradeTest(unittest.TestCase):
         self.assertEqual(summary["files_ingested"], 0)
         self.assertEqual(summary["files_skipped"], summary["files_scanned"])
         self.assertNotIn("cost_usd", self._columns())
-        self.assertEqual(self._user_version(), 8)
+        self.assertEqual(self._user_version(), ingest_mod.SCHEMA_VERSION)
         self.assertEqual(self._snapshot(), before)
 
     def test_v7_upgrade_is_not_refused_over_a_reaped_source(self) -> None:
@@ -2889,7 +2893,7 @@ class CostColumnRemovalUpgradeTest(unittest.TestCase):
         # The rebuild re-derives from the transcripts, so the rows come back
         # (this corpus is fully re-readable) and the column is gone either way.
         self.assertNotIn("cost_usd", self._columns())
-        self.assertEqual(self._user_version(), 8)
+        self.assertEqual(self._user_version(), ingest_mod.SCHEMA_VERSION)
         self.assertEqual(summary["files_ingested"], summary["files_scanned"])
         self.assertTrue(self._snapshot(), "the rebuild must re-ingest the rows")
 
@@ -2922,15 +2926,19 @@ class SchemaVersionSetsAreDecidedTest(unittest.TestCase):
     It is not cumulative by habit: a version belongs in it only while every
     difference between its shape and the CURRENT one can be applied without
     deleting a row. This test cannot judge that for a future version -- what it
-    pins is that the set was re-read at the bump, by tying it to the two hops
-    (#20's added table, #30's dropped column) that were actually reasoned about.
+    pins is that the set was re-read at the bump, by tying it to the three hops
+    (#20's added table, #30's dropped column, #15's added census table) that
+    were actually reasoned about.
     """
 
-    def test_schema_version_is_8(self) -> None:
-        self.assertEqual(ingest_mod.SCHEMA_VERSION, 8)
+    def test_schema_version_is_9(self) -> None:
+        self.assertEqual(ingest_mod.SCHEMA_VERSION, 9)
 
-    def test_only_the_two_reasoned_hops_upgrade_in_place(self) -> None:
-        self.assertEqual(ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7}))
+    def test_only_the_three_reasoned_hops_upgrade_in_place(self) -> None:
+        # v8 was re-checked against the CURRENT shape at this bump, not
+        # inherited: v8 -> v9 adds `source_shape` and nothing else, and an
+        # empty one is true of a v8 database (see IN_PLACE_CREATABLE_TABLES).
+        self.assertEqual(ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7, 8}))
 
     def test_the_current_version_is_not_in_the_upgrade_set(self) -> None:
         # A no-op hop is not an upgrade; listing it would make the branch
@@ -3545,14 +3553,20 @@ class InPlaceRepairSetsAreDecidedTest(unittest.TestCase):
     with the reason, and a new entry has to change this test.
     """
 
-    def test_only_the_run_stamp_may_be_created_from_nothing(self) -> None:
+    def test_only_a_stamp_and_a_census_may_be_created_from_nothing(self) -> None:
         # `ingest_runs` holds no row derived from a transcript, so creating it
         # empty states the truth ("no run recorded yet"), which is exactly what
         # a v6 database's state is. `turns` created empty is a lie about a
         # source that `ingest_state` still marks unchanged.
+        #
+        # `source_shape` (#15) qualifies for the same reason and only because
+        # a row in it is a POSITIVE observation: empty means "nothing censused
+        # yet", which is a v8 database's true state. It is admitted WITH the
+        # cost -- `ingest()` reports censused-of-tracked, so an empty census is
+        # never read as a clean corpus (`ShapeCensusUpgradeTest`).
         self.assertEqual(
             ingest_mod.IN_PLACE_CREATABLE_TABLES,
-            frozenset({ingest_mod.INGEST_RUNS_TABLE}),
+            frozenset({ingest_mod.INGEST_RUNS_TABLE, ingest_mod.SHAPE_TABLE}),
         )
 
     def test_only_archived_at_may_be_added_to_rows_that_already_exist(
@@ -3886,6 +3900,817 @@ class SchemaCommentPlacementTest(unittest.TestCase):
                     conn.execute(f"SELECT COUNT(*) FROM {table}")
             finally:
                 conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Transcript-shape census fixtures (#15).
+#
+# Anthropic documents the JSONL entry format as INTERNAL and changing between
+# Claude Code versions, so every assumption CPB makes about it has to be
+# COUNTED rather than assumed. These fixtures pin the counts deliberately
+# unequal -- per file and in the corpus total -- so a census that mixed two
+# versions up, or that counted files instead of records, cannot pass.
+#
+#   file      version A   version B   no version field
+#   one           3           -              1
+#   two           2           6              0
+#   three         -           -              7
+#   TOTAL         5           6              8
+#
+# Version strings are synthetic and unlike any real one; the real corpus is
+# never quoted here (CLAUDE.md: never commit captured session content).
+SHAPE_SESSION = "shape-census"
+SHAPE_VERSION_A = "7.3.101"
+SHAPE_VERSION_B = "7.3.202"
+# Unequal per class AND unequal to every other fixture in this file, so a
+# swapped column mapping cannot pass through the shape tests either.
+SHAPE_USAGE = {
+    "input_tokens": 31,
+    "cache_creation_input_tokens": 37,
+    "cache_read_input_tokens": 41,
+    "output_tokens": 43,
+}
+
+
+def shape_line(
+    record_type: str,
+    *,
+    version: object = None,
+    usage: object = None,
+    message_id: str = None,
+    omit_type: bool = False,
+) -> str:
+    """One JSONL record, built from parts, for the shape-census fixtures."""
+    record: dict = {
+        "sessionId": SHAPE_SESSION,
+        "timestamp": "2026-08-05T10:00:00.000Z",
+    }
+    if not omit_type:
+        record["type"] = record_type
+    if version is not None:
+        record["version"] = version
+    if record_type == "assistant":
+        message: dict = {
+            "model": "claude-sonnet-5-20260115",
+            "usage": dict(SHAPE_USAGE) if usage is None else usage,
+        }
+        if message_id is not None:
+            message["id"] = message_id
+        record["message"] = message
+    elif record_type == "user":
+        record["message"] = {"role": "user", "content": "a turn"}
+    return json.dumps(record) + "\n"
+
+
+def census_rows(
+    db: Path, fact: str, path: Path = None
+) -> dict:
+    """`{name: records}` for one shape fact, corpus-wide or for one source.
+
+    Returned as a plain dict rather than a Counter on purpose: a Counter
+    answers 0 for a name it has never seen, which is exactly the
+    absence-rendered-as-a-value the census exists to prevent, and it would
+    make every "this name was never recorded" assertion below vacuous.
+
+    The per-source branch REFUSES to fold two rows with the same name into
+    one. It did fold them at first, and that made a real defect invisible:
+    with the delete-before-insert removed from `store_source`, a re-ingested
+    file accumulated a second set of rows and this helper quietly kept the
+    last of each -- a fixture making the defect undetectable, which is the one
+    thing CLAUDE.md says a fixture may never do. Verified by mutation.
+    """
+    conn = sqlite3.connect(db)
+    try:
+        if path is None:
+            # GROUP BY, so one row per name by construction.
+            return {
+                name: records
+                for name, records in conn.execute(
+                    f"SELECT name, SUM(records) FROM {ingest_mod.SHAPE_TABLE}"
+                    " WHERE fact = ? GROUP BY name",
+                    (fact,),
+                ).fetchall()
+            }
+        rows = conn.execute(
+            f"SELECT name, records FROM {ingest_mod.SHAPE_TABLE}"
+            " WHERE fact = ? AND path = ?",
+            (fact, str(path)),
+        ).fetchall()
+    finally:
+        conn.close()
+    census: dict = {}
+    for name, records in rows:
+        if name in census:
+            raise AssertionError(
+                f"two {fact} rows name the same thing for one source"
+                f" ({name!r}: {census[name]} and {records}). The census must be"
+                " REPLACED per file, not accumulated across parses."
+            )
+        census[name] = records
+    return census
+
+
+class TranscriptVersionCensusTest(unittest.TestCase):
+    """The Claude Code `version` that wrote each measured record, counted (#15).
+
+    Anthropic's own documentation says the entry format "changes between
+    versions", so the version is the single most load-bearing piece of
+    provenance a transcript carries -- and CPB stored none of it. A composition
+    figure spanning two incompatible versions could not even be identified as
+    one.
+
+    The census ranges over the records CPB DERIVES NUMBERS FROM (assistant and
+    user), not over every line: an aggregate must name the set it ranges over,
+    and 10 of the 14 record types on the reference corpus never carry a version
+    at all, so counting them would bury the one case that matters -- a MEASURED
+    record with no version, of which there are 0 in 524,160 (checked
+    2026-08-05).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-version-census-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.db = self.tmp / "usage.db"
+
+        self.one = self.projects / "census-one.jsonl"
+        self.one.write_text(
+            shape_line("assistant", version=SHAPE_VERSION_A, message_id="m-one-1")
+            + shape_line("user", version=SHAPE_VERSION_A)
+            + shape_line("assistant", version=SHAPE_VERSION_A, message_id="m-one-2")
+            + shape_line("user")
+        )
+        # A session that spanned a Claude Code upgrade: TWO versions in ONE
+        # file, which is why the census cannot be a single column per source.
+        self.two = self.projects / "census-two.jsonl"
+        self.two.write_text(
+            "".join(
+                shape_line(
+                    "assistant", version=SHAPE_VERSION_B, message_id=f"m-two-{i}"
+                )
+                for i in range(6)
+            )
+            + shape_line("user", version=SHAPE_VERSION_A)
+            + shape_line("assistant", version=SHAPE_VERSION_A, message_id="m-two-a")
+        )
+        self.three = self.projects / "census-three.jsonl"
+        self.three.write_text(
+            "".join(
+                shape_line("assistant", message_id=f"m-three-{i}") for i in range(4)
+            )
+            + "".join(shape_line("user") for _ in range(3))
+        )
+        self.summary = ingest(self.projects, self.db)
+
+    def test_each_version_is_counted_per_source_file(self) -> None:
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION, self.one),
+            {SHAPE_VERSION_A: 3, None: 1},
+        )
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION, self.two),
+            {SHAPE_VERSION_B: 6, SHAPE_VERSION_A: 2, None: 0},
+        )
+
+    def test_two_sources_reporting_different_versions_stay_distinguishable(
+        self,
+    ) -> None:
+        # The whole point of keying the census on the SOURCE: a corpus-wide
+        # "versions seen" list cannot say which file to distrust.
+        conn = sqlite3.connect(self.db)
+        try:
+            rows = conn.execute(
+                f"SELECT path, name FROM {ingest_mod.SHAPE_TABLE}"
+                " WHERE fact = ? AND name IS NOT NULL",
+                (ingest_mod.SHAPE_VERSION,),
+            ).fetchall()
+        finally:
+            conn.close()
+        by_path: dict = {}
+        for path, name in rows:
+            by_path.setdefault(path, set()).add(name)
+        self.assertEqual(by_path[str(self.one)], {SHAPE_VERSION_A})
+        self.assertEqual(by_path[str(self.two)], {SHAPE_VERSION_A, SHAPE_VERSION_B})
+        self.assertNotIn(str(self.three), by_path)
+
+    def test_a_source_reporting_no_version_names_none(self) -> None:
+        # Rule #12: absent is not a version. The file gets a counted ABSENCE,
+        # never a substituted string and never a row naming some other file's
+        # version.
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION, self.three), {None: 7}
+        )
+
+    def test_a_file_whose_records_all_report_a_version_records_a_measured_zero(
+        self,
+    ) -> None:
+        # 0 is a healthy sample here and must stay distinguishable from "this
+        # source was never censused" (which is NO row at all -- see
+        # ShapeCensusUpgradeTest).
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION, self.two)[None], 0
+        )
+
+    def test_the_corpus_census_sums_records_not_files(self) -> None:
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION),
+            {SHAPE_VERSION_A: 5, SHAPE_VERSION_B: 6, None: 8},
+        )
+
+    def test_an_empty_version_string_is_an_absence_not_a_version(self) -> None:
+        custom = self.projects / "empty-version.jsonl"
+        custom.write_text(shape_line("assistant", version="", message_id="m-empty"))
+        parsed = parse_file(custom)
+        self.assertEqual(
+            parsed.shape[(ingest_mod.SHAPE_VERSION, None)],
+            1,
+            "an empty version string must count as an absence",
+        )
+        self.assertNotIn((ingest_mod.SHAPE_VERSION, ""), parsed.shape)
+
+    def test_a_line_that_is_not_json_is_not_censused(self) -> None:
+        # It is already counted as unparsed; censusing it would invent a
+        # versionless MEASURED record out of a line we could not read at all.
+        custom = self.projects / "broken.jsonl"
+        custom.write_text(
+            shape_line("assistant", version=SHAPE_VERSION_A, message_id="m-ok")
+            + "{not json at all\n"
+        )
+        parsed = parse_file(custom)
+        self.assertEqual(parsed.unparsed_records, 1)
+        self.assertEqual(parsed.shape[(ingest_mod.SHAPE_VERSION, SHAPE_VERSION_A)], 1)
+        self.assertEqual(parsed.shape[(ingest_mod.SHAPE_VERSION, None)], 0)
+
+    def test_the_run_summary_reports_how_much_of_the_corpus_is_censused(
+        self,
+    ) -> None:
+        # "no unknown shapes" and "nothing has been looked at" are different
+        # facts and the summary has to tell them apart.
+        self.assertEqual(self.summary["sources_censused"], 3)
+        self.assertEqual(self.summary["sources_tracked"], 3)
+
+    def test_pruning_a_source_removes_its_census(self) -> None:
+        self.three.unlink()
+        ingest(self.projects, self.db, prune_missing=True)
+        self.assertEqual(census_rows(self.db, ingest_mod.SHAPE_VERSION, self.three), {})
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION),
+            {SHAPE_VERSION_A: 5, SHAPE_VERSION_B: 6, None: 1},
+        )
+
+    def test_re_ingesting_a_changed_file_replaces_its_census(self) -> None:
+        # The census is per FILE and must not accumulate across re-parses --
+        # doubling it would misreport which version wrote a corpus.
+        with open(self.one, "a") as fh:
+            fh.write(
+                shape_line("assistant", version=SHAPE_VERSION_B, message_id="m-new")
+            )
+        ingest(self.projects, self.db)
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION, self.one),
+            {SHAPE_VERSION_A: 3, SHAPE_VERSION_B: 1, None: 1},
+        )
+
+
+class UnknownRecordTypeCensusTest(unittest.TestCase):
+    """A record type this tool has never heard of is COUNTED and NAMED (#15).
+
+    The ingest skipped every non-assistant/user record without counting it, on
+    the comment "known-irrelevant". That is true of the 12 types measured on
+    the reference corpus and says nothing at all about the 13th: if a Claude
+    Code release renamed `assistant`, every total would drop quietly and no
+    counter in this tool would move.
+
+    Reference corpus, checked 2026-08-05: 638,813 records over 2,952 files and
+    18 projects, carrying exactly the 14 types in `KNOWN_RECORD_TYPES`.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-type-census-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.db = self.tmp / "usage.db"
+        self.source = self.projects / "unknown-types.jsonl"
+        # Counts deliberately unequal: 2 of one unknown type, 1 untyped
+        # record, 3 of a KNOWN-irrelevant type, 1 measured assistant record.
+        self.source.write_text(
+            shape_line("sparkle-event")
+            + shape_line("sparkle-event")
+            + shape_line("assistant", omit_type=True, message_id="m-untyped")
+            + "".join(shape_line("mode") for _ in range(3))
+            + shape_line("assistant", version=SHAPE_VERSION_A, message_id="m-known")
+        )
+        self.summary = ingest(self.projects, self.db)
+
+    def test_an_unknown_type_is_counted_under_its_own_name(self) -> None:
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_UNKNOWN_RECORD_TYPE, self.source),
+            {"sparkle-event": 2, None: 1},
+        )
+
+    def test_a_known_irrelevant_type_is_not_reported_as_unknown(self) -> None:
+        # Otherwise the loud count is loud on every run and stops being read.
+        self.assertNotIn(
+            "mode",
+            census_rows(self.db, ingest_mod.SHAPE_UNKNOWN_RECORD_TYPE, self.source),
+        )
+
+    def test_an_unknown_type_does_not_become_a_parse_failure(self) -> None:
+        # Two different facts: `unparsed_records` says a record we TRIED to
+        # read defeated us; the census says we did not try. Folding one into
+        # the other would make the existing INCONCLUSIVE figure mean two
+        # things.
+        self.assertEqual(self.summary["unparsed_records"], 0)
+
+    def test_an_unknown_type_does_not_zero_out_what_was_measured(self) -> None:
+        # "Counting an unknown record type must not turn it into a known zero
+        # for some other type": the one real assistant record is still a call.
+        conn = sqlite3.connect(self.db)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*), SUM(output_tokens) FROM api_calls"
+            ).fetchone()
+        finally:
+            conn.close()
+        # ONE call: the record whose `type` is absent carries a `message.usage`
+        # and is still NOT measured, because nothing says what it is. It is
+        # counted as an unknown shape instead -- unmeasured, not zero.
+        self.assertEqual(row[0], 1)
+        self.assertEqual(row[1], SHAPE_USAGE["output_tokens"])
+
+    def test_the_summary_names_the_unknown_types(self) -> None:
+        # A count with no name is unactionable -- the operator cannot look up
+        # a type they cannot see.
+        self.assertEqual(
+            self.summary["unknown_record_types"], {"sparkle-event": 2, None: 1}
+        )
+
+    def test_the_census_survives_a_run_that_skips_every_file(self) -> None:
+        # The loud signal must not be a one-shot: the file is unchanged on the
+        # next run and therefore skipped, and the shape finding still stands.
+        again = ingest(self.projects, self.db)
+        self.assertEqual(again["files_ingested"], 0)
+        self.assertEqual(
+            again["unknown_record_types"], {"sparkle-event": 2, None: 1}
+        )
+
+
+class UsageShapeCensusTest(unittest.TestCase):
+    """An unexpected `usage` shape is counted and named, never silently read
+    past (#15).
+
+    Two directions, and the second is the dangerous one:
+
+      * a key this tool has never seen (`output_tokens_details` is documented
+        and present in API responses, and appears on 0 of 338,030 assistant
+        records in the reference corpus, checked 2026-08-05) -- a signal that
+        the token accounting may have moved;
+      * one of the four keys CPB's numbers are made of going MISSING. `tok()`
+        reads an absent key as a real 0, which is right for a token class that
+        did not occur and catastrophic if a release renames `output_tokens`:
+        every figure would read zero and nothing would say so. All four are
+        present on 338,030 of 338,030 assistant records.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-usage-census-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.db = self.tmp / "usage.db"
+
+    def _usage_with(self, **overrides) -> dict:
+        usage = dict(SHAPE_USAGE)
+        usage.update(overrides)
+        return usage
+
+    def test_an_unseen_usage_key_is_counted_under_its_own_name(self) -> None:
+        source = self.projects / "unknown-usage-keys.jsonl"
+        # Deliberately unequal: 2 records carry one new key, 1 carries another.
+        source.write_text(
+            "".join(
+                shape_line(
+                    "assistant",
+                    version=SHAPE_VERSION_A,
+                    message_id=f"m-details-{i}",
+                    usage=self._usage_with(output_tokens_details={"reasoning": 5}),
+                )
+                for i in range(2)
+            )
+            + shape_line(
+                "assistant",
+                version=SHAPE_VERSION_A,
+                message_id="m-sparkle",
+                usage=self._usage_with(sparkle_tokens=9),
+            )
+        )
+        ingest(self.projects, self.db)
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_UNKNOWN_USAGE_KEY, source),
+            {"output_tokens_details": 2, "sparkle_tokens": 1},
+        )
+
+    def test_an_unseen_usage_key_does_not_stop_the_call_being_measured(
+        self,
+    ) -> None:
+        source = self.projects / "extra-key.jsonl"
+        source.write_text(
+            shape_line(
+                "assistant",
+                version=SHAPE_VERSION_A,
+                message_id="m-extra",
+                usage=self._usage_with(sparkle_tokens=9),
+            )
+        )
+        parsed = parse_file(source)
+        self.assertEqual(parsed.unparsed_records, 0)
+        self.assertEqual(len(parsed.calls), 1)
+        self.assertEqual(parsed.calls[0].output_tokens, SHAPE_USAGE["output_tokens"])
+
+    def test_a_usage_of_exactly_the_expected_shape_names_nothing(self) -> None:
+        source = self.projects / "clean-usage.jsonl"
+        source.write_text(
+            shape_line("assistant", version=SHAPE_VERSION_A, message_id="m-clean")
+        )
+        ingest(self.projects, self.db)
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_UNKNOWN_USAGE_KEY, source), {}
+        )
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_MISSING_USAGE_KEY, source), {}
+        )
+
+    def test_every_key_the_token_columns_are_read_from_is_counted_when_absent(
+        self,
+    ) -> None:
+        # Parameterised over the constant itself, so a key added to the tuple
+        # without a census is a failing test rather than a silent zero.
+        for key in ingest_mod.USAGE_TOKEN_KEYS:
+            with self.subTest(missing=key):
+                usage = dict(SHAPE_USAGE)
+                del usage[key]
+                source = self.projects / f"missing-{key}.jsonl"
+                source.write_text(
+                    shape_line(
+                        "assistant",
+                        version=SHAPE_VERSION_A,
+                        message_id=f"m-{key}",
+                        usage=usage,
+                    )
+                )
+                parsed = parse_file(source)
+                self.assertEqual(
+                    parsed.shape[(ingest_mod.SHAPE_MISSING_USAGE_KEY, key)], 1
+                )
+                # ...and the record is still stored, with the honest 0 that
+                # absence has always meant. The census is the thing that keeps
+                # that 0 distinguishable from a renamed key.
+                self.assertEqual(len(parsed.calls), 1)
+                self.assertEqual(parsed.unparsed_records, 0)
+
+    def test_a_malformed_value_is_still_unparsed_and_still_censused(self) -> None:
+        # The two mechanisms are independent: a record can defeat the parser
+        # AND tell us which version wrote it. Losing the second because of the
+        # first is how a breaking release stays anonymous.
+        source = self.projects / "malformed-and-versioned.jsonl"
+        source.write_text(
+            shape_line(
+                "assistant",
+                version=SHAPE_VERSION_B,
+                message_id="m-bad",
+                usage=self._usage_with(input_tokens="oops", sparkle_tokens=1),
+            )
+        )
+        parsed = parse_file(source)
+        self.assertEqual(parsed.unparsed_records, 1)
+        self.assertEqual(len(parsed.calls), 0)
+        self.assertEqual(parsed.shape[(ingest_mod.SHAPE_VERSION, SHAPE_VERSION_B)], 1)
+        self.assertEqual(
+            parsed.shape[(ingest_mod.SHAPE_UNKNOWN_USAGE_KEY, "sparkle_tokens")], 1
+        )
+
+
+class ShapeCensusUpgradeTest(unittest.TestCase):
+    """v8 -> v9 adds the census table and must not cost a single row (#15).
+
+    The census is the whole reason the schema moved, and a rebuild to install
+    it would meet the reaped-source guard -- refusing exactly the corpora whose
+    database is the only surviving copy. So `source_shape` is added to
+    `IN_PLACE_CREATABLE_TABLES`, which is a claim that an EMPTY one is TRUE of
+    a v8 database. It is: a row in it is a POSITIVE observation about a source,
+    so no rows means "nothing has been censused yet", which is precisely a v8
+    database's state. That is why "this source has no census" is a queryable
+    fact rather than something a reader has to infer from silence.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-census-upgrade-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+
+    def _downgrade_to_v8(self) -> None:
+        """The v8 shape: everything current, minus the census table."""
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(f"DROP TABLE {ingest_mod.SHAPE_TABLE}")
+            conn.execute("PRAGMA user_version = 8")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _counts(self) -> tuple:
+        conn = sqlite3.connect(self.db)
+        try:
+            return (
+                conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM ingest_state").fetchone()[0],
+            )
+        finally:
+            conn.close()
+
+    def test_a_v8_database_upgrades_in_place_without_re_parsing(self) -> None:
+        before = self._counts()
+        self._downgrade_to_v8()
+        summary = ingest(self.projects, self.db)
+        self.assertFalse(summary["schema_rebuilt"])
+        self.assertEqual(summary["files_ingested"], 0)
+        self.assertEqual(summary["files_skipped"], summary["files_scanned"])
+        self.assertEqual(self._counts(), before)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                ingest_mod.SCHEMA_VERSION,
+            )
+        finally:
+            conn.close()
+
+    def test_the_upgrade_is_not_refused_over_a_reaped_source(self) -> None:
+        self.transcript.unlink()
+        ingest(self.projects, self.db)  # archives it; rows retained
+        before = self._counts()
+        self._downgrade_to_v8()
+        ingest(self.projects, self.db)  # must not raise SystemExit
+        self.assertEqual(self._counts(), before)
+
+    def test_an_uncensused_source_is_not_reported_as_a_clean_one(self) -> None:
+        # The cost of creating the table empty, paid honestly: a v8 database's
+        # sources have NOT been censused, and the run summary must say so
+        # rather than let an empty census read as "no unknown shapes found".
+        self._downgrade_to_v8()
+        summary = ingest(self.projects, self.db)
+        self.assertEqual(summary["sources_tracked"], 1)
+        self.assertEqual(summary["sources_censused"], 0)
+        self.assertEqual(census_rows(self.db, ingest_mod.SHAPE_VERSION), {})
+
+    def test_a_censused_source_and_an_uncensused_one_are_distinguishable(
+        self,
+    ) -> None:
+        self._downgrade_to_v8()
+        ingest(self.projects, self.db)
+        fresh = self.projects / "second.jsonl"
+        fresh.write_text(
+            shape_line("assistant", version=SHAPE_VERSION_A, message_id="m-fresh")
+        )
+        summary = ingest(self.projects, self.db)
+        self.assertEqual(summary["sources_tracked"], 2)
+        self.assertEqual(summary["sources_censused"], 1)
+        # No row for the old source; a named row for the new one. "Never
+        # looked" and "looked, found no version" are different shapes of
+        # answer, and the second one is a row with a NULL name.
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION, self.transcript), {}
+        )
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION, fresh),
+            {SHAPE_VERSION_A: 1, None: 0},
+        )
+
+
+class SingleFileShapeCensusTest(unittest.TestCase):
+    """Single-file mode censuses the ONE file it opened, and claims no more.
+
+    The mode's whole discipline is that it looked at one file, so it may
+    conclude nothing about any other source. The census obeys the same rule
+    from both directions: the summary reports THIS file's shape rather than the
+    database's roll-up (which directory mode reports), and on the SKIP path it
+    carries no census keys at all -- an empty census would state that a file
+    was examined and found unsurprising, when it was never opened.
+
+    Storage is shared with directory mode through `store_source()`, which is
+    what keeps the two modes from describing the same file differently.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-single-census-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.db = self.tmp / "usage.db"
+        self.one = self.projects / "single-census.jsonl"
+        self.one.write_text(
+            shape_line("assistant", version=SHAPE_VERSION_A, message_id="m-single")
+            + shape_line("user", version=SHAPE_VERSION_A)
+            + shape_line("sparkle-event")
+        )
+        # A second source the run must say nothing about.
+        self.other = self.projects / "untouched.jsonl"
+        self.other.write_text(
+            shape_line("assistant", version=SHAPE_VERSION_B, message_id="m-other")
+        )
+
+    def test_the_censused_file_is_the_one_that_was_opened(self) -> None:
+        summary = ingest_mod.ingest_transcript(self.one, self.db)
+        self.assertEqual(summary["files_ingested"], 1)
+        self.assertEqual(summary["claude_code_versions"], {SHAPE_VERSION_A: 2, None: 0})
+        self.assertEqual(summary["unknown_record_types"], {"sparkle-event": 1})
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION, self.one),
+            {SHAPE_VERSION_A: 2, None: 0},
+        )
+        # The other file was never opened, so it has no census -- not an empty
+        # one, and certainly not this file's.
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION, self.other), {}
+        )
+
+    def test_the_skip_path_reports_no_census_at_all(self) -> None:
+        ingest_mod.ingest_transcript(self.one, self.db)
+        again = ingest_mod.ingest_transcript(self.one, self.db)
+        self.assertEqual(again["files_skipped"], 1)
+        # Absent keys, not empty ones: nothing was parsed, so there is nothing
+        # to report, and reporting {} would say the file was found clean.
+        for key in (
+            "claude_code_versions",
+            "unknown_record_types",
+            "unknown_usage_keys",
+            "missing_usage_keys",
+        ):
+            with self.subTest(key=key):
+                self.assertNotIn(key, again)
+        # ...and the stored census from the first run is untouched.
+        self.assertEqual(
+            census_rows(self.db, ingest_mod.SHAPE_VERSION, self.one),
+            {SHAPE_VERSION_A: 2, None: 0},
+        )
+
+    def test_the_summary_never_carries_a_corpus_wide_coverage_claim(self) -> None:
+        summary = ingest_mod.ingest_transcript(self.one, self.db)
+        # Directory mode reports censused-of-tracked. This mode cannot: it has
+        # not looked at the other sources, so it does not count them.
+        self.assertNotIn("sources_tracked", summary)
+        self.assertNotIn("sources_censused", summary)
+
+
+class RealTranscriptShapeSmokeTest(unittest.TestCase):
+    """The assumed shape, checked against a REAL transcript (#15).
+
+    Every other test in this file runs on a synthetic fixture that this
+    repository wrote, so all of them agree with CPB's assumptions by
+    construction. They cannot notice the one failure mode Anthropic documents:
+    "the entry format is internal to Claude Code and changes between versions".
+    This class is the only one that can, because it reads what Claude Code
+    actually wrote on this machine.
+
+    **The privacy tension, and how it is resolved.** Real transcripts contain
+    prompts, file paths and source code, and CLAUDE.md forbids committing any
+    of it -- so this test may not carry a captured fixture, may not write one,
+    and may not quote what it read. It therefore reads the corpus AT TEST TIME
+    from `~/.claude/projects` and asserts only over the SHAPE CENSUS: key
+    names, record-type names and counts, all of which are vocabulary of the
+    format rather than content of a session. No assertion message can contain
+    a prompt, a path or a session id, so a failure is safe to paste into CI.
+
+    The tradeoff is that this test cannot run where there is no corpus --
+    CI included. It skips there, LOUDLY: the skip reason is printed to stderr
+    as well as recorded, because a shape test that silently passes on the
+    machine that runs the merge is worth nothing at all. What it buys is that
+    the break surfaces on a developer's machine the first time they run the
+    suite after a Claude Code upgrade, which is months before a chart would
+    have quietly changed shape.
+    """
+
+    # Bounded: the reference corpus is 2,952 files and 638,813 records and
+    # takes ~26 s to walk. The most recently written transcripts are the ones
+    # a new Claude Code release will have touched, so they are the sample.
+    MAX_FILES = 3
+
+    NO_CORPUS = (
+        "SKIPPED LOUDLY: no Claude Code transcripts under ~/.claude/projects, "
+        "so the assumed transcript SHAPE was NOT checked against anything real "
+        "on this machine. Every other test in this suite runs on fixtures this "
+        "repository wrote, which agree with CPB's assumptions by construction "
+        "(#15)."
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Find and parse the sample ONCE, and say so when there is none.
+
+        Parsed here rather than per test method so the four assertions below
+        read the SAME sample -- a live transcript grows between two reads of
+        it, and four disagreeing samples would make a failure unreproducible.
+        The banner is printed here for the same reason: once per run, to
+        stderr, so the skip is visible without `-v` and cannot pass for green.
+        """
+        transcripts = []
+        for project in available_projects():
+            transcripts.extend(project.glob(f"*{ingest_mod.TRANSCRIPT_SUFFIX}"))
+        readable = []
+        for path in transcripts:
+            try:
+                readable.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+        readable.sort(reverse=True)
+        cls.sample = [path for _mtime, path in readable[: cls.MAX_FILES]]
+        cls.parsed = [parse_file(path) for path in cls.sample]
+        if not cls.parsed:
+            print(f"\n{cls.NO_CORPUS}", file=sys.stderr)
+
+    def setUp(self) -> None:
+        # Skipped per TEST, not per class, so every one of these assertions is
+        # individually reported as "not checked here" rather than the class
+        # quietly vanishing from the run.
+        if not self.parsed:
+            self.skipTest(self.NO_CORPUS)
+
+    def _census(self, fact: str) -> dict:
+        totals: dict = {}
+        for parsed in self.parsed:
+            for (kind, name), records in parsed.shape.items():
+                if kind == fact:
+                    totals[name] = totals.get(name, 0) + records
+        return totals
+
+    def test_every_record_type_is_one_this_tool_has_heard_of(self) -> None:
+        unknown = self._census(ingest_mod.SHAPE_UNKNOWN_RECORD_TYPE)
+        self.assertEqual(
+            unknown,
+            {},
+            "a real transcript carries record type(s) this tool does not know."
+            " Names and counts above; nothing else from the file is shown."
+            " Decide what each one means, then add it to KNOWN_RECORD_TYPES"
+            " (or teach the parser to read it) -- a type nobody has looked at"
+            " is spend that may be leaving the totals silently.",
+        )
+
+    def test_usage_carries_exactly_the_keys_this_tool_expects(self) -> None:
+        unknown = self._census(ingest_mod.SHAPE_UNKNOWN_USAGE_KEY)
+        self.assertEqual(
+            unknown,
+            {},
+            "a real `usage` object carries key(s) this tool has never seen."
+            " Check what they measure before adding them to KNOWN_USAGE_KEYS:"
+            " a new key can mean the token accounting itself has moved"
+            " (`output_tokens_details` is the documented candidate).",
+        )
+        missing = self._census(ingest_mod.SHAPE_MISSING_USAGE_KEY)
+        self.assertEqual(
+            missing,
+            {},
+            "a real `usage` object is MISSING a key every CPB token column is"
+            " read from. An absent key is read as a real 0, so this is the"
+            " shape change that would zero out the report without raising"
+            " anything at all.",
+        )
+
+    def test_the_measured_records_still_report_a_claude_code_version(self) -> None:
+        versions = self._census(ingest_mod.SHAPE_VERSION)
+        named = {name for name in versions if name is not None}
+        self.assertTrue(
+            named,
+            "no record in the sampled real transcripts carries a `version`"
+            " field. The per-source version census cannot be derived from"
+            " anything else, so it is now blank rather than wrong -- but the"
+            " field has moved or gone, which is exactly the instability this"
+            " test exists to surface.",
+        )
+
+    def test_the_parser_still_finds_api_calls_in_a_real_transcript(self) -> None:
+        calls = sum(len(parsed.calls) for parsed in self.parsed)
+        self.assertGreater(
+            calls,
+            0,
+            "no `message.usage` record was found in the most recently written"
+            " real transcripts. Either the sampled sessions genuinely made no"
+            " API call, or the assistant/usage shape has moved -- and the"
+            " second one silently empties every figure this tool reports.",
+        )
+        # A call whose context is 0 across the board would satisfy the count
+        # above while measuring nothing: the tokens have to be there too.
+        self.assertGreater(
+            sum(call.context_size for parsed in self.parsed for call in parsed.calls),
+            0,
+            "every real API call measured a context of 0 tokens.",
+        )
 
 
 if __name__ == "__main__":
