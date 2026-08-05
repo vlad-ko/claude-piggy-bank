@@ -45,7 +45,15 @@ from typing import NamedTuple, Optional, Sequence
 # The version of CPB itself -- what a user names when they say which build
 # produced a number. Distinct from ingest.py's SCHEMA_VERSION, which describes
 # the database's shape and says nothing about the code that filled it.
-VERSION = "0.1.0"
+#
+# Semantic Versioning, and what a bump MEANS is written down in
+# `docs/versioning.md` rather than assumed: the governed surfaces are the CLI
+# (including exit statuses), the HTTP API, and what a figure MEASURES -- a
+# stable field name over a changed definition is a breaking change. Explicitly
+# NOT governed is SCHEMA_VERSION, so long as an existing database upgrades
+# without data loss and without a refusal; the migration machinery in
+# `ingest.py`, not this number, is what carries that guarantee.
+VERSION = "1.0.0"
 
 PROG = "cpb"
 

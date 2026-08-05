@@ -25,7 +25,18 @@ already writes locally into SQLite and serves a single-page report over them.
 That last point is deliberate. This is a tool for understanding what your
 sessions consume; it would be a poor one if using it consumed anything.
 
-CPB is **pre-1.0**. The defect that once made its headline numbers wrong is
+CPB is **1.0.0** and follows [Semantic
+Versioning](https://semver.org/spec/v2.0.0.html). What that promises you is
+written down rather than left to be guessed at: the command line, the HTTP API,
+and **what each figure measures** are the interface, so a number that changes
+what it counts is a breaking change even when its name does not move. The
+database's internal schema is deliberately **not** part of the promise, because
+upgrading it is the tool's job rather than yours — an older database is
+migrated in place, and where that cannot be done without losing a measurement
+CPB refuses rather than rebuilding over it. The rule, and the exact condition
+that exclusion depends on, is in [`docs/versioning.md`](docs/versioning.md).
+
+The defect that once made its headline numbers wrong is
 fixed, and the whole correction is kept on the record below under
 [The record](#the-record-the-defect-that-made-the-headline-numbers-wrong) —
 a tool about measurement should show its own corrections rather than quietly
@@ -524,8 +535,12 @@ rather than trusting a derived figure the tool cannot keep current.
 
 ## The record: the defect that made the headline numbers wrong
 
-CPB is pre-1.0. This is kept in the README rather than in a changelog because a
-tool about measurement should show its own corrections.
+There is no changelog; this is kept in the README because a tool about
+measurement should show its own corrections, and because a number's history is
+more useful beside the number than in a file of one-line entries. A correction
+like this one is **not** a breaking change — the figure always claimed to count
+API calls and had been counting transcript records — which is a distinction
+[`docs/versioning.md`](docs/versioning.md) draws deliberately.
 
 `api_calls` used to count transcript *records*. Claude Code writes one record
 per streamed content block, and each repeats the same `message.usage` object,
@@ -607,6 +622,9 @@ Longer-form reference lives in [`docs/`](docs/), indexed by
   content; whether it is re-billed as input on later turns depends on the
   model; cache writes carry a markup and the cacheable minimum is a per-model
   lookup, not a constant.
+- [Versioning](docs/versioning.md) — what the version number promises: the
+  three surfaces SemVer governs here, why the database schema is excluded and
+  the condition that exclusion rests on, and which part to bump.
 - [The Claude Code plugin](docs/plugin.md) — why the packaging looks the way it
   does: which three hooks fire and why `SubagentStop` is load-bearing, why every
   timeout is explicit, where the database lives and when the hook refuses to

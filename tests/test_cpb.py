@@ -271,6 +271,92 @@ class VersionTest(unittest.TestCase):
         self.assertEqual(manifest["version"], cpb.VERSION)
 
 
+DOCS = REPO_ROOT / "docs"
+VERSIONING_RULE = DOCS / "versioning.md"
+DOCS_INDEX = DOCS / "README.md"
+README = REPO_ROOT / "README.md"
+CONTRIBUTING = REPO_ROOT / "CONTRIBUTING.md"
+
+# The code the versioning rule's central argument rests on. The rule says a
+# SCHEMA_VERSION bump is not a MAJOR bump *because* these exist and bound what
+# an upgrade is allowed to do to a database it did not write. If one is renamed
+# or deleted, the rule is promising a guarantee the code no longer makes -- and
+# a stale claim about compatibility is the same defect class as a stale number.
+RULE_CITED_SYMBOLS = (
+    "SCHEMA_VERSION",
+    "IN_PLACE_UPGRADE_FROM",
+    "IN_PLACE_CREATABLE_TABLES",
+    "IN_PLACE_ADDABLE_COLUMNS",
+    "PLAN_REFUSE_REAPED",
+)
+
+
+class VersioningRuleTest(unittest.TestCase):
+    """#21/#55: the rule that says what a version number MEANS, and 1.0.0.
+
+    Bumping the number without writing the rule is the weaker half: `1.0.0`
+    with nothing saying what a major bump covers is a promise with no terms.
+    So the number and its rule are pinned together here.
+
+    The version assertion is deliberately `>= 1.0.0` rather than `== 1.0.0`.
+    Pinning the literal would make every future release edit this file, which
+    trains people to update the test to match the code -- the habit that makes
+    a test decorative. What must not silently change is the DECISION: CPB has
+    committed to a stable interface, and cannot slide back to a 0.x that
+    promises nothing.
+    """
+
+    def parsed_version(self) -> tuple[int, ...]:
+        return tuple(int(part) for part in cpb.VERSION.split("."))
+
+    def test_the_version_has_reached_1_0_0(self):
+        self.assertGreaterEqual(self.parsed_version(), (1, 0, 0))
+
+    def test_the_versioning_rule_is_written_down(self):
+        # The deliverable is the rule, not the digits.
+        self.assertTrue(
+            VERSIONING_RULE.is_file(), f"{VERSIONING_RULE.name} does not exist"
+        )
+
+    def test_the_rule_is_indexed_rather_than_orphaned(self):
+        # `docs/README.md` states its own rule: a document not listed there is
+        # an orphan. A compatibility promise nobody can find is not a promise.
+        self.assertIn("versioning.md", DOCS_INDEX.read_text(encoding="utf-8"))
+
+    def test_the_front_door_and_the_contributor_contract_both_point_at_it(self):
+        # One home and a pointer: a user asking "what does 1.0.0 promise me?"
+        # starts at the README, a contributor asking "which part do I bump?"
+        # starts at CONTRIBUTING, and both must arrive at the same text rather
+        # than at two copies free to drift.
+        for path in (README, CONTRIBUTING):
+            with self.subTest(path.name):
+                self.assertIn("docs/versioning.md", path.read_text(encoding="utf-8"))
+
+    def test_the_schema_argument_cites_code_that_exists(self):
+        # The tie between the claim and the mechanism. The rule's hardest
+        # clause -- that a schema bump is not a major bump -- is only true
+        # while these bound the upgrade; nothing else would notice them going
+        # away, because prose does not fail to import.
+        import ingest
+
+        rule = VERSIONING_RULE.read_text(encoding="utf-8")
+        for symbol in RULE_CITED_SYMBOLS:
+            with self.subTest(symbol):
+                self.assertIn(symbol, rule, f"the rule no longer cites {symbol}")
+                self.assertTrue(
+                    hasattr(ingest, symbol),
+                    f"the rule cites ingest.{symbol}, which does not exist",
+                )
+
+    def test_no_shipped_prose_still_calls_the_project_pre_1_0(self):
+        # Both statements were true and are now false. A README that announces
+        # a status the code contradicts is the documentation form of a number
+        # that looks right.
+        for path in (README, CONTRIBUTING):
+            with self.subTest(path.name):
+                self.assertNotIn("pre-1.0", path.read_text(encoding="utf-8"))
+
+
 class EndToEndTest(unittest.TestCase):
     """Runs the real entry point in a subprocess, from an unrelated directory.
 

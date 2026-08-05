@@ -36,7 +36,8 @@ anyone who has it in a script. `_exit_status()` reproduces CPython's own
 report a run that measured nothing as a run that measured zero. `VERSION` lives
 in `cpb.py`; `.claude-plugin/plugin.json` repeats it as a literal because the
 plugin loader reads that JSON without running Python, and `tests/test_cpb.py`
-pins the two equal.
+pins the two equal. CPB is **1.0.0** under SemVer, and what a bump *means* is
+`docs/versioning.md` — see Commits and PRs below.
 
 Both scripts default `--db` to `db/usage.db` (gitignored); `ingest.py` also
 reads `CPB_DB`, `serve.py` deliberately does not (pass `--db "$CPB_DB"`).
@@ -275,6 +276,15 @@ Consequences encoded in the code, which must be preserved:
   turns on a measurement, put the numbers in the body.
 - Branch protection requires a PR and the `suite` check; never commit to `main`
   directly.
+- **Know whether your change is breaking before you open the PR.**
+  `docs/versioning.md` is the rule and the only home for it: SemVer here
+  governs the CLI (exit statuses included), the HTTP API, and **what a figure
+  measures** — a stable field name over a changed definition is breaking, a
+  *correction* to a figure that was wrong is not. It explicitly does **not**
+  govern `SCHEMA_VERSION`, which is why 6 → 9 was not four major releases; that
+  exclusion holds only while an existing database upgrades without data loss
+  and without a refusal, so a schema change that cannot offer that is a major
+  release rather than a reason to widen `IN_PLACE_UPGRADE_FROM`.
 
 ## Provenance
 
