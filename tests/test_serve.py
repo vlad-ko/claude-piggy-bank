@@ -1942,6 +1942,9 @@ X_FOR = re.compile(r'x-for="\(?\s*([A-Za-z_$][\w$]*)[^"]*?\bin\b([^"]*)"')
 # is a real structural guarantee and not an exemption: `contextSpread` renders
 # one line per percentile without naming any of them.
 BULK_READ = re.compile(r"Object\.(?:keys|values|entries)\(([^()]*)\)")
+# `get shownModels() {`: a component getter, which is the one indirection this
+# walk follows between an `x-for` and the payload it renders (#70).
+GETTER_DECL = re.compile(r"\bget\s+([A-Za-z_$][\w$]*)\s*\(\s*\)\s*\{")
 
 # Never a plausible substitute for a resolved node (rule #12 in the test layer).
 UNRESOLVED = object()
@@ -1975,16 +1978,51 @@ def reads_any(source: str, exprs) -> bool:
     return any(binding_regex(expr).search(source) for expr in exprs)
 
 
-def iteration_aliases(surface: str, exprs) -> frozenset:
-    """The loop variables the page binds a list's ELEMENTS to.
+def getter_bodies(surface: str) -> dict[str, str]:
+    """Every `get name() { ... }` in the page, by name.
 
-    Containment rather than equality on the iterated expression, because the
-    page legitimately guards one: `x-for="(r, i) in (summary ? summary.models :
-    [])"` iterates `summary.models` through a ternary, and a rule that demanded
-    the bare expression would call that list uniterated.
+    Brace-matched through `js_function_body`, so a nested block cannot end a
+    body early and a getter that merely MENTIONS a field in a comment cannot
+    stand in for one that reads it.
     """
+    return {
+        name: js_function_body(surface, f"get {name}(")
+        for name in GETTER_DECL.findall(surface)
+    }
+
+
+def iterates(surface: str, iterated: str, exprs) -> bool:
+    """Does this `x-for`'s expression iterate the node `exprs` names?
+
+    Containment rather than equality on the expression, because the page
+    legitimately guards one: `x-for="(r, i) in (summary ? summary.models : [])"`
+    iterates `summary.models` through a ternary, and a rule that demanded the
+    bare expression would call that list uniterated.
+
+    #70 added the second clause. A view that FILTERS a table iterates a getter
+    -- `x-for="(r, i) in (shownModels ?? [])"` -- and the payload it renders is
+    one hop away, inside that getter. A guard that stopped at the loop would
+    report the whole of `summary.models` unwired the moment a deep-link filter
+    was added to the panel that renders it, which is a check reporting an
+    absence it can see is not there.
+
+    EXACTLY ONE HOP, through a getter DEFINED IN THIS PAGE, and the hop must
+    itself read the payload. A getter that stopped reading `summary.models`
+    turns the guard red again, which is the property worth having: the
+    indirection is followed, not excused.
+    """
+    if reads_any(iterated, exprs):
+        return True
+    return any(
+        re.search(rf"\b{re.escape(name)}\b", iterated) and reads_any(body, exprs)
+        for name, body in getter_bodies(surface).items()
+    )
+
+
+def iteration_aliases(surface: str, exprs) -> frozenset:
+    """The loop variables the page binds a list's ELEMENTS to."""
     return frozenset(
-        var for var, iterated in X_FOR.findall(surface) if reads_any(iterated, exprs)
+        var for var, iterated in X_FOR.findall(surface) if iterates(surface, iterated, exprs)
     )
 
 
@@ -2491,6 +2529,20 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
                     f"{path} is exempted without citing the decision it records",
                 )
                 self.assertGreater(len(reason), 60, f"{path}: not a reason")
+
+    def test_moving_a_field_between_views_does_not_widen_the_register(self) -> None:
+        # #70 splits the page into an overview and a detail view. A field that
+        # MOVES between them is still rendered, so the register must not grow
+        # to cover one -- an entry added by a layout change would be a field
+        # quietly dropped from the report while the allowlist made it look
+        # decided. Twenty-one is the count #76 found and declared; the healthy
+        # direction is down.
+        self.assertLessEqual(
+            len(self.NOT_RENDERED),
+            21,
+            "a field that stopped being rendered was exempted rather than "
+            "re-homed. Moving a panel between views does not orphan a field.",
+        )
 
     def test_the_context_block_owes_no_exemption_at_all(self) -> None:
         # #61 and #76 are one change on purpose: the guard that starts seeing
@@ -4551,10 +4603,19 @@ class DeclarativeRenderLayerTest(unittest.TestCase):
 
     # table id -> the state the rows must be iterated FROM.
     ROW_SOURCES = {
-        "models": "summary.models",
+        "models": "shownModels",
         "sessions": "sessions",
         "agents": "agents",
-        "outliers": "outliers",
+        "outliers": "shownOutliers",
+    }
+    # #70: two of those are DERIVED -- a deep link filters them -- so the
+    # source above is a getter rather than the payload itself. That indirection
+    # is exactly how "iterating a literal []" would come back wearing a
+    # respectable name, so each derived source is pinned to the state it must
+    # read. Getter -> the payload it derives from.
+    DERIVED_ROW_SOURCES = {
+        "shownModels": "this.summary.models",
+        "shownOutliers": "this.outliers",
     }
 
     def test_every_table_body_is_produced_by_iterating_the_payload(self) -> None:
@@ -4577,6 +4638,15 @@ class DeclarativeRenderLayerTest(unittest.TestCase):
                     rf"\bin\s+.*\b{re.escape(source)}\b",
                     f"#{table_id} does not iterate {source}",
                 )
+
+    def test_a_derived_row_source_still_reads_the_payload(self) -> None:
+        # The hop, checked. A filtered table iterates a getter, and a getter
+        # that stopped reading the payload would render nothing while every
+        # field it mentions still looked wired -- which is the original defect
+        # (`summary.models`) with one more step in front of it.
+        for getter, source in self.DERIVED_ROW_SOURCES.items():
+            with self.subTest(getter=getter):
+                self.assertIn(source, js_function_body(self.html, f"get {getter}("))
 
     def test_a_not_yet_loaded_table_is_not_an_empty_one(self) -> None:
         # Three states, not two. "No sessions in this period" is a claim about
@@ -6626,6 +6696,421 @@ class RecommendationVersionTest(unittest.TestCase):
             "payload field and so a MINOR release (docs/versioning.md). The "
             "plugin manifest is Claude Code's update cache key: left unbumped, "
             "installed users receive nothing.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# #70: two views of one payload.
+# ---------------------------------------------------------------------------
+#
+# The report used to be one page serving two readers. It is now an OVERVIEW
+# (the landing view) and a DETAILS & RAW DATA view one click away, and the
+# whole risk of that split is stated in one sentence: two renderings of one
+# figure that can drift is "one sample, one definition" with a navigation step
+# hidden in the middle.
+#
+# Three mechanisms answer it, and each has its own test below:
+#
+#   * what BOTH views need is rendered ONCE, above them, in neither section --
+#     the banner and the data-age line are single elements, so they cannot
+#     disagree because there is no second rendering to disagree with;
+#   * no `summary.<path>` may be bound in both sections. A figure needed by
+#     both goes through ONE named getter, which is the only shape in which
+#     "there is a single definition" is a checkable statement;
+#   * the period every figure covers is `periodLabel`, defined once and bound
+#     in both, and neither view may compose one from `from`/`to` itself.
+#
+# These are structural assertions with the limit the rest of this file records:
+# the project ships no JS runtime (stdlib only, no Node), so they pin the
+# bindings rather than executing the render. What they CANNOT catch is two
+# DIFFERENT fields presented as one figure -- no static check can -- which is
+# exactly what the single-getter rule exists to make unnecessary.
+
+# The panels that make up the report, and which of the three regions each one
+# lives in. This dict IS the acceptance criterion "every panel on the report
+# today survives": a panel dropped from the detail view leaves its id in no
+# section and turns `test_every_panel_survives_in_a_named_view` red.
+CHROME_PANELS = {
+    # Rendered ONCE for both views. A warning is the worst possible thing to
+    # render twice: two copies free to disagree is a reader shown the milder
+    # of two true statements with no sign the other exists (BannerPrecedence-
+    # Test's defect, one level up), and a warning visible on only one view is
+    # a warning the reader can navigate away from without resolving.
+    "banner",
+    "data-age",
+    # The affordance itself: one click there, one click back, from either view.
+    "view-tabs",
+}
+OVERVIEW_PANELS = {"overview-period", "cards", "scope-note", "context-note", "advice-note"}
+DETAIL_PANELS = {
+    "filters", "chart-panel", "models", "detail", "sessions", "agents", "outliers",
+}
+
+# Every JS member name that can sit on the tail of a payload read. Stripped
+# before two views' bindings are compared, so `summary.calls` in one view and
+# `summary.calls.toLocaleString()` in the other are recognised as the same
+# field read twice rather than as two different paths.
+JS_MEMBERS = frozenset({
+    "length", "join", "includes", "toLocaleString", "toFixed", "toPrecision",
+    "slice", "filter", "map", "split", "entries", "keys", "values", "some",
+    "every", "find", "indexOf", "sort", "reverse", "concat", "push",
+})
+SUMMARY_PATH = re.compile(
+    r"\bsummary(?:\??\.[A-Za-z_$][\w$]*)+"
+)
+# The attributes through which a value reaches the page. A binding is one of
+# these; a mention in prose is not.
+BINDING_ATTR = re.compile(r'(?:x-text|x-model|x-if|x-show|x-for|:value|:class|:title)="([^"]*)"')
+
+
+def view_section(html: str, view: str) -> str:
+    """The markup of one of #70's two views, comments stripped."""
+    return html_element(html, f'id="view-{view}"')
+
+
+def view_surface(html: str, section: str) -> str:
+    """Everything one view can read the payload THROUGH.
+
+    Not the section markup alone. A view renders `x-for="(c, i) in cards"`, and
+    the figures that loop puts on screen are spelled in the `cards` GETTER --
+    so a check that compared the two sections' markup would call the six
+    summary cards unbound and, worse, would let the detail view re-render the
+    median card's own figure without noticing. The surface of a view is its
+    markup plus the body of every getter it names, transitively.
+
+    Transitively because `cards` reads `contextSampleLine`, which is where that
+    card's sample is composed: one hop would stop exactly where the fields are.
+    """
+    bodies = getter_bodies(strip_comments(html))
+    surface, seen = section, set()
+    while True:
+        named = {
+            name for name in bodies
+            if name not in seen and re.search(rf"\b{re.escape(name)}\b", surface)
+        }
+        if not named:
+            return surface
+        seen |= named
+        surface += "\n" + "\n".join(bodies[name] for name in sorted(named))
+
+
+def summary_paths(source: str) -> set[str]:
+    """Every `/api/summary` path `source` reads, normalised.
+
+    Normalised by dropping JS member names from the tail, so the comparison is
+    between FIELDS rather than between spellings of a read.
+    """
+    paths = set()
+    for match in SUMMARY_PATH.findall(source):
+        parts = match.replace("?.", ".").split(".")[1:]
+        while parts and parts[-1] in JS_MEMBERS:
+            parts.pop()
+        if parts:
+            paths.add(".".join(parts))
+    return paths
+
+
+class ReportViewSplitTest(unittest.TestCase):
+    """The overview is the front door; the detail view keeps every panel (#70).
+
+    The owner's decision, taken before this was built: the overview is the
+    landing view and the details view is one click away. It costs the heaviest
+    reader -- the person who has been reading the tables all along -- one extra
+    click, forever, which is why two of these tests are load-bearing rather
+    than tidy. One click there and one click BACK, or the extra click compounds
+    instead of being paid once. And the view is in the URL, or anyone who has
+    bookmarked this report loses their bookmark silently.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+        cls.overview = view_section(cls.raw, "overview")
+        cls.details = view_section(cls.raw, "details")
+
+    def component(self, decl: str) -> str:
+        return js_function_body(self.html, decl)
+
+    # --- the landing view and the way back ---------------------------------
+
+    def test_the_overview_is_the_landing_view(self) -> None:
+        # The DEFAULT, not merely a reachable state: a page that opens on the
+        # details view has not been split, it has been rearranged.
+        component = self.component("function report(")
+        self.assertRegex(component, re.compile(r'^\s*view: DEFAULT_VIEW,$', re.M))
+        self.assertRegex(
+            self.html, r'const DEFAULT_VIEW = "overview";'
+        )
+        self.assertIn("""x-show="view === 'overview'\"""", self.raw)
+        self.assertIn("""x-show="view === 'details'\"""", self.raw)
+
+    def test_one_click_reaches_details_and_one_click_returns(self) -> None:
+        # Symmetry is the whole point. The tabs sit in NEITHER section, so both
+        # are on screen whichever view is showing -- a "back" that is reachable
+        # only from the top of a long scrolled page is not one click.
+        tabs = html_element(self.raw, 'id="view-tabs"')
+        for view in ("overview", "details"):
+            with self.subTest(view=view):
+                self.assertIn(f"setView('{view}')", tabs)
+        self.assertNotIn('id="view-tabs"', self.overview)
+        self.assertNotIn('id="view-tabs"', self.details)
+
+    # --- nothing is removed ------------------------------------------------
+
+    def test_every_panel_survives_in_a_named_view(self) -> None:
+        # THE acceptance criterion: every panel on the report before the split
+        # is still on it, in a named place. A dropped detail panel is red here
+        # and nowhere else -- the wiring guard would not see it, because the
+        # payload field it renders may well still be read somewhere.
+        for panel in sorted(OVERVIEW_PANELS):
+            with self.subTest(panel=panel, view="overview"):
+                self.assertIn(f'id="{panel}"', self.overview)
+                self.assertNotIn(f'id="{panel}"', self.details)
+        for panel in sorted(DETAIL_PANELS):
+            with self.subTest(panel=panel, view="details"):
+                self.assertIn(f'id="{panel}"', self.details)
+                self.assertNotIn(f'id="{panel}"', self.overview)
+
+    def test_each_panel_exists_exactly_once_in_the_page(self) -> None:
+        # A panel duplicated into both views is the disagreement this issue is
+        # about, in its most literal form.
+        for panel in sorted(CHROME_PANELS | OVERVIEW_PANELS | DETAIL_PANELS):
+            with self.subTest(panel=panel):
+                self.assertEqual(self.html.count(f'id="{panel}"'), 1)
+
+    def test_the_shared_chrome_belongs_to_neither_view(self) -> None:
+        # The strongest form of "cannot disagree": not two bindings kept equal,
+        # but ONE element that both views are looking at.
+        for panel in sorted(CHROME_PANELS):
+            with self.subTest(panel=panel):
+                self.assertIn(f'id="{panel}"', self.html)
+                self.assertNotIn(f'id="{panel}"', self.overview)
+                self.assertNotIn(f'id="{panel}"', self.details)
+
+    # --- the two views cannot disagree -------------------------------------
+
+    def test_no_summary_field_is_bound_in_both_views(self) -> None:
+        # A field read in both views is two renderings of one figure with a
+        # navigation step between them, and nothing keeps them equal. The
+        # remedy is not "keep them in sync": it is one getter, named once, so
+        # that there is one definition to be right or wrong.
+        #
+        # Over the view SURFACE, not the markup: the six summary cards are
+        # composed in a getter, and a detail panel that re-rendered one of
+        # their figures would be invisible to a check that read templates only.
+        both = (
+            summary_paths(view_surface(self.raw, self.overview))
+            & summary_paths(view_surface(self.raw, self.details))
+        )
+        self.assertEqual(
+            sorted(both),
+            [],
+            f"{sorted(both)} is bound in BOTH views. Two renderings of one "
+            "figure can drift; route it through a single named getter instead.",
+        )
+
+    def test_the_period_is_named_by_one_binding_in_both_views(self) -> None:
+        # The one figure both views genuinely need, and therefore the test case
+        # for the rule above: the overview names the period it describes, the
+        # detail view opens on the same one, and there is ONE definition.
+        self.assertEqual(self.html.count("get periodLabel("), 1)
+        for view, section in (("overview", self.overview), ("details", self.details)):
+            with self.subTest(view=view):
+                self.assertIn("periodLabel", section)
+
+    def test_neither_view_composes_a_period_of_its_own(self) -> None:
+        # How the rule above would be defeated: not by binding the same path
+        # twice, but by rebuilding the same sentence out of the range state.
+        # The picker owns `from`/`to`/`range`; everything else asks
+        # `periodLabel`.
+        for expr in BINDING_ATTR.findall(self.overview):
+            with self.subTest(binding=expr):
+                self.assertNotRegex(expr, r"\b(from|to|range)\b")
+        picker = html_element(self.raw, 'id="filters"')
+        for expr in BINDING_ATTR.findall(self.details.replace(picker, "")):
+            with self.subTest(binding=expr):
+                self.assertNotRegex(expr, r"\b(from|to)\b")
+
+    def test_a_figure_unmeasured_in_one_view_is_unmeasured_in_the_other(self) -> None:
+        # Absence must not become a value by changing level, so both views run
+        # every figure through the SAME formatters -- the ones
+        # `AbsenceIsNeverRenderedAsAValueTest` pins as answering absence before
+        # they compute. A second copy of one would be a second rule.
+        for formatter in ("fmtTok", "fmtCount", "fmtPct"):
+            with self.subTest(formatter=formatter):
+                self.assertEqual(self.html.count(f"function {formatter}("), 1)
+        self.assertIn("fmtTok(", self.overview)
+        self.assertIn("fmtTok(", self.details)
+
+    # --- the view is in the URL --------------------------------------------
+
+    def test_the_view_is_written_to_the_url(self) -> None:
+        # A details view that cannot be linked or reloaded is a silent
+        # regression for everyone who has bookmarked this report.
+        body = self.component("writeUrl() {")
+        self.assertIn('p.set("view", this.view)', body)
+        self.assertIn("history.replaceState", body)
+        self.assertIn("this.writeUrl()", self.component("setView(view) {"))
+
+    def test_the_url_is_read_back_on_load_and_on_navigation(self) -> None:
+        body = self.component("applyUrl() {")
+        self.assertIn("location.hash", body)
+        self.assertIn("this.applyUrl()", self.component("init() {"))
+        # Alpine's own event modifier, not `addEventListener` (#8): the page
+        # reaches no DOM API. A bookmark opened in an already-loaded tab, or a
+        # back button, must land on the view the URL names.
+        self.assertIn('x-on:hashchange.window="applyUrl()"', self.raw)
+
+    def test_an_unknown_view_in_the_url_falls_back_to_the_overview(self) -> None:
+        # A hash is not a route -- there is no request to answer with a 404 --
+        # so the page states the view it CAN show rather than a view it cannot.
+        body = self.component("applyUrl() {")
+        self.assertRegex(body, r"VIEWS\.includes\(\w+\)\s*\?\s*\w+\s*:\s*DEFAULT_VIEW")
+
+    # --- deep links carry their filter -------------------------------------
+
+    # An overview figure, the detail panel it drills into, and the filter the
+    # link carries. A bare "Details" link makes the reader do the join
+    # themselves, which is the thing this issue names.
+    DEEP_LINKS = (
+        # #61's per-scope saturation band -> the models table, filtered to that
+        # scope. The filter value is the payload's OWN scope label on both
+        # ends (`by_scope[].scope` and `models[].scope` are both
+        # `serve.SCOPE_LABELS`), so the page invents no equivalence.
+        ("context-note", "showPanel('models', { scope: s.scope })"),
+        # The unknown-window models -> the heaviest calls that ran on them.
+        # Again both ends are server strings: `unknown_models` and
+        # `outliers[].model`.
+        (
+            "context-note",
+            "showPanel('outliers', { models: summary.context.utilisation.unknown_models })",
+        ),
+        # The scope band already told the reader that subagent calls appear
+        # under their own bucket in the by-turn-type chart. Now it takes them
+        # there, with that grouping selected.
+        ("scope-note", "showPanel('chart', { by: 'turntype' })"),
+    )
+
+    def test_every_deep_link_names_a_panel_and_carries_its_filter(self) -> None:
+        for element, call in self.DEEP_LINKS:
+            with self.subTest(link=call):
+                self.assertIn(call, html_element(self.raw, f'id="{element}"'))
+
+    def test_a_deep_link_lands_on_the_detail_view(self) -> None:
+        body = self.component("showPanel(panel, opts) {")
+        self.assertIn('this.view = "details"', body)
+        self.assertIn("this.writeUrl()", body)
+        # And says where it landed: a filter nobody can see is a table that
+        # silently disagrees with the figure that linked to it.
+        self.assertIn("scrollIntoView", body)
+
+    def test_the_filter_is_carried_in_the_url_too(self) -> None:
+        # Otherwise the deep link survives the click and not the reload, which
+        # is the same regression as losing the view.
+        body = self.component("writeUrl() {")
+        for param in ("panel", "scope", "models", "by"):
+            with self.subTest(param=param):
+                self.assertIn(f'p.set("{param}"', body)
+
+    def test_a_filtered_table_says_what_it_is_hiding(self) -> None:
+        # An unexplained filter is a table that disagrees with the figure that
+        # linked to it. Every filtered panel states the filter, the two counts
+        # and the way out of it.
+        for table in ("models", "outliers"):
+            with self.subTest(table=table):
+                panel = html_element(self.raw, f'id="{table}-panel"')
+                self.assertIn("clearFilters()", panel)
+                self.assertIn("filterNote", panel)
+                self.assertIn("Showing", panel)
+
+    def test_the_page_spells_no_scope_label_of_its_own(self) -> None:
+        # The filter compares one payload string against another. A page-side
+        # map from `is_sidechain` to a scope label would be the page inventing
+        # an equivalence the API never stated -- `is_sidechain` is the record's
+        # own flag and `scope` is derived from `source_kind`, two different
+        # measurements -- and that is this issue's defect one level down.
+        for decl in ("get shownModels(", "get shownOutliers(", "showPanel(panel, opts) {"):
+            with self.subTest(decl=decl):
+                body = self.component(decl)
+                for label in (SCOPE_MAIN, SCOPE_SUBAGENT):
+                    self.assertNotIn(f'"{label}"', body)
+                    self.assertNotIn(f"'{label}'", body)
+
+    def test_a_filter_never_turns_an_absence_into_an_empty_window(self) -> None:
+        # "Not fetched yet" and "the window holds none" are different facts and
+        # only the second may say "No calls in this period" -- so a filtered
+        # view of a null payload is null, never []. And a filter that excludes
+        # every row says THAT, rather than reporting an empty window.
+        self.assertIn("if (this.outliers === null) return null;", self.component("get shownOutliers("))
+        self.assertIn("if (!this.summary) return null;", self.component("get shownModels("))
+        for table in ("models", "outliers"):
+            with self.subTest(table=table):
+                self.assertIn("No rows match the filter", html_element(self.raw, f'id="{table}"'))
+
+    # --- the detail view keeps its behaviour -------------------------------
+
+    def test_the_time_picker_still_filters(self) -> None:
+        # EVERY control, individually: a picker with one dead button is a
+        # picker that silently shows the wrong window for one of its four
+        # presets, which is worse than one that visibly does nothing.
+        picker = html_element(self.raw, 'id="filters"')
+        clicks = re.findall(r'@click="([^"]+)"', picker)
+        self.assertEqual(
+            clicks,
+            ["setRange(1)", "setRange(7)", "setRange(30)", "setRange('all')",
+             "applyCustomRange()"],
+            "a range control is bound to something other than the picker",
+        )
+        # The picker is inert unless it re-reads, and inert unless what it
+        # re-reads carries the window: a range that changes state and fetches
+        # nothing, or fetches without its dates, is a filter that does not
+        # filter.
+        for decl in ("setRange(days) {", "applyCustomRange() {"):
+            with self.subTest(decl=decl):
+                self.assertIn("this.load()", self.component(decl))
+        qs = self.component("rangeQS() {")
+        self.assertIn('p.set("from", this.from)', qs)
+        self.assertIn('p.set("to", this.to)', qs)
+        self.assertIn("this.rangeQS()", self.component("async load("))
+
+    def test_the_chart_still_switches_groupings(self) -> None:
+        # EVERY radio, not "the panel mentions a load()". One grouping left
+        # bound to the model and not to the fetch is a control that changes the
+        # legend and not the data -- the chart would then be labelled by one
+        # grouping and drawn by another, which is a wrong number wearing a
+        # right heading.
+        panel = html_element(self.raw, 'id="chart-panel"')
+        radios = re.findall(r"<input[^>]*type=\"radio\"[^>]*>", panel)
+        self.assertEqual(
+            sorted(re.search(r'value="([^"]+)"', r).group(1) for r in radios),
+            ["class", "scope", "turntype"],
+        )
+        for radio in radios:
+            with self.subTest(radio=radio):
+                self.assertIn('x-model="by"', radio)
+                self.assertIn('@change="load()"', radio)
+        self.assertIn("this.by", self.component("async load("))
+
+    def test_the_chart_is_resized_when_its_view_becomes_visible(self) -> None:
+        # Chart.js sizes to its container, and `x-show` gives a hidden one no
+        # size at all -- so a chart drawn while the overview was showing comes
+        # up 0px high unless it is told to re-measure.
+        self.assertIn("this.chart.resize()", self.component("setView(view) {"))
+
+    def test_the_split_introduces_no_new_fetch(self) -> None:
+        # The page already retrieves everything both views need. A split that
+        # multiplied requests would pay for the structure with the one budget
+        # this tool does not have -- `serve.py` is a single-threaded
+        # HTTPServer.
+        self.assertEqual(self.html.count("await fetch("), 1)
+        self.assertEqual(
+            self.html.count("getJSON("),
+            7,
+            "one declaration, five in load(), one in showDetail() -- any other "
+            "count is a request the split added",
         )
 
 
