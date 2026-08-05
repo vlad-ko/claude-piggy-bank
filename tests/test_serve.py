@@ -9,16 +9,20 @@ reversed-range validation added in this cycle's review pass.
 
 from __future__ import annotations
 
+import hashlib
+import http.client
 import json
 import re
 import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Sequence
 from datetime import date
+from http.server import HTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -59,6 +63,7 @@ from serve import (  # noqa: E402
     clamp_limit,
     day_bounds,
     eastern_day,
+    make_handler,
     nearest_rank,
     project_of,
     staleness_verdict,
@@ -945,13 +950,24 @@ class ProjectScopeNoteTest(unittest.TestCase):
     no JS runtime, so the composition cannot be executed here. These pin the
     branch that exists to keep the single-project case silent, and the decision
     that the band states COUNTS rather than project names.
+
+    Since #8 the band is a template, so `body` is the band's own markup plus
+    the two getters it binds text from. Those two sentences stay in JS on
+    purpose and the code says why: each continues the preceding `<strong>` with
+    a comma and NO space, which HTML's whitespace collapsing would otherwise
+    render as "projects , of which".
     """
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.body = js_function_body(
-            (Path(__file__).resolve().parent.parent / "index.html").read_text(),
-            "function renderScopeNote(",
+        html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+        stripped = strip_comments(html)
+        cls.body = "\n".join(
+            [
+                html_element(html, 'id="scope-note"'),
+                js_function_body(stripped, "get crossProjectTail("),
+                js_function_body(stripped, "get narrowProjectTail("),
+            ]
         )
 
     def test_the_scope_note_reads_the_project_block(self) -> None:
@@ -961,7 +977,9 @@ class ProjectScopeNoteTest(unittest.TestCase):
         # The BRANCH, not a mention: without the `> 1` guard every existing
         # single-project user gets a new sentence about a dimension their
         # database does not have.
-        self.assertRegex(self.body, r"if \(p\.in_database > 1\) \{")
+        self.assertRegex(
+            self.body, r'x-if="summary\.scope\.projects\.in_database > 1"'
+        )
 
     def test_it_names_both_the_window_set_and_the_database_set(self) -> None:
         # A project with no calls in this window is a measured zero, and the
@@ -972,14 +990,46 @@ class ProjectScopeNoteTest(unittest.TestCase):
     def test_it_surfaces_calls_whose_project_could_not_be_derived(self) -> None:
         # Again the BRANCH: the field name also appears inside the sentence, so
         # matching the bare substring let a disabled clause pass.
-        self.assertRegex(self.body, r"if \(p\.unattributed_calls\) \{")
+        self.assertRegex(
+            self.body, r'x-if="summary\.scope\.projects\.unattributed_calls"'
+        )
 
     def test_the_project_note_reaches_the_band_on_both_paths(self) -> None:
         # Composed and never appended is the "fully tested, never wired"
-        # pattern SummaryPayloadIsWiredTest exists for. renderScopeNote has TWO
-        # exits -- main-thread-only and both-scopes -- and the project note
+        # pattern SummaryPayloadIsWiredTest exists for. The band has TWO scope
+        # branches -- main-thread-only and both-scopes -- and the project note
         # belongs on both: it does not depend on that axis.
-        self.assertEqual(self.body.count("projects + undated"), 2)
+        #
+        # This used to be asserted as "the tail is concatenated onto both
+        # exits" (`count("projects + undated") == 2`). The template cannot HAVE
+        # two exits: there is ONE band, the project and undated blocks are
+        # siblings of both scope branches, and appending to one alone is not
+        # expressible. Asserted as exactly that: one occurrence of each block,
+        # placed after both scope branches rather than inside either.
+        scope_branches = [
+            m.start()
+            for m in re.finditer(
+                r'x-if="!?summary\.scope\.coverage\.sessions_with_subagent_transcripts"',
+                self.body,
+            )
+        ]
+        self.assertEqual(len(scope_branches), 2, "the two scope branches are gone")
+        for block in (
+            r'x-if="summary\.scope\.projects\.in_database > 1"',
+            r'x-if="summary\.scope\.projects\.unattributed_calls"',
+            r'x-if="summary\.scope\.coverage\.runs_undated_unavailable"',
+        ):
+            with self.subTest(block=block):
+                found = [m.start() for m in re.finditer(block, self.body)]
+                self.assertEqual(
+                    len(found), 1, "composed once, for both scope branches"
+                )
+                self.assertGreater(
+                    found[0],
+                    max(scope_branches),
+                    "the note is nested inside one scope branch, so the other "
+                    "branch renders without it",
+                )
 
     def test_it_reports_counts_not_project_names(self) -> None:
         # DECISION, pinned so it cannot drift by accident. A project name is a
@@ -1604,6 +1654,46 @@ def js_function_body(html: str, decl: str) -> str:
     return re.sub(r"^\s*//.*$", "", body, flags=re.M)
 
 
+def strip_comments(source: str) -> str:
+    """`index.html` with HTML and whole-line JS comments removed.
+
+    Every structural assertion below runs over this rather than the raw file:
+    the prose in this repository's comments quotes the very strings the tests
+    look for, so an un-stripped haystack lets a DELETED binding keep passing
+    because its rationale is still described above it.
+    """
+    source = re.sub(r"<!--.*?-->", "", source, flags=re.S)
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    return re.sub(r"^\s*//.*$", "", source, flags=re.M)
+
+
+def html_element(html: str, needle: str) -> str:
+    """The source of the element whose opening tag contains `needle`.
+
+    Tag-matched rather than regexed to the next `</div>`, so a nested element
+    of the same name cannot end the match early. Comments are stripped, for
+    the reason `strip_comments` gives.
+
+    The Alpine rewrite moved most of the page's branching OUT of JS function
+    bodies and INTO templates, so the checks that used to read a render
+    function's source now read the element it renders into. That is the point:
+    a binding cannot be present in the template and absent from the page.
+    """
+    at = html.index(needle)
+    start = html.rindex("<", 0, at)
+    tag = re.match(r"<([a-zA-Z][a-zA-Z0-9-]*)", html[start:])
+    if tag is None:  # pragma: no cover - means the needle is not in a tag
+        raise AssertionError(f"{needle!r} is not inside an opening tag")
+    name = tag.group(1)
+    token = re.compile(rf"<{name}\b|</{name}\s*>", re.I)
+    depth = 0
+    for m in token.finditer(html, start):
+        depth += 1 if m.group(0).startswith("</") is False else -1
+        if depth == 0:
+            return strip_comments(html[start : m.end()])
+    raise AssertionError(f"could not find the end of the <{name}> at {needle!r}")
+
+
 class BannerPrecedenceTest(unittest.TestCase):
     """Three writers, one banner element: the loudest true thing must win (#20).
 
@@ -1615,30 +1705,41 @@ class BannerPrecedenceTest(unittest.TestCase):
     the milder fact with no sign the harsher one exists, which is this
     repository's core rule failing inside the feature built to enforce it.
 
-    These assertions are STRUCTURAL, and that is a real limit, not a stylistic
+    Since #8 the "one writer" half is not a convention any more. The element
+    carries a single `x-text` binding over `bannerMessages` and NO code in the
+    page reaches into the DOM at all, so a second writer is unreachable rather
+    than merely discouraged -- that is asserted below as an absence of DOM
+    access, not as a count of one call site.
+
+    The rest stays STRUCTURAL, and that is a real limit, not a stylistic
     choice: the project ships no JS runtime (stdlib-only, no Node), so the
-    composition cannot be executed here. They pin the two properties that make
-    the defect unreachable -- one writer, and a fixed order -- and a renamed
-    binding still defeats them. `DataStalenessTest` covers the same
+    composition cannot be executed here. `DataStalenessTest` covers the same
     two-things-true-at-once case at the layer that CAN be executed.
     """
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+        cls.raw = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
 
     def test_the_banner_element_has_exactly_one_writer(self) -> None:
-        writers = self.html.count('getElementById("banner")')
+        # ONE binding, ON the banner element, and nothing else in the page can
+        # write it -- the imperative DOM handle that made three writers
+        # possible is gone from the whole file.
+        banner = html_element(self.raw, 'id="banner"')
+        self.assertIn("x-text=\"bannerMessages.join(' ')\"", banner)
         self.assertEqual(
-            writers,
+            self.html.count('x-text="bannerMessages'),
             1,
-            "every write to the banner goes through renderBanner(); a second "
-            "direct writer is how one warning silently replaces another",
+            "a second binding over the banner text is how one warning "
+            "silently replaces another",
         )
-        self.assertIn('getElementById("banner")', js_function_body(self.html, "function renderBanner("))
+        for handle in ("getElementById", "querySelector", "innerHTML"):
+            with self.subTest(dom_api=handle):
+                self.assertNotIn(handle, self.html)
 
     def test_the_precedence_order_is_failure_then_stale_then_notices(self) -> None:
-        body = js_function_body(self.html, "function renderBanner(")
+        body = js_function_body(self.html, "get bannerMessages(")
         order = [body.index(k) for k in ("loadFailure", "stale", "notices")]
         self.assertEqual(
             order,
@@ -1650,27 +1751,27 @@ class BannerPrecedenceTest(unittest.TestCase):
     def test_a_load_failure_is_cleared_only_by_a_fully_successful_load(self) -> None:
         # A failure that any later render can clear is a failure that can be
         # hidden by a partial success.
-        self.assertEqual(self.html.count("bannerState.loadFailure = null"), 1)
+        self.assertEqual(self.html.count("this.banner.loadFailure = null"), 1)
         self.assertIn(
-            "bannerState.loadFailure = null",
-            js_function_body(self.html, "async function loadAll("),
+            "this.banner.loadFailure = null",
+            js_function_body(self.html, "async load("),
         )
 
     def test_only_a_true_staleness_verdict_raises_the_banner(self) -> None:
         # `stale` is tri-state; the null case ("no ingest run was ever
         # recorded") is an UNKNOWN age, and a banner it can never clear would
         # train the reader to ignore the one that means something.
-        body = js_function_body(self.html, "function renderSummary(")
-        self.assertIn("s.ingest.stale === true", body)
+        body = js_function_body(self.html, "applySummary(")
+        self.assertIn("this.summary.ingest.stale === true", body)
 
     def test_the_data_age_line_distinguishes_never_recorded_from_zero(self) -> None:
         # The BRANCH, not a mention: `=== 0` reads a never-recorded run as an
         # ingest at the epoch, and matching the bare substring elsewhere in the
-        # function let exactly that mutation survive.
-        body = js_function_body(self.html, "function renderDataAge(")
-        self.assertRegex(body, r"if \(ing\.last_run_at === null\) \{")
-        self.assertRegex(body, r"if \(ing\.newest_call_ts === null\) \{")
-        self.assertIn("not recorded", body)
+        # region let exactly that mutation survive.
+        band = html_element(self.raw, 'id="data-age"')
+        self.assertRegex(band, r'x-if="summary\.ingest\.last_run_at === null"')
+        self.assertRegex(band, r'x-if="summary\.ingest\.newest_call_ts === null"')
+        self.assertIn("not recorded", band)
 
 
 class DataAgeCauseTest(unittest.TestCase):
@@ -1690,6 +1791,12 @@ class DataAgeCauseTest(unittest.TestCase):
     branch and the vocabulary rather than executing the render. They are
     written against the reason strings `serve.py` defines, so a rename on
     either side goes red instead of silently unwiring the branch.
+
+    Since #8 the branch lives in the data-age element's template rather than in
+    a `renderDataAge()` body, so that is what these read. Quoting is matched
+    permissively because an Alpine expression sits inside a double-quoted
+    attribute and therefore spells its own strings with single quotes -- the
+    assertion is about the branch, not about which quote character carries it.
     """
 
     @classmethod
@@ -1697,17 +1804,17 @@ class DataAgeCauseTest(unittest.TestCase):
         cls.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
 
     def data_age(self) -> str:
-        return js_function_body(self.html, "function renderDataAge(")
+        return html_element(self.html, 'id="data-age"')
 
     def summary(self) -> str:
-        return js_function_body(self.html, "function renderSummary(")
+        return js_function_body(strip_comments(self.html), "applySummary(")
 
     def test_the_data_age_line_branches_on_the_reason_the_api_reports(self) -> None:
         body = self.data_age()
-        self.assertIn("ing.stale_unknown_reason", body)
+        self.assertIn("ingest.stale_unknown_reason", body)
         for reason in (STALE_UNKNOWN_NO_RUN_TABLE, STALE_UNKNOWN_NO_RUN_RECORDED):
             with self.subTest(reason=reason):
-                self.assertIn(f'"{reason}"', body)
+                self.assertRegex(body, r"""['"]%s['"]""" % re.escape(reason))
 
     def test_the_predates_claim_is_reachable_only_under_the_missing_table(
         self,
@@ -1717,8 +1824,10 @@ class DataAgeCauseTest(unittest.TestCase):
         # because a second copy outside the branch is exactly the regression.
         body = self.data_age()
         self.assertEqual(body.count("predates"), 1)
+        guard = re.search(r"""['"]%s['"]""" % re.escape(STALE_UNKNOWN_NO_RUN_TABLE), body)
+        self.assertIsNotNone(guard, "nothing tests for the missing run table")
         self.assertLess(
-            body.index(f'"{STALE_UNKNOWN_NO_RUN_TABLE}"'),
+            guard.start(),
             body.index("predates"),
             "the 'predates CPB' claim is made before anything establishes it",
         )
@@ -1752,8 +1861,8 @@ class DataAgeCauseTest(unittest.TestCase):
         # unknown age that seized it would be a warning the reader cannot
         # clear by re-running ingest when the cause is a skewed clock.
         body = self.summary()
-        self.assertIn("s.ingest.stale === true", body)
-        self.assertEqual(body.count("bannerState.stale ="), 1)
+        self.assertIn("this.summary.ingest.stale === true", body)
+        self.assertEqual(body.count("this.banner.stale ="), 1)
 
 
 class SummaryPayloadIsWiredTest(unittest.TestCase):
@@ -1774,23 +1883,50 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
     that must be a DECLARED decision with a reason, not an accident nobody
     noticed -- so adding a field to the payload forces the author either to
     render it or to name it here.
+
+    #8 DECISION: STRENGTHENED, NOT RETIRED.
+    ---------------------------------------
+    The Alpine rewrite makes `x-for` a real structural guarantee for the ROW
+    payloads: `/api/sessions`, `/api/agents`, `/api/outliers` and
+    `summary.models` are iterated by a template, and a column cannot exist
+    without markup that names it. `/api/summary`'s TOP-LEVEL fields are not
+    like that. They are scalars rendered by individually named bindings, so
+    nothing structural forces any of them to have a consumer -- which is
+    exactly where the original defect lived (`models`, a summary field). The
+    guarantee therefore does not cover this payload and retiring the check here
+    would lose coverage at the only place it ever caught anything.
+
+    What changed is the haystack, which is the weakness Qodo named. It was one
+    function's body, matched as `s.<field>`; that missed every field consumed
+    by a template and could be defeated by a rename to any other local. It is
+    now the WHOLE PAGE with comments stripped, matched as a property access on
+    the one identifier the payload is ever bound through: the component's
+    `summary` state. Every consumer, JS or template, spells it `summary.<field>`
+    (or `summary?.<field>`), so this ranges over the render layer entirely
+    rather than over one function of nine.
+
+    It is still a heuristic and still not a proof -- destructuring `summary`
+    into a local would defeat it. It is now defeated by a deliberate act rather
+    than by ordinary refactoring.
+
+    NOT_RENDERED is empty, and that is a fix, not a simplification: it listed
+    the four token totals as "plotted per-day via /api/timeseries" while the
+    summary cards had been rendering `s.input`, `s.cache_read`, `s.cache_write`
+    and `s.output` all along. A stale exemption is how an allowlist rots into a
+    rubber stamp, so a field that IS rendered may no longer be listed here --
+    `test_the_allowlist_cannot_exempt_a_field_that_is_rendered` pins that.
     """
 
-    NOT_RENDERED = {
-        # The window's token totals by class are plotted from /api/timeseries,
-        # which carries them per-day; the flat summary totals would be a second
-        # expression of the same fact and are deliberately not shown.
-        "input": "plotted per-day via /api/timeseries",
-        "cache_read": "plotted per-day via /api/timeseries",
-        "cache_write": "plotted per-day via /api/timeseries",
-        "output": "plotted per-day via /api/timeseries",
-        # #31's data layer, landing ahead of its view DELIBERATELY. The block
-        # is built to be bound declaratively -- named scalars and one ordered
-        # list of bands, no arithmetic left for the template -- and #8 is
-        # rewriting this render layer to Alpine right now, so wiring it into
-        # the string-concatenating `renderSummary` would be written to be
-        # deleted. This entry is the declaration the allowlist exists to
-        # force: it must become a rendered field, not stay here.
+    # Fields `/api/summary` computes that the page deliberately does not show.
+    # An entry must name the reason. Empty is the healthy state.
+    NOT_RENDERED: dict[str, str] = {
+        # #31's data layer, landing ahead of its view DELIBERATELY. The block is
+        # built to be bound declaratively -- named scalars and one ordered list
+        # of bands, no arithmetic left for the template -- so wiring it into the
+        # string-concatenating `renderSummary` that this commit deletes would
+        # have been written to be deleted. This entry is the declaration the
+        # allowlist exists to force: it must BECOME a rendered field, not stay
+        # here, and the next commit is the one that owes it.
         "context": "payload for #31; bound by the view in the #8 rewrite",
     }
 
@@ -1813,33 +1949,53 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     @staticmethod
-    def _render_summary_body(html: str) -> str:
-        """`renderSummary`'s body, comments stripped.
+    def _binding_surface(html: str) -> str:
+        """Everything in `index.html` that can CONSUME the summary payload.
 
-        Qodo, on this PR: searching the WHOLE file for `s.<field>` is spoofable
-        by a mention in a comment or an unrelated string, and can also match a
-        different function's local `s`. Narrowing to the one function that
-        receives the summary payload, and stripping comments first, removes
-        both. It stays a heuristic -- a renamed binding or destructuring still
-        defeats it -- which is why the PR names the structural fix (declarative
-        binding, i.e. the Alpine rewrite) as a separate change rather than
-        claiming this test is a guarantee.
+        The whole page, comments stripped -- a mention in a comment or in a
+        prose string must not be able to stand in for a binding, and this
+        repository's comments quote the field names at length.
         """
-        return js_function_body(html, "function renderSummary(")
+        return strip_comments(html)
+
+    @staticmethod
+    def _is_bound(surface: str, field: str) -> bool:
+        """Is `field` read off the component's `summary` state anywhere?
+
+        `summary.<field>` in a template binding, `this.summary.<field>` in a
+        getter and `summary?.<field>` in either all match; a bare `<field>`
+        belonging to some other object does not.
+        """
+        return re.search(rf"\bsummary\??\.{re.escape(field)}\b", surface) is not None
 
     def test_every_summary_field_is_rendered_or_declared_unrendered(self) -> None:
         payload = self.api.summary(*day_bounds(None, None))
-        body = self._render_summary_body(self.html)
+        surface = self._binding_surface(self.html)
         unwired = [
             k
             for k in payload
-            if k not in self.NOT_RENDERED and f"s.{k}" not in body
+            if k not in self.NOT_RENDERED and not self._is_bound(surface, k)
         ]
         self.assertEqual(
             unwired,
             [],
             f"/api/summary computes {unwired} and index.html never reads them. "
             "Render the field, or add it to NOT_RENDERED with the reason.",
+        )
+
+    def test_the_allowlist_cannot_exempt_a_field_that_is_rendered(self) -> None:
+        # The other way an allowlist rots, and the one that had actually
+        # happened: four fields were exempted as "plotted per-day via
+        # /api/timeseries" while the summary cards rendered them. An entry that
+        # describes the page wrongly is worse than no entry -- it asserts a
+        # decision nobody made and hides the field from the check above.
+        surface = self._binding_surface(self.html)
+        wrong = sorted(k for k in self.NOT_RENDERED if self._is_bound(surface, k))
+        self.assertEqual(
+            wrong,
+            [],
+            f"NOT_RENDERED claims {wrong} are not shown, but index.html binds "
+            "them. Drop the entry.",
         )
 
     def test_the_allowlist_cannot_hide_a_field_that_no_longer_exists(self) -> None:
@@ -3103,6 +3259,359 @@ class ContextUtilisationApiTest(unittest.TestCase):
     def test_the_block_is_window_scoped_like_every_other_figure(self) -> None:
         self.assertEqual(self.block(CONTEXT_DAY), self.block())
         self.assertNotEqual(self.block(CONTEXT_EMPTY_DAY), self.block())
+
+
+class VendoredAssetTest(unittest.TestCase):
+    """Every library the page runs is on this disk, pinned, and inert (#8).
+
+    CLAUDE.md constraint 2 is not an availability preference. `index.html`
+    renders the user's own prompts, file paths and source code, so a script
+    fetched from a CDN at runtime is a privacy and supply-chain surface -- it
+    sees the transcripts, and whoever controls it decides what it does with
+    them. Chart.js was vendored for that reason and Alpine gets identical
+    treatment.
+
+    Four separable claims, one test each, because they fail independently:
+    the bytes are the reviewed bytes, their provenance is written down, they
+    contain no way to reach the network, and the page loads them from nowhere
+    else.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    VENDOR = ROOT / "vendor"
+
+    # Recorded on 2026-08-05 from the committed files; provenance for each is
+    # in vendor/README.md. A bundle upgrade changes these deliberately.
+    PINNED = {
+        "alpine.min.js": (
+            46346,
+            "57b37d7cae9a27d965fdae4adcc844245dfdc407e655aee85dcfff3a08036a3f",
+        ),
+        "chart.umd.min.js": (
+            205399,
+            "d2af8974e95271638772e9e9524db5b9a6f58d6ec2d5d781400447b4a31c681e",
+        ),
+    }
+
+    # Everything a script could use to originate a request. A vendored bundle
+    # that contains none of these cannot phone home whatever it is asked to do.
+    NETWORK_APIS = (
+        "fetch(",
+        "XMLHttpRequest",
+        "importScripts",
+        "navigator.sendBeacon",
+        "WebSocket",
+        "EventSource",
+        "import(",
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.html = (cls.ROOT / "index.html").read_text()
+
+    def bundles(self) -> list[Path]:
+        return sorted(self.VENDOR.glob("*.js"))
+
+    def test_the_bundles_on_disk_are_the_ones_that_were_reviewed(self) -> None:
+        # A vendored file is code that runs in the user's browser over the
+        # user's transcripts, and nothing else in this repository would notice
+        # it being edited.
+        found = {p.name for p in self.bundles()}
+        self.assertEqual(found, set(self.PINNED), "vendor/ gained or lost a bundle")
+        for name, (size, digest) in self.PINNED.items():
+            with self.subTest(bundle=name):
+                raw = (self.VENDOR / name).read_bytes()
+                self.assertEqual(len(raw), size)
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), digest)
+
+    def test_every_bundle_has_its_provenance_written_down(self) -> None:
+        # "Where did this 46KB of minified code come from" must be answerable
+        # from the tree, not from someone's memory (CLAUDE.md: if you add a
+        # number, say where it came from and when it was checked).
+        readme = (self.VENDOR / "README.md").read_text()
+        for name, (_, digest) in self.PINNED.items():
+            with self.subTest(bundle=name):
+                self.assertIn(name, readme)
+                self.assertIn(digest, readme)
+
+    def test_no_vendored_bundle_can_reach_the_network(self) -> None:
+        for path in self.bundles():
+            source = path.read_text(errors="replace")
+            for api in self.NETWORK_APIS:
+                with self.subTest(bundle=path.name, api=api):
+                    self.assertNotIn(api, source)
+
+    def test_the_page_loads_its_scripts_only_from_vendor(self) -> None:
+        srcs = re.findall(r"""<script[^>]*\ssrc=["']([^"']+)["']""", self.html)
+        self.assertEqual(
+            sorted(srcs),
+            ["/vendor/alpine.min.js", "/vendor/chart.umd.min.js"],
+            "a script in the shipped page is loaded from somewhere other than "
+            "vendor/",
+        )
+
+    def test_no_remote_reference_survives_anywhere_in_the_page(self) -> None:
+        # Wider than the <script> tags above: a stylesheet, a font, a
+        # preconnect hint or a protocol-relative URL leaks just as much.
+        for remote in ("http://", "https://", 'src="//', "href=\"//", "cdn",
+                       "unpkg", "jsdelivr", "integrity=", "crossorigin"):
+            with self.subTest(token=remote):
+                self.assertNotIn(remote, self.html)
+
+    def test_vendoring_added_no_build_step(self) -> None:
+        # A package manifest anywhere would also fail the stdlib-only CI job,
+        # which is the point: Alpine is one file, not a dependency tree.
+        for manifest in ("package.json", "package-lock.json", "pyproject.toml",
+                         "requirements.txt", "Pipfile", "setup.py"):
+            with self.subTest(manifest=manifest):
+                self.assertFalse((self.ROOT / manifest).exists())
+                self.assertFalse((self.VENDOR / manifest).exists())
+        self.assertFalse((self.ROOT / "node_modules").exists())
+
+
+class VendorRouteTest(unittest.TestCase):
+    """`/vendor/*` serves the new bundle through the existing, checked handler.
+
+    #8 needed NO change to `serve.py`: `_serve_vendor_asset()` was already
+    generic over the directory. These assertions are what makes that claim
+    checkable rather than asserted -- Alpine really is reachable over the
+    route, and the path-escape check that guards it still refuses to leave the
+    directory now that there is a second file to ask for.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-vendor-route-test-"))
+        projects = cls.tmp / "projects"
+        projects.mkdir()
+        shutil.copy(FIXTURE, projects / "session-fixture.jsonl")
+        ingest(projects, cls.tmp / "usage.db")
+        cls.api = Api(cls.tmp / "usage.db")
+        cls.server = HTTPServer(("127.0.0.1", 0), make_handler(cls.api))
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def get(self, path: str) -> tuple[int, str, bytes]:
+        conn = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+        try:
+            conn.request("GET", path)
+            r = conn.getresponse()
+            return r.status, r.getheader("Content-Type") or "", r.read()
+        finally:
+            conn.close()
+
+    def test_alpine_is_served_byte_for_byte_as_javascript(self) -> None:
+        status, ctype, body = self.get("/vendor/alpine.min.js")
+        self.assertEqual(status, 200)
+        self.assertEqual(ctype, "application/javascript")
+        expected = (Path(__file__).resolve().parent.parent
+                    / "vendor" / "alpine.min.js").read_bytes()
+        self.assertEqual(body, expected)
+
+    def test_the_page_itself_still_asks_for_exactly_that_path(self) -> None:
+        # The route and the reference are two halves of one fact; a test that
+        # fetches a path the page never requests proves nothing.
+        _, _, page = self.get("/")
+        self.assertIn(b'src="/vendor/alpine.min.js"', page)
+
+    def test_the_escape_check_still_refuses_to_leave_the_vendor_directory(
+        self,
+    ) -> None:
+        for escape in ("/vendor/../serve.py", "/vendor/../../etc/passwd",
+                       "/vendor/nope.js"):
+            with self.subTest(path=escape):
+                status, _, _ = self.get(escape)
+                self.assertEqual(status, 404)
+
+
+class DeclarativeRenderLayerTest(unittest.TestCase):
+    """The render layer is bindings, not string-built markup (#8).
+
+    `index.html` used to assemble the DOM with 12 `innerHTML` assignments and a
+    hand-written `esc()` on 29 interpolations. That is the shape that made the
+    "computed but never rendered" defect possible -- a payload field could
+    simply have no consumer -- and every one of those interpolations was one
+    forgotten `esc()` away from executing a session transcript's contents as
+    markup in the page that displays them.
+
+    `x-text` sets textContent, so it escapes by construction: there is nothing
+    to forget. These tests keep the property rather than the diff -- the ways
+    back to string-built markup are named individually, because each of them
+    reintroduces the same surface on its own.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (cls.ROOT / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+
+    def test_no_markup_is_built_from_strings_any_more(self) -> None:
+        for api in ("innerHTML", "outerHTML", "insertAdjacentHTML",
+                    "document.write", "createElement", "createContextualFragment"):
+            with self.subTest(api=api):
+                self.assertNotIn(api, self.html)
+
+    def test_the_hand_written_escaper_is_gone_and_not_needed(self) -> None:
+        # `esc()` existed only because values were concatenated into markup.
+        # Keeping it would be an invitation to concatenate again.
+        self.assertNotIn("esc(", self.html)
+        self.assertNotIn("function esc", self.html)
+
+    def test_no_binding_interprets_a_payload_value_as_markup(self) -> None:
+        # THE regression to fear: `x-html` is `innerHTML` with a shorter name,
+        # and a turn preview is arbitrary text from the user's own transcript.
+        self.assertNotIn("x-html", self.html)
+
+    def test_the_page_reaches_the_dom_through_bindings_alone(self) -> None:
+        # An imperative handle is how a second writer gets added later (see
+        # BannerPrecedenceTest). There is exactly one component and no lookups.
+        self.assertEqual(self.html.count("x-data="), 1)
+        for lookup in ("getElementById", "querySelector", "addEventListener"):
+            with self.subTest(dom_api=lookup):
+                self.assertNotIn(lookup, self.html)
+
+    # table id -> the state the rows must be iterated FROM.
+    ROW_SOURCES = {
+        "models": "summary.models",
+        "sessions": "sessions",
+        "agents": "agents",
+        "outliers": "outliers",
+    }
+
+    def test_every_table_body_is_produced_by_iterating_the_payload(self) -> None:
+        # This is the structural half of the "computed but never rendered"
+        # fix, and the reason SummaryPayloadIsWiredTest could be narrowed to
+        # the summary scalars: a row payload is iterated, so a column cannot
+        # exist without markup naming the field it shows.
+        #
+        # The SOURCE is asserted, not merely the presence of an `x-for`.
+        # Iterating a literal `[]` is a table that renders nothing while every
+        # field name it mentions still looks wired -- which is the exact defect
+        # (`summary.models`) this whole guard was built for.
+        for table_id, source in self.ROW_SOURCES.items():
+            with self.subTest(table=table_id):
+                table = html_element(self.raw, f'id="{table_id}"')
+                loop = re.search(r'<template x-for="([^"]+)"', table)
+                self.assertIsNotNone(loop, f"#{table_id} builds its rows some other way")
+                self.assertRegex(
+                    loop.group(1),
+                    rf"\bin\s+.*\b{re.escape(source)}\b",
+                    f"#{table_id} does not iterate {source}",
+                )
+
+    def test_a_not_yet_loaded_table_is_not_an_empty_one(self) -> None:
+        # Three states, not two. "No sessions in this period" is a claim about
+        # the window and must not be made before the window has been fetched,
+        # so each list starts as null rather than [].
+        component = js_function_body(self.html, "function report(")
+        for field in ("sessions", "agents", "outliers", "summary", "detail"):
+            with self.subTest(field=field):
+                self.assertRegex(
+                    component, re.compile(rf"^\s*{field}: null,$", re.M)
+                )
+
+
+class TurnTypeChartColourTest(unittest.TestCase):
+    """The stack needs more colours than the chart can produce series.
+
+    `TT_COLORS` is cycled with `i % TT_COLORS.length`, so a list shorter than
+    the key count gives two series the same colour -- and a stacked bar chart
+    with two identically coloured bands does not look broken, it looks like one
+    band. The by-turn-type breakdown can emit 11 keys: `turns.turn_type` has 9
+    values, plus "(no turn)" for calls with no main-thread turn, plus the
+    "subagent" scope bucket those calls get instead.
+
+    Pinned here because the count is a REQUIREMENT of the chart code and was
+    only ever recorded in a comment beside it, which is how it came to be too
+    short once already.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.html = strip_comments(
+            (Path(__file__).resolve().parent.parent / "index.html").read_text()
+        )
+
+    def colours(self) -> list[str]:
+        block = re.search(r"const TT_COLORS = \[(.*?)\];", self.html, re.S)
+        self.assertIsNotNone(block, "TT_COLORS is gone")
+        return re.findall(r"#[0-9a-fA-F]{6}", block.group(1))
+
+    def test_there_are_at_least_as_many_colours_as_reachable_series(self) -> None:
+        self.assertGreaterEqual(len(self.colours()), 11)
+
+    def test_no_two_series_can_be_handed_the_same_colour(self) -> None:
+        colours = self.colours()
+        self.assertEqual(
+            len(set(colours)), len(colours), "a duplicate colour in the cycle"
+        )
+
+
+class AbsenceIsNeverRenderedAsAValueTest(unittest.TestCase):
+    """`null` renders as "—", never "0" -- the repository's central rule.
+
+    A real 0 is a healthy sample; no sample at all is not. The page is where
+    the two become indistinguishable if a formatter is careless, because both
+    end up as characters in the same column. Every formatter must therefore
+    answer the absence BEFORE it does any arithmetic -- `String(null)` and
+    `(null).toLocaleString()` are the two ways a missing measurement acquires a
+    plausible value.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.html = strip_comments(
+            (Path(__file__).resolve().parent.parent / "index.html").read_text()
+        )
+
+    # formatter -> the first token of the arithmetic the guard must precede.
+    FORMATTERS = {
+        "function fmtTok(": "1e9",
+        "function fmtCount(": "toLocaleString",
+        "function fmtTs(": "new Date",
+        "function fmtAge(": "fmtSpan",
+    }
+
+    def test_each_formatter_answers_absence_before_it_computes(self) -> None:
+        for decl, arithmetic in self.FORMATTERS.items():
+            with self.subTest(formatter=decl):
+                body = js_function_body(self.html, decl)
+                guard = re.search(
+                    r"if \((\w+) === null \|\| \1 === undefined\) return \"—\";",
+                    body,
+                )
+                self.assertIsNotNone(
+                    guard,
+                    f"{decl} does not refuse a missing measurement outright",
+                )
+                self.assertLess(
+                    guard.start(),
+                    body.index(arithmetic),
+                    f"{decl} computes over the value before checking it is one",
+                )
+
+    def test_the_dash_is_never_a_zero(self) -> None:
+        # The mutation this exists to catch, stated as an absence: no formatter
+        # may return a numeric string for a missing value.
+        for decl in self.FORMATTERS:
+            with self.subTest(formatter=decl):
+                body = js_function_body(self.html, decl)
+                self.assertNotRegex(body, r"=== null \|\| \w+ === undefined\) return \"0")
+
+    def test_an_absent_label_falls_back_to_the_dash_too(self) -> None:
+        # `orDash` is the non-numeric half: an unmeasured dispatch has no model
+        # name, and an empty cell reads as "no model" rather than "not known".
+        self.assertIn('return v ?? "—";', js_function_body(self.html, "function orDash("))
 
 
 if __name__ == "__main__":

@@ -13,8 +13,12 @@ already writes locally into SQLite and serves a single-page report over them.
   step. The floor is tested, not assumed: CI runs the suite on 3.10, 3.11, 3.12
   and 3.13, and a separate job fails the build if any import in any shipped
   module resolves outside the standard library.
-- **Nothing leaves your machine.** No network calls, no telemetry, no CDN — the
-  chart library is vendored so the page renders fully offline.
+- **Nothing leaves your machine.** No network calls, no telemetry, no CDN. Both
+  browser libraries the report uses — Chart.js for the plot, Alpine.js for the
+  bindings — are vendored into `vendor/` and served from there, so the page
+  renders fully offline. `vendor/README.md` records each one's version, origin
+  and SHA-256, and the test suite re-checks those digests and that neither
+  bundle contains a way to reach the network.
 - **No model in the loop.** Every number is arithmetic, SQL, or JSON parsing.
   Running CPB costs nothing.
 
