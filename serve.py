@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -37,7 +38,13 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
-from ingest import SOURCE_MAIN, SOURCE_SUBAGENT, STATUS_INGESTED, STATUS_UNAVAILABLE
+from ingest import (
+    INGEST_RUNS_TABLE,
+    SOURCE_MAIN,
+    SOURCE_SUBAGENT,
+    STATUS_INGESTED,
+    STATUS_UNAVAILABLE,
+)
 from pricing import RATES_AS_OF
 
 EASTERN = ZoneInfo("America/New_York")
@@ -67,6 +74,26 @@ SCOPE_INCLUDES_MAIN_ONLY = "main-thread only"
 # `unavailable` (a gap PROVEN to fall in this window) because "we cannot tell
 # whether this window is affected" is a different claim from "it is".
 STATUS_UNAVAILABLE_UNDATED = "unavailable-undated"
+
+# How old the LAST INGEST RUN may get before the page says so in the banner
+# (#20). It qualifies the run, never the newest measured call: an idle machine
+# legitimately produces no calls for hours, and warning on that would cry stale
+# over a database that is perfectly current.
+#
+# 15 minutes, from two measurements rather than taste:
+#
+#   * The incident that opened #20 was 1.2 h of unflagged staleness. Any
+#     threshold near that would not have fired on the case it exists for, so
+#     the ceiling is well under an hour.
+#   * The floor is what a refresh costs, or the banner would fire on people
+#     who ARE re-ingesting. Measured 2026-08-04 on macOS 15 against the
+#     largest transcript corpus on this machine (2,891 files, 1.9 GB): a cold
+#     full ingest took 39.9 s, an all-skipped incremental re-run 1.8 s.
+#
+# 900 s is ~500x that incremental run and ~23x a full cold parse, so anyone
+# re-ingesting on any sane cadence never sees the banner. It marks NEGLECT,
+# not latency. Re-check the floor if ingest ever stops being incremental.
+STALE_AFTER_SECONDS = 15 * 60
 
 MIN_LIMIT = 1
 MAX_LIMIT = 500
@@ -117,11 +144,82 @@ class Api:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
 
+    def _last_ingest_run(self) -> Optional[float]:
+        """When `ingest.py` last COMPLETED, or None if that was never recorded.
+
+        Two different absences collapse to the same None, and both are an
+        honest "no sample" rather than a value:
+
+        * a pre-v7 database has no `ingest_runs` table at all -- `serve.py`
+          never migrates, it reads the database as the ingester left it, so a
+          user who upgrades CPB and opens the report before re-running ingest
+          is in exactly this state;
+        * a v7 database that has not been ingested since the upgrade has the
+          table and no row.
+
+        Neither is an ingest at the epoch and neither is stale-forever: the
+        age is UNKNOWN, and `_ingest_health` says so with `stale: null`.
+
+        The missing table is detected by asking `sqlite_master` rather than by
+        catching `OperationalError`, because that except would also swallow a
+        corrupt or locked database and report the failure as an unknown age.
+        """
+        present = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (INGEST_RUNS_TABLE,),
+        ).fetchone()
+        if present is None:
+            return None
+        row = self.conn.execute(
+            f"SELECT finished_at FROM {INGEST_RUNS_TABLE}"
+            " ORDER BY finished_at DESC LIMIT 1"
+        ).fetchone()
+        return row["finished_at"] if row is not None else None
+
     def _ingest_health(self) -> dict[str, Any]:
+        """Freshness and parse health of the DATABASE -- corpus-wide (#20).
+
+        Alone in `summary()`, this block does NOT range over the selected
+        window, and that is the point: it describes how current the database
+        is, not the period on screen. Windowed, `newest_call_ts` would call a
+        deliberately historical view months stale seconds after an ingest.
+        The UI labels it as corpus-wide for the same reason.
+
+        Two timestamps, never conflated, because either alone misleads:
+        `last_run_at` is when this tool last LOOKED at the transcripts, and
+        `newest_call_ts` is the most recent call it FOUND. A fresh run over an
+        idle machine is healthy and shows an old `newest_call_ts`; a database
+        nobody has re-ingested for a week can show a recent `newest_call_ts`
+        for the last thing it ever saw. Only the pair is readable.
+
+        `as_of` is the server's own clock at the moment this response was
+        built, so an age is measured against the machine that owns the data
+        rather than against whatever the browser believes the time is.
+        """
         row = self.conn.execute(
             "SELECT COUNT(*) files, SUM(unparsed_records) unparsed FROM ingest_state"
         ).fetchone()
-        return {"files": row["files"], "unparsed_records": row["unparsed"]}
+        last_run_at = self._last_ingest_run()
+        # MAX over an empty set is SQL NULL and stays None: "no calls
+        # ingested" is not a call at the epoch (rule #12).
+        newest_call_ts = self.conn.execute(
+            "SELECT MAX(ts) newest FROM api_calls"
+        ).fetchone()["newest"]
+        as_of = time.time()
+        return {
+            "files": row["files"],
+            "unparsed_records": row["unparsed"],
+            "last_run_at": last_run_at,
+            "newest_call_ts": newest_call_ts,
+            "as_of": as_of,
+            "stale_after_seconds": STALE_AFTER_SECONDS,
+            # Tri-state on purpose: True, False, or None for "cannot tell".
+            "stale": (
+                None
+                if last_run_at is None
+                else (as_of - last_run_at) > STALE_AFTER_SECONDS
+            ),
+        }
 
     def _durability(self, start: float, end: float) -> dict[str, Any]:
         """Can the numbers in this window be recomputed, or only read here? (#14)

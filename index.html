@@ -12,6 +12,9 @@
   h1 { font-size:20px; margin:0 0 4px; }
   .sub { color:var(--muted); margin-bottom:16px; }
   .banner { background:#fef3c7; border:1px solid #f59e0b; color:#78350f; padding:10px 14px; border-radius:8px; margin-bottom:14px; display:none; }
+  .data-age { color:var(--muted); font-size:12px; margin-bottom:8px; }
+  .data-age strong { color:var(--ink); }
+  .data-age.unknown strong { color:#92400e; }
   .cost-basis-note { background:#eef2ff; border:1px solid #c7d2fe; color:#3730a3; padding:8px 14px; border-radius:8px; margin-bottom:14px; font-size:12px; cursor:help; }
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:16px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
@@ -54,6 +57,12 @@
     <input type="date" id="from"> <input type="date" id="to">
     <button id="apply">Apply</button>
   </div>
+
+  <!-- #20: how old these numbers are, immediately above the numbers -- a
+       freshness note in a corner is one nobody reads before trusting a total. -->
+  <!-- "not loaded yet" rather than "loading", because it stays TRUE if the
+       first load fails: renderDataAge only ever runs on a successful one. -->
+  <div class="data-age" id="data-age">Data age: not loaded yet.</div>
 
   <div class="cards" id="cards"></div>
 
@@ -142,6 +151,20 @@ function fmtTs(ts) {
   if (ts === null || ts === undefined) return "—";
   return new Date(ts * 1000).toLocaleString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
+function fmtSpan(sec) {
+  if (sec < 90) return Math.round(sec) + " seconds";
+  if (sec < 5400) return Math.round(sec / 60) + " minutes";
+  if (sec < 129600) return (sec / 3600).toFixed(1) + " hours";
+  return (sec / 86400).toFixed(1) + " days";
+}
+function fmtAge(sec) {
+  if (sec === null || sec === undefined) return "—";
+  // Ages are measured against the SERVER's clock (`ingest.as_of`), so a
+  // negative one means the two disagree. Say that rather than round it to
+  // "just now", which is the reassuring reading of an unexplained fact.
+  if (sec < 0) return "in the future (clock skew)";
+  return fmtSpan(sec) + " ago";
+}
 function esc(s) {
   // textContent/innerHTML only escapes &, <, > -- not quotes, and this value
   // is interpolated into a double-quoted data-id attribute (line below).
@@ -203,6 +226,65 @@ function renderScopeNote(scope) {
     undated;
 }
 
+// ONE banner element, three things that can want it: a failed load, the
+// staleness warning, and the routine data-quality notices. Each used to write
+// the element directly, so whichever ran LAST decided which true statement the
+// reader was allowed to see -- and the reader would be shown one warning with
+// no sign the other existed. That is this project's own rule (a fact that
+// cannot be shown must not be silently replaced by a milder one) failing
+// inside the feature built to enforce it.
+//
+// So there is exactly one writer, composing in a FIXED order chosen by how
+// badly the figures on screen can mislead:
+//   1. load failure -- the numbers are not this response's numbers at all
+//   2. stale data   -- the numbers are real but describe a moment now past
+//   3. notices      -- the numbers are current, with caveats on what is in them
+// A failure is never dropped by a later render: only a load in which EVERY
+// endpoint succeeded clears it, and `loadAll` is the one place that happens.
+let bannerState = { loadFailure: null, stale: null, notices: [] };
+
+function renderBanner() {
+  const msgs = [bannerState.loadFailure, bannerState.stale, ...bannerState.notices].filter(Boolean);
+  const el = document.getElementById("banner");
+  el.style.display = msgs.length ? "block" : "none";
+  el.textContent = msgs.join(" ");
+}
+
+// #20: TWO facts, never collapsed into a single "data age" number.
+// `last_run_at` is when this tool last LOOKED at the transcripts;
+// `newest_call_ts` is the newest call it FOUND, corpus-wide rather than
+// window-scoped. A fresh run over an idle machine shows a recent first value
+// and an old second one and is perfectly healthy -- merging them would report
+// that as staleness, and would hide a week-old database whose last-seen call
+// happens to be recent.
+//
+// A null `last_run_at` is not an age of zero and not a stale-forever verdict:
+// it is a database written before CPB recorded run times at all, and it says
+// exactly that.
+function renderDataAge(ing) {
+  const el = document.getElementById("data-age");
+  const parts = [];
+  if (ing.last_run_at === null) {
+    parts.push(
+      `<strong>Last ingest: not recorded</strong> — this database predates ` +
+      `CPB recording ingest times, so its age is UNKNOWN, not zero. Run ` +
+      `<code>ingest.py</code> to start recording it`
+    );
+  } else {
+    parts.push(`Last ingest: <strong>${esc(fmtAge(ing.as_of - ing.last_run_at))}</strong> (${esc(fmtTs(ing.last_run_at))})`);
+  }
+  if (ing.newest_call_ts === null) {
+    parts.push(`newest measured call: <strong>none</strong> — no API calls ingested`);
+  } else {
+    parts.push(
+      `newest measured call: <strong>${esc(fmtAge(ing.as_of - ing.newest_call_ts))}</strong> ` +
+      `(${esc(fmtTs(ing.newest_call_ts))}), across ALL ingested data — not this window`
+    );
+  }
+  el.innerHTML = parts.join(" · ");
+  el.classList.toggle("unknown", ing.last_run_at === null);
+}
+
 function renderSummary(s) {
   const noData = !s.calls;
   const cards = [
@@ -236,8 +318,17 @@ function renderSummary(s) {
     `and will differ from your actual bill. Rate table last checked ` +
     `${esc(s.cost_basis.rates_as_of)} (${esc(s.cost_basis.source)}).`;
 
-  const banner = document.getElementById("banner");
+  renderDataAge(s.ingest);
+
   const msgs = [];
+  // `stale` is TRI-STATE: true, false, or null for "no ingest run was ever
+  // recorded". Only an actual true warns -- an unknown age is reported by the
+  // data-age line above, and must not become a banner that can never clear.
+  bannerState.stale = s.ingest.stale === true
+    ? `Data is STALE: ingest.py last ran ${fmtAge(s.ingest.as_of - s.ingest.last_run_at)}, ` +
+      `past the threshold of ${fmtSpan(s.ingest.stale_after_seconds)}. Every figure below ` +
+      `describes the transcripts as of THEN, not as of now — re-run ingest.py.`
+    : null;
   if (s.ingest.files === 0) msgs.push("No files ingested yet — run ingest.py.");
   if (s.ingest.unparsed_records > 0) msgs.push(`INCONCLUSIVE: ${s.ingest.unparsed_records} unparsed record(s) across ingested files — totals may undercount.`);
   if (s.unpriced_calls > 0) msgs.push(`${s.unpriced_calls} call(s) on unpriced model(s) [${s.unpriced_models.join(", ")}] are EXCLUDED from cost (never priced at $0).`);
@@ -245,8 +336,8 @@ function renderSummary(s) {
   // not is reproducible: those transcripts are gone, so this database is the
   // only copy and re-ingesting will not bring them back. Back it up.
   if (!s.durability.reproducible) msgs.push(`${s.durability.archived_calls} call(s) in this window come from ${s.durability.archived_sources} transcript(s) no longer on disk — counted in the totals, but NOT reproducible by re-ingesting. This database is their only copy.`);
-  banner.style.display = msgs.length ? "block" : "none";
-  banner.textContent = msgs.join(" ");
+  bannerState.notices = msgs;
+  renderBanner();
 }
 
 const CLASS_COLORS = { input: "#2563eb", cache_read: "#059669", cache_write: "#d97706", output: "#dc2626" };
@@ -435,9 +526,10 @@ document.getElementById("detail-close").addEventListener("click", hideDetail);
 function reportLoadFailure(e) {
   // A failed refresh must say so, not leave the previous numbers on screen
   // looking current (CodeRabbit finding -- stale data read as current).
-  const banner = document.getElementById("banner");
-  banner.textContent = "Load failed: " + e.message + " -- displayed figures may be stale.";
-  banner.style.display = "block";
+  // Highest precedence in `renderBanner`, and cleared only by a load in which
+  // every endpoint returned.
+  bannerState.loadFailure = "Load failed: " + e.message + " -- displayed figures may be stale.";
+  renderBanner();
 }
 
 async function loadAll() {
@@ -455,6 +547,9 @@ async function loadAll() {
     reportLoadFailure(e);
     return;
   }
+  // Every endpoint returned, so the previous failure is genuinely resolved --
+  // the ONE place that is true, and therefore the only place it is cleared.
+  bannerState.loadFailure = null;
   renderSummary(summary);
   renderChart(ts);
   renderSessions(sessions);

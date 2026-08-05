@@ -14,6 +14,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1690,6 +1691,164 @@ class ClassifyTurnEndToEndTest(unittest.TestCase):
 
     def test_no_record_was_dropped_as_unparsed(self) -> None:
         self.assertEqual(self.summary["unparsed_records"], 0)
+class IngestRunTimestampTest(unittest.TestCase):
+    """WHEN ingest last ran is a fact the database did not record at all (#20).
+
+    Nothing in the v6 schema dated a RUN. `ingest_state.mtime` looks like the
+    same fact and is not: it is the SOURCE FILE's mtime, so a database
+    untouched for a week, holding transcripts that were themselves last
+    written a week ago, is indistinguishable from one refreshed a second ago.
+    The report then renders week-old totals as current ones -- absence
+    rendering as a value, turned on this tool.
+
+    The fixtures pin the run time and the file mtime DELIBERATELY UNEQUAL, so
+    an implementation that reports `MAX(ingest_state.mtime)` -- the nearest
+    wrong answer, and the one that already exists in the schema -- cannot pass.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-runstamp-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+
+    def _recorded_runs(self) -> list[float]:
+        conn = sqlite3.connect(self.db)
+        try:
+            return [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT finished_at FROM {ingest_mod.INGEST_RUNS_TABLE}"
+                )
+            ]
+        finally:
+            conn.close()
+
+    def test_a_completed_run_records_when_it_finished(self) -> None:
+        before = time.time()
+        ingest(self.projects, self.db)
+        after = time.time()
+        runs = self._recorded_runs()
+        self.assertEqual(len(runs), 1, "the run stamp is one row, not a log")
+        self.assertGreaterEqual(runs[0], before)
+        self.assertLessEqual(runs[0], after)
+
+    def test_the_run_time_is_not_the_source_file_mtime(self) -> None:
+        # Pinned a day back: a run stamp derived from the transcript's own
+        # mtime -- the fact already in `ingest_state` -- lands here instead.
+        mtime = time.time() - 86400.0
+        os.utime(self.transcript, (mtime, mtime))
+        ingest(self.projects, self.db)
+        (recorded,) = self._recorded_runs()
+        self.assertGreater(
+            recorded,
+            mtime + 3600.0,
+            "the run stamp is when INGEST ran, never the source file's mtime",
+        )
+
+    def test_a_run_that_ingests_nothing_still_counts_as_a_run(self) -> None:
+        # The load-bearing case from #20: a fresh ingest that found nothing new
+        # is HEALTHY, and must not read like no ingest at all. If the stamp
+        # were written per ingested file, an all-skipped run would leave it
+        # ageing forever and the page would cry stale over current data.
+        ingest(self.projects, self.db)
+        (first,) = self._recorded_runs()
+        time.sleep(0.01)
+        summary = ingest(self.projects, self.db)
+        self.assertEqual(summary["files_ingested"], 0)
+        self.assertGreater(summary["files_skipped"], 0)
+        (second,) = self._recorded_runs()
+        self.assertGreater(second, first)
+
+
+class AdditiveSchemaUpgradeTest(unittest.TestCase):
+    """Adding a table must not cost the rows a re-ingest cannot reproduce (#20).
+
+    `_prepare_schema` drops and rebuilds on a version change, and REFUSES to
+    do so when any tracked source is gone from disk (`SchemaRebuildSafetyTest`
+    above). Both are right for a shape change. Neither is right for v6 -> v7,
+    which only ADDS a table: a rebuild would discard every row to re-derive
+    identical ones, and on a corpus with a reaped transcript the guard would
+    refuse outright -- making a purely additive change unlandable for exactly
+    the users whose data this database is the only copy of.
+
+    `test_rebuild_still_proceeds_when_every_source_is_re_readable` above is the
+    other side of this boundary: an older shape still takes the rebuild path.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-upgrade-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+
+    def _downgrade_to_v6(self) -> None:
+        """Put the database back in the shape v6 shipped: no run stamp at all."""
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(f"DROP TABLE {ingest_mod.INGEST_RUNS_TABLE}")
+            conn.execute("PRAGMA user_version = 6")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _counts(self) -> tuple[int, int]:
+        conn = sqlite3.connect(self.db)
+        try:
+            return (
+                conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM ingest_state").fetchone()[0],
+            )
+        finally:
+            conn.close()
+
+    def test_a_v6_database_upgrades_in_place_without_re_parsing(self) -> None:
+        before = self._counts()
+        self._downgrade_to_v6()
+        summary = ingest(self.projects, self.db)
+        self.assertFalse(summary["schema_rebuilt"])
+        # A rebuild empties `ingest_state`, so every file would be re-parsed.
+        # Skipping them all is the observable proof the rows survived.
+        self.assertEqual(summary["files_ingested"], 0)
+        self.assertEqual(summary["files_skipped"], summary["files_scanned"])
+        self.assertEqual(self._counts(), before)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                ingest_mod.SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {ingest_mod.INGEST_RUNS_TABLE}"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            conn.close()
+
+    def test_the_upgrade_is_not_refused_over_a_reaped_source(self) -> None:
+        self.transcript.unlink()
+        ingest(self.projects, self.db)  # archives it; rows retained
+        before = self._counts()
+        self._downgrade_to_v6()
+        ingest(self.projects, self.db)  # must not raise SystemExit
+        self.assertEqual(self._counts(), before)
+        conn = sqlite3.connect(self.db)
+        try:
+            archived = conn.execute(
+                "SELECT COUNT(*) FROM ingest_state WHERE archived_at IS NOT NULL"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(archived, 1, "the archived source survived the upgrade")
 
 
 if __name__ == "__main__":

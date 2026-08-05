@@ -94,6 +94,45 @@ python3 ingest.py --projects-dir ~/.claude/projects/<name>
 If the derived directory does not exist, CPB refuses and lists the projects
 that *do* have transcripts, rather than reporting an empty run.
 
+### The report tells you how old its data is
+
+`serve.py` reads whatever the database holds, and `ingest.py` never runs on its
+own — so the report is exactly as current as your last ingest, and a page left
+open for a week would otherwise look identical to one opened a second ago.
+
+Directly above the totals the report states **two facts, never merged into one
+"data age"**:
+
+| line | what it means |
+|---|---|
+| **Last ingest** | when `ingest.py` last completed — when this tool last *looked* at the transcripts |
+| **Newest measured call** | the most recent API call in the database — the newest thing it *found*, across **all** ingested data, not the selected window |
+
+Both, because either alone misleads. A fresh ingest on a machine you have not
+used since lunch is perfectly healthy and shows an old newest-call. A database
+nobody has re-ingested for a week can show a recent newest-call — for the last
+thing it ever saw. Only the pair is readable.
+
+**Past 15 minutes since the last ingest, the report raises a banner** in the
+same place as its unpriced-model and archived-source warnings, saying the
+figures describe the transcripts as of then rather than as of now. The
+threshold is measured, not taste: re-ingesting is incremental, and on the
+largest corpus available here (2,891 transcripts, 1.9 GB, macOS, checked
+2026-08-04) an all-skipped re-run took **1.8 s** against **39.9 s** for a cold
+full parse — so anyone re-running `ingest.py` on any reasonable cadence never
+sees it. It marks neglect, not latency. The warning applies to the *ingest run*
+only; an idle machine that produced no calls for hours is not stale.
+
+A database written before CPB recorded ingest times (schema v6 and earlier)
+reads **"Last ingest: not recorded"**. That is an *unknown* age, not an age of
+zero and not a permanent staleness warning — run `ingest.py` once and it starts
+recording. Upgrading such a database does not re-parse anything: adding this
+was a purely additive schema change, applied in place, keeping every row.
+
+There is no automatic refresh yet — refreshing means running `ingest.py` again.
+Scheduling that from inside `serve.py` is [issue #20](https://github.com/vlad-ko/claude-piggy-bank/issues/20)'s
+second half and ships separately.
+
 ## Where the data comes from
 
 Claude Code writes every session to disk as JSONL. CPB reads two globs:
