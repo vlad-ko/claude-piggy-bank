@@ -36,7 +36,7 @@ anyone who has it in a script. `_exit_status()` reproduces CPython's own
 report a run that measured nothing as a run that measured zero. `VERSION` lives
 in `cpb.py`; `.claude-plugin/plugin.json` repeats it as a literal because the
 plugin loader reads that JSON without running Python, and `tests/test_cpb.py`
-pins the two equal. CPB is **<!--cpb:version-->1.2.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
+pins the two equal. CPB is **<!--cpb:version-->1.3.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
 authority; this line lagged a release once already and may again), and what a
 bump *means* is `docs/versioning.md` — see Commits and PRs below.
 
@@ -225,7 +225,7 @@ response that never happened — and the ambiguity is counted (a *different* set
 from the 108 above, and re-measure before quoting any of these). Records with no
 `message.id` each stay their own call; `NULL` is not a shared key.
 
-**Schema** (`SCHEMA_VERSION = 11`, `PRAGMA user_version`): `sessions`, `turns`,
+**Schema** (`SCHEMA_VERSION = 12`, `PRAGMA user_version`): `sessions`, `turns`,
 `api_calls`, `agent_dispatches`, `subagent_runs`, `task_index_sessions`,
 `ingest_state`, `ingest_runs`, `source_shape`. Ingest is incremental per file,
 keyed on size+mtime in `ingest_state`; re-ingesting a changed file deletes its
@@ -275,10 +275,32 @@ authority: `band_provenance`'s failure mode reappearing one level down. Note
 what the citation does and does not cover: TA-8 documents `1.0` for the
 **5-minute** write only. The 1-hour write is 2x and needs **two** reads (2.10
 against 2.00 at n=2, still a loss), and TA-8 warns in as many words against
-compressing either into "repays on the second hit" — so a `1.0` boundary
-applied to 1-hour cache writes would be a judged number wearing a cited
-number's clothes, which is the same defect this rule exists to stop. #78 is in
-progress; the rule is decided, the module is not shipped.
+compressing either into "repays on the second hit" — so a `1.0` boundary that
+claimed to settle 1-hour cache writes on that citation would be a judged number
+wearing a cited number's clothes, which is the same defect this rule exists to
+stop.
+
+**How that was settled, because the paragraph above once ended by hedging it.**
+`recommendations.py` shipped with #78 and was wired into `/api/summary` and the
+report by #85. There are now **two** cache-repayment metrics rather than one
+boundary doing two jobs, and each carries the citation it has actually earned.
+`cache_reads_per_write` is the flat ratio over every call, and its `1.0` is
+cited for exactly what it claims — below one read per write **no** cache write
+is repaid, whichever TTL it asked for — with the band between one read and two
+left explicitly unresolved, because one flat total cannot name the TTL.
+`cache_write_repayment_at_own_ttl` (#84) is the second: CPB reads the per-TTL
+split from `usage.cache_creation` per call, so every measured write token is
+weighted at its **own** break-even — one read token per 5-minute write token,
+two per 1-hour — and `1.0` there is cited *because* the arithmetic is per TTL
+rather than in spite of it. Neither break-even moved; which one applies stopped
+being unknown wherever the split was read. The second metric ranges over the
+calls whose split was measured and takes its reads from **those same calls**: a
+row written before #84 is unmeasured on both sides, never a 5-minute write and
+never a zero, so on a database not re-ingested since the split was first read
+the metric is `None` and is named in `unmeasured` rather than banded. Both
+metrics exist permanently — a transcript past `cleanupPeriodDays` can never be
+re-ingested to acquire a split, so for most history the flat ratio is the only
+one of the two that can be computed at all.
 
 **Serve** is `http.server` + `sqlite3`, bound to loopback, with a Host-header
 check against DNS rebinding. Routes: `/api/summary`, `/api/timeseries`,
@@ -304,18 +326,20 @@ Consequences encoded in the code, which must be preserved:
 - Which is why a schema change that loses no measurement must not go through
   that rebuild: on any corpus past the retention window the guard would refuse a
   change that risks nothing, and an untrue refusal is the same class of defect
-  as an untrue number. `IN_PLACE_UPGRADE_FROM` (currently `{6, 7, 8, 9, 10}`)
-  lists the versions whose delta to the **current** shape can be applied without
-  losing one. Five hops exist, and a v6 database makes all five at once: v6→v7
-  adds `ingest_runs`; v7→v8 drops `api_calls.cost_usd` (#30) via
-  `ALTER TABLE ... DROP COLUMN`, gated on a **runtime** check of
-  `sqlite3.sqlite_version` ≥ 3.35; v8→v9 adds `source_shape` (#15); v9→v10 adds
-  the UNIQUE `idx_agent_dispatches_task_id`, which `_dedupe_dispatch_task_ids()`
-  has to precede because the index cannot be built over a table already holding
-  duplicates (#36); and v10→v11 adds the three nullable cache-miss diagnostic
-  columns to `api_calls` (#5). It is re-decided at every bump against the
-  current shape, never extended by habit, and the sub-3.35 fallback goes through
-  the rebuild path **including** the guard — never around it.
+  as an untrue number. `IN_PLACE_UPGRADE_FROM` (currently
+  `{6, 7, 8, 9, 10, 11}`) lists the versions whose delta to the **current**
+  shape can be applied without losing one. Six hops exist, and a v6 database
+  makes all six at once: v6→v7 adds `ingest_runs`; v7→v8 drops
+  `api_calls.cost_usd` (#30) via `ALTER TABLE ... DROP COLUMN`, gated on a
+  **runtime** check of `sqlite3.sqlite_version` ≥ 3.35; v8→v9 adds
+  `source_shape` (#15); v9→v10 adds the UNIQUE `idx_agent_dispatches_task_id`,
+  which `_dedupe_dispatch_task_ids()` has to precede because the index cannot be
+  built over a table already holding duplicates (#36); v10→v11 adds the three
+  nullable cache-miss diagnostic columns to `api_calls` (#5); and v11→v12 adds
+  the two nullable per-TTL cache-write columns to the same table (#84). It is
+  re-decided at every bump against the current shape, never extended by habit,
+  and the sub-3.35 fallback goes through the rebuild path **including** the
+  guard — never around it.
 - **The bar moved at the v10 bump**, which is what re-deciding rather than
   extending is for. It read "the delta preserves every **row**"; v9→v10 deletes
   rows, because a duplicate `task_id` is one dispatch recorded by a second
@@ -335,8 +359,12 @@ Consequences encoded in the code, which must be preserved:
   before CPB read `message.diagnostics`", i.e. unmeasured, which is true of
   every row a pre-v11 build wrote and is a *different* statement from `absent`
   or `no-divergence`; back-filling either would manufacture an observation
-  nobody made, over a whole corpus at once. A NOT NULL column cannot be added
-  this way at all.
+  nobody made, over a whole corpus at once. NULL in `cache_write_5m` (#84) says
+  the same thing about the per-TTL cache-write split, and the tempting back-fill
+  there is sharper: `cache_write_5m = cache_write` looks like a safe default and
+  would state that no session in the corpus ever asked for the 1-hour TTL —
+  inventing the answer to the exact question the columns were added to ask. A
+  NOT NULL column cannot be added this way at all.
 - Windows containing archived sources are flagged in the report banner: totals
   are complete but no longer reproducible by re-ingesting.
 

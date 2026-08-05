@@ -67,6 +67,7 @@ from ingest import (
 from recommendations import (
     METRIC_CACHE_READS_PER_WRITE,
     METRIC_CACHE_WRITE_ONLY_SHARE,
+    METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
     METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,
     METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
     METRICS,
@@ -78,10 +79,70 @@ from recommendations import (
     Lever,
     Provenance,
     assess_all,
+    cache_write_repayment,
 )
 EASTERN = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
 VENDOR_DIR = (HERE / "vendor").resolve()
+
+# THE TIE BETWEEN TWO ENUMERATIONS OF ONE SET (#84). `recommendations.METRICS`
+# DECLARES the metrics the table assesses; `_recommendations()` COMPUTES a value
+# for each. Until this constant existed, nothing connected them -- and the cost
+# of that gap is on the record rather than hypothetical: the branch that added
+# the fifth metric ran a fully green suite, because at the commit it forked from
+# `serve.py` contained no reference to `assess_all()` at all, and the
+# incompleteness appeared only when a request was served over a merged tree.
+#
+# This is `RANKED_BY`'s discipline one level over. There a heading and an
+# `ORDER BY` were free to disagree and did, for a whole release; here a table
+# and its only caller were. So the set is named ONCE, checked against the table
+# AT IMPORT by `_refuse_unwired_metrics()` below, and asserted equal in
+# tests/test_serve.py. A metric added to the table and not wired here now fails
+# the moment anything imports this module.
+RECOMMENDED_METRICS = frozenset(
+    {
+        METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,
+        METRIC_CACHE_READS_PER_WRITE,
+        METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+        METRIC_CACHE_WRITE_ONLY_SHARE,
+        METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
+    }
+)
+
+
+def _refuse_unwired_metrics(declared: frozenset[str], table: frozenset[str]) -> None:
+    """Refuse to import if the two enumerations of the metric set disagree.
+
+    Both directions, and they are not the same mistake. A metric the table
+    declares and this module never computes reaches `assess_all()` as a partial
+    mapping, which it rightly refuses -- so the whole payload 500s, and every
+    figure on the page goes with it. A key this module supplies that the table
+    does not declare is the quieter one: arithmetic run, a query paid for, and
+    a value nobody assesses. Neither is caught by `assess_all()` alone, which
+    sees only the mapping it is handed and only when a request builds one.
+
+    AT IMPORT rather than at request time, deliberately. `assess_all()`'s
+    refusal cannot fire until a summary is served, so it is invisible to any
+    suite that never serves one -- which is exactly how #84 came to be green in
+    isolation and red on merge. Raising here fails `import serve`, and every
+    test module that imports it, on the branch where the metric was added.
+
+    `RuntimeError` rather than `SystemExit`: this is a wiring defect in the
+    repository, not a refusal to answer a question about the user's data, and
+    the traceback naming this function is the whole diagnosis.
+    """
+    unwired = sorted(table - declared)
+    undeclared = sorted(declared - table)
+    if unwired or undeclared:
+        raise RuntimeError(
+            "serve.RECOMMENDED_METRICS and recommendations.METRICS disagree: "
+            f"declared by the table and computed nowhere here: {unwired}; "
+            f"computed here and declared by no table entry: {undeclared}. "
+            "One of the two is the set that ships; make them the same set."
+        )
+
+
+_refuse_unwired_metrics(RECOMMENDED_METRICS, frozenset(METRICS))
 
 # What the "top dispatches" ranking orders by, named ONCE (#30). The panel
 # was headed "by spend" for its whole life while `agents()` ordered by
@@ -1147,13 +1208,15 @@ class Api:
         which is what makes the report dynamic without making it generative
         (constraint 3: no model produces a figure).
 
-        **The four values are computed from each metric's `measurement` string,
+        **The five values are computed from each metric's `measurement` string,
         not from its key.** That field names exactly what is divided by what,
         and it is the thing a reader checks the advice against; a query that
         agreed with the key and disagreed with the measurement would be a wrong
-        number that reads right. Two of the four say so in as many words --
+        number that reads right. Three of the five say so in as many words --
         `main_vs_subagent_tokens_per_reply` is per API CALL, not per assistant
-        turn, whatever "reply" suggests.
+        turn, whatever "reply" suggests, and
+        `cache_write_repayment_at_own_ttl` names the set it ranges over as the
+        calls whose per-TTL split was measured, which is not the set beside it.
 
         **A zero denominator yields None, never 0.** `assess()` refuses a
         non-finite value precisely so this cannot arrive as `inf`, and a share
@@ -1167,7 +1230,9 @@ class Api:
         present with None where there is no sample. The module refuses a
         partial one, and that refusal is right: a caller that forgot a metric
         and a caller that measured nothing would otherwise produce the same
-        page, and only one of them is telling the truth.
+        page, and only one of them is telling the truth. What that refusal
+        cannot do is fire before a request exists, so completeness is stated
+        separately as `RECOMMENDED_METRICS` and checked at import (#84).
 
         `context` is passed in rather than recomputed, so the main-thread
         saturation share is read off the SAME per-scope band tally the page
@@ -1181,6 +1246,9 @@ class Api:
                 self._main_thread_over_half_window_share(context)
             ),
             **self._cache_reuse_metrics(start, end),
+            METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL: (
+                self._cache_write_repayment_at_own_ttl(start, end)
+            ),
             METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY: (
                 self._main_vs_subagent_tokens_per_call(start, end)
             ),
@@ -1260,6 +1328,11 @@ class Api:
 
         `SUM` over no rows is SQL NULL, which is the same answer as 0 here --
         no call wrote cache -- and both take the None branch.
+
+        Every call in the window, unfiltered, which is what separates this from
+        `_cache_write_repayment_at_own_ttl()` one method down: that one ranges
+        over the calls whose per-TTL split was measured and must not borrow
+        this denominator, nor lend it these reads (#84).
         """
         row = self.conn.execute(
             "SELECT SUM(cache_read) reads, SUM(cache_write) writes,"
@@ -1279,6 +1352,52 @@ class Api:
                 (row["write_only_calls"] / writing_calls) if writing_calls else None
             ),
         }
+
+    def _cache_write_repayment_at_own_ttl(
+        self, start: float, end: float
+    ) -> Optional[float]:
+        """`METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL`, over ONE set of calls.
+
+        A THIRD query rather than two more columns on `_cache_reuse_metrics()`'s
+        one, and the extra query IS the reason: that one ranges over every call
+        in the window, this one over the calls whose per-TTL cache-write split
+        was measured (#84). Two different sets, so a single `SELECT` could only
+        answer both by handing one of them the other's denominator.
+
+        **NUMERATOR AND DENOMINATOR COME FROM THE SAME ROWS.** The `WHERE`
+        picks the set and the reads are summed INSIDE it, never over the whole
+        window. A call ingested before the split was read, or one whose record
+        carried only one of the two TTL keys, contributes no write token to the
+        denominator -- so its read tokens must contribute nothing to the
+        numerator either. Mixing them would report reads repaying writes CPB
+        never saw, and the error runs one way only: the ratio inflates by
+        exactly the traffic it cannot account for. On a database not
+        re-ingested since #84 -- every database today -- that is every read in
+        the window over a denominator of nothing.
+
+        **Both TTLs are required**, because `cache_write_5m IS NULL` means
+        UNMEASURED and never 0. A 1-hour write whose column was read as absent
+        would be counted at the 5-minute break-even and reported repaid a read
+        early; `ingest.Call.cache_write_split_total` refuses a partial split on
+        the write path for the same reason, and this is the read path's half.
+
+        `SUM` over no matching row is SQL NULL, which is the state of every
+        database that predates the split, and `cache_write_repayment()` turns
+        it into None -- so the metric is NAMED in `unmeasured` rather than
+        banded as the worst reading a project could have. The weighting stays
+        in that function and is deliberately not written into this query:
+        which multiplier goes with which TTL is the CITED boundary, and a
+        `2 *` here would be free to drift from the citation justifying it.
+        """
+        row = self.conn.execute(
+            "SELECT SUM(cache_read) reads, SUM(cache_write_5m) write_5m,"
+            " SUM(cache_write_1h) write_1h"
+            " FROM api_calls"
+            " WHERE ts >= ? AND ts < ?"
+            " AND cache_write_5m IS NOT NULL AND cache_write_1h IS NOT NULL",
+            (start, end),
+        ).fetchone()
+        return cache_write_repayment(row["reads"], row["write_5m"], row["write_1h"])
 
     def _main_vs_subagent_tokens_per_call(
         self, start: float, end: float

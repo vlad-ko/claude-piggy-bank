@@ -582,12 +582,20 @@
        CONSTRAINT 4 (do not overwhelm the UI). This is a note-band, not a
        table, and it is the page's existing idiom for ANNOTATING the figures
        above rather than restating them: `#scope-note` annotates the cards and
-       `#context-note` annotates the context card. Every one of the four
+       `#context-note` annotates the context card. Every one of the five
        assessments is a lookup of a figure this page already carries the inputs
        for -- the saturation share off the per-scope bands directly above, the
-       two cache figures off the cache-read and cache-write cards, the reply
+       three cache figures off the cache-read and cache-write cards, the reply
        ratio off the main-vs-subagent split -- so what earns the space is the
        verdict on those numbers, not a second copy of them.
+
+       THE FIFTH ENTRY NEEDED NO MARKUP (#84), and that is the structure
+       working rather than an oversight. `ranked` is iterated and `unmeasured`
+       is consumed whole, so a metric added to the table reaches this band by
+       construction, in whichever of the two it lands -- which for
+       `cache_write_repayment_at_own_ttl` is `unmeasured` on every database not
+       re-ingested since the split was first read. A band that had spelled its
+       five entries out would have rendered four and looked complete.
 
        THE RENDERING IS DELIBERATELY PROVISIONAL. #70 splits the report into an
        overview and a details view; the ranked levers belong on the overview
