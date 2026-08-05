@@ -18,8 +18,8 @@ already writes locally into SQLite and serves a single-page report over them.
 - **No model in the loop.** Every number is arithmetic, SQL, or JSON parsing.
   Running CPB costs nothing.
 
-That last point is deliberate. This is a tool for understanding cost; it would
-be a poor one if using it cost anything.
+That last point is deliberate. This is a tool for understanding what your
+sessions consume; it would be a poor one if using it consumed anything.
 
 ## Status: early, and honest about it
 
@@ -35,12 +35,11 @@ so a single API response was counted many times. On one real corpus:
 |---|---|---|---|
 | main-thread calls | 85,324 | 36,167 | 2.36x |
 | subagent calls | 242,242 | 126,757 | 1.91x |
-| estimated cost | $144,697 | $65,776 | 2.20x |
 
-The factor differed by scope, so comparisons were distorted in **shape**, not
-merely in magnitude. The clearest casualty: main-thread spend appeared to
-dominate subagent spend, $83k against $61k. Deduplicated, it is **$33,073
-against $32,703** — a dead heat. A conclusion, not just a scale, was wrong.
+The factor differed by scope — **2.36x against 1.91x** — so any main-thread
+versus subagent comparison was distorted in **shape**, not merely in
+magnitude: the two sides were scaled by different amounts before being read
+against each other. A conclusion, not just a scale, was wrong.
 
 Ingest now emits one row per distinct `message.id`. The resolution rule is
 measured rather than assumed: across that corpus `output_tokens` is
@@ -56,7 +55,7 @@ Records with **no** `message.id` each stay their own call; on this corpus there
 were none, but dropping them would delete real spend and grouping them would
 merge unrelated calls.
 
-Cost figures remain list-rate estimates, not a bill -- see below.
+CPB no longer converts any of this into money — see "No dollar figures" below.
 
 Publishing a tool whose README documented its own broken numbers was a choice.
 The alternative was to fix it privately first, and the point of this project is
@@ -114,7 +113,7 @@ nobody has re-ingested for a week can show a recent newest-call — for the last
 thing it ever saw. Only the pair is readable.
 
 **Past 15 minutes since the last ingest, the report raises a banner** in the
-same place as its unpriced-model and archived-source warnings, saying the
+same place as its parse-quality and archived-source warnings, saying the
 figures describe the transcripts as of then rather than as of now. The
 threshold is measured, not taste: re-ingesting is incremental, and on the
 largest corpus available here (2,891 transcripts, 1.9 GB, macOS, checked
@@ -126,8 +125,12 @@ only; an idle machine that produced no calls for hours is not stale.
 A database written before CPB recorded ingest times (schema v6 and earlier)
 reads **"Last ingest: not recorded"**. That is an *unknown* age, not an age of
 zero and not a permanent staleness warning — run `ingest.py` once and it starts
-recording. Upgrading such a database does not re-parse anything: adding this
-was a purely additive schema change, applied in place, keeping every row.
+recording. Upgrading a v6 or v7 database does not re-parse anything: both hops
+to the current shape are applied in place and keep every row — the run-stamp
+table is added, and the retired cost column is dropped. (Dropping a column
+needs SQLite 3.35+, which CPB detects at runtime; on an older library it falls
+back to a full rebuild, which still refuses outright if any tracked source has
+already been reaped.)
 
 There is no automatic refresh yet — refreshing means running `ingest.py` again.
 Scheduling that from inside `serve.py` is [issue #20](https://github.com/vlad-ko/claude-piggy-bank/issues/20)'s
@@ -232,13 +235,21 @@ their size is recorded as *unknown* rather than `0`. Recording `0` would make a
 composition table state that thinking costs nothing — false, and invisible,
 because it looks like a measurement.
 
-**Cost figures are an estimate, never a bill.** Every dollar amount is
-list-rate arithmetic over measured token counts, using a hand-maintained rate
-table carrying the date it was last checked. It does not model subscription
-accounting, discounts, or overage. On one real session this tool's arithmetic
-produced ~$57 where the subscription-accounted spend was ~$21 — overstating by
-more than 2.5×. Token counts (measured) are therefore kept visually and
-semantically distinct from dollar figures (derived) throughout.
+**No dollar figures.** CPB reports measured tokens and never converts them
+into money. It used to: list-rate arithmetic over a hand-maintained rate
+table, which modelled no subscription accounting, discount or overage, went
+stale twice, and on one real session produced ~$57 where the
+subscription-accounted spend was ~$21 — over 2.5× out. A precise-looking
+number that is wrong by a factor of two is worse than no number, because the
+reader has no way to see the error; that is the rule above turned on the
+tool's own headline, so the estimate was removed rather than qualified
+([#30](https://github.com/vlad-ko/claude-piggy-bank/issues/30)).
+
+What replaced it is the honest version of the same question: panels that
+claimed to rank "by spend" rank by **total tokens** and say so in the heading,
+with the **model** shown beside each row. Tokens are not tiers — a large Haiku
+dispatch can outrank a small Opus one — and the reader weighs that themselves
+rather than trusting a derived figure the tool cannot keep current.
 
 ## Tests
 

@@ -77,8 +77,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from pricing import cost_usd
-
 SOURCE_MAIN = "main"
 SOURCE_SUBAGENT = "subagent"
 
@@ -124,19 +122,37 @@ DERIVED_TABLES = (
 # Bumped whenever the shape below changes. The DB is a pure DERIVED rendering
 # of the transcripts (regenerable in full by re-running this script), so an
 # older shape is rebuilt from scratch rather than migrated in place -- see
-# `_prepare_schema`, and `ADDITIVE_UPGRADE_FROM` below for the narrow case
+# `_prepare_schema`, and `IN_PLACE_UPGRADE_FROM` below for the narrow case
 # where rebuilding would cost rows to arrive at the identical database.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
-# Versions whose shape differs from the current one only by ADDITIONS that
-# `CREATE TABLE IF NOT EXISTS` supplies on its own, so they upgrade in place
-# instead of being dropped and rebuilt. v6 -> v7 adds `ingest_runs` and
-# changes nothing else: no column moves, no row rewrites.
+# Versions whose difference from the current shape can be applied WITHOUT
+# deleting a row, so they upgrade in place instead of being dropped and
+# rebuilt. Two such hops exist, and a v6 database makes both at once:
 #
-# This set is not cumulative by default. Whoever bumps SCHEMA_VERSION next has
-# to re-decide it, because a version belongs here only while the delta to the
-# NEW shape is still purely additive.
-ADDITIVE_UPGRADE_FROM = frozenset({6})
+#   v6 -> v7  ADDS `ingest_runs`, supplied by `CREATE TABLE IF NOT EXISTS`.
+#   v7 -> v8  DROPS `api_calls.cost_usd` (#30), applied by `ALTER TABLE ...
+#             DROP COLUMN`, which rewrites that table's storage in place --
+#             no rebuild, no DROP TABLE, no row deleted.
+#
+# The set was RE-DECIDED at this bump rather than extended, and it is
+# deliberately no longer called "additive": v7 -> v8 removes a column, so the
+# property that admits a version here is "the delta preserves every row",
+# which is the property `_prepare_schema`'s refusal guard actually protects.
+# Whoever bumps SCHEMA_VERSION next has to re-decide it again -- a version
+# belongs here only while EVERY difference between its shape and the current
+# one is row-preserving, and that is not a property that accumulates.
+IN_PLACE_UPGRADE_FROM = frozenset({6, 7})
+
+# `ALTER TABLE ... DROP COLUMN` shipped in SQLite 3.35.0 (2021-03-12), well
+# after this project's Python floor (3.10, 2021-10) but not implied by it: the
+# SQLite a Python build links is the platform's business, and a distro or CI
+# runner can pair a new interpreter with an old library. So the capability is
+# DETECTED at runtime (`_sqlite_supports_drop_column`) and the upgrade falls
+# back to the ordinary rebuild path -- refusal guard included -- when it is
+# absent. Assuming it would turn an upgrade into an OperationalError on
+# exactly the machines we cannot see.
+DROP_COLUMN_MIN_SQLITE = (3, 35, 0)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -169,7 +185,10 @@ CREATE TABLE IF NOT EXISTS api_calls (
     output_tokens INTEGER NOT NULL,
     context_size INTEGER NOT NULL,
     is_sidechain INTEGER NOT NULL DEFAULT 0,
-    cost_usd REAL,
+    -- No money column. Tokens are MEASURED; dollars were derived from a
+    -- hand-maintained list-rate table that went stale twice and diverged from
+    -- real spend by >2.5x (#30). A precise-looking figure wrong by a factor of
+    -- two is worse than no figure: the reader cannot see the error.
     -- The API's own id for this response. NULL is legitimate and is NOT a
     -- shared key: two NULL-id records are two calls, never one.
     message_id TEXT
@@ -1367,8 +1386,8 @@ def store_source(
         conn.execute(
             "INSERT INTO api_calls (session_id, source_path, source_kind, agent_id,"
             " turn_id, ts, model, input_tokens, cache_read, cache_write,"
-            " output_tokens, context_size, is_sidechain, cost_usd, message_id)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " output_tokens, context_size, is_sidechain, message_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 source.session_id,
                 source_path,
@@ -1383,8 +1402,6 @@ def store_source(
                 call.output_tokens,
                 call.context_size,
                 1 if call.is_sidechain else 0,
-                cost_usd(call.model, call.input_tokens, call.cache_read,
-                         call.cache_write, call.output_tokens),
                 call.message_id,
             ),
         )
@@ -1550,6 +1567,50 @@ def record_ingest_run(conn: sqlite3.Connection, finished_at: float) -> None:
     )
 
 
+def _sqlite_supports_drop_column(version: Optional[str] = None) -> bool:
+    """Can THIS SQLite run `ALTER TABLE ... DROP COLUMN`? (3.35.0+)
+
+    Reads the live `sqlite3.sqlite_version` by default -- a version baked in
+    at authoring time would describe the machine that wrote this line, not the
+    one running it.
+
+    Conservative on anything it cannot parse: an unreadable version string
+    yields False, so the upgrade takes the slower rebuild path instead of
+    attempting a statement that may not exist. An input we cannot read is not
+    a permission (the same rule the rest of this file applies to measurements).
+    """
+    raw = sqlite3.sqlite_version if version is None else version
+    parts = raw.split(".")[: len(DROP_COLUMN_MIN_SQLITE)]
+    try:
+        # Padded, so "3.35" reads as (3, 35, 0) rather than comparing short.
+        parsed = tuple(int(p) for p in parts)
+    except ValueError:
+        return False
+    if len(parsed) < 2:  # "3" says nothing about a minor release
+        return False
+    parsed += (0,) * (len(DROP_COLUMN_MIN_SQLITE) - len(parsed))
+    return parsed >= DROP_COLUMN_MIN_SQLITE
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Column names of `table`, or an empty set if it does not exist."""
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _drop_retired_cost_column(conn: sqlite3.Connection) -> None:
+    """Remove `api_calls.cost_usd` where an older shape still carries it (#30).
+
+    ONE statement, applied to that table's own storage: SQLite's DROP COLUMN
+    is not a rebuild, so every row survives it and none is re-derived. Callers
+    must have established `_sqlite_supports_drop_column()` first -- this is a
+    3.35+ statement, and attempting it on an older library raises rather than
+    degrading. Idempotent: a database that never had the column is left alone.
+    """
+    if "cost_usd" in _table_columns(conn, "api_calls"):
+        with conn:
+            conn.execute("ALTER TABLE api_calls DROP COLUMN cost_usd")
+
+
 def _prepare_schema(conn: sqlite3.Connection) -> bool:
     """Create the schema, rebuilding from scratch if an older shape is present.
 
@@ -1560,9 +1621,10 @@ def _prepare_schema(conn: sqlite3.Connection) -> bool:
     (4): a regenerable artifact, deleted through a legitimate capability.
 
     Two exits from that default, both narrower than it: a shape listed in
-    `ADDITIVE_UPGRADE_FROM` is carried forward untouched (the new shape only
-    ADDS), and a rebuild that would destroy rows whose source file is gone is
-    refused outright (it would not be regenerable at all).
+    `IN_PLACE_UPGRADE_FROM` is carried forward row for row (the delta to the
+    current shape deletes nothing), and a rebuild that would destroy rows whose
+    source file is gone is refused outright (it would not be regenerable at
+    all).
 
     The probe and the drop loop BOTH range over `DERIVED_TABLES` -- the same
     set, deliberately. When they were two hand-maintained lists, a table added
@@ -1582,12 +1644,21 @@ def _prepare_schema(conn: sqlite3.Connection) -> bool:
     )
     rebuilt = False
     if has_tables and version != SCHEMA_VERSION:
-        if version in ADDITIVE_UPGRADE_FROM:
-            # Nothing is dropped, altered or rewritten on this path: the
-            # `CREATE TABLE IF NOT EXISTS` script below supplies the added
-            # table and leaves every existing row where it is.
+        if version in IN_PLACE_UPGRADE_FROM and _sqlite_supports_drop_column():
+            # NO ROW IS DELETED on this path. Two statements, both of which
+            # leave every existing row where it is:
             #
-            # It runs BEFORE the reaped-source guard on purpose, and does not
+            #   * `CREATE TABLE IF NOT EXISTS` supplies whatever tables the
+            #     older shape lacks (`ingest_runs`, for a v6 database);
+            #   * `ALTER TABLE api_calls DROP COLUMN cost_usd` removes the
+            #     retired list-rate estimate (#30). SQLite applies this to the
+            #     table's own storage -- it is not a rebuild and not a
+            #     DROP/re-CREATE, so no row is destroyed and none is
+            #     re-derived. Gated on `_sqlite_supports_drop_column()`
+            #     because the statement needs SQLite 3.35+; without it we fall
+            #     through to the rebuild path below, guard included.
+            #
+            # This runs BEFORE the reaped-source guard on purpose, and does not
             # route around it. That guard gates the DROP loop -- it refuses a
             # REBUILD because a rebuild deletes rows no re-ingest can
             # reproduce. Applied here it would refuse a change that deletes
@@ -1597,6 +1668,7 @@ def _prepare_schema(conn: sqlite3.Connection) -> bool:
             # would be untrue, and an untrue refusal is the same class of
             # defect as an untrue number.
             conn.executescript(SCHEMA)
+            _drop_retired_cost_column(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             return False
 
@@ -1636,14 +1708,26 @@ def _prepare_schema(conn: sqlite3.Connection) -> bool:
             )
 
         # Additive migrations, applied in place, for shapes we can carry
-        # forward without a rebuild.
-        columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(ingest_state)").fetchall()
-        }
-        if columns and "archived_at" not in columns and "source_kind" in columns:
+        # forward without a rebuild. Reached only past the guard above, i.e.
+        # only when every tracked source is still re-readable.
+        #
+        # `_sqlite_supports_drop_column()` is part of the condition because a
+        # database that takes this shortcut must arrive at the CURRENT shape,
+        # not most of it: a pre-v5 database still carries `cost_usd`, and
+        # leaving it behind would stamp `user_version = 8` on a table that is
+        # not v8. Where the statement is unavailable the rebuild below reaches
+        # the same shape by re-parsing, which is safe here by construction.
+        columns = _table_columns(conn, "ingest_state")
+        if (
+            columns
+            and "archived_at" not in columns
+            and "source_kind" in columns
+            and _sqlite_supports_drop_column()
+        ):
             with conn:
                 conn.execute("ALTER TABLE ingest_state ADD COLUMN archived_at REAL")
             conn.executescript(SCHEMA)
+            _drop_retired_cost_column(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             return False
 

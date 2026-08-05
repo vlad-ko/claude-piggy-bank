@@ -15,7 +15,7 @@
   .data-age { color:var(--muted); font-size:12px; margin-bottom:8px; }
   .data-age strong { color:var(--ink); }
   .data-age.unknown strong { color:#92400e; }
-  .cost-basis-note { background:#eef2ff; border:1px solid #c7d2fe; color:#3730a3; padding:8px 14px; border-radius:8px; margin-bottom:14px; font-size:12px; cursor:help; }
+  .note-band { background:#eef2ff; border:1px solid #c7d2fe; color:#3730a3; padding:8px 14px; border-radius:8px; margin-bottom:14px; font-size:12px; }
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:16px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
   .card .label { color:var(--muted); font-size:12px; }
@@ -45,8 +45,7 @@
   <h1>Claude Code Usage Report</h1>
   <div class="sub">Token usage from local session transcripts. Dates are America/New_York.</div>
   <div class="banner" id="banner"></div>
-  <div class="cost-basis-note" id="scope-note">Loading scope&hellip;</div>
-  <div class="cost-basis-note" id="cost-basis-note" title="Cost figures are list-rate arithmetic over measured tokens, computed from a local, hand-maintained rate table. They do not reflect subscription accounting, discounts, or overage behavior and will differ from your actual bill.">Loading cost basis&hellip;</div>
+  <div class="note-band" id="scope-note">Loading scope&hellip;</div>
 
   <div class="filters" id="filters">
     <button data-range="1">24h</button>
@@ -78,7 +77,11 @@
   </div>
 
   <div class="panel">
-    <h2>Spend by model
+    <!-- Named for what it shows and what it sorts on. It was "Spend by model"
+         while ordering by cache-read, the same heading-vs-query drift #30
+         fixes in the dispatch panel below -- smaller only because no dollar
+         column made the claim look precise. -->
+    <h2>Token usage by model (largest cache-read first)
       <span class="toggle" style="font-weight:normal;color:var(--muted);font-size:12px;">
         the same model is a separate row per scope -- main-thread and subagent are never merged
       </span>
@@ -86,7 +89,6 @@
     <div style="overflow-x:auto"><table id="models"><thead><tr>
       <th>Model</th><th>Scope</th><th>Calls</th>
       <th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th>
-      <th title="List-rate ESTIMATE from a local rate table -- not a bill.">Cost estimate</th>
     </tr></thead><tbody></tbody></table></div>
   </div>
 
@@ -103,21 +105,24 @@
       <th title="Of the API calls, how many came from subagent (sidechain) transcripts.">Subagent calls</th>
       <th>Input</th><th>Cache read</th>
       <th>Cache write</th><th>Output</th><th>Avg ctx/call</th>
-      <th title="List-rate ESTIMATE from a local rate table -- not a bill.">Cost estimate</th>
       <th title="Task-tool dispatches within the selected from/to period.">Dispatches</th>
     </tr></thead><tbody></tbody></table></div>
   </div>
 
   <div class="panel">
-    <h2>Top subagent dispatches (by spend)
+    <!-- The heading names the ORDERING KEY, and `serve.RANKED_BY` is the one
+         place that phrase is decided (#30). It read "by spend" for its whole
+         life while the query ordered by cache-read alone. -->
+    <h2>Top subagent dispatches (by total tokens)
       <span class="toggle" style="font-weight:normal;color:var(--muted);font-size:12px;">
-        "unavailable" = transcript reaped from /private/tmp -- spend unknown, never $0
+        model is shown because tokens are not tiers -- "unavailable" = transcript reaped from /private/tmp, so usage is UNKNOWN, never 0
       </span>
     </h2>
     <div style="overflow-x:auto"><table id="agents"><thead><tr>
       <th>Agent</th><th>Type</th><th>Description</th><th>Session</th>
-      <th>Model</th><th>Calls</th><th>Cache read</th>
-      <th title="List-rate ESTIMATE from a local rate table -- not a bill.">Cost estimate</th>
+      <th title="The model these calls ran on. Weigh the tier yourself: a large Haiku dispatch can outrank a small Opus one. 'N models' = the run spanned several; '—' = unmeasured.">Model</th>
+      <th>Calls</th><th>Cache read</th>
+      <th title="Input + cache-read + cache-write + output, measured from the subagent transcript. This column is what the table is sorted by.">Total tokens</th>
       <th>Status</th>
     </tr></thead><tbody></tbody></table></div>
   </div>
@@ -141,11 +146,6 @@ function fmtTok(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
   return String(n);
-}
-function fmtCost(c) {
-  if (c === null || c === undefined) return "—";
-  if (c > 0 && c < 0.01) return "<$0.01"; // a real nonzero cost must never render as fabricated "$0.00"
-  return "$" + c.toFixed(2);
 }
 function fmtTs(ts) {
   if (ts === null || ts === undefined) return "—";
@@ -292,11 +292,6 @@ function renderSummary(s) {
     card("Cache-read tokens", noData ? "—" : fmtTok(s.cache_read)),
     card("Cache-write tokens", noData ? "—" : fmtTok(s.cache_write)),
     card("Output tokens", noData ? "—" : fmtTok(s.output)),
-    card(
-      "Cost estimate",
-      noData ? "—" : fmtCost(s.cost_estimate_usd),
-      `List-rate estimate, not a bill (rates as of ${esc(s.cost_basis.rates_as_of)})`
-    ),
     card("Sessions", s.sessions),
     card(
       "API calls",
@@ -311,13 +306,6 @@ function renderSummary(s) {
   renderScopeNote(s.scope);
   renderModels(s.models);
 
-  document.getElementById("cost-basis-note").innerHTML =
-    `<strong>Cost figures are an ESTIMATE, not a bill.</strong> They are list-rate ` +
-    `arithmetic (<code>pricing.py</code>) over the measured token counts above -- ` +
-    `they do not reflect subscription accounting, discounts, or overage behavior, ` +
-    `and will differ from your actual bill. Rate table last checked ` +
-    `${esc(s.cost_basis.rates_as_of)} (${esc(s.cost_basis.source)}).`;
-
   renderDataAge(s.ingest);
 
   const msgs = [];
@@ -331,7 +319,6 @@ function renderSummary(s) {
     : null;
   if (s.ingest.files === 0) msgs.push("No files ingested yet — run ingest.py.");
   if (s.ingest.unparsed_records > 0) msgs.push(`INCONCLUSIVE: ${s.ingest.unparsed_records} unparsed record(s) across ingested files — totals may undercount.`);
-  if (s.unpriced_calls > 0) msgs.push(`${s.unpriced_calls} call(s) on unpriced model(s) [${s.unpriced_models.join(", ")}] are EXCLUDED from cost (never priced at $0).`);
   // Totals here are COMPLETE — the archived calls are counted. What they are
   // not is reproducible: those transcripts are gone, so this database is the
   // only copy and re-ingesting will not bring them back. Back it up.
@@ -415,9 +402,8 @@ function renderSessions(rows) {
       <td>${fmtTok(r.input)}</td><td>${fmtTok(r.cache_read)}</td>
       <td>${fmtTok(r.cache_write)}</td><td>${fmtTok(r.output)}</td>
       <td>${fmtTok(Math.round(r.avg_context))}</td>
-      <td>${fmtCost(r.cost_estimate_usd)}${r.unpriced_calls ? " *" : ""}</td>
       <td>${r.dispatches}</td>
-    </tr>`).join("") || `<tr><td colspan="11">No sessions in this period.</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="10">No sessions in this period.</td></tr>`;
   tb.querySelectorAll("tr.clickable").forEach(tr => {
     tr.tabIndex = 0;
     tr.setAttribute("role", "button");
@@ -429,10 +415,12 @@ function renderSessions(rows) {
 }
 
 function renderAgents(rows) {
-  // #4966: this is "which agent cost me that" in one look -- the exact gap
-  // the issue's live evidence found (the most expensive agent appeared
-  // nowhere in the tool's output). An `unavailable` run's figures are NULL
-  // from the API and fmtTok/fmtCost already render null as "--", never "0".
+  // #4966: this is "which agent consumed that" in one look -- the exact gap
+  // the issue's live evidence found (the biggest agent appeared nowhere in the
+  // tool's output). #30 made the heading true: the rows are ordered by TOTAL
+  // TOKENS, the column shown here, with the model beside it so the reader
+  // weighs the tier themselves. An `unavailable` run's figures are NULL from
+  // the API and fmtTok renders null as "—", never "0".
   document.querySelector("#agents tbody").innerHTML = rows.map(r => `
     <tr${r.status === "unavailable" ? ' style="color:var(--muted)"' : ""}>
       <td class="mono">${esc((r.agent_id || "").slice(0, 10))}</td>
@@ -442,7 +430,7 @@ function renderAgents(rows) {
       <td>${esc(r.model ?? "—")}</td>
       <td>${r.calls === null ? "—" : r.calls.toLocaleString()}</td>
       <td>${fmtTok(r.cache_read)}</td>
-      <td>${fmtCost(r.cost_estimate_usd)}</td>
+      <td>${fmtTok(r.total_tokens)}</td>
       <td>${r.status === "unavailable" ? "unavailable (transcript reaped)" : "ingested"}</td>
     </tr>`).join("") || `<tr><td colspan="9">No subagent dispatches in this period.</td></tr>`;
 }
@@ -461,10 +449,10 @@ function renderOutliers(rows) {
 }
 
 function tokenCols(r) {
-  return `<td>${fmtTok(r.input)}</td><td>${fmtTok(r.cache_read)}</td><td>${fmtTok(r.cache_write)}</td><td>${fmtTok(r.output)}</td><td>${fmtCost(r.cost_estimate_usd)}</td>`;
+  return `<td>${fmtTok(r.input)}</td><td>${fmtTok(r.cache_read)}</td><td>${fmtTok(r.cache_write)}</td><td>${fmtTok(r.output)}</td>`;
 }
 
-// Window-level spend by model. `models()` splits every model by scope on
+// Window-level token usage by model. `models()` splits every model by scope on
 // purpose, so the same model appears once per scope and the two are never
 // summed into a figure that hides which side spent it.
 //
@@ -474,7 +462,7 @@ function tokenCols(r) {
 function renderModels(models) {
   const body = document.querySelector("#models tbody");
   if (!models || models.length === 0) {
-    body.innerHTML = `<tr><td colspan="8">No API calls in this period.</td></tr>`;
+    body.innerHTML = `<tr><td colspan="7">No API calls in this period.</td></tr>`;
     return;
   }
   body.innerHTML = models.map(r =>
@@ -504,21 +492,20 @@ async function showDetail(id) {
   const at = d.agent_types.map(r =>
     `<tr><td>${esc(r.agent_type)}</td><td>${r.dispatches}</td>` +
     `<td>${fmtTok(r.peak_context_tokens)}${r.dispatches_without_peak ? ` (${r.dispatches_without_peak} unreported)` : ""}</td>` +
-    `<td>${fmtTok(r.measured_tokens)}${r.dispatches_without_spend ? ` (${r.dispatches_without_spend} unmeasured)` : ""}</td>` +
-    `<td>${fmtCost(r.cost_estimate_usd)}</td></tr>`
-  ).join("") || `<tr><td colspan="5">No agent dispatches recorded.</td></tr>`;
+    `<td>${fmtTok(r.measured_tokens)}${r.dispatches_without_spend ? ` (${r.dispatches_without_spend} unmeasured)` : ""}</td></tr>`
+  ).join("") || `<tr><td colspan="4">No agent dispatches recorded.</td></tr>`;
   const ot = d.outlier_turns.map(r => `<tr><td>${fmtTs(r.ts)}</td><td>${esc(r.turn_type)}</td><td>${r.calls}</td><td>${fmtTok(r.cache_read)}</td><td class="preview">${esc(r.preview)}</td></tr>`).join("");
   const sc = d.scopes.map(r => `<tr><td>${esc(r.scope)}</td><td>${r.calls}</td>${tokenCols(r)}</tr>`).join("")
-    || `<tr><td colspan="7">No API calls recorded for this session.</td></tr>`;
+    || `<tr><td colspan="6">No API calls recorded for this session.</td></tr>`;
   document.getElementById("detail-body").innerHTML = `
     <h3>By scope (main-thread vs subagent)</h3>
-    <table><thead><tr><th>Scope</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th title="List-rate ESTIMATE -- not a bill.">Cost estimate</th></tr></thead><tbody>${sc}</tbody></table>
+    <table><thead><tr><th>Scope</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>${sc}</tbody></table>
     <h3>By turn type</h3>
-    <table><thead><tr><th>Turn type</th><th>Turns</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th title="List-rate ESTIMATE -- not a bill.">Cost estimate</th></tr></thead><tbody>${tt}</tbody></table>
+    <table><thead><tr><th>Turn type</th><th>Turns</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>${tt}</tbody></table>
     <h3>By model</h3>
-    <table><thead><tr><th>Model</th><th></th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th title="List-rate ESTIMATE -- not a bill.">Cost estimate</th></tr></thead><tbody>${mm}</tbody></table>
+    <table><thead><tr><th>Model</th><th></th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>${mm}</tbody></table>
     <h3>Agent dispatches: peak context vs measured spend</h3>
-    <table><thead><tr><th>Agent type</th><th>Dispatches</th><th title="The subagent-reported &lt;subagent_tokens&gt; figure is a PEAK CONTEXT high-water mark -- how big the subagent's context got, not what it cost. Shown for the largest single dispatch; summing high-water marks is meaningless. '(n unreported)' = dispatches that emitted no figure -- no sample, not zero.">Peak context (largest dispatch)</th><th title="Cumulative tokens measured from the subagent transcripts -- what these dispatches actually consumed. Typically ~50x the peak-context figure beside it. '(n unmeasured)' = dispatches with no transcript read, so this total is a LOWER BOUND.">Measured spend (tokens)</th><th title="List-rate ESTIMATE -- not a bill.">Cost estimate</th></tr></thead><tbody>${at}</tbody></table>
+    <table><thead><tr><th>Agent type</th><th>Dispatches</th><th title="The subagent-reported &lt;subagent_tokens&gt; figure is a PEAK CONTEXT high-water mark -- how big the subagent's context got, not how much it consumed. Shown for the largest single dispatch; summing high-water marks is meaningless. '(n unreported)' = dispatches that emitted no figure -- no sample, not zero.">Peak context (largest dispatch)</th><th title="Cumulative tokens measured from the subagent transcripts -- what these dispatches actually consumed. Typically ~50x the peak-context figure beside it. '(n unmeasured)' = dispatches with no transcript read, so this total is a LOWER BOUND.">Measured spend (tokens)</th></tr></thead><tbody>${at}</tbody></table>
     <h3>Top turns by cache-read</h3>
     <table><thead><tr><th>When</th><th>Type</th><th>Calls</th><th>Cache read</th><th>Preview</th></tr></thead><tbody>${ot}</tbody></table>`;
   const panel = document.getElementById("detail");

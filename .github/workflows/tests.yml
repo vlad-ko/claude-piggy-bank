@@ -30,7 +30,16 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Show interpreter
-        run: python -VV
+        # Also prints the SQLite this runner links and the verdict CPB's own
+        # capability check reaches on it (#30). The v7 -> v8 upgrade drops a
+        # column IN PLACE on SQLite 3.35+ and falls back to a full rebuild
+        # below that; both paths are correct, so this does not gate the build.
+        # It is printed per matrix leg because "the runners have a new enough
+        # SQLite" is an observation about the runners, and a developer laptop
+        # is not evidence for it.
+        run: |
+          python -VV
+          python -c "import sqlite3, ingest; print('sqlite_version', sqlite3.sqlite_version, '| drop_column_supported', ingest._sqlite_supports_drop_column())"
 
       - name: Run the suite
         # No pip install, deliberately: see stdlib-only below.
