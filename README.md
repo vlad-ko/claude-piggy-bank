@@ -25,70 +25,34 @@ already writes locally into SQLite and serves a single-page report over them.
 That last point is deliberate. This is a tool for understanding what your
 sessions consume; it would be a poor one if using it consumed anything.
 
-## Status: early, and honest about it
-
-CPB is pre-1.0. The defect that made its headline numbers wrong is **fixed**;
-what follows is the record, because a tool about measurement should show its
-own corrections rather than quietly restate them.
-
-`api_calls` used to count transcript *records*. Claude Code writes one record
-per streamed content block, and each repeats the same `message.usage` object,
-so a single API response was counted many times. On one real corpus:
-
-| | counted before | actual | inflation |
-|---|---|---|---|
-| main-thread calls | 85,324 | 36,167 | 2.36x |
-| subagent calls | 242,242 | 126,757 | 1.91x |
-
-The factor differed by scope — **2.36x against 1.91x** — so any main-thread
-versus subagent comparison was distorted in **shape**, not merely in
-magnitude: the two sides were scaled by different amounts before being read
-against each other. A conclusion, not just a scale, was wrong.
-
-Ingest now emits one row per distinct `message.id`, and the surviving row is
-the record with the **greatest `output_tokens`**, ties resolving to the later
-record. Taking the first would have under-counted output by roughly 99%.
-
-That rule is often described as "the last record wins", and on the corpus above
-the two were the same record every time: `output_tokens` was non-decreasing
-over the records of one id in **4,928 of 4,928** cases, so the greatest record
-*was* the final one. That is a measurement, not a guarantee, and it has since
-drifted. Re-measured **2026-08-05** across 49 main-thread transcripts on one
-machine, non-decreasing holds for **26,998 of 27,106** multi-record ids
-(**99.6%**). On the **108** ids where output falls, keeping the last record
-would report a *smaller* finished total than a record already seen — 107,810
-output tokens understated in aggregate, up to 6,858 on a single id. `max` is
-kept precisely because it does not depend on the tendency holding. Both
-percentages are dated samples from a corpus that keeps growing, not constants:
-the denominator moved from 27,106 to 27,110 within ten minutes of that scan,
-because the session doing the measuring was being transcribed into it. Expect a
-different denominator, and re-measure before quoting either figure.
-
-Two residual cases are counted and printed rather than hidden. On the earlier
-corpus, **109 ids** whose records disagreed on something other than
-`output_tokens` keep one whole real record, never a per-field maximum -- that
-would report a call which both wrote and did not write cache, a combination
-present in no real response. That count ranges over a **different set** from
-the 108 above (disagreeing beyond `output_tokens`, versus `output_tokens`
-falling) on a different corpus and date; on the 2026-08-05 corpus those two
-sets happened to be the same 108 ids, which is an observation about that corpus
-rather than a property of either rule. Records with **no** `message.id` each
-stay their own call; on this corpus there were none, but dropping them would
-delete real spend and grouping them would merge unrelated calls.
-
-CPB no longer converts any of this into money — see "No dollar figures" below.
-
-Publishing a tool whose README documented its own broken numbers was a choice.
-The alternative was to fix it privately first, and the point of this project is
-that measurement should be inspectable, including when it is wrong.
+CPB is **pre-1.0**. The defect that once made its headline numbers wrong is
+fixed, and the whole correction is kept on the record below under
+[The record](#the-record-the-defect-that-made-the-headline-numbers-wrong) —
+a tool about measurement should show its own corrections rather than quietly
+restate them.
 
 ## Install
 
-CPB ships as a **Claude Code plugin**. Enabling it activates three hooks that
-ingest each transcript as it is written, so the report stays current without
-anyone remembering to run anything.
+CPB is one repository that can be used two ways. **The plugin and the checkout
+are the same code** — the hooks run the same `ingest.py` you would run by hand,
+nothing is compiled, and there are no dependencies either way.
 
-There is no marketplace yet, so install by cloning into your personal skills
+| | **as a Claude Code plugin** | **as a plain checkout** |
+|---|---|---|
+| suits | using CPB on your own ongoing work | reading the code before trusting it with your history; analysing one project on demand; developing on CPB |
+| ingest | automatic — three hooks ingest each transcript as it is written | manual — you run `cpb.py ingest` when you want it |
+| database | `${CLAUDE_PLUGIN_DATA}/usage.db`, one per install, survives updates | `db/usage.db` beside the checkout |
+| report | `/cpb` from inside a session | `python3 cpb.py serve` |
+
+**Prefer the plugin if you intend to keep using CPB.** Subagent transcripts are
+reaped, and its `SubagentStop` hook is the difference between capturing that
+spend and losing it — see [What the hooks do](#what-the-hooks-do). Prefer the
+checkout if you want to look first; you can enable the plugin later over the
+same clone.
+
+### As a plugin
+
+There is no marketplace, so install by cloning into your personal skills
 directory. Claude Code loads any folder there that contains a
 `.claude-plugin/plugin.json` as a plugin on the next session — no install step,
 no copy into a cache:
@@ -100,17 +64,25 @@ git clone https://github.com/vlad-ko/claude-piggy-bank.git \
 
 Restart Claude Code and it loads as `claude-piggy-bank@skills-dir`.
 
-To try it without installing anything — for development, or to read the code
-before trusting it with your history:
+To load it for one session without installing it anywhere:
 
 ```bash
 git clone https://github.com/vlad-ko/claude-piggy-bank.git
 claude --plugin-dir ./claude-piggy-bank
 ```
 
-Either way there are no dependencies: the plugin *is* this repository, the hooks
-run the same `ingest.py` you would run by hand, and nothing is compiled or
-fetched.
+### As a plain checkout
+
+```bash
+git clone https://github.com/vlad-ko/claude-piggy-bank.git
+cd claude-piggy-bank
+python3 cpb.py ingest
+python3 cpb.py serve      # then open http://127.0.0.1:8377/
+```
+
+Nothing is installed onto your system and nothing is added to your `PATH`:
+`cpb.py` is a file in the checkout that you run with `python3`, which is why
+every command in this README names it that way.
 
 ### What the hooks do
 
@@ -123,10 +95,10 @@ Enabling the plugin activates three triggers. **No edit to any
 | `Stop` | Claude finishes a response | the session transcript, per turn |
 | `SessionEnd` | the session ends | the session transcript, best-effort |
 
-Each one spawns `ingest.py` for **exactly one file** — no directory scans, no
-network, no model. `SubagentStop` is the one that earns its place: subagent
-transcripts are reaped, and on the reference corpus 211 subagent runs are
-already permanently unmeasurable while subagents are ~78% of all API calls.
+Each one spawns `ingest.py --transcript` for **exactly one file** — no directory
+scans, no network, no model. `SubagentStop` is the one that earns its place:
+subagent transcripts are reaped, and on the reference corpus 211 subagent runs
+are already permanently unmeasurable while subagents are ~78% of all API calls.
 Ingesting the moment a subagent finishes is the difference between capturing
 that spend and losing it.
 
@@ -147,7 +119,7 @@ it explicitly — `serve.py` reads only `--db`, not `CPB_DB`, so without the fla
 it opens its own default and shows you an empty report rather than an error:
 
 ```bash
-python3 serve.py --db ~/.claude/plugins/data/<plugin-id>/usage.db
+python3 cpb.py serve --db ~/.claude/plugins/data/<plugin-id>/usage.db
 ```
 
 ### Upgrade
@@ -186,76 +158,61 @@ From inside Claude Code, once the plugin is enabled:
 That starts the report server and gives you the URL. Everything below works the
 same from a plain checkout, with or without the plugin.
 
-```bash
-# Ingest your transcripts (idempotent and incremental — run any time)
-python3 ingest.py
+### The `cpb` command
 
-# Serve the report
-python3 serve.py
-# then open http://127.0.0.1:8377/
+`cpb.py` is the entry point, with one subcommand per thing CPB does:
+
+```bash
+python3 cpb.py ingest        # read your transcripts into SQLite (idempotent, incremental)
+python3 cpb.py serve         # serve the report at http://127.0.0.1:8377/
+python3 cpb.py --version     # which build produced a number
+python3 cpb.py --help        # the command list
 ```
 
-`ingest.py` defaults to **this project's own** transcript directory, derived
-from the repository root using Claude Code's naming convention (the absolute
-path with each separator folded to `-`). To analyse a different project, pass
-it explicitly:
+Everything after the subcommand belongs to the subcommand, so every flag
+documented below works there too, and `python3 cpb.py ingest --help` prints the
+same help `ingest.py` does. It **composes** the two scripts rather than
+replacing them — `python3 ingest.py` and `python3 serve.py` keep working
+unchanged for anyone who has them in a script, and each keeps its own flags,
+with one definition and one help text.
+
+`cpb.py --version` reports the version of **CPB itself** — what you name when
+you say which build produced a figure. That is a different thing from the
+database's schema version, which describes the shape of the file and says
+nothing about the code that filled it.
+
+### Ingesting
 
 ```bash
-python3 ingest.py --projects-dir ~/.claude/projects/<name>
+python3 cpb.py ingest
+```
+
+`ingest` defaults to **this project's own** transcript directory, derived from
+the repository root using Claude Code's naming convention (the absolute path
+with each separator folded to `-`). To analyse a different project, pass it
+explicitly:
+
+```bash
+python3 cpb.py ingest --projects-dir ~/.claude/projects/<name>
 ```
 
 If the derived directory does not exist, CPB refuses and lists the projects
 that *do* have transcripts, rather than reporting an empty run.
 
-### The report tells you how old its data is
+Two more flags, both about not destroying measurements:
 
-`serve.py` reads whatever the database holds, and `ingest.py` never runs on its
-own — so the report is exactly as current as your last ingest, and a page left
-open for a week would otherwise look identical to one opened a second ago.
-
-Directly above the totals the report states **two facts, never merged into one
-"data age"**:
-
-| line | what it means |
+| flag | what it does |
 |---|---|
-| **Last ingest** | when `ingest.py` last completed — when this tool last *looked* at the transcripts |
-| **Newest measured call** | the most recent API call in the database — the newest thing it *found*, across **all** ingested data, not the selected window |
+| `--transcript <path>` | ingest **exactly one** file and nothing else — see below |
+| `--prune-missing` | **DELETE** the rows for sources no longer on disk. Off by default; see [Transcripts expire](#transcripts-expire--back-up-the-database) |
 
-Both, because either alone misleads. A fresh ingest on a machine you have not
-used since lunch is perfectly healthy and shows an old newest-call. A database
-nobody has re-ingested for a week can show a recent newest-call — for the last
-thing it ever saw. Only the pair is readable.
-
-**Past 15 minutes since the last ingest, the report raises a banner** in the
-same place as its parse-quality and archived-source warnings, saying the
-figures describe the transcripts as of then rather than as of now. The
-threshold is measured, not taste: re-ingesting is incremental, and on the
-largest corpus available here (2,891 transcripts, 1.9 GB, macOS, checked
-2026-08-04) an all-skipped re-run took **1.8 s** against **39.9 s** for a cold
-full parse — so anyone re-running `ingest.py` on any reasonable cadence never
-sees it. It marks neglect, not latency. The warning applies to the *ingest run*
-only; an idle machine that produced no calls for hours is not stale.
-
-A database written before CPB recorded ingest times (schema v6 and earlier)
-reads **"Last ingest: not recorded"**. That is an *unknown* age, not an age of
-zero and not a permanent staleness warning — run `ingest.py` once and it starts
-recording. Upgrading a v6 or v7 database does not re-parse anything: both hops
-to the current shape are applied in place and keep every row — the run-stamp
-table is added, and the retired cost column is dropped. (Dropping a column
-needs SQLite 3.35+, which CPB detects at runtime; on an older library it falls
-back to a full rebuild, which still refuses outright if any tracked source has
-already been reaped.)
-
-There is no automatic refresh yet — refreshing means running `ingest.py` again.
-Scheduling that from inside `serve.py` is [issue #20](https://github.com/vlad-ko/claude-piggy-bank/issues/20)'s
-second half and ships separately.
-### Ingesting a single transcript
+#### Ingesting a single transcript
 
 `--transcript` ingests **exactly one file** — a main-thread transcript or a
 subagent one — and nothing else:
 
 ```bash
-python3 ingest.py --transcript ~/.claude/projects/<name>/<session-id>.jsonl
+python3 cpb.py ingest --transcript ~/.claude/projects/<name>/<session-id>.jsonl
 ```
 
 This is the cheap path for automation that already knows which file changed,
@@ -271,14 +228,14 @@ It is incremental and idempotent exactly as the directory scan is, and it
 **makes no claim about any source it did not open**. It never archives and
 never prunes: one file is evidence about one file, and concluding from it that
 the rest of the corpus had vanished would mark a whole history as gone. Run
-`python3 ingest.py` periodically for that reconciliation. `--transcript` and
-`--projects-dir` are mutually exclusive, a path that is not a readable
+`python3 cpb.py ingest` periodically for that reconciliation. `--transcript`
+and `--projects-dir` are mutually exclusive, a path that is not a readable
 transcript is an error rather than a quiet no-op, and the exit status is 0 only
 on success — a hook that cannot see a failure is worse than no hook.
 
 ### Where the database lives
 
-`ingest.py` resolves the database path highest-first:
+`ingest` resolves the database path highest-first:
 
 1. `--db <path>`
 2. the `CPB_DB` environment variable
@@ -289,10 +246,126 @@ directory without threading a flag through each one. It applies to both ingest
 modes. Setting it to an empty value is refused rather than falling back, so a
 misconfigured wrapper cannot quietly write to a database nobody reads.
 
-`serve.py` does not read `CPB_DB`; point it at the same file with
-`python3 serve.py --db "$CPB_DB"`.
+`serve` does **not** read `CPB_DB`; point it at the same file explicitly:
 
-### One database can hold several projects, and the report says which
+```bash
+python3 cpb.py serve --db "$CPB_DB"
+```
+
+## What the report tells you
+
+### How big your calls are, and whether that is a lot
+
+The headline card is **`Median context/call`**. It used to be the mean, and the
+change is not cosmetic: measured 2026-08-05 over the reference corpus, the mean
+was 237,153 tokens against a median of 155,255 — **1.53x** — with only **28.7%**
+of calls above the mean. A figure that 71.3% of calls fall below is not
+describing them. The mean is still on the page, but only as **evidence of the
+skew** it demonstrates, printed beside the ratio and the share above it.
+
+A context size on its own is a fact with no referent — nothing says whether
+266.6k is a lot. Self-comparison cannot supply one, because a percentile of your
+own calls compares waste to waste and says nothing if every call is wasteful. So
+the referent is external: each call's context is divided by **that model's own
+documented context window**, a published hard limit, and the calls are grouped
+into four bands.
+
+| band | reading |
+|---|---|
+| 90% or more of the window | probably wrong |
+| 50–90% | likely wasteful |
+| 25–50% | *(no verdict)* |
+| under 25% | *(no verdict)* |
+
+**Only the top two bands carry a verdict, because only those two were judged.**
+A call under half its window was not judged at all, so its label is a range and
+nothing more; a word there would invent a verdict nobody decided.
+
+### Two provenances, kept apart on purpose
+
+That paragraph mixes two kinds of claim, and the report never lets them blur:
+
+- **The window is documented.** Per-model, from Anthropic's published model
+  overview, carrying the date it was last checked (`WINDOWS_AS_OF`, currently
+  2026-08-05). It is per-model rather than one constant because the difference
+  is large: Haiku's window is 200K where the current Opus, Sonnet and Fable
+  families are 1M. Measured 2026-08-05, Haiku's largest call on the reference
+  corpus carries 111,700 tokens — 55.9% of its real window, but 11.2% of a
+  wrongly assumed 1M one, a 5x misread that moves the call across two band
+  boundaries.
+- **The band boundaries are not Anthropic's.** Anthropic publishes the window;
+  it publishes no guidance that half a window is wasteful. Where the boundaries
+  sit is a **product-owner judgment**, separately dated (`BANDS_AS_OF`), and the
+  page says so in those words.
+
+The two travel across the API as two fields with two dates, and are rendered as
+two separate statements with the judged one visually marked. Presenting a
+judgment in a documented fact's voice would borrow an authority this project has
+not earned — which is the whole reason the split exists.
+
+### What the bands refuse to say
+
+- **A model CPB has no window for keeps its context and loses its utilisation.**
+  Its size was measured, so it counts in the spread; its window is not something
+  this tool knows, so it is counted and **named** as `UNKNOWN, not low` rather
+  than banded against a guess. Defaulting to 1M would file every Haiku call four
+  bands too low.
+- **A call with no context accounting at all is `UNMEASURED, not zero`.** It
+  stays out of the median, the mean and the bands. Banded, it would file as the
+  most frugal call in the corpus.
+- **Calls measuring above 100% of their window read `INCONCLUSIVE`,** and say
+  that this build's window table has gone stale — treat the bands as suspect
+  rather than the calls as extraordinary. That is the point of a hand-maintained
+  *denominator*: a stale window fails loudly and absurdly, where a stale rate
+  would have failed silently inside a plausible number.
+
+Banded + unknown + unmeasured is the window's whole call count, and the
+denominator of every band share is published beside them.
+
+### How old the data is
+
+`serve` reads whatever the database holds, and `ingest` never runs on its own —
+so the report is exactly as current as your last ingest, and a page left open
+for a week would otherwise look identical to one opened a second ago.
+
+Directly above the totals the report states **two facts, never merged into one
+"data age"**:
+
+| line | what it means |
+|---|---|
+| **Last ingest** | when `ingest` last completed — when this tool last *looked* at the transcripts |
+| **Newest measured call** | the most recent API call in the database — the newest thing it *found*, across **all** ingested data, not the selected window |
+
+Both, because either alone misleads. A fresh ingest on a machine you have not
+used since lunch is perfectly healthy and shows an old newest-call. A database
+nobody has re-ingested for a week can show a recent newest-call — for the last
+thing it ever saw. Only the pair is readable.
+
+**Past 15 minutes since the last ingest, the report raises a banner** in the
+same place as its parse-quality and archived-source warnings, saying the
+figures describe the transcripts as of then rather than as of now. The
+threshold is measured, not taste: re-ingesting is incremental, and on the
+largest corpus available here (2,891 transcripts, 1.9 GB, macOS, checked
+2026-08-04) an all-skipped re-run took **1.8 s** against **39.9 s** for a cold
+full parse — so anyone re-running ingest on any reasonable cadence never sees
+it. It marks neglect, not latency. The warning applies to the *ingest run*
+only; an idle machine that produced no calls for hours is not stale.
+
+A database written before CPB recorded ingest times (schema v6 and earlier)
+reads **"Last ingest: not recorded"**. That is an *unknown* age, not an age of
+zero and not a permanent staleness warning — run ingest once and it starts
+recording. Upgrading an older database does not re-parse anything: every hop
+from v6 to the current shape is applied in place and keeps every row — the
+run-stamp table is added, the retired cost column is dropped, and the
+format-census table is added. (Dropping a column needs SQLite 3.35+, which CPB
+detects at runtime; on an older library it falls back to a full rebuild, which
+still refuses outright if any tracked source has already been reaped.)
+
+There is no automatic refresh yet — refreshing means running ingest again.
+Scheduling that from inside `serve.py` is [issue #20](https://github.com/vlad-ko/claude-piggy-bank/issues/20)'s
+second half and ships separately.
+
+### Which projects a total covers
 
 Claude Code keys transcripts on the **working directory**, so every repo — and
 every git worktree — is its own project. One database can therefore hold
@@ -312,7 +385,7 @@ misleads:
 
 A database with **one** project says nothing new: the line is unchanged, and no
 dimension is announced that your data does not have. Calls whose transcript
-path does not match the layout above are counted and named separately — they
+path does not match the layout below are counted and named separately — they
 stay in the totals, and they are never folded into a neighbouring project.
 
 Project *names* are not printed on the page. A project directory is your
@@ -361,10 +434,10 @@ and the response is to make a break **loud and diagnosable** instead of silent.
 The shape has already moved within a single corpus: `usage` carries
 `output_tokens_details` on some model/version combinations and not others,
 `thinking` blocks persist with empty text plus a signature, and one API response
-is written as many records sharing one `message.id` (the defect at the top of
-this README).
+is written as many records sharing one `message.id` (the defect recorded at the
+bottom of this README).
 
-So ingest now **counts the shape it saw**, per source file, in a `source_shape`
+So ingest **counts the shape it saw**, per source file, in a `source_shape`
 table:
 
 - which Claude Code **`version`** wrote the records each figure is derived
@@ -379,8 +452,8 @@ table:
   if a release renames `output_tokens`.
 
 A row in that table is a positive observation, so a source with no rows has not
-been censused rather than been found clean — `ingest.py` prints the ratio, and
-an upgraded database censuses each source the next time its file changes.
+been censused rather than been found clean — ingest prints the ratio, and an
+upgraded database censuses each source the next time its file changes.
 
 One test in the suite reads a **real** transcript from `~/.claude/projects` at
 run time and fails if any of those assumptions has moved. It asserts only over
@@ -389,6 +462,8 @@ prompt, path or session id can reach a failure message. On a machine with no
 corpus (CI included) it skips **loudly**, printing why: it is the only test here
 that can see a format change, because every other one runs on fixtures this
 repository wrote, which agree with CPB's assumptions by construction.
+
+## What not to trust, and why
 
 ### Transcripts expire — back up the database
 
@@ -404,7 +479,7 @@ Pruning them is available as an explicit `--prune-missing`, never a default, and
 a schema upgrade that would destroy them **refuses to run** rather than
 rebuilding over them.
 
-The practical consequence: past the retention window, **`db/usage.db` is the
+The practical consequence: past the retention window, **your database is the
 only copy of your history**. It is not derived data you can drop and regenerate.
 Back it up, and raise `cleanupPeriodDays` in `~/.claude/settings.json` if you
 want a longer window — though the tool is designed to be correct at the default,
@@ -413,37 +488,93 @@ not only when configured.
 Any window containing archived sources says so in the report banner: the totals
 are complete, but they are no longer reproducible by re-ingesting.
 
-## Two design rules worth knowing
+### Absence is never rendered as a value
 
-These explain decisions in the code that otherwise look odd.
-
-**Absence is never rendered as a value.** A read that cannot produce a
-trustworthy answer refuses — null, inconclusive, or a loud operator-visible
-message — rather than returning a plausible number. A parse failure is counted
-and surfaced, never silently coerced to `0`. A session with no subagent
-transcripts on disk reports "not measured", a different fact from a measured
-zero, and the two stay distinguishable everywhere.
+A read that cannot produce a trustworthy answer refuses — null, inconclusive, or
+a loud operator-visible message — rather than returning a plausible number. A
+parse failure is counted and surfaced, never silently coerced to `0`. A session
+with no subagent transcripts on disk reports "not measured", a different fact
+from a measured zero, and the two stay distinguishable everywhere.
 
 The sharpest case: Claude Code persists thinking blocks with **empty text**, so
 their size is recorded as *unknown* rather than `0`. Recording `0` would make a
 composition table state that thinking costs nothing — false, and invisible,
 because it looks like a measurement.
 
-**No dollar figures.** CPB reports measured tokens and never converts them
-into money. It used to: list-rate arithmetic over a hand-maintained rate
-table, which modelled no subscription accounting, discount or overage, went
-stale twice, and on one real session produced ~$57 where the
-subscription-accounted spend was ~$21 — over 2.5× out. A precise-looking
-number that is wrong by a factor of two is worse than no number, because the
-reader has no way to see the error; that is the rule above turned on the
-tool's own headline, so the estimate was removed rather than qualified
-([#30](https://github.com/vlad-ko/claude-piggy-bank/issues/30)).
+This is the rule the whole report is built on, and the bands above are it
+applied to the newest surface: unknown model, unmeasured call and
+over-100% window each get their own honest answer instead of a number.
+
+### There are no dollar figures
+
+CPB reports measured tokens and never converts them into money. It used to:
+list-rate arithmetic over a hand-maintained rate table, which modelled no
+subscription accounting, discount or overage, went stale twice, and on one real
+session produced ~$57 where the subscription-accounted spend was ~$21 — over
+2.5x out. A precise-looking number that is wrong by a factor of two is worse
+than no number, because the reader has no way to see the error; that is the rule
+above turned on the tool's own headline, so the estimate was removed rather than
+qualified ([#30](https://github.com/vlad-ko/claude-piggy-bank/issues/30)).
 
 What replaced it is the honest version of the same question: panels that
 claimed to rank "by spend" rank by **total tokens** and say so in the heading,
 with the **model** shown beside each row. Tokens are not tiers — a large Haiku
 dispatch can outrank a small Opus one — and the reader weighs that themselves
 rather than trusting a derived figure the tool cannot keep current.
+
+## The record: the defect that made the headline numbers wrong
+
+CPB is pre-1.0. This is kept in the README rather than in a changelog because a
+tool about measurement should show its own corrections.
+
+`api_calls` used to count transcript *records*. Claude Code writes one record
+per streamed content block, and each repeats the same `message.usage` object,
+so a single API response was counted many times. On one real corpus:
+
+| | counted before | actual | inflation |
+|---|---|---|---|
+| main-thread calls | 85,324 | 36,167 | 2.36x |
+| subagent calls | 242,242 | 126,757 | 1.91x |
+
+The factor differed by scope — **2.36x against 1.91x** — so any main-thread
+versus subagent comparison was distorted in **shape**, not merely in
+magnitude: the two sides were scaled by different amounts before being read
+against each other. A conclusion, not just a scale, was wrong.
+
+Ingest now emits one row per distinct `message.id`, and the surviving row is
+the record with the **greatest `output_tokens`**, ties resolving to the later
+record. Taking the first would have under-counted output by roughly 99%.
+
+That rule is often described as "the last record wins", and on the corpus above
+the two were the same record every time: `output_tokens` was non-decreasing
+over the records of one id in **4,928 of 4,928** cases, so the greatest record
+*was* the final one. That is a measurement, not a guarantee, and it has since
+drifted. Re-measured **2026-08-05** across 49 main-thread transcripts on one
+machine, non-decreasing holds for **26,998 of 27,106** multi-record ids
+(**99.6%**). On the **108** ids where output falls, keeping the last record
+would report a *smaller* finished total than a record already seen — 107,810
+output tokens understated in aggregate, up to 6,858 on a single id. `max` is
+kept precisely because it does not depend on the tendency holding. Both
+percentages are dated samples from a corpus that keeps growing, not constants:
+the denominator moved from 27,106 to 27,110 within ten minutes of that scan,
+because the session doing the measuring was being transcribed into it. Expect a
+different denominator, and re-measure before quoting either figure.
+
+Two residual cases are counted and printed rather than hidden. On the earlier
+corpus, **109 ids** whose records disagreed on something other than
+`output_tokens` keep one whole real record, never a per-field maximum -- that
+would report a call which both wrote and did not write cache, a combination
+present in no real response. That count ranges over a **different set** from
+the 108 above (disagreeing beyond `output_tokens`, versus `output_tokens`
+falling) on a different corpus and date; on the 2026-08-05 corpus those two
+sets happened to be the same 108 ids, which is an observation about that corpus
+rather than a property of either rule. Records with **no** `message.id` each
+stay their own call; on this corpus there were none, but dropping them would
+delete real spend and grouping them would merge unrelated calls.
+
+Publishing a tool whose README documented its own broken numbers was a choice.
+The alternative was to fix it privately first, and the point of this project is
+that measurement should be inspectable, including when it is wrong.
 
 ## Tests
 
@@ -461,10 +592,14 @@ smoke test described above opens the most recently written files under
 `~/.claude/projects` at run time, asserts only over key names and counts, and
 skips loudly where there is no corpus.
 
+Running one class or one test is not uniform across the suite — see
+[CONTRIBUTING.md](CONTRIBUTING.md#tests), which records which form works for
+which module and why.
+
 ## Documentation
 
 Longer-form reference lives in [`docs/`](docs/), indexed by
-[`docs/README.md`](docs/README.md). The one to know about:
+[`docs/README.md`](docs/README.md):
 
 - [Claude API token accounting](docs/claude-api-token-accounting.md) — the API
   accounting facts the analysis rests on, each with its source URL and the date
@@ -472,6 +607,11 @@ Longer-form reference lives in [`docs/`](docs/), indexed by
   content; whether it is re-billed as input on later turns depends on the
   model; cache writes carry a markup and the cacheable minimum is a per-model
   lookup, not a constant.
+- [The Claude Code plugin](docs/plugin.md) — why the packaging looks the way it
+  does: which three hooks fire and why `SubagentStop` is load-bearing, why every
+  timeout is explicit, where the database lives and when the hook refuses to
+  decide, and how failing loudly is reconciled with never interrupting a
+  session.
 
 ## Provenance
 
