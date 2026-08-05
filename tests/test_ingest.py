@@ -1,4 +1,4 @@
-"""Tests for the usage-report ingest pipeline and pricing table (#4948).
+"""Tests for the usage-report ingest pipeline (#4948).
 
 Fixture design note (CLAUDE.md "fixture must not make the defect undetectable"):
 every token class in the fixture carries a DELIBERATELY UNEQUAL value, so a
@@ -18,6 +18,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -30,7 +31,6 @@ from ingest import (  # noqa: E402
     parse_file,
     transcript_slug,
 )
-from pricing import RATES_AS_OF, cost_usd, rates_for_model  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FIXTURE = FIXTURES / "session-fixture.jsonl"
@@ -106,17 +106,18 @@ class IngestTest(unittest.TestCase):
         row = self.q1("SELECT is_sidechain FROM api_calls WHERE model = 'claude-fable-5'")
         self.assertEqual(row["is_sidechain"], 1)
 
-    def test_priced_call_cost(self) -> None:
-        row = self.q1(
-            "SELECT cost_usd FROM api_calls WHERE model = 'claude-sonnet-5-20260115' "
-            "ORDER BY ts LIMIT 1"
+    def test_api_calls_stores_no_derived_money_column(self) -> None:
+        # #30: the list-rate estimate is gone from the schema, not merely
+        # hidden from the API. A column that still existed would be a stale
+        # figure waiting to be re-surfaced by the next reader of the DB.
+        columns = {
+            r[1] for r in self.conn.execute("PRAGMA table_info(api_calls)")
+        }
+        self.assertNotIn("cost_usd", columns)
+        # ...and the token columns it was derived from are all still there.
+        self.assertLessEqual(
+            {"input_tokens", "cache_read", "cache_write", "output_tokens"}, columns
         )
-        # 100*2.00 + 400*0.20 + 200*2.50 + 50*10.00, all per MTok (introductory rates)
-        self.assertAlmostEqual(row["cost_usd"], 0.00128, places=9)
-
-    def test_unknown_model_cost_is_null_not_zero(self) -> None:
-        row = self.q1("SELECT cost_usd FROM api_calls WHERE model = 'mystery-model-9'")
-        self.assertIsNone(row["cost_usd"])
 
     def test_synthetic_record_stored_with_zero_usage(self) -> None:
         row = self.q1("SELECT context_size FROM api_calls WHERE model = '<synthetic>'")
@@ -715,15 +716,15 @@ class TaskIndexAttributionTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_per_agent_rollup_carries_cost_and_model(self) -> None:
+    def test_per_agent_rollup_carries_tokens_and_model(self) -> None:
         row = self.q1(
             "SELECT agent_id, COUNT(*) calls, SUM(cache_read) cr,"
-            " SUM(cost_usd) cost FROM api_calls WHERE agent_id = 'atest1'"
-            " GROUP BY agent_id"
+            " SUM(input_tokens + cache_read + cache_write + output_tokens) tokens"
+            " FROM api_calls WHERE agent_id = 'atest1' GROUP BY agent_id"
         )
         self.assertEqual(row["calls"], 2)
         self.assertEqual(row["cr"], 4090)
-        self.assertGreater(row["cost"], 0.0)
+        self.assertGreater(row["tokens"], row["cr"])
 
     def test_main_thread_calls_have_no_agent_id(self) -> None:
         self.assertEqual(
@@ -840,40 +841,6 @@ class CarriesApiCallsTriStateTest(unittest.TestCase):
             ingest_mod.carries_api_calls(self.tmp / "does-not-exist.jsonl"),
             ingest_mod.CARRIES_UNREADABLE,
         )
-
-
-class PricingTest(unittest.TestCase):
-    def test_longest_prefix_wins(self) -> None:
-        self.assertEqual(rates_for_model("claude-opus-4-8")["input"], 15.00)
-        self.assertEqual(rates_for_model("claude-opus-5-20260201")["input"], 5.00)
-        self.assertEqual(rates_for_model("claude-sonnet-5-20260115")["output"], 10.00)
-        self.assertEqual(rates_for_model("claude-fable-5")["cache_read"], 1.00)
-
-    def test_unknown_model_returns_none(self) -> None:
-        self.assertIsNone(rates_for_model("mystery-model-9"))
-        self.assertIsNone(rates_for_model("<synthetic>"))
-
-    def test_prefix_match_requires_boundary(self) -> None:
-        # A hypothetical claude-opus-45 must NOT match the claude-opus-4 prefix
-        # (CodeRabbit finding: unbounded startswith would silently misprice it).
-        self.assertIsNone(rates_for_model("claude-opus-45"))
-        # Same family, exact match with no trailing id is still priced.
-        self.assertEqual(rates_for_model("claude-opus-4")["input"], 15.00)
-
-    def test_cost_none_for_unpriced_never_zero(self) -> None:
-        self.assertIsNone(cost_usd("mystery-model-9", 1000, 1000, 1000, 1000))
-
-    def test_cost_arithmetic(self) -> None:
-        # haiku: 1.00 in / 0.10 cache_read / 1.25 cache_write / 5.00 out per MTok
-        c = cost_usd("claude-haiku-4-5", 1_000_000, 2_000_000, 3_000_000, 4_000_000)
-        self.assertAlmostEqual(c, 1.00 + 2 * 0.10 + 3 * 1.25 + 4 * 5.00, places=9)
-
-    def test_rates_as_of_is_a_dated_iso_string(self) -> None:
-        # RATES_AS_OF is what tells a reader whether the hand-maintained
-        # PRICES table is fresh or stale (README "Cost figures are an
-        # ESTIMATE"). A missing/blank value would silently look current.
-        self.assertRegex(RATES_AS_OF, r"^\d{4}-\d{2}-\d{2}$")
-        self.assertEqual(RATES_AS_OF, "2026-08-02")
 
 
 class DefaultProjectsDirTest(unittest.TestCase):
@@ -2025,11 +1992,17 @@ class AdditiveSchemaUpgradeTest(unittest.TestCase):
 
     `_prepare_schema` drops and rebuilds on a version change, and REFUSES to
     do so when any tracked source is gone from disk (`SchemaRebuildSafetyTest`
-    above). Both are right for a shape change. Neither is right for v6 -> v7,
-    which only ADDS a table: a rebuild would discard every row to re-derive
+    above). Both are right for a shape change. Neither is right for a delta
+    that touches no row: a rebuild would discard every row to re-derive
     identical ones, and on a corpus with a reaped transcript the guard would
-    refuse outright -- making a purely additive change unlandable for exactly
-    the users whose data this database is the only copy of.
+    refuse outright -- making the change unlandable for exactly the users whose
+    data this database is the only copy of.
+
+    v6 -> v8 is now TWO such deltas at once: the added `ingest_runs` table
+    (#20) and the dropped `api_calls.cost_usd` column (#30). Neither deletes a
+    row, so the whole hop still upgrades in place -- see
+    `CostColumnRemovalUpgradeTest` for the column half and for the fallback
+    taken when SQLite is too old to drop a column.
 
     `test_rebuild_still_proceeds_when_every_source_is_re_readable` above is the
     other side of this boundary: an older shape still takes the rebuild path.
@@ -2046,10 +2019,16 @@ class AdditiveSchemaUpgradeTest(unittest.TestCase):
         ingest(self.projects, self.db)
 
     def _downgrade_to_v6(self) -> None:
-        """Put the database back in the shape v6 shipped: no run stamp at all."""
+        """Put the database back in the shape v6 shipped.
+
+        Two differences from the current shape, not one: v6 had no run stamp
+        table, and it still carried the `api_calls.cost_usd` estimate. Restore
+        BOTH, or the fixture tests a hop that no real database ever made.
+        """
         conn = sqlite3.connect(self.db)
         try:
             conn.execute(f"DROP TABLE {ingest_mod.INGEST_RUNS_TABLE}")
+            conn.execute("ALTER TABLE api_calls ADD COLUMN cost_usd REAL")
             conn.execute("PRAGMA user_version = 6")
             conn.commit()
         finally:
@@ -2695,6 +2674,395 @@ class SingleFileIngestCliTest(unittest.TestCase):
         # than the operator configured, and say nothing about it.
         with self.assertRaises(SystemExit):
             ingest_mod.resolve_db_path(None, "   ", Path("/default/usage.db"))
+class DropColumnCapabilityTest(unittest.TestCase):
+    """`ALTER TABLE ... DROP COLUMN` is DETECTED, never assumed (#30).
+
+    It landed in SQLite 3.35 (2021-03), and the version a Python interpreter
+    ships is the platform's business, not ours -- a developer laptop's 3.53 says
+    nothing about a CI runner or a distro Python. Assuming it would turn an
+    upgrade into an `OperationalError` on exactly the machines we cannot see.
+
+    The parser is deliberately strict-in / conservative-out: anything it cannot
+    read as a version becomes "not supported", so an unrecognized string takes
+    the slower rebuild path instead of attempting a statement that may not
+    exist. That is this repo's own rule -- an unreadable input is not a
+    permission.
+    """
+
+    def test_the_documented_floor_is_supported_and_the_release_below_it_is_not(
+        self,
+    ) -> None:
+        self.assertTrue(ingest_mod._sqlite_supports_drop_column("3.35.0"))
+        self.assertFalse(ingest_mod._sqlite_supports_drop_column("3.34.1"))
+        # The boundary from the other side: a 3.34.x with a large patch level
+        # is still older than 3.35.0, which a naive string compare gets wrong.
+        self.assertFalse(ingest_mod._sqlite_supports_drop_column("3.34.100"))
+
+    def test_a_two_component_version_is_read_as_its_zero_patch_release(self) -> None:
+        # Tuple comparison alone reads "3.35" as (3, 35) < (3, 35, 0) and would
+        # reject a supported build.
+        self.assertTrue(ingest_mod._sqlite_supports_drop_column("3.35"))
+        self.assertFalse(ingest_mod._sqlite_supports_drop_column("3.34"))
+
+    def test_an_unreadable_version_is_not_supported(self) -> None:
+        # "4" is the case that gives the `len(parsed) < 2` guard teeth. The
+        # other single-component string here, "3", is rejected by the version
+        # comparison anyway -- padded to (3, 0, 0) it is already below the
+        # (3, 35, 0) floor -- so the guard could be DELETED with the suite
+        # green. "4" pads to (4, 0, 0), which clears the floor: without the
+        # guard a string saying nothing whatever about a minor release reads
+        # as a permission to run DROP COLUMN.
+        for value in ("", "not-a-version", "3.x.1", "3", "4"):
+            with self.subTest(value=value):
+                self.assertFalse(ingest_mod._sqlite_supports_drop_column(value))
+
+    def test_the_default_argument_reads_the_live_runtime_version(self) -> None:
+        # The check must range over THIS interpreter's SQLite, not a constant
+        # baked in at authoring time.
+        with mock.patch.object(sqlite3, "sqlite_version", "3.34.1"):
+            self.assertFalse(ingest_mod._sqlite_supports_drop_column())
+        with mock.patch.object(sqlite3, "sqlite_version", "3.35.0"):
+            self.assertTrue(ingest_mod._sqlite_supports_drop_column())
+
+
+class CostColumnRemovalUpgradeTest(unittest.TestCase):
+    """v7 -> v8 drops `api_calls.cost_usd` without touching a single row (#30).
+
+    The estimate is being removed from the schema, and the databases it has to
+    be removed from may be the ONLY copy of their measurements: past Claude
+    Code's `cleanupPeriodDays` window the transcripts are gone. So the upgrade
+    is held to a stronger standard than "the tests still pass" -- every
+    surviving column of every surviving row must be byte-identical afterwards,
+    and the reaped-source guard must be untouched underneath it.
+
+    `ALTER TABLE ... DROP COLUMN` (SQLite 3.35+) rewrites the table's own
+    storage in place: no rebuild, no DROP TABLE, so the guard is never met
+    because nothing it protects is at risk. Where SQLite is too old the change
+    is NOT forced through -- it falls back to the ordinary rebuild path, guard
+    included, which refuses over a reaped source exactly as it always has.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-cost-drop-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+
+    # -- helpers ---------------------------------------------------------
+    def _columns(self, table: str = "api_calls") -> list[str]:
+        conn = sqlite3.connect(self.db)
+        try:
+            return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+        finally:
+            conn.close()
+
+    def _user_version(self) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _snapshot(self) -> list[tuple]:
+        """Every api_calls row, every column EXCEPT the one being dropped.
+
+        Whole rows rather than a COUNT: the claim under test is "nothing but
+        that column changed", and a row count cannot tell a preserved value
+        from a re-derived or shifted one.
+        """
+        columns = [c for c in self._columns() if c != "cost_usd"]
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                f"SELECT {', '.join(columns)} FROM api_calls ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def _downgrade_to_v7(self) -> None:
+        """Restore the shape v7 shipped: `cost_usd` present and populated.
+
+        The values are distinct per row and deliberately not derivable from the
+        token columns, so a "migration" that silently rebuilt the table from
+        the transcripts would be visible as a changed snapshot rather than
+        landing on the same numbers by luck.
+        """
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("ALTER TABLE api_calls ADD COLUMN cost_usd REAL")
+            conn.execute("UPDATE api_calls SET cost_usd = id * 0.25 + 0.125")
+            conn.execute("PRAGMA user_version = 7")
+            conn.commit()
+        finally:
+            conn.close()
+
+    # -- the in-place path ------------------------------------------------
+    def test_a_fresh_database_has_no_cost_column_at_all(self) -> None:
+        self.assertNotIn("cost_usd", self._columns())
+        self.assertEqual(self._user_version(), ingest_mod.SCHEMA_VERSION)
+
+    def test_v7_upgrade_drops_the_column_and_changes_nothing_else(self) -> None:
+        self._downgrade_to_v7()
+        self.assertIn("cost_usd", self._columns())
+        before = self._snapshot()
+        self.assertTrue(before, "the fixture must hold rows for this to mean anything")
+
+        summary = ingest(self.projects, self.db)
+
+        self.assertFalse(summary["schema_rebuilt"])
+        # A rebuild empties `ingest_state`, so every file would be re-parsed.
+        # Skipping them all is the observable proof the rows were carried, not
+        # re-derived.
+        self.assertEqual(summary["files_ingested"], 0)
+        self.assertEqual(summary["files_skipped"], summary["files_scanned"])
+        self.assertNotIn("cost_usd", self._columns())
+        self.assertEqual(self._user_version(), 8)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_v7_upgrade_is_not_refused_over_a_reaped_source(self) -> None:
+        # The case that makes a DROP-and-rebuild migration unshippable: on any
+        # corpus older than the retention window the guard fires and the user
+        # is told to stay on the old version forever.
+        self.transcript.unlink()
+        ingest(self.projects, self.db)  # archives it; rows retained
+        self._downgrade_to_v7()
+        before = self._snapshot()
+
+        ingest(self.projects, self.db)  # must not raise SystemExit
+
+        self.assertNotIn("cost_usd", self._columns())
+        self.assertEqual(self._snapshot(), before)
+        conn = sqlite3.connect(self.db)
+        try:
+            archived = conn.execute(
+                "SELECT COUNT(*) FROM ingest_state WHERE archived_at IS NOT NULL"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(archived, 1, "the archived source survived the upgrade")
+
+    def test_v6_upgrade_adds_the_run_table_and_drops_the_column_in_one_hop(self) -> None:
+        # v6 -> v8 is both deltas at once; a user who skipped v7 must not be
+        # left half-upgraded.
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("ALTER TABLE api_calls ADD COLUMN cost_usd REAL")
+            conn.execute(f"DROP TABLE {ingest_mod.INGEST_RUNS_TABLE}")
+            conn.execute("PRAGMA user_version = 6")
+            conn.commit()
+        finally:
+            conn.close()
+        before = self._snapshot()
+
+        summary = ingest(self.projects, self.db)
+
+        self.assertFalse(summary["schema_rebuilt"])
+        self.assertNotIn("cost_usd", self._columns())
+        self.assertEqual(self._snapshot(), before)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {ingest_mod.INGEST_RUNS_TABLE}"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            conn.close()
+
+    # -- the fallback, FORCED (never skipped on a new local SQLite) --------
+    def test_old_sqlite_falls_back_to_the_rebuild_path(self) -> None:
+        # Forced by patching the reported version, not by skipping when the
+        # local build happens to be new: a fallback nobody executes is a
+        # fallback nobody knows is broken.
+        self._downgrade_to_v7()
+        with mock.patch.object(sqlite3, "sqlite_version", "3.34.1"):
+            summary = ingest(self.projects, self.db)
+        self.assertTrue(
+            summary["schema_rebuilt"],
+            "without DROP COLUMN the only correct route is the rebuild",
+        )
+        # The rebuild re-derives from the transcripts, so the rows come back
+        # (this corpus is fully re-readable) and the column is gone either way.
+        self.assertNotIn("cost_usd", self._columns())
+        self.assertEqual(self._user_version(), 8)
+        self.assertEqual(summary["files_ingested"], summary["files_scanned"])
+        self.assertTrue(self._snapshot(), "the rebuild must re-ingest the rows")
+
+    def test_the_fallback_does_not_route_around_the_reaped_source_guard(self) -> None:
+        # The guard is the whole reason the in-place path exists. A fallback
+        # that bypassed it would delete the measurements the refusal protects
+        # -- worse than the refusal it was written to avoid.
+        self.transcript.unlink()
+        ingest(self.projects, self.db)  # archives it; rows retained
+        self._downgrade_to_v7()
+        before = self._snapshot()
+
+        with mock.patch.object(sqlite3, "sqlite_version", "3.34.1"):
+            with self.assertRaises(SystemExit) as caught:
+                ingest(self.projects, self.db)
+
+        message = str(caught.exception)
+        self.assertIn("REFUSING", message)
+        self.assertIn(str(self.transcript), message)
+        # Refused means REFUSED: the database is untouched, still v7, still
+        # carrying the column and every row.
+        self.assertEqual(self._user_version(), 7)
+        self.assertIn("cost_usd", self._columns())
+        self.assertEqual(self._snapshot(), before)
+
+
+class SchemaVersionSetsAreDecidedTest(unittest.TestCase):
+    """The in-place upgrade set names versions whose delta is row-preserving.
+
+    It is not cumulative by habit: a version belongs in it only while every
+    difference between its shape and the CURRENT one can be applied without
+    deleting a row. This test cannot judge that for a future version -- what it
+    pins is that the set was re-read at the bump, by tying it to the two hops
+    (#20's added table, #30's dropped column) that were actually reasoned about.
+    """
+
+    def test_schema_version_is_8(self) -> None:
+        self.assertEqual(ingest_mod.SCHEMA_VERSION, 8)
+
+    def test_only_the_two_reasoned_hops_upgrade_in_place(self) -> None:
+        self.assertEqual(ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7}))
+
+    def test_the_current_version_is_not_in_the_upgrade_set(self) -> None:
+        # A no-op hop is not an upgrade; listing it would make the branch
+        # unreachable-but-plausible, which is how a set rots into a rubber stamp.
+        self.assertNotIn(
+            ingest_mod.SCHEMA_VERSION, ingest_mod.IN_PLACE_UPGRADE_FROM
+        )
+
+    def test_the_shipped_schema_creates_no_money_column(self) -> None:
+        self.assertNotIn("cost_usd", ingest_mod.SCHEMA)
+
+
+class PreV5ShortcutIsGatedOnDropColumnTest(unittest.TestCase):
+    """The pre-v5 in-place hop refuses to run without DROP COLUMN (#30).
+
+    That branch adds `ingest_state.archived_at` and then stamps
+    `user_version = 8`. Reaching v8 also means shedding `api_calls.cost_usd`,
+    so the branch is gated on `_sqlite_supports_drop_column()`: on an older
+    library it must fall through to the rebuild, which reaches the same shape
+    by re-parsing. Ungated, an ancient SQLite would either raise mid-upgrade
+    or stamp "v8" on a table still carrying the retired money column -- a
+    version number asserting a shape that is not there.
+
+    Pinning this is awkward because the suite's other version tests patch
+    `sqlite3.sqlite_version` while the real library happily executes DROP
+    COLUMN, so the statement itself cannot be made to fail. This intercepts
+    `_drop_retired_cost_column` instead and asserts on WHETHER IT IS REACHED,
+    which is the decision the gate actually makes. Both directions are pinned:
+    the modern-version half proves the fixture reaches the branch at all, so
+    the "not reached" assertion is not passing for want of a code path.
+    """
+
+    # The pre-v5 shape of `ingest_state`, STATED rather than derived by
+    # dropping `archived_at` off the current one.
+    #
+    # The first version of this fixture did derive it, and it passed here on
+    # SQLite 3.53.3 while failing every CI leg on 3.45.1 with "error in table
+    # ingest_state after drop column: incomplete input". `archived_at` is the
+    # LAST column of `ingest_state` and the text immediately before it is a
+    # four-line `--` comment; DROP COLUMN rewrites the table's stored CREATE
+    # text, and where the dropped column is last the closing paren is
+    # re-appended at the truncation point -- which on that shape falls inside
+    # a commented-out line, so the reconstructed statement never closes.
+    # (Measured on 3.53.3: the drop discards the comment block entirely and
+    # emits `last_ts REAL)`, which is why the newer library tolerates it. The
+    # 3.45.1 mechanism is inferred from the error string, not observed here.)
+    #
+    # Deriving a historical schema by mutating the current one through an
+    # operation with its own version-dependent constraints is what made a test
+    # about a version gate itself version-dependent.
+    PRE_V5_INGEST_STATE = """
+        CREATE TABLE ingest_state (
+            path TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            unparsed_records INTEGER NOT NULL,
+            first_ts REAL,
+            last_ts REAL
+        )
+    """
+
+    def _pre_v5_database(self) -> sqlite3.Connection:
+        """A pre-v5 database: no `ingest_state.archived_at`, `cost_usd` present.
+
+        `ingest_state` is left EMPTY so the reaped-source guard upstream has
+        nothing to refuse over -- this test is about the gate below it.
+
+        `cost_usd` is added rather than stated because ADD COLUMN only appends
+        to the stored CREATE text: it triggers no schema reconstruction and so
+        carries none of the version-dependent risk DROP COLUMN does. It is
+        also how `CostColumnRemovalUpgradeTest._downgrade_to_v7` builds the
+        same column.
+        """
+        tmp = Path(tempfile.mkdtemp(prefix="cpb-prev5-gate-test-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        conn = sqlite3.connect(tmp / "usage.db")
+        self.addCleanup(conn.close)
+        ingest_mod._prepare_schema(conn)
+        conn.execute("DROP TABLE ingest_state")
+        conn.execute(self.PRE_V5_INGEST_STATE)
+        conn.execute("ALTER TABLE api_calls ADD COLUMN cost_usd REAL")
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        columns = ingest_mod._table_columns(conn, "ingest_state")
+        # The branch's own preconditions, asserted rather than assumed.
+        self.assertNotIn("archived_at", columns)
+        self.assertIn("source_kind", columns)
+        # ...and the retired column really is there to be shed, so the
+        # assertion that the rebuild sheds it is not vacuous.
+        self.assertIn("cost_usd", ingest_mod._table_columns(conn, "api_calls"))
+        return conn
+
+    def test_a_modern_sqlite_takes_the_shortcut(self) -> None:
+        # The control. Without it, the assertion below could pass because the
+        # fixture never reaches the branch, not because the gate held.
+        conn = self._pre_v5_database()
+        with mock.patch.object(sqlite3, "sqlite_version", "3.45.0"), \
+                mock.patch.object(ingest_mod, "_drop_retired_cost_column") as drop:
+            rebuilt = ingest_mod._prepare_schema(conn)
+        self.assertFalse(rebuilt, "the in-place hop should not rebuild")
+        drop.assert_called_once()
+        self.assertIn(
+            "archived_at", ingest_mod._table_columns(conn, "ingest_state")
+        )
+
+    def test_an_old_sqlite_falls_through_to_the_rebuild_instead(self) -> None:
+        conn = self._pre_v5_database()
+
+        def unreachable(_conn: sqlite3.Connection) -> None:
+            raise AssertionError(
+                "the pre-v5 shortcut ran on a SQLite without DROP COLUMN"
+            )
+
+        with mock.patch.object(sqlite3, "sqlite_version", "3.34.1"), \
+                mock.patch.object(
+                    ingest_mod, "_drop_retired_cost_column", side_effect=unreachable
+                ) as drop:
+            rebuilt = ingest_mod._prepare_schema(conn)
+        drop.assert_not_called()
+        self.assertTrue(rebuilt, "the old-SQLite path must rebuild, not shortcut")
+        # The rebuild reaches the SAME shape the shortcut would have: the
+        # fall-through is a slower route to v8, not a skipped upgrade.
+        self.assertIn(
+            "archived_at", ingest_mod._table_columns(conn, "ingest_state")
+        )
+        self.assertNotIn("cost_usd", ingest_mod._table_columns(conn, "api_calls"))
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            ingest_mod.SCHEMA_VERSION,
+        )
 
 
 if __name__ == "__main__":

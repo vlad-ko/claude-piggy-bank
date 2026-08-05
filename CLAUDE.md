@@ -64,25 +64,33 @@ operator-visible message — rather than return a plausible number.
 - An aggregate must name the set it ranges over. Main-thread-only figures that
   read like session totals are wrong numbers even when every input was right —
   hence `SCOPE_*` labelling throughout `serve.py`.
+- A ranking must name the key it orders by, and the name must be the key. "Top
+  subagent dispatches (by spend)" ordered by `cache_read DESC` for its whole
+  life; the heading and the query were free to disagree because nothing tied
+  them together. `serve.RANKED_BY` is that tie — one phrase, used by the
+  `ORDER BY`, the payload field and the panel heading, asserted equal in tests.
 
 Worked examples in the code: `ContentBlock.chars` is `Optional[int]` because
 Claude Code persists thinking blocks with empty text — recording `0` would make
 the composition table state that thinking is free. `subagent_runs.status =
 'unavailable'` means a dispatch is proven but its transcript is gone, which is
-unmeasured spend, not zero. `rates_for_model()` returns `None` for an unpriced
-model so an unknown price never renders as a free call.
+unmeasured spend, not zero — including in `total_tokens`, the column its panel
+ranks on. `_last_ingest_run()` returns `None` for a database that predates run
+stamping, and `ingest.stale` is tri-state, so "never recorded" reads as an
+unknown age rather than an ingest at the epoch.
 
-**Cost is an estimate, never a bill.** Dollar figures are list-rate arithmetic
-over measured tokens from `pricing.py`'s hand-maintained table, which carries
-`RATES_AS_OF` and is surfaced in the UI. It models no subscription accounting,
-discount or overage, and has diverged from real spend by >2.5x. Keep measured
-token counts visually and semantically distinct from derived dollars.
+**No dollar figures anywhere (#30).** Tokens are measured; dollars were derived
+from a hand-maintained list-rate table that went stale twice and diverged from
+real spend by >2.5x, so the estimate was removed — schema column, module and
+all — rather than qualified. A precise-looking figure wrong by a factor of two
+is worse than none, because the reader cannot see the error. Do not reintroduce
+a cost estimate, a "relative cost index" or any money-shaped field; rank by
+total tokens and show the model so the reader weighs the tiers themselves.
 
 ## Architecture
 
-Three modules, one direction of flow: `ingest.py` (transcripts → SQLite) →
+Two modules, one direction of flow: `ingest.py` (transcripts → SQLite) →
 `db/usage.db` → `serve.py` (SQLite → JSON) → `index.html` (JSON → charts).
-`pricing.py` is a leaf imported by both.
 
 **Sources.** Two globs are data — `<project>/<session>.jsonl` (main thread) and
 `<project>/<session>/subagents/agent-<id>.jsonl` (subagents). A third path, the
@@ -133,6 +141,15 @@ Consequences encoded in the code, which must be preserved:
   would drop rows whose source file no longer exists. It asks the filesystem,
   not `archived_at`, because that column postdates the older DBs the guard has
   to protect.
+- Which is why a schema change that deletes no row must not go through that
+  rebuild: on any corpus past the retention window the guard would refuse a
+  change that risks nothing, and an untrue refusal is the same class of defect
+  as an untrue number. `IN_PLACE_UPGRADE_FROM` lists the versions whose delta
+  is row-preserving (v6 adds `ingest_runs`; v7 drops `api_calls.cost_usd` via
+  `ALTER TABLE ... DROP COLUMN`, gated on a **runtime** check of
+  `sqlite3.sqlite_version` ≥ 3.35). It is re-decided at every bump, never
+  extended by habit, and the sub-3.35 fallback goes through the rebuild path
+  **including** the guard — never around it.
 - Windows containing archived sources are flagged in the report banner: totals
   are complete but no longer reproducible by re-ingesting.
 

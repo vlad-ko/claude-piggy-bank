@@ -15,13 +15,13 @@ sessions, files) and SQL NULL sums stay null in the JSON -- an empty period
 renders as "no data", never as a fabricated zero. `unparsed_records` is
 surfaced on every summary response.
 
-Cost fields are named `cost_estimate_usd` (never bare `cost_usd`) everywhere
-they cross the API boundary, so a consumer cannot mistake a list-rate
-estimate for a billed figure -- see `pricing.py`'s module docstring and
-`README.md`'s "Cost figures are an ESTIMATE" section for what that estimate
-does and does not reflect. `summary()` additionally carries `cost_basis`,
-naming the rate table and its `RATES_AS_OF` date ONCE per response (the UI
-reads it from there rather than re-stating it per row).
+No route emits a dollar figure (#30). Every quantity here is MEASURED --
+tokens, calls, sessions, timestamps -- and the list-rate estimate that used to
+sit beside them is gone rather than qualified: it was arithmetic over a
+hand-maintained table that went stale twice and diverged from real spend by
+more than 2.5x, which is this project's own defect (absence rendered as a
+value) pointed at the reader. Rankings that claimed to be "by spend" now order
+by total tokens and say so -- see `RANKED_BY`.
 """
 
 from __future__ import annotations
@@ -45,18 +45,26 @@ from ingest import (
     STATUS_INGESTED,
     STATUS_UNAVAILABLE,
 )
-from pricing import RATES_AS_OF
-
 EASTERN = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
 VENDOR_DIR = (HERE / "vendor").resolve()
 
-# Named ONCE (rule #15 outward check) and surfaced via summary()'s
-# `cost_basis` key -- never re-derived or restated per-row/per-endpoint.
-COST_BASIS: dict[str, str] = {
-    "source": "local hand-maintained list-rate table (pricing.py) -- not a bill",
-    "rates_as_of": RATES_AS_OF,
-}
+# What the "top dispatches" ranking orders by, named ONCE (#30). The panel
+# was headed "by spend" for its whole life while `agents()` ordered by
+# `cache_read DESC` -- measured 2026-08-05 over a local transcript corpus, only
+# 4 of the 10 most expensive dispatches ever reached it, and the row shown 7th
+# was the 343rd most expensive. The defect was not a wrong sort: it was a
+# heading and a query free to disagree, with nothing tying them together.
+#
+# So this string is the tie. `agents()` orders by the column it names, the
+# payload carries that column, and `index.html` puts THIS phrase in the
+# heading -- one quantity, three places, asserted equal in tests/test_serve.py.
+RANKED_BY = "total tokens"
+# The quantity itself, in SQL, spelled ONCE for every query that needs it --
+# the four MEASURED classes summed. Unqualified on purpose: only `api_calls`
+# carries these columns, so the expression is unambiguous in the joined query
+# too, and one spelling cannot drift from another.
+TOTAL_TOKENS_SQL = "input_tokens + cache_read + cache_write + output_tokens"
 
 # #4966: an aggregate must NAME the set it ranges over. `source_kind` in the
 # DB is the ingester's vocabulary ('main'/'subagent'); these are the labels
@@ -276,15 +284,14 @@ class Api:
             for r in self.conn.execute(
                 "SELECT source_kind, COUNT(*) calls, SUM(input_tokens) input,"
                 " SUM(cache_read) cache_read, SUM(cache_write) cache_write,"
-                " SUM(output_tokens) output, SUM(cost_usd) cost_estimate_usd,"
-                " AVG(context_size) avg_context"
+                " SUM(output_tokens) output, AVG(context_size) avg_context"
                 " FROM api_calls WHERE ts >= ? AND ts < ? GROUP BY source_kind",
                 (start, end),
             )
         }
         empty = {
             "calls": 0, "input": 0, "cache_read": 0, "cache_write": 0,
-            "output": 0, "cost_estimate_usd": None, "avg_context": None,
+            "output": 0, "avg_context": None,
         }
 
         def bucket(kind: str) -> dict[str, Any]:
@@ -342,8 +349,8 @@ class Api:
         }
 
     def models(self, start: float, end: float) -> list[dict[str, Any]]:
-        """Per-model spend, split by scope -- the same model used by the main
-        thread and by a subagent is TWO rows, never one merged figure."""
+        """Per-model token usage, split by scope -- the same model used by the
+        main thread and by a subagent is TWO rows, never one merged figure."""
         return [
             {
                 "model": r["model"],
@@ -353,7 +360,7 @@ class Api:
             for r in self.conn.execute(
                 "SELECT model, source_kind, COUNT(*) calls, SUM(input_tokens) input,"
                 " SUM(cache_read) cache_read, SUM(cache_write) cache_write,"
-                " SUM(output_tokens) output, SUM(cost_usd) cost_estimate_usd"
+                " SUM(output_tokens) output"
                 " FROM api_calls WHERE ts >= ? AND ts < ?"
                 " GROUP BY model, source_kind ORDER BY cache_read DESC",
                 (start, end),
@@ -361,13 +368,25 @@ class Api:
         ]
 
     def agents(self, start: float, end: float, limit: int) -> list[dict[str, Any]]:
-        """Per-DISPATCH spend: which agent cost what, ranked, in one look.
+        """Per-DISPATCH token usage: which agent consumed what, ranked (#30).
+
+        **Ranked by `RANKED_BY` -- total tokens -- which is the column
+        `total_tokens` in the payload and the phrase in the panel heading.**
+        The three used to be free to disagree, and did: the heading said "by
+        spend" while this query ordered by `cache_read DESC`. Ordering here
+        must stay the quantity `RANKED_BY` names.
+
+        `model` sits beside the ranking because tokens are not tiers: an Opus
+        dispatch can rank below a larger Haiku one, and the reader weighs that
+        themselves rather than being handed a derived dollar figure to trust.
+        A run spanning several models reports "N models", never one of them.
 
         An `unavailable` run (its transcript reaped from /private/tmp) is
         listed with NULL figures, never zeros -- the operator must be able to
-        see that an agent ran and that its cost is unknown. Sorting puts the
-        measured spenders first and the unmeasured ones at the end, where they
-        read as an explicit gap rather than as the cheapest agents.
+        see that an agent ran and that its usage is unknown. The FIRST sort key
+        is the status, so unmeasured runs land at the end deliberately rather
+        than wherever a NULL happens to collate; they read as an explicit gap
+        rather than as the smallest dispatches.
 
         **Both sides of the join are restricted to the window.** Filtering
         only `api_calls` mixed two sets: a dispatch whose calls all fall
@@ -386,7 +405,8 @@ class Api:
             "   session_id,"
             " COUNT(a.id) n_calls, SUM(a.input_tokens) input,"
             " SUM(a.cache_read) cache_read, SUM(a.cache_write) cache_write,"
-            " SUM(a.output_tokens) output, SUM(a.cost_usd) cost_estimate_usd,"
+            " SUM(a.output_tokens) output,"
+            f" SUM({TOTAL_TOKENS_SQL}) total_tokens,"
             " COUNT(DISTINCT a.model) n_models,"
             " MIN(a.model) any_model, MIN(a.ts) first_ts, MAX(a.ts) last_ts"
             " FROM subagent_runs r"
@@ -396,7 +416,7 @@ class Api:
             "   OR (r.dispatched_at >= ? AND r.dispatched_at < ?)"
             " GROUP BY r.agent_id"
             " HAVING COUNT(a.id) > 0 OR r.status = ?"
-            " ORDER BY r.status = ?, cache_read DESC, r.agent_id"
+            " ORDER BY r.status = ?, total_tokens DESC, r.agent_id"
             " LIMIT ?",
             (start, end, STATUS_UNAVAILABLE, start, end,
              STATUS_UNAVAILABLE, STATUS_UNAVAILABLE, limit),
@@ -418,8 +438,11 @@ class Api:
                 else (any_model if n_models == 1 else f"{n_models} models")
             )
             if unavailable:
+                # Including `total_tokens`, the key this panel RANKS on: a 0
+                # there would file a reaped dispatch among the smallest ones
+                # instead of showing it as unmeasured.
                 for key in ("input", "cache_read", "cache_write", "output",
-                            "cost_estimate_usd", "first_ts", "last_ts"):
+                            "total_tokens", "first_ts", "last_ts"):
                     row[key] = None
             out.append(row)
         return out
@@ -429,26 +452,13 @@ class Api:
             "SELECT COUNT(*) calls, COUNT(DISTINCT session_id) sessions,"
             " SUM(input_tokens) input, SUM(cache_read) cache_read,"
             " SUM(cache_write) cache_write, SUM(output_tokens) output,"
-            " SUM(cost_usd) cost_estimate_usd, AVG(context_size) avg_context,"
-            " SUM(cost_usd IS NULL AND input_tokens + cache_read + cache_write"
-            "     + output_tokens > 0) unpriced_calls"
+            " AVG(context_size) avg_context"
             " FROM api_calls WHERE ts >= ? AND ts < ?",
             (start, end),
         ).fetchone()
-        unpriced_models = [
-            r["model"]
-            for r in self.conn.execute(
-                "SELECT DISTINCT model FROM api_calls WHERE cost_usd IS NULL"
-                " AND input_tokens + cache_read + cache_write + output_tokens > 0"
-                " AND ts >= ? AND ts < ? ORDER BY model",
-                (start, end),
-            )
-        ]
         return {
             **dict(row),
-            "unpriced_models": unpriced_models,
             "ingest": self._ingest_health(),
-            "cost_basis": COST_BASIS,
             "scope": self._scope(start, end),
             "durability": self._durability(start, end),
             "models": self.models(start, end),
@@ -528,9 +538,6 @@ class Api:
             "SELECT a.session_id id, MIN(a.ts) first_ts, MAX(a.ts) last_ts,"
             " COUNT(*) calls, SUM(a.input_tokens) input, SUM(a.cache_read) cache_read,"
             " SUM(a.cache_write) cache_write, SUM(a.output_tokens) output,"
-            " SUM(a.cost_usd) cost_estimate_usd,"
-            " SUM(a.cost_usd IS NULL AND a.input_tokens + a.cache_read + a.cache_write"
-            "     + a.output_tokens > 0) unpriced_calls,"
             " SUM(a.source_kind = ?) subagent_calls,"
             " SUM(a.source_kind <> ?) main_thread_calls,"
             " AVG(a.context_size) avg_context"
@@ -616,8 +623,7 @@ class Api:
             for r in self.conn.execute(
                 "SELECT t.turn_type, COUNT(DISTINCT t.id) turns, COUNT(a.id) calls,"
                 " SUM(a.input_tokens) input, SUM(a.cache_read) cache_read,"
-                " SUM(a.cache_write) cache_write, SUM(a.output_tokens) output,"
-                " SUM(a.cost_usd) cost_estimate_usd"
+                " SUM(a.cache_write) cache_write, SUM(a.output_tokens) output"
                 " FROM turns t LEFT JOIN api_calls a ON a.turn_id = t.id"
                 " WHERE t.session_id = ? GROUP BY t.turn_type ORDER BY cache_read DESC",
                 (session_id,),
@@ -628,7 +634,7 @@ class Api:
             for r in self.conn.execute(
                 "SELECT model, COUNT(*) calls, SUM(input_tokens) input,"
                 " SUM(cache_read) cache_read, SUM(cache_write) cache_write,"
-                " SUM(output_tokens) output, SUM(cost_usd) cost_estimate_usd"
+                " SUM(output_tokens) output"
                 " FROM api_calls WHERE session_id = ? GROUP BY model ORDER BY cache_read DESC",
                 (session_id,),
             )
@@ -671,13 +677,10 @@ class Api:
                 " MAX(d.subagent_tokens) peak_context_tokens,"
                 " SUM(d.subagent_tokens IS NULL) dispatches_without_peak,"
                 " SUM(m.tokens) measured_tokens,"
-                " SUM(m.cost) cost_estimate_usd,"
                 " SUM(m.agent_id IS NULL) dispatches_without_spend"
                 " FROM agent_dispatches d"
                 " LEFT JOIN (SELECT agent_id,"
-                "     SUM(input_tokens + cache_read + cache_write + output_tokens)"
-                "       tokens,"
-                "     SUM(cost_usd) cost"
+                f"     SUM({TOTAL_TOKENS_SQL}) tokens"
                 "   FROM api_calls WHERE agent_id IS NOT NULL GROUP BY agent_id) m"
                 "   ON m.agent_id = d.task_id"
                 " WHERE d.session_id = ?"
@@ -707,8 +710,7 @@ class Api:
             for r in self.conn.execute(
                 "SELECT source_kind, COUNT(*) calls, SUM(input_tokens) input,"
                 " SUM(cache_read) cache_read, SUM(cache_write) cache_write,"
-                " SUM(output_tokens) output, SUM(cost_usd) cost_estimate_usd,"
-                " AVG(context_size) avg_context"
+                " SUM(output_tokens) output, AVG(context_size) avg_context"
                 " FROM api_calls WHERE session_id = ?"
                 " GROUP BY source_kind ORDER BY source_kind",
                 (session_id,),

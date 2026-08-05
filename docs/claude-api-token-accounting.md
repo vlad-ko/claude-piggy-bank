@@ -383,7 +383,7 @@ ignored and no error is returned:
 Not monotonic across generations: Haiku went **up**, 2,048 (Haiku 3.5) to 4,096
 (Haiku 4.5), while Opus came down 4,096 → 2,048 → 1,024 → 512 across 4.5/4.6 →
 4.7 → 4.8 → 5. A single "minimum cacheable prompt" constant is therefore wrong
-by construction; it is a per-model lookup, like `pricing.py`'s rate table.
+by construction; it is a per-model lookup.
 These figures are for the Claude API, Claude Platform on AWS, Google Cloud and
 Microsoft Foundry; Bedrock is documented separately by AWS.
 
@@ -485,8 +485,7 @@ Forward links, so a change here is traceable to what it affects:
   unverified, with what you checked and when, and say what would settle it.
 - Re-checking a fact means updating its **checked** date even when nothing
   changed — an old date is information.
-- If a documented fact changes, keep the previous statement and date it, the
-  way `pricing.py` carries `RATES_AS_OF`. A detector built against the old
-  behaviour needs to know when the ground moved.
+- If a documented fact changes, keep the previous statement and date it. A
+  detector built against the old behaviour needs to know when the ground moved.
 - A "measured here" figure is re-measured, not adjusted. Its corpus line
   (files, records, versions, dates) is part of the figure.

@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ingest import INGEST_RUNS_TABLE, ingest, record_ingest_run  # noqa: E402
 from test_ingest import build_corpus  # noqa: E402
-from pricing import RATES_AS_OF  # noqa: E402
 from serve import (  # noqa: E402
+    RANKED_BY,
     STALE_AFTER_SECONDS,
     Api,
     clamp_limit,
@@ -118,58 +118,153 @@ class ClampLimitTest(unittest.TestCase):
             clamp_limit("not-a-number")
 
 
-class ApiCostFieldContractTest(unittest.TestCase):
-    """The API must expose an ESTIMATE, never something a consumer could
-    mistake for a bill (#4948 follow-up, product-owner direction 2026-08-02).
-    Every cost figure crossing the `Api` JSON boundary is named
-    `cost_estimate_usd` -- never bare `cost_usd` -- and `summary()` carries a
-    `cost_basis` naming the rate table + its `RATES_AS_OF` date.
+# Field names the API must no longer emit anywhere (#30). The estimate was
+# list-rate arithmetic over a hand-maintained table that went stale twice and
+# diverged from real spend by >2.5x, so it is removed rather than qualified: a
+# precise-looking figure that is wrong by a factor of two is worse than no
+# figure, because the reader has no way to see the error.
+REMOVED_COST_FIELDS = frozenset({
+    "cost_estimate_usd",
+    "cost_usd",
+    "cost_basis",
+    "rates_as_of",
+    "unpriced_calls",
+    "unpriced_models",
+})
+# ...and the shape they would come back in. Matched on whole name COMPONENTS,
+# so `stale_after_seconds` is not swept up while `cost_per_call` or
+# `estimated_usd` would be. Named removals rot: a reintroduction under a new
+# name would pass a list of six literals.
+MONEY_NAME_RE = re.compile(
+    r"(?:^|_)(?:cost|costs|usd|price|prices|pricing"
+    r"|rate|rates|dollar|dollars)(?:_|$)"
+)
+
+
+def json_keys(payload) -> set[str]:
+    """Every key name anywhere in a JSON-shaped payload, at any depth."""
+    if isinstance(payload, dict):
+        found = set(payload)
+        for value in payload.values():
+            found |= json_keys(value)
+        return found
+    if isinstance(payload, list):
+        found: set[str] = set()
+        for item in payload:
+            found |= json_keys(item)
+        return found
+    return set()
+
+
+class NoMoneyCrossesTheApiTest(unittest.TestCase):
+    """No route emits a dollar figure, or the fields that framed one (#30).
+
+    Asserted PER ROUTE rather than on `/api/summary` alone: the estimate was
+    summed in seven different queries across five endpoints, and a check on the
+    headline payload would have called the job done while
+    `/api/session`'s three tables still carried it.
+
+    The corpus is the full one (main thread + subagent transcripts + a reaped
+    dispatch + task index), so every route returns rows -- a route that
+    returned nothing would satisfy this vacuously.
     """
 
-    def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="usage-report-serve-test-"))
-        projects_dir = self.tmp / "projects"
-        projects_dir.mkdir()
-        shutil.copy(FIXTURE, projects_dir / "session-fixture.jsonl")
-        self.db_path = self.tmp / "usage.db"
-        ingest(projects_dir, self.db_path)
-        self.api = Api(self.db_path)
-        self.start, self.end = day_bounds(None, None)
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-nomoney-test-"))
+        projects_dir, tasks_dir = build_corpus(cls.tmp)
+        cls.db_path = cls.tmp / "usage.db"
+        ingest(projects_dir, cls.db_path, tasks_dir=tasks_dir)
+        cls.api = Api(cls.db_path)
 
-    def tearDown(self) -> None:
-        self.api.conn.close()
-        shutil.rmtree(self.tmp)
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def test_summary_exposes_cost_estimate_usd_not_cost_usd(self) -> None:
-        s = self.api.summary(self.start, self.end)
-        self.assertIn("cost_estimate_usd", s)
-        self.assertNotIn("cost_usd", s)
-        self.assertGreater(s["cost_estimate_usd"], 0.0)
+    def payloads(self) -> dict[str, object]:
+        start, end = day_bounds(None, None)
+        return {
+            "/api/summary": self.api.summary(start, end),
+            "/api/timeseries?by=class": self.api.timeseries(start, end, "class"),
+            "/api/timeseries?by=turntype": self.api.timeseries(start, end, "turntype"),
+            "/api/timeseries?by=scope": self.api.timeseries(start, end, "scope"),
+            "/api/sessions": self.api.sessions(start, end),
+            "/api/session": self.api.session_detail("session-fixture"),
+            "/api/outliers": self.api.outliers(start, end, 20),
+            "/api/agents": self.api.agents(start, end, 20),
+        }
 
-    def test_summary_cost_basis_names_the_rate_table_and_its_date(self) -> None:
-        s = self.api.summary(self.start, self.end)
-        self.assertIn("cost_basis", s)
-        self.assertEqual(s["cost_basis"]["rates_as_of"], RATES_AS_OF)
-        # The source string must actually name the table + say "not a bill" --
-        # a consumer reading only cost_basis (no other context) must still be
-        # able to tell this figure is an estimate.
-        self.assertIn("pricing.py", s["cost_basis"]["source"])
-        self.assertIn("not a bill", s["cost_basis"]["source"])
+    def test_the_corpus_gives_every_route_something_to_return(self) -> None:
+        # Without this the assertions below can pass on empty responses.
+        for route, payload in self.payloads().items():
+            with self.subTest(route=route):
+                self.assertTrue(payload, f"{route} returned nothing to inspect")
 
-    def test_sessions_expose_cost_estimate_usd_not_cost_usd(self) -> None:
-        rows = self.api.sessions(self.start, self.end)
-        self.assertEqual(len(rows), 1)
-        self.assertIn("cost_estimate_usd", rows[0])
-        self.assertNotIn("cost_usd", rows[0])
-        self.assertGreater(rows[0]["cost_estimate_usd"], 0.0)
+    def test_no_route_returns_a_removed_cost_field(self) -> None:
+        for route, payload in self.payloads().items():
+            with self.subTest(route=route):
+                leaked = sorted(json_keys(payload) & REMOVED_COST_FIELDS)
+                self.assertEqual(leaked, [], f"{route} still emits {leaked}")
 
-    def test_session_detail_turn_types_and_models_expose_cost_estimate_usd(self) -> None:
-        d = self.api.session_detail("session-fixture")
-        self.assertGreater(len(d["turn_types"]), 0)
-        self.assertGreater(len(d["models"]), 0)
-        for row in d["turn_types"] + d["models"]:
-            self.assertIn("cost_estimate_usd", row)
-            self.assertNotIn("cost_usd", row)
+    def test_no_route_returns_any_money_shaped_field(self) -> None:
+        for route, payload in self.payloads().items():
+            with self.subTest(route=route):
+                leaked = sorted(
+                    k for k in json_keys(payload) if MONEY_NAME_RE.search(k)
+                )
+                self.assertEqual(
+                    leaked,
+                    [],
+                    f"{route} emits money-shaped field(s) {leaked}; #30 removed "
+                    "the estimate rather than renaming it",
+                )
+
+    def test_the_serving_layer_imports_no_pricing_module(self) -> None:
+        self.assertNotIn("pricing", sys.modules)
+        source = (Path(__file__).resolve().parent.parent / "serve.py").read_text()
+        self.assertNotIn("pricing", source)
+
+
+class NoDollarFigureIsRenderedTest(unittest.TestCase):
+    """The removal reaches the PAGE, not just the payload (#30).
+
+    An API that stopped emitting the estimate while `index.html` still had a
+    "Cost estimate" column would render "—" in a money column forever -- the
+    tool's own failure mode (a shape that looks like a measurement) applied to
+    the very number this issue removed. So the rate table, the totals card, the
+    columns, the basis banner and the formatter all go together.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.html = (cls.ROOT / "index.html").read_text()
+
+    def test_the_rate_table_module_is_gone_from_the_repository(self) -> None:
+        self.assertFalse(
+            (self.ROOT / "pricing.py").exists(),
+            "pricing.py is deleted, not merely unimported",
+        )
+
+    def test_no_shipped_module_mentions_pricing(self) -> None:
+        for name in ("ingest.py", "serve.py", "index.html"):
+            with self.subTest(module=name):
+                self.assertNotIn("pricing", (self.ROOT / name).read_text())
+
+    def test_the_page_renders_no_money(self) -> None:
+        for gone in (
+            "fmtCost",           # the dollar formatter
+            "cost_estimate_usd",  # the payload field
+            "cost_basis",         # the rate-table banner's source
+            "Cost estimate",      # the card and the column headings
+            "unpriced",           # the "excluded from cost" notice
+            "not a bill",         # the estimate's disclaimer, no longer needed
+            "$0.01",              # the sub-cent floor in the old formatter
+        ):
+            with self.subTest(string=gone):
+                self.assertNotIn(gone, self.html)
 
 
 class SessionsDispatchPeriodFilterTest(unittest.TestCase):
@@ -513,7 +608,7 @@ class AgentAttributionApiTest(unittest.TestCase):
         self.api.conn.close()
         shutil.rmtree(self.tmp)
 
-    def test_agents_endpoint_ranks_by_spend_and_names_the_agent(self) -> None:
+    def test_agents_endpoint_ranks_by_total_tokens_and_names_the_agent(self) -> None:
         rows = self.api.agents(self.start, self.end, 20)
         by_id = {r["agent_id"]: r for r in rows}
         self.assertEqual(by_id["atest1"]["agent_type"], "laravel-expert")
@@ -522,19 +617,24 @@ class AgentAttributionApiTest(unittest.TestCase):
         self.assertEqual(by_id["atest1"]["cache_read"], 4090)
         self.assertEqual(by_id["atest2"]["agent_type"], "architect")
         self.assertEqual(by_id["atest2"]["session_id"], "other-session")
-        # Ranked by cache-read descending: atest1 (4090) before atest2 (7).
+        # Ranked by TOTAL tokens descending: atest1 before atest2.
         ingested = [r["agent_id"] for r in rows if r["status"] == "ingested"]
         self.assertEqual(ingested, ["atest1", "atest2"])
+        self.assertGreater(
+            by_id["atest1"]["total_tokens"], by_id["atest2"]["total_tokens"]
+        )
 
     def test_agents_endpoint_lists_unavailable_runs_with_null_not_zero(self) -> None:
         rows = self.api.agents(self.start, self.end, 20)
         gone = [r for r in rows if r["agent_id"] == "agone"]
         self.assertEqual(len(gone), 1)
         self.assertEqual(gone[0]["status"], "unavailable")
-        # The whole point: an unmeasured agent must NOT report 0 spend.
+        # The whole point: an unmeasured agent must NOT report 0 spend. That
+        # now includes the field the panel RANKS on -- a 0 there would sort a
+        # reaped dispatch among the cheapest agents instead of showing a gap.
         self.assertIsNone(gone[0]["calls"])
         self.assertIsNone(gone[0]["cache_read"])
-        self.assertIsNone(gone[0]["cost_estimate_usd"])
+        self.assertIsNone(gone[0]["total_tokens"])
 
     def test_summary_scope_reports_unavailable_transcripts(self) -> None:
         cov = self.api.summary(self.start, self.end)["scope"]["coverage"]
@@ -814,10 +914,10 @@ class BannerPrecedenceTest(unittest.TestCase):
     `renderSummary` rebuilt the banner's whole text on every render and
     `reportLoadFailure` overwrote it wholesale, so the later writer decided
     which of two true statements the reader got -- and the staleness warning
-    added here would have been a third. A user shown "unpriced models" while a
-    load failure or a stale database goes unmentioned has been handed the
-    milder fact with no sign the harsher one exists, which is this repository's
-    core rule failing inside the feature built to enforce it.
+    added here would have been a third. A user shown an unparsed-records notice
+    while a load failure or a stale database goes unmentioned has been handed
+    the milder fact with no sign the harsher one exists, which is this
+    repository's core rule failing inside the feature built to enforce it.
 
     These assertions are STRUCTURAL, and that is a real limit, not a stylistic
     choice: the project ships no JS runtime (stdlib-only, no Node), so the
@@ -1160,7 +1260,6 @@ class AgentDispatchPeakContextTest(unittest.TestCase):
     def test_measured_spend_is_reported_beside_the_peak(self) -> None:
         row = self.rows()["backend-expert"]
         self.assertEqual(row["measured_tokens"], PK1_SPEND + PK2_SPEND)
-        self.assertGreater(row["cost_estimate_usd"], 0.0)
 
     def test_a_dispatch_with_no_tag_has_no_peak_sample_not_a_zero(self) -> None:
         # architect's one dispatch emitted no <subagent_tokens>: absence must
@@ -1177,7 +1276,6 @@ class AgentDispatchPeakContextTest(unittest.TestCase):
         row = self.rows()["reviewer"]
         self.assertEqual(row["peak_context_tokens"], 480000)
         self.assertIsNone(row["measured_tokens"])
-        self.assertIsNone(row["cost_estimate_usd"])
         self.assertEqual(row["dispatches_without_spend"], 1)
 
     def test_rows_rank_by_measured_spend_with_unmeasured_last(self) -> None:
@@ -1200,6 +1298,324 @@ class AgentDispatchPeakContextTest(unittest.TestCase):
         self.assertNotIn("r.subagent_tokens", self.html)
         self.assertNotIn("Agent dispatch spend", self.html)
         self.assertIn("Peak context", self.html)
+
+
+# --- #30: the panel ranks by the quantity its heading names ----------------
+#
+# Fixture design (CLAUDE.md, "a fixture must not make the defect
+# undetectable"). THREE orderings are pinned mutually different, so no
+# leftover sort can pass by looking right:
+#
+#   agent      model         input   cache_read  cache_write  output    total
+#   rkout      haiku        11,000      400,000       13,000  600,000  1,024,000
+#   rkcache    haiku         5,000      900,000        7,000    8,000    920,000
+#   rkopus     opus-4        1,000        2,000        3,000    4,000     10,000
+#   rkmixed    sonnet+opus     110          220          330      440      1,100
+#
+#   by total tokens (the new key):  rkout, rkcache, rkopus, rkmixed
+#   by cache_read (the OLD query):  rkcache, rkout, rkopus, rkmixed
+#   by list-rate cost (the old HEADING's claim, output- and tier-weighted):
+#                                   rkout, rkopus, rkcache, rkmixed
+#
+# The top two swap between the token order and the cache-read order, and
+# rkopus/rkcache swap between the token order and any tier-weighted price
+# order. `rkcache` is deliberately the cache-read leader while `rkout` is the
+# token leader, which is exactly the pair a cache-read sort gets wrong.
+RANK_SESSION = "rank-fixture"
+RANK_AGENTS: dict[str, list[tuple[str, int, int, int, int]]] = {
+    # agent_id -> [(model, input, cache_read, cache_write, output), ...]
+    "rkout": [("claude-haiku-4-5", 11_000, 400_000, 13_000, 600_000)],
+    "rkcache": [
+        ("claude-haiku-4-5", 2_000, 400_000, 3_000, 3_000),
+        ("claude-haiku-4-5", 3_000, 500_000, 4_000, 5_000),
+    ],
+    "rkopus": [("claude-opus-4-8", 1_000, 2_000, 3_000, 4_000)],
+    "rkmixed": [
+        ("claude-sonnet-5-20260115", 100, 200, 300, 400),
+        ("claude-opus-5-20260201", 10, 20, 30, 40),
+    ],
+}
+RANK_TOTALS = {
+    "rkout": 1_024_000,
+    "rkcache": 920_000,
+    "rkopus": 10_000,
+    "rkmixed": 1_100,
+}
+RANK_BY_TOTAL_TOKENS = ["rkout", "rkcache", "rkopus", "rkmixed"]
+RANK_BY_CACHE_READ = ["rkcache", "rkout", "rkopus", "rkmixed"]
+
+# A FIFTH dispatch, and the one both safety properties of this panel actually
+# turn on: reaped AFTER it was ingested.
+#
+# `rkgone` above is reaped-before-ingest -- no transcript ever landed, so its
+# SQL `total_tokens` is already NULL, NULL collates last under DESC anyway,
+# and the Python null-ing is a no-op on a value that is already None. Both
+# `serve.py` safety properties (the status-first sort key, and `total_tokens`
+# in the unavailable null-list) therefore SURVIVED deliberate mutation against
+# `rkgone` alone: the assertions passed for the wrong reason, which is exactly
+# the "a fixture must not make the defect undetectable" failure in CLAUDE.md.
+#
+# `rkarch` is the other, load-bearing half of the durability story: ingested
+# on one run, its transcript reaped before the next. `store_subagent_runs()`
+# rebuilds its row as `unavailable` from the task index, while the archive
+# path KEEPS its `api_calls` rows (CLAUDE.md, "Durability -- the DB is not
+# regenerable"). So its raw SQL sort key is 9,003,000, NOT NULL:
+#
+#   * with the status key moved off first, it ranks #1 and the panel opens
+#     with an all-dashes row;
+#   * with `total_tokens` dropped from the null-list, it renders 9,003,000
+#     beside `cache_read=—` and `model=—`.
+#
+# Its total is ~8.8x the measured leader's so the ordering property bites at
+# the very top of the list, and its four token classes are pinned mutually
+# different so a swapped column mapping cannot pass either.
+RANK_REAPED = "rkarch"
+RANK_REAPED_CALLS = [("claude-opus-4-8", 3_000_000, 4_000_000, 2_000_000, 3_000)]
+RANK_REAPED_TOTAL = 9_003_000
+# Every agent that gets a real transcript written, measured or later reaped.
+RANK_TRANSCRIPTS = {**RANK_AGENTS, RANK_REAPED: RANK_REAPED_CALLS}
+
+
+def build_ranking_corpus(root: Path) -> tuple[Path, Path]:
+    """A session dispatching four measured agents and two reaped ones.
+
+    Reaping is a two-step story, so this only lays down the corpus in its
+    pre-reap state: the caller ingests, calls `reap_ingested_transcript()`,
+    and ingests again.
+    """
+    projects = root / "projects"
+    subagents = projects / RANK_SESSION / "subagents"
+    subagents.mkdir(parents=True)
+
+    def rec(obj: dict) -> str:
+        return json.dumps(obj) + "\n"
+
+    (projects / f"{RANK_SESSION}.jsonl").write_text(rec({
+        "type": "user", "sessionId": RANK_SESSION,
+        "timestamp": "2026-03-04T09:00:00.000Z",
+        "message": {"role": "user", "content": "Delegate"},
+    }))
+    for agent_id, calls in RANK_TRANSCRIPTS.items():
+        (subagents / f"agent-{agent_id}.jsonl").write_text("".join(
+            rec({
+                "type": "assistant", "sessionId": RANK_SESSION,
+                "agentId": f"agent-{agent_id}",
+                "timestamp": f"2026-03-04T09:1{n}:00.000Z", "isSidechain": True,
+                "message": {
+                    "id": f"msg_{agent_id}_{n}",
+                    "model": model,
+                    "usage": {"input_tokens": inp,
+                              "cache_creation_input_tokens": cw,
+                              "cache_read_input_tokens": cr,
+                              "output_tokens": out},
+                    "content": [{"type": "text", "text": f"{agent_id} step {n}"}],
+                },
+            })
+            for n, (model, inp, cr, cw, out) in enumerate(calls)
+        ))
+        (subagents / f"agent-{agent_id}.meta.json").write_text(json.dumps({
+            "agentType": f"type-{agent_id}", "description": f"work by {agent_id}",
+        }))
+
+    tasks = root / "tasks"
+    index = tasks / RANK_SESSION / "tasks"
+    index.mkdir(parents=True)
+    for agent_id in RANK_TRANSCRIPTS:
+        (index / f"{agent_id}.output").symlink_to(
+            subagents / f"agent-{agent_id}.jsonl"
+        )
+    # A dispatch whose transcript is gone: its spend is UNMEASURED, and the
+    # ranking must not read that as the cheapest agent.
+    (index / "rkgone.output").symlink_to(subagents / "agent-rkgone.jsonl")
+    return projects, tasks
+
+
+def reap_ingested_transcript(projects: Path) -> None:
+    """Delete `RANK_REAPED`'s transcript, leaving its task-index entry behind.
+
+    What Claude Code's `cleanupPeriodDays` does between two ingests: the
+    canonical transcript goes, the index symlink stays and dangles. Only the
+    subagent's own files are touched -- the sidecar goes with it, because a
+    reap takes the directory entry, not just the JSONL.
+    """
+    subagents = projects / RANK_SESSION / "subagents"
+    (subagents / f"agent-{RANK_REAPED}.jsonl").unlink()
+    (subagents / f"agent-{RANK_REAPED}.meta.json").unlink()
+
+
+class AgentRankingByTotalTokensTest(unittest.TestCase):
+    """The panel ranks by the quantity its heading names (#30).
+
+    "Top subagent dispatches (by spend)" ordered by `cache_read DESC` for its
+    whole life -- the heading claimed a ranking the query never computed.
+    Measured over a local transcript corpus on 2026-08-05 (48 main-thread
+    sessions, 2,891 transcripts), only 4 of the 10 dispatches shown were among
+    the 10 most expensive; the row displayed seventh was the 343rd. Ranking by
+    total tokens reproduces the displayed order almost exactly (one adjacent
+    swap in the top 10, because cache reads are ~83% of cache volume), so this
+    is a truth-in-labelling fix rather than a behaviour change.
+
+    The durable half is that heading, payload field and `ORDER BY` are now ONE
+    quantity, named once in `serve.RANKED_BY`. The defect was never a wrong
+    sort -- it was a heading and a query free to disagree with nothing
+    asserting they agreed.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-ranking-test-"))
+        projects, tasks = build_ranking_corpus(cls.tmp)
+        cls.db = cls.tmp / "usage.db"
+        # TWO ingests, which is the whole point of `rkarch`: the first measures
+        # it, the reap takes its transcript, the second archives the source
+        # (rows KEPT) and rebuilds its run row as `unavailable`. One ingest
+        # cannot produce a dispatch that is unmeasured and has measurements.
+        ingest(projects, cls.db, tasks_dir=tasks)
+        reap_ingested_transcript(projects)
+        ingest(projects, cls.db, tasks_dir=tasks)
+        cls.api = Api(cls.db)
+        cls.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def rows(self) -> list[dict]:
+        return self.api.agents(*day_bounds(None, None), 20)
+
+    def test_fixture_landed_with_the_totals_these_tests_assume(self) -> None:
+        # If the corpus did not ingest as designed, every ordering assertion
+        # below is vacuous.
+        measured = {r["agent_id"]: r for r in self.rows() if r["status"] == "ingested"}
+        self.assertEqual(
+            {k: v["total_tokens"] for k, v in measured.items()}, RANK_TOTALS
+        )
+
+    def test_measured_dispatches_rank_by_total_tokens(self) -> None:
+        order = [r["agent_id"] for r in self.rows() if r["status"] == "ingested"]
+        self.assertEqual(order, RANK_BY_TOTAL_TOKENS)
+        # ...and specifically NOT by the quantity the old query used.
+        self.assertNotEqual(order, RANK_BY_CACHE_READ)
+
+    def test_the_returned_order_matches_the_field_the_heading_names(self) -> None:
+        # Self-consistency, so a future ORDER BY change on any other column is
+        # red even if this fixture's rows happen to be re-arranged.
+        totals = [
+            r["total_tokens"] for r in self.rows() if r["status"] == "ingested"
+        ]
+        self.assertEqual(totals, sorted(totals, reverse=True))
+
+    def test_total_tokens_is_the_four_token_classes_summed(self) -> None:
+        for row in self.rows():
+            if row["status"] != "ingested":
+                continue
+            with self.subTest(agent=row["agent_id"]):
+                self.assertEqual(
+                    row["total_tokens"],
+                    row["input"] + row["cache_read"]
+                    + row["cache_write"] + row["output"],
+                )
+
+    def test_an_unmeasured_dispatch_ranks_last_with_no_total_at_all(self) -> None:
+        # The trap in removing the money column: whatever replaces it as the
+        # sort key must not read a reaped dispatch as a 0-token one. It sorts
+        # last by the EXPLICIT status key, not by however NULL happens to
+        # collate, and its total stays absent.
+        rows = self.rows()
+        self.assertEqual(rows[-1]["agent_id"], "rkgone")
+        self.assertEqual(rows[-1]["status"], "unavailable")
+        self.assertIsNone(rows[-1]["total_tokens"])
+
+    # --- the reaped-AFTER-ingest dispatch: measurements outlive the source ---
+
+    def test_fixture_landed_a_reaped_dispatch_that_still_has_its_call_rows(
+        self,
+    ) -> None:
+        # THE guard. Both properties below are vacuous unless the raw sort key
+        # `serve.agents()` reads for `rkarch` is a large NUMBER while its
+        # status is `unavailable`. `rkgone` cannot establish that -- it has no
+        # call rows at all, so its SQL total is NULL and every assertion about
+        # NULL-handling passes without the code doing anything.
+        status = self.api.conn.execute(
+            "SELECT status FROM subagent_runs WHERE agent_id = ?", (RANK_REAPED,)
+        ).fetchone()
+        self.assertIsNotNone(status, f"{RANK_REAPED} has no subagent_runs row")
+        self.assertEqual(status["status"], "unavailable")
+        # Archived, not pruned: the rows the first ingest wrote are still here.
+        calls, total = self.api.conn.execute(
+            "SELECT COUNT(*), SUM(input_tokens + cache_read + cache_write"
+            " + output_tokens) FROM api_calls WHERE agent_id = ?",
+            (RANK_REAPED,),
+        ).fetchone()
+        self.assertEqual(calls, len(RANK_REAPED_CALLS))
+        self.assertEqual(total, RANK_REAPED_TOTAL)
+        # ...and it is bigger than the measured leader, so an ordering that
+        # reads it as a number cannot come out looking right by accident.
+        self.assertGreater(total, max(RANK_TOTALS.values()))
+        # The source really is gone from disk and marked archived.
+        archived = self.api.conn.execute(
+            "SELECT archived_at FROM ingest_state WHERE path LIKE ?",
+            (f"%agent-{RANK_REAPED}.jsonl",),
+        ).fetchone()
+        self.assertIsNotNone(archived, "the reaped source lost its ingest_state row")
+        self.assertIsNotNone(archived["archived_at"])
+
+    def test_a_reaped_dispatch_ranks_last_however_large_its_surviving_total(
+        self,
+    ) -> None:
+        # Property 1 (serve.py: "The FIRST sort key is the status"). `rkarch`
+        # carries 9,003,000 measured tokens in `api_calls`, so a sort that puts
+        # `total_tokens DESC` first opens the panel with an all-dashes row --
+        # an unmeasured dispatch presented as the single biggest spender.
+        rows = self.rows()
+        statuses = [r["status"] for r in rows]
+        self.assertEqual(rows[0]["agent_id"], RANK_BY_TOTAL_TOKENS[0])
+        self.assertEqual(
+            [r["agent_id"] for r in rows],
+            RANK_BY_TOTAL_TOKENS + [RANK_REAPED, "rkgone"],
+        )
+        # Stated as the property rather than as this fixture's order: every
+        # measured row precedes every unmeasured one, whatever they contain.
+        self.assertEqual(
+            statuses, sorted(statuses, key=lambda s: s == "unavailable"),
+            "an unavailable dispatch was interleaved with the measured ones",
+        )
+
+    def test_a_reaped_dispatch_reports_no_total_even_though_its_rows_survive(
+        self,
+    ) -> None:
+        # Property 2 (serve.py: a 0 -- or here a 9,003,000 -- "would file a
+        # reaped dispatch among the smallest ones"). The DB is now the only
+        # copy of that spend, but this panel cannot attribute it to a run whose
+        # transcript is gone, so it reports absence rather than a number beside
+        # a row of dashes. CLAUDE.md: absence is never rendered as a value.
+        row = {r["agent_id"]: r for r in self.rows()}[RANK_REAPED]
+        self.assertEqual(row["status"], "unavailable")
+        self.assertIsNone(row["total_tokens"])
+        # ALL of it, not just the sort key -- a row showing one live figure
+        # beside six dashes is a worse lie than a row showing none.
+        for key in ("input", "cache_read", "cache_write", "output",
+                    "calls", "model", "first_ts", "last_ts"):
+            with self.subTest(field=key):
+                self.assertIsNone(row[key])
+
+    def test_the_model_is_carried_beside_the_ranking(self) -> None:
+        by_id = {r["agent_id"]: r for r in self.rows()}
+        self.assertEqual(by_id["rkout"]["model"], "claude-haiku-4-5")
+        self.assertEqual(by_id["rkopus"]["model"], "claude-opus-4-8")
+        # A run spanning two models must not be attributed to ONE of them --
+        # and an unmeasured one to none at all (the page renders null as "—").
+        self.assertEqual(by_id["rkmixed"]["model"], "2 models")
+        self.assertIsNone(by_id["rkgone"]["model"])
+
+    def test_the_heading_names_the_ordering_key(self) -> None:
+        self.assertIn(f"Top subagent dispatches (by {RANKED_BY})", self.html)
+        self.assertNotIn("(by spend)", self.html)
+
+    def test_the_page_shows_the_ranked_quantity_it_sorted_on(self) -> None:
+        # A ranking whose key is not on screen cannot be checked by the reader.
+        self.assertIn("r.total_tokens", self.html)
 
 
 if __name__ == "__main__":
