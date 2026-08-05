@@ -306,23 +306,113 @@
 
       <span class="context-line">Spread: <span x-text="contextSpread"></span></span>
 
-      <span class="context-line">Against each model's own documented window, over
-        <span x-text="fmtCount(summary.context.utilisation.banded_calls)"></span> banded
-        call(s):</span>
-      <span class="context-line">
-        <!-- Ordered high to low by the API, so the template neither sorts nor
-             labels: the verdicts on the top two bands are the data layer's
-             words, and only those two carry one because only those two were
-             judged. -->
-        <template x-for="(b, i) in summary.context.utilisation.bands" :key="i">
-          <!-- The trailing space is load-bearing: the chips are inline-block,
-               so they read correctly on screen either way, but without it the
-               page's text -- copied, or read aloud -- runs one band's share
-               into the next band's label. -->
-          <span class="util-band"><span x-text="b.label"></span>:
-            <strong x-text="fmtCount(b.calls)"></strong>
-            (<span x-text="fmtPct(b.share)"></span>) </span>
-        </template>
+      <!-- #61: SCOPED FIRST, POOLED SECOND.
+
+           Measured 2026-08-05 over this project's own transcripts (44 sources,
+           8,163 records, 0 unparsed), 2,722 banded calls:
+
+               scope        banded   >=90% of the window
+               main-thread     390   52 (13.3%)
+               subagent      2,332    0  (0.0%)
+               pooled        2,722   52  (1.9%)
+
+           Every red-band call was main-thread; not one was a subagent. 2,332
+           healthy subagent calls dilute 390 main-thread ones 6:1, so the pooled
+           share erases the one scope the reader can act on -- and it moves the
+           WRONG WAY under the condition it exists to detect, because a saturated
+           orchestrator dispatches MORE subagents, which pushes the pooled share
+           down. "13.3% of your main-thread calls ran at 90%+ of the window"
+           prompts an action; "1.9% probably wrong" prompts none.
+
+           The two DATES ride with the figures, so the reader can see how old
+           both inputs are without hunting; the two provenance SENTENCES stay at
+           the foot of this band, in their two separately marked voices, and
+           never inside this loop -- which window a model has and where the
+           boundaries sit are properties of context_window.py, not of a scope. -->
+      <span class="context-line">Against each model's own documented window
+        (table checked <span x-text="summary.context.utilisation.windows_as_of"></span>),
+        cut at boundaries this project judges
+        (<span x-text="summary.context.utilisation.bands_as_of"></span>),
+        <strong>by scope</strong>:</span>
+      <template x-for="s in summary.context.utilisation.by_scope" :key="s.scope">
+        <span class="context-line">
+          <strong x-text="s.scope"></strong>:
+          <!-- A scope with no banded sample is a NAMED ABSENCE, not four bands
+               of 0.0%. Four zero bands is a true statement three different ways
+               -- the scope ran nothing, it ran calls that carried no context
+               measurement, it ran measured calls on models with no documented
+               window -- with three different remedies, and every `share` beside
+               them is null rather than 0.0. The API says which; the page says
+               it instead of drawing the bands. -->
+          <template x-if="s.no_sample_reason"><span><strong>no banded sample</strong>
+            &mdash; <span x-text="s.no_sample_reason"></span>
+            (<span x-text="fmtCount(s.calls)"></span> call(s),
+            <span x-text="fmtCount(s.sample_calls)"></span> with a measured
+            context). A share of an empty set is not 0%, so no band is drawn.
+          </span></template>
+          <template x-if="!s.no_sample_reason"><span>
+            <span x-text="fmtCount(s.banded_calls)"></span> banded call(s) of
+            <span x-text="fmtCount(s.calls)"></span>
+            (<span x-text="fmtCount(s.sample_calls)"></span> measured):
+            <!-- Ordered high to low by the API, so the template neither sorts
+                 nor labels: the verdicts on the top two bands are the data
+                 layer's words, and only those two carry one because only those
+                 two were judged. Keyed on the band rather than on the loop
+                 index, because the band IS the row's identity and an index says
+                 only where it happened to sit. -->
+            <template x-for="b in s.bands" :key="b.band">
+              <!-- The trailing space is load-bearing: the chips are
+                   inline-block, so they read correctly on screen either way,
+                   but without it the page's text -- copied, or read aloud --
+                   runs one band's share into the next band's label. -->
+              <span class="util-band" :title="bandRange(b)"><span x-text="b.label"></span>:
+                <strong x-text="fmtCount(b.calls)"></strong>
+                (<span x-text="fmtPct(b.share)"></span>) </span>
+            </template>
+          </span></template>
+          <!-- The three caveats, per scope, as TALLIES. The prose that explains
+               what each one means is stated ONCE with the pooled figures below:
+               a scope line repeating three paragraphs would bury the split it
+               exists to show (CLAUDE.md constraint 4). -->
+          <template x-if="s.unmeasured_calls"><span> &middot;
+            <span x-text="fmtCount(s.unmeasured_calls)"></span> carried no context
+            accounting</span></template>
+          <template x-if="s.unknown_model_calls"><span> &middot;
+            <span x-text="fmtCount(s.unknown_model_calls)"></span> on a model with no
+            documented window (<span x-text="s.unknown_models.join(', ')"></span>)</span></template>
+          <template x-if="s.over_window_calls"><span> &middot;
+            <strong>INCONCLUSIVE:</strong>
+            <span x-text="fmtCount(s.over_window_calls)"></span> above 100% of the
+            window</span></template>
+        </span>
+      </template>
+
+      <!-- The POOLED tally, DEMOTED below the scoped ones and carrying the name
+           of the set it spans. Kept rather than deleted: it is still the honest
+           answer to "of every call in this window, how many were red", and it is
+           the denominator the bands + unknown + unmeasured partition is checked
+           against, so removing it would delete a true figure to prevent a
+           misreading. What was wrong with it was never the arithmetic -- it was
+           that it did not name its set. -->
+      <span class="context-line">Pooled across
+        <strong x-text="summary.context.utilisation.includes"></strong> &mdash; the same
+        calls under one denominator, which is where the split above disappears:
+        <span x-text="fmtCount(summary.context.utilisation.banded_calls)"></span>
+        banded call(s) of
+        <span x-text="fmtCount(summary.context.utilisation.calls)"></span>
+        (<span x-text="fmtCount(summary.context.utilisation.sample_calls)"></span> measured,
+        <span x-text="fmtCount(summary.context.utilisation.unmeasured_calls)"></span> not).
+        <template x-if="summary.context.utilisation.no_sample_reason"><span>
+          <strong>No banded sample:</strong>
+          <span x-text="summary.context.utilisation.no_sample_reason"></span>.
+        </span></template>
+        <template x-if="!summary.context.utilisation.no_sample_reason"><span>
+          <template x-for="b in summary.context.utilisation.bands" :key="b.band">
+            <span class="util-band" :title="bandRange(b)"><span x-text="b.label"></span>:
+              <strong x-text="fmtCount(b.calls)"></strong>
+              (<span x-text="fmtPct(b.share)"></span>) </span>
+          </template>
+        </span></template>
       </span>
 
       <template x-if="summary.context.utilisation.unknown_model_calls"><span class="context-line">
@@ -617,6 +707,18 @@ function fmtPct(x) {
   // "0% of calls are in this band" is a measurement nobody made.
   if (x === null || x === undefined) return "—";
   return (x * 100).toFixed(1) + "%";
+}
+// Where a band is CUT, read off the payload rather than copied here (#31): the
+// boundaries are the JUDGED half of the two provenances, so the chip carries the
+// judgment as well as its verdict and a reader can audit one against the other.
+//
+// A null `upper` is the top band's OPEN end -- "and above" -- and NOT a missing
+// measurement, so it is spelled out rather than run through `fmtPct`, which
+// would render it as the em-dash this page reserves for "nobody measured". The
+// two absences are different facts and must not print alike.
+function bandRange(b) {
+  if (b.upper === null) return fmtPct(b.lower) + " of the window and above";
+  return fmtPct(b.lower) + " to " + fmtPct(b.upper) + " of the window";
 }
 function fmtRatio(x) {
   if (x === null || x === undefined) return "—";

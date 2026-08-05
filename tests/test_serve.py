@@ -1875,6 +1875,254 @@ class DataAgeCauseTest(unittest.TestCase):
         self.assertEqual(body.count("this.banner.stale ="), 1)
 
 
+# ---------------------------------------------------------------------------
+# #76: the wiring guard walks the payload BY PATH, not by top-level key.
+# ---------------------------------------------------------------------------
+#
+# `for k in payload` walked the top level and nothing else, so `context` --
+# bound, and therefore passed -- hid everything inside it however deep. That is
+# how PR #71 shipped `context.utilisation.by_scope` with no consumer at all and
+# a green suite: the check silently ranged over a smaller set than its name
+# claimed, which is this repository's own rule ("an aggregate must name the set
+# it ranges over") failing inside its own safety net.
+#
+# The walk below is defined by three rules, and each one exists because the
+# alternative would have let the shipped defect through:
+#
+#   * a field is named by its PATH (`context.utilisation.by_scope`), and every
+#     path is checked, however deep;
+#   * an ARRAY OF OBJECTS is walked through, not stepped over. `by_scope` is a
+#     list, so a walk that descended only into `dict` values would leave exactly
+#     the shape that caused this uncovered. Its elements are reached through the
+#     `x-for` alias that iterates them, so a field rendered only inside a loop
+#     over a nested list counts as bound -- which is the ordinary way this page
+#     renders a row;
+#   * a node the walk cannot adjudicate makes it REFUSE (`UnwalkablePayload`),
+#     never skip. Skipping is the defect in miniature: a check that cannot see
+#     its answer must not report a clean one.
+#
+# It is still a heuristic about a page no test here can execute (stdlib only, no
+# JS runtime), and it is still defeated by destructuring a payload object into a
+# local. It is defeated by a deliberate act rather than by depth.
+
+# Everything a JSON payload can hold that is not a container. Anything else --
+# a set, a datetime, an object -- means the payload grew a shape this walk was
+# never designed for, and it says so instead of quietly ignoring it.
+PAYLOAD_LEAVES = (str, int, float, bool, type(None))
+
+# `x-for="s in summary.context.utilisation.by_scope"` and
+# `x-for="(b, i) in s.bands"`: the loop VARIABLE, and what it iterates.
+X_FOR = re.compile(r'x-for="\(?\s*([A-Za-z_$][\w$]*)[^"]*?\bin\b([^"]*)"')
+# A mapping consumed WHOLE, e.g. `Object.entries(this.summary.context.percentiles)`.
+# Every member of an iterated mapping reaches the reader by construction, which
+# is a real structural guarantee and not an exemption: `contextSpread` renders
+# one line per percentile without naming any of them.
+BULK_READ = re.compile(r"Object\.(?:keys|values|entries)\(([^()]*)\)")
+
+# Never a plausible substitute for a resolved node (rule #12 in the test layer).
+UNRESOLVED = object()
+
+
+class UnwalkablePayload(AssertionError):
+    """The walk met something it cannot adjudicate, so it refuses.
+
+    Raised rather than skipped, and an `AssertionError` so it fails the test
+    that provoked it rather than erroring out of the suite unattributed. The
+    three reachable causes are a value of an unforeseen type, a list that mixes
+    objects with scalars, and a list the fixture leaves EMPTY -- an empty list
+    cannot show what it holds, so a walk that stepped over one would report
+    every field of its elements as fine without having looked at one.
+    """
+
+
+def binding_regex(expr: str) -> "re.Pattern[str]":
+    """`summary.context.utilisation` -> the property access that reads it.
+
+    Optional-chained at every hop (`summary?.context?.utilisation`), because
+    both spellings are the same read.
+    """
+    return re.compile(
+        r"\b" + r"\??\.".join(re.escape(part) for part in expr.split(".")) + r"\b"
+    )
+
+
+def reads_any(source: str, exprs) -> bool:
+    """Does `source` read the node those expressions name?"""
+    return any(binding_regex(expr).search(source) for expr in exprs)
+
+
+def iteration_aliases(surface: str, exprs) -> frozenset:
+    """The loop variables the page binds a list's ELEMENTS to.
+
+    Containment rather than equality on the iterated expression, because the
+    page legitimately guards one: `x-for="(r, i) in (summary ? summary.models :
+    [])"` iterates `summary.models` through a ternary, and a rule that demanded
+    the bare expression would call that list uniterated.
+    """
+    return frozenset(
+        var for var, iterated in X_FOR.findall(surface) if reads_any(iterated, exprs)
+    )
+
+
+def is_read_whole(surface: str, exprs) -> bool:
+    """Is this mapping handed to `Object.entries`/`values`/`keys` entire?
+
+    EQUALITY on the argument, not containment: `Object.entries(x.percentiles)`
+    consumes `percentiles`, and it says nothing whatever about `x` -- which is
+    the whole payload. Containment here would declare every field on the page
+    reached, by one call.
+    """
+    consumed = {
+        re.sub(r"^this\.", "", arg.strip()) for arg in BULK_READ.findall(surface)
+    }
+    return bool(consumed & set(exprs))
+
+
+def merge_rows(rows: Sequence[dict]) -> dict:
+    """One representative row, keeping the MOST informative value per key.
+
+    A list's elements are one shape, and the fixture pins them deliberately
+    unequal: `by_scope[0].unknown_models` names a model while `by_scope[1]`'s is
+    empty, because one scope ran an unwindowed model and the other did not.
+    Walking the empty one alone would refuse a list it could have read, so the
+    key is taken from whichever row can answer for it.
+    """
+    merged: dict = {}
+    for row in rows:
+        for key, value in row.items():
+            if key not in merged:
+                merged[key] = value
+            elif merged[key] is None and value is not None:
+                merged[key] = value
+            elif isinstance(merged[key], (dict, list)) and not merged[key] and value:
+                merged[key] = value
+    return merged
+
+
+def walk_payload(
+    node,
+    surface: str,
+    declared,
+    path: str = "",
+    exprs=frozenset({"summary"}),
+) -> list:
+    """Every path in `node` that nothing in `surface` reads, deepest first.
+
+    `declared` is the allowlist: a declared path is neither reported nor
+    descended into, which is what an exemption MEANS -- the fields under it are
+    covered by the decision recorded there, not by this walk.
+    """
+    unwired: list = []
+    if isinstance(node, dict):
+        if is_read_whole(surface, exprs):
+            for key, value in node.items():
+                if not isinstance(value, PAYLOAD_LEAVES):
+                    raise UnwalkablePayload(
+                        f"{path}.{key}: a container inside a mapping the page "
+                        "consumes whole. The iteration reaches the member; it "
+                        "cannot say which of the member's own fields are read."
+                    )
+            return unwired
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else key
+            if child in declared:
+                continue
+            child_exprs = frozenset(f"{expr}.{key}" for expr in exprs)
+            if not reads_any(surface, child_exprs):
+                unwired.append(child)
+                continue
+            unwired += walk_payload(value, surface, declared, child, child_exprs)
+        return unwired
+    if isinstance(node, list):
+        return _walk_rows(node, surface, declared, path, exprs)
+    if not isinstance(node, PAYLOAD_LEAVES):
+        raise UnwalkablePayload(
+            f"{path}: {type(node).__name__} is not a shape this walk can read."
+        )
+    return unwired
+
+
+def _walk_rows(rows: Sequence, surface: str, declared, path: str, exprs) -> list:
+    """A list, adjudicated by what it holds."""
+    if not rows:
+        raise UnwalkablePayload(
+            f"{path}: empty in this fixture, so the walk cannot see what it "
+            "holds. Give the fixture a row, or declare the path."
+        )
+    objects = [row for row in rows if isinstance(row, dict)]
+    if objects and len(objects) != len(rows):
+        raise UnwalkablePayload(
+            f"{path}: mixes objects with scalars, so no one rule reads it."
+        )
+    if not objects:
+        for row in rows:
+            if not isinstance(row, PAYLOAD_LEAVES):
+                raise UnwalkablePayload(
+                    f"{path}: holds {type(row).__name__}, which the walk cannot read."
+                )
+        # A list of scalars carries no field of its own: the binding on the
+        # list itself is the whole of what there is to check, and it passed.
+        return []
+    aliases = iteration_aliases(surface, exprs)
+    if not aliases:
+        return [f"{path}[]"]
+    return walk_payload(merge_rows(objects), surface, declared, f"{path}[]", aliases)
+
+
+def locate_path(payload: dict, surface: str, path: str):
+    """The node an allowlist path names, and the expressions that reach it.
+
+    `(UNRESOLVED, empty)` when it does not resolve -- a stale exemption must
+    fail loudly rather than pass by naming nothing.
+    """
+    node, exprs = payload, frozenset({"summary"})
+    for step in path.split("."):
+        key, mark, _ = step.partition("[]")
+        if not isinstance(node, dict) or key not in node:
+            return UNRESOLVED, frozenset()
+        node = node[key]
+        exprs = frozenset(f"{expr}.{key}" for expr in exprs)
+        if mark:
+            if not isinstance(node, list) or not node:
+                return UNRESOLVED, frozenset()
+            if not all(isinstance(row, dict) for row in node):
+                return UNRESOLVED, frozenset()
+            node = merge_rows(node)
+            exprs = iteration_aliases(surface, exprs)
+    return node, exprs
+
+
+# The reasons the register below records, spelled once each because several
+# paths share one decision and a copied reason is a reason free to drift.
+SCOPE_SPLIT_IS_PLOTTED = (
+    "#4966: the per-scope TOKEN split is plotted per day by "
+    "/api/timeseries?by=scope, which the chart already renders, and the "
+    "API-calls card states the per-scope CALL counts beside it. Tabulating it "
+    "here as well would be a second surface for one figure (constraint 4)."
+)
+SCOPE_CONTEXT_MEAN_HAS_NO_READER = (
+    "#4966/#25: the per-scope context MEAN and its sample counts have no "
+    "reader. The context surface is the median card and #61's per-scope "
+    "utilisation bands, which range over the same calls and say more about "
+    "them. Declared by #76, the first check able to SEE it -- putting it on "
+    "the page is a change of its own, not a line in this dict."
+)
+REAPED_IN_WINDOW_HAS_NO_READER = (
+    "#41: the scope band renders `runs_undated_unavailable` -- the residue "
+    "that belongs to no window -- and the sessions table marks reaped "
+    "dispatches per session through `subagent_status`. These two "
+    "window-scoped counts have no reader of their own. Declared by #76, which "
+    "is the first check able to see them; a banner line for them is its own "
+    "change."
+)
+PROJECT_NAMES_ARE_COUNTS_ON_THE_PAGE = (
+    "#44: COUNTS, not names, by decision. A project name is the working "
+    "directory with its separators folded to `-`, so it carries the username "
+    "and the repo path, and eighteen of them would swamp a one-line band. "
+    "/api/summary carries them for anyone who needs them."
+)
+
+
 class SummaryPayloadIsWiredTest(unittest.TestCase):
     """Every field `/api/summary` computes must REACH a reader, or say why not.
 
@@ -1934,13 +2182,76 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
     so the entry is gone and `ContextReferentIsBoundTest` says what was decided
     instead -- which is the stronger record. An allowlist entry can only say
     that somebody thought about it.
+
+    #76: THE HAYSTACK WAS RIGHT AND THE NEEDLE SET WAS NOT.
+    ------------------------------------------------------
+    All of the above ranged over the TOP LEVEL of the payload. `context` is a
+    top-level key, it is bound, and it passed -- so everything inside it was
+    unchecked, which is how `context.utilisation.by_scope` shipped with no
+    consumer at all and a green suite. The walk is now by PATH and goes all the
+    way down, through arrays of objects, refusing rather than skipping anything
+    it cannot adjudicate (see `walk_payload`).
+
+    That turned the register from empty to twenty-one entries, and the entries
+    are the FINDING, not a regression. Every one of them is a decision somebody
+    made and nobody ever declared, because until this change nothing could see
+    them to ask. An undeclared decision is invisible; a declared one can be
+    argued with. Two things keep the list from rotting into the rubber stamp
+    this class was built to prevent: an entry that names a field the page DOES
+    render fails, and an entry that names a field the payload no longer has
+    fails -- both by path, and both mutation-checked below.
+
+    #61's own subtree needs no entry. Everything `context` computes, down to
+    each band's boundaries and each scope's reason for having no sample, is
+    rendered -- which is the point of doing the guard and the render together.
     """
 
-    # Fields `/api/summary` computes that the page deliberately does not show.
-    # An entry must name the reason. Empty is the healthy state.
-    # Fields `/api/summary` computes that the page deliberately does not show.
-    # An entry must name the reason. Empty is the healthy state.
-    NOT_RENDERED: dict[str, str] = {}
+    # Fields `/api/summary` computes that the page deliberately does not show,
+    # BY PATH. An entry must name its reason and cite the issue that owns the
+    # decision (`test_every_exemption_cites_the_decision_it_records`). Empty is
+    # the healthy state and this is not it -- see the class docstring.
+    NOT_RENDERED: dict[str, str] = {
+        "scope.includes": (
+            "#4966: the scope band composes its own sentence from `coverage` "
+            "and SHOUTS 'MAIN-THREAD ONLY' where this string would merely say "
+            "it. Two spellings of one fact is a smell; declared by #76 rather "
+            "than fixed here, because rewording that band is neither #76's "
+            "subject nor #61's."
+        ),
+        "scope.main_thread.input": SCOPE_SPLIT_IS_PLOTTED,
+        "scope.main_thread.cache_read": SCOPE_SPLIT_IS_PLOTTED,
+        "scope.main_thread.cache_write": SCOPE_SPLIT_IS_PLOTTED,
+        "scope.main_thread.output": SCOPE_SPLIT_IS_PLOTTED,
+        "scope.main_thread.avg_context": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
+        "scope.main_thread.context_calls": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
+        "scope.main_thread.unmeasured_calls": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
+        "scope.subagent.input": SCOPE_SPLIT_IS_PLOTTED,
+        "scope.subagent.cache_read": SCOPE_SPLIT_IS_PLOTTED,
+        "scope.subagent.cache_write": SCOPE_SPLIT_IS_PLOTTED,
+        "scope.subagent.output": SCOPE_SPLIT_IS_PLOTTED,
+        "scope.subagent.avg_context": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
+        "scope.subagent.context_calls": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
+        "scope.subagent.unmeasured_calls": SCOPE_CONTEXT_MEAN_HAS_NO_READER,
+        "scope.coverage.subagent_transcripts_unavailable": (
+            REAPED_IN_WINDOW_HAS_NO_READER
+        ),
+        "scope.coverage.sessions_with_unavailable_subagents": (
+            REAPED_IN_WINDOW_HAS_NO_READER
+        ),
+        "scope.projects.names_in_window": PROJECT_NAMES_ARE_COUNTS_ON_THE_PAGE,
+        "scope.projects.names_in_database": PROJECT_NAMES_ARE_COUNTS_ON_THE_PAGE,
+        "scope.projects.unattributed_sources": (
+            "#44: `unattributed_calls` is what the band states, because the "
+            "reader acts on calls. The source count is the same absence "
+            "measured a second way -- another number, no further decision."
+        ),
+        "durability.sources": (
+            "#14: the banner states the archived-source COUNT and the calls it "
+            "qualifies; the paths are the user's own directory names, and "
+            "/api/summary carries them for anyone who needs the list. #44's "
+            "decision about project names, one axis over."
+        ),
+    }
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -1970,30 +2281,123 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
         """
         return strip_comments(html)
 
-    @staticmethod
-    def _is_bound(surface: str, field: str) -> bool:
-        """Is `field` read off the component's `summary` state anywhere?
+    # `_is_bound(surface, field)` used to live here, matching `summary.<field>`
+    # for one top-level name. `reads_any` replaces it: same haystack, same
+    # optional-chaining, but a PATH rather than a name -- and it is module-level
+    # because the walk, the resolver and both allowlist tests all ask the same
+    # question, and two spellings of "is this read?" would be free to disagree.
 
-        `summary.<field>` in a template binding, `this.summary.<field>` in a
-        getter and `summary?.<field>` in either all match; a bare `<field>`
-        belonging to some other object does not.
-        """
-        return re.search(rf"\bsummary\??\.{re.escape(field)}\b", surface) is not None
+    def payload(self) -> dict:
+        return self.api.summary(*day_bounds(None, None))
+
+    def surface(self) -> str:
+        return self._binding_surface(self.html)
 
     def test_every_summary_field_is_rendered_or_declared_unrendered(self) -> None:
-        payload = self.api.summary(*day_bounds(None, None))
-        surface = self._binding_surface(self.html)
-        unwired = [
-            k
-            for k in payload
-            if k not in self.NOT_RENDERED and not self._is_bound(surface, k)
-        ]
+        unwired = walk_payload(self.payload(), self.surface(), self.NOT_RENDERED)
         self.assertEqual(
             unwired,
             [],
             f"/api/summary computes {unwired} and index.html never reads them. "
-            "Render the field, or add it to NOT_RENDERED with the reason.",
+            "Render the field, or add the PATH to NOT_RENDERED with the reason.",
         )
+
+    def test_the_walk_goes_below_the_top_level(self) -> None:
+        # THE regression #76 exists for, pinned as a test rather than left to a
+        # one-off mutation: `context.utilisation.by_scope` is nested three deep
+        # under a top-level key that IS bound, which is exactly why the old
+        # `for k in payload` reported a clean page while nothing rendered it.
+        #
+        # The page is mutated here, not the guard, so this stays red for the
+        # real reason if the walk is ever narrowed back to the top level.
+        surface = self.surface().replace("summary.context.utilisation.by_scope", "")
+        self.assertIn(
+            "context.utilisation.by_scope",
+            walk_payload(self.payload(), surface, self.NOT_RENDERED),
+            "a nested field with no consumer does not turn this guard red -- "
+            "which is the state PR #71 shipped in",
+        )
+
+    def test_the_walk_reports_a_nested_field_by_its_whole_path(self) -> None:
+        # The path is the name: two `calls` at two depths are two fields, and a
+        # report that said only "calls" would send the reader to the wrong one.
+        unwired = walk_payload(
+            {"context": {"utilisation": {"calls": 1}}},
+            "summary.context.utilisation",
+            {},
+        )
+        self.assertEqual(unwired, ["context.utilisation.calls"])
+
+    def test_an_array_of_objects_is_walked_through_not_stepped_over(self) -> None:
+        # `by_scope` is a LIST. A walk that descended only into dicts would
+        # leave the exact shape that caused #76 uncovered, so this pins the
+        # element's own fields -- one rendered, one not, in one payload, so a
+        # walk that reported everything or nothing cannot pass.
+        surface = '<template x-for="s in summary.rows"><span x-text="s.shown">'
+        self.assertEqual(
+            walk_payload({"rows": [{"shown": 1, "dark": 2}]}, surface, {}),
+            ["rows[].dark"],
+        )
+
+    def test_a_field_bound_only_inside_a_loop_over_a_nested_list_counts(self) -> None:
+        # The ordinary way this page renders a row: the field is never spelled
+        # `summary.<path>` anywhere, only against the loop's alias.
+        surface = (
+            '<template x-for="s in summary.a.rows">'
+            '<template x-for="b in s.bands"><span x-text="b.label">'
+        )
+        self.assertEqual(
+            walk_payload({"a": {"rows": [{"bands": [{"label": "x"}]}]}}, surface, {}),
+            [],
+        )
+
+    def test_a_list_of_objects_nothing_iterates_is_unwired(self) -> None:
+        # Naming the list is not rendering it: a reference that never iterates
+        # cannot put a single one of its rows on the page.
+        self.assertEqual(
+            walk_payload({"rows": [{"a": 1}]}, "summary.rows.length", {}),
+            ["rows[]"],
+        )
+
+    def test_a_mapping_the_page_consumes_whole_reaches_every_member(self) -> None:
+        # `contextSpread` renders one line per percentile without naming p10,
+        # p25 or any other. The iteration IS the binding, and requiring a
+        # per-key one would force the page to spell out a list it deliberately
+        # does not know the length of.
+        self.assertEqual(
+            walk_payload(
+                {"percentiles": {"p10": 1, "p99": 2}},
+                "Object.entries(this.summary.percentiles)",
+                {},
+            ),
+            [],
+        )
+
+    def test_consuming_a_mapping_whole_says_nothing_about_its_parent(self) -> None:
+        # The sharpest way this walk could report a clean page: match the bulk
+        # read by CONTAINMENT and `Object.entries(summary.percentiles)` marks
+        # the whole payload consumed, and every field on it passes at once.
+        self.assertEqual(
+            walk_payload(
+                {"percentiles": {"p10": 1}, "dark": 2},
+                "Object.entries(summary.percentiles)",
+                {},
+            ),
+            ["dark"],
+        )
+
+    def test_the_walk_refuses_a_shape_it_cannot_read(self) -> None:
+        # A traversal that hit an unexpected type and SKIPPED it would be this
+        # very defect in miniature -- a check reporting a clean answer over a
+        # set it never looked at.
+        for node, why in (
+            ({"odd": {1, 2}}, "a value of an unforeseen type"),
+            ({"mixed": [{"a": 1}, "scalar"]}, "objects mixed with scalars"),
+            ({"empty": []}, "a list the fixture leaves empty"),
+        ):
+            with self.subTest(shape=why):
+                with self.assertRaises(UnwalkablePayload):
+                    walk_payload(node, "summary.odd summary.mixed summary.empty", {})
 
     def test_the_allowlist_cannot_exempt_a_field_that_is_rendered(self) -> None:
         # The other way an allowlist rots, and the one that had actually
@@ -2001,8 +2405,17 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
         # /api/timeseries" while the summary cards rendered them. An entry that
         # describes the page wrongly is worse than no entry -- it asserts a
         # decision nobody made and hides the field from the check above.
-        surface = self._binding_surface(self.html)
-        wrong = sorted(k for k in self.NOT_RENDERED if self._is_bound(surface, k))
+        #
+        # By PATH since #76, and it must resolve THROUGH lists: an exemption on
+        # `x.rows[].field` is checked against the loop alias that renders it,
+        # not against a name nothing on this page ever spells.
+        surface = self.surface()
+        payload = self.payload()
+        wrong = sorted(
+            path
+            for path in self.NOT_RENDERED
+            if reads_any(surface, locate_path(payload, surface, path)[1])
+        )
         self.assertEqual(
             wrong,
             [],
@@ -2013,10 +2426,59 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
     def test_the_allowlist_cannot_hide_a_field_that_no_longer_exists(self) -> None:
         # A stale exemption is how an allowlist rots into a rubber stamp: the
         # field is renamed, the entry stays, and the NEW name is unguarded
+        # while the list still looks deliberate. A path makes that failure
+        # sharper AND likelier -- `scope.main_thread.input` stops resolving if
+        # any of three names changes -- so the resolution is checked at every
+        # hop and an unresolved path is UNRESOLVED, never a plausible node.
+        surface = self.surface()
+        payload = self.payload()
+        stale = sorted(
+            path
+            for path in self.NOT_RENDERED
+            if locate_path(payload, surface, path)[0] is UNRESOLVED
+        )
+        self.assertEqual(stale, [], f"NOT_RENDERED names absent paths: {stale}")
+
+    def test_a_stale_exemption_fails_rather_than_passing_quietly(self) -> None:
+        # Teeth on the test above: every hop of the path is resolved, so a
+        # renamed leaf, a renamed parent and a list that stopped being one all
+        # fail. Each of these would otherwise be an entry that guards nothing
         # while the list still looks deliberate.
-        payload = self.api.summary(*day_bounds(None, None))
-        stale = [k for k in self.NOT_RENDERED if k not in payload]
-        self.assertEqual(stale, [], f"NOT_RENDERED names absent fields: {stale}")
+        payload = {"scope": {"main_thread": {"input": 1}}, "rows": [{"a": 1}]}
+        for path in (
+            "scope.main_thread.renamed",
+            "scope.renamed.input",
+            "renamed.main_thread.input",
+            "scope[].main_thread",
+        ):
+            with self.subTest(path=path):
+                self.assertIs(locate_path(payload, "", path)[0], UNRESOLVED)
+        self.assertEqual(locate_path(payload, "", "scope.main_thread.input")[0], 1)
+
+    def test_every_exemption_cites_the_decision_it_records(self) -> None:
+        # "An entry must name the reason" was a comment; this is the check. A
+        # bare "not needed" is how a register of decisions becomes a list of
+        # shrugs, so every entry names the issue whose decision it records.
+        for path, reason in sorted(self.NOT_RENDERED.items()):
+            with self.subTest(path=path):
+                self.assertRegex(
+                    reason,
+                    r"#\d+",
+                    f"{path} is exempted without citing the decision it records",
+                )
+                self.assertGreater(len(reason), 60, f"{path}: not a reason")
+
+    def test_the_context_block_owes_no_exemption_at_all(self) -> None:
+        # #61 and #76 are one change on purpose: the guard that starts seeing
+        # nested fields sees #61's unrendered ones first. Every field under
+        # `context` -- including `by_scope`, every scope's `no_sample_reason`
+        # and every band's boundaries -- is rendered, so none of them is
+        # declared here. An entry appearing under this prefix means the render
+        # half regressed and was papered over.
+        under_context = sorted(
+            path for path in self.NOT_RENDERED if path.startswith("context")
+        )
+        self.assertEqual(under_context, [])
 
 
 # --- #10: peak context is not spend --------------------------------------
@@ -4205,6 +4667,13 @@ class AbsenceIsNeverRenderedAsAValueTest(unittest.TestCase):
         self.assertIn('return v ?? "—";', js_function_body(self.html, "function orDash("))
 
 
+# The loop #61's render half turns on, spelled once: the tests below assert
+# both that it EXISTS and that certain things sit outside it, and two spellings
+# of it would let one of those pass against a loop the other never saw.
+SCOPE_LOOP_EXPR = "s in summary.context.utilisation.by_scope"
+SCOPE_LOOP = f'x-for="{SCOPE_LOOP_EXPR}"'
+
+
 class ContextReferentIsBoundTest(unittest.TestCase):
     """#31's `context` block reaches the reader, and keeps its two voices (#8).
 
@@ -4232,6 +4701,9 @@ class ContextReferentIsBoundTest(unittest.TestCase):
         cls.band = html_element(cls.raw, 'id="context-note"')
         cls.cards = js_function_body(cls.html, "get cards(")
         cls.sample_line = js_function_body(cls.html, "get contextSampleLine(")
+        # The per-scope block ALONE (#61), so a test about what belongs inside
+        # the loop cannot be satisfied by something that sits beside it.
+        cls.scope_loop = html_element(cls.raw, SCOPE_LOOP)
 
     # --- the median displaced the mean, rather than joining it ---
 
@@ -4332,9 +4804,118 @@ class ContextReferentIsBoundTest(unittest.TestCase):
     def test_the_bands_are_iterated_from_the_payload(self) -> None:
         # Structural, like every other row payload on this page: the page
         # cannot show a band the API did not send, and cannot omit one it did.
-        loop = re.search(r'<template x-for="([^"]+)"', self.band)
-        self.assertIsNotNone(loop, "the bands are built some other way")
-        self.assertIn("summary.context.utilisation.bands", loop.group(1))
+        # TWO band loops since #61 -- one per scope and one pooled -- and both
+        # iterate a list the API sent rather than a list the page assembled.
+        loops = re.findall(r'<template x-for="([^"]+)"', self.band)
+        self.assertEqual(
+            [loop for loop in loops if "bands" in loop],
+            ["b in s.bands", "b in summary.context.utilisation.bands"],
+            "a band list is built some other way, or one of the two is gone",
+        )
+
+    def test_the_bands_lead_with_the_scope_split(self) -> None:
+        # #61: the FIRST thing under this heading is the scoped tally. On this
+        # project's own transcripts the pooled banner read "52 (1.9%) at 90%+",
+        # a non-event; the same calls scoped read main-thread 52 of 390 (13.3%)
+        # and subagent 0 of 2,332. Every red-band call was the orchestrating
+        # thread. Order is the whole difference between a figure that prompts
+        # an action and one that prompts none, so it is pinned.
+        loops = re.findall(r'<template x-for="([^"]+)"', self.band)
+        self.assertEqual(loops[0], SCOPE_LOOP_EXPR, "the pooled tally leads")
+        self.assertLess(
+            self.band.index(SCOPE_LOOP_EXPR),
+            self.band.index("summary.context.utilisation.includes"),
+            "the pooled figure is not demoted below the split it hides",
+        )
+
+    def test_the_pooled_tally_names_the_set_it_spans(self) -> None:
+        # Kept, not deleted -- it is the honest answer to "of every call in
+        # this window" and the denominator the partition is checked against.
+        # What was wrong with it was that it did not NAME its set: 2,332
+        # subagent calls dilute 390 main-thread ones 6:1 in it.
+        self.assertIn('x-text="summary.context.utilisation.includes"', self.band)
+
+    def test_each_scope_states_its_own_name_and_its_own_denominator(self) -> None:
+        # An aggregate must name the set it ranges over, and a share of the
+        # BANDED calls is neither a share of the sample nor of the window's
+        # calls. Both come from the scope's own row, never from the pooled one.
+        for field in ("scope", "banded_calls", "calls", "sample_calls"):
+            with self.subTest(field=field):
+                self.assertIn(f"s.{field}", self.scope_loop)
+
+    def test_a_scope_with_no_banded_sample_says_why_instead_of_drawing_zeroes(
+        self,
+    ) -> None:
+        # THE rule this block turns on: a real 0 and "no sample" must not
+        # render alike. A scope that ran calls with none in a band shows 0; a
+        # scope with no banded sample shows the API's reason. Its `share` is
+        # null, not 0.0, and four bands of "0.0%" would state a measurement
+        # nobody made -- so the chips live under the NEGATIVE branch, which is
+        # asserted by position rather than by their mere presence.
+        self.assertIn('x-if="s.no_sample_reason"', self.scope_loop)
+        self.assertIn('x-if="!s.no_sample_reason"', self.scope_loop)
+        self.assertLess(
+            self.scope_loop.index('x-if="!s.no_sample_reason"'),
+            self.scope_loop.index("b in s.bands"),
+            "the bands are drawn outside the branch that establishes a sample",
+        )
+        self.assertIn('x-text="s.no_sample_reason"', self.scope_loop)
+
+    def test_every_caveat_is_counted_per_scope_and_not_only_pooled(self) -> None:
+        # The three ways a call leaves the bands are scope facts too: a pooled
+        # count of them cannot say which scope to look at, which is the same
+        # defect as the pooled share one line up.
+        for field in (
+            "unmeasured_calls", "unknown_model_calls", "unknown_models",
+            "over_window_calls",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(f"s.{field}", self.scope_loop)
+
+    def test_the_provenances_stay_outside_the_scope_loop(self) -> None:
+        # Which window a model has, and where the boundaries sit, are
+        # properties of `context_window.py` -- not of a scope. Rendered inside
+        # this loop they would be stated once per scope, implying they could
+        # differ by one, and would put two copies of each date on the page.
+        # The API refuses to carry them per scope
+        # (`test_the_provenances_are_stated_once_and_not_per_scope`); this is
+        # the same refusal one layer up.
+        for field in ("window_provenance", "band_provenance"):
+            with self.subTest(field=field):
+                self.assertNotIn(field, self.scope_loop)
+                self.assertEqual(self.band.count(f'utilisation.{field}"'), 1)
+
+    def test_the_judged_boundaries_are_shown_and_not_just_their_verdict(self) -> None:
+        # Where a band is CUT is the judged half of the two provenances, and
+        # the page rendered only the verdict it produces. The chip now carries
+        # the boundary itself, read off the payload rather than copied here.
+        self.assertIn(":title=\"bandRange(b)\"", self.band)
+        body = js_function_body(self.html, "function bandRange(")
+        for field in ("b.lower", "b.upper"):
+            with self.subTest(field=field):
+                self.assertIn(field, body)
+
+    def test_the_open_top_band_is_not_rendered_as_an_absence(self) -> None:
+        # `upper` is null on the top band because it has NO upper bound, which
+        # is a fact about the band -- not a measurement nobody made. Run
+        # through `fmtPct` it would print the em-dash this page reserves for
+        # the other kind of absence, so the two must not print alike.
+        body = js_function_body(self.html, "function bandRange(")
+        self.assertLess(
+            body.index("b.upper === null"),
+            body.index("fmtPct(b.upper)"),
+            "a null upper bound is formatted before it is recognised",
+        )
+        self.assertIn("and above", body)
+
+    def test_both_dates_ride_with_the_figures(self) -> None:
+        # The two sentences stay at the foot of the band in their two voices;
+        # the two DATES sit with the numbers they qualify, so a reader weighing
+        # a band never has to hunt for how old the window table is or when the
+        # boundaries were last judged.
+        for field in ("windows_as_of", "bands_as_of"):
+            with self.subTest(field=field):
+                self.assertIn(f'x-text="summary.context.utilisation.{field}"', self.band)
 
     def test_the_page_invents_no_band_of_its_own(self) -> None:
         # Boundaries, labels and verdicts all belong to `context_window.py`,
