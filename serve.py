@@ -33,7 +33,7 @@ import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -44,6 +44,8 @@ from ingest import (
     SOURCE_SUBAGENT,
     STATUS_INGESTED,
     STATUS_UNAVAILABLE,
+    SUBAGENTS_DIR,
+    TASKS_DIR,
 )
 EASTERN = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
@@ -77,6 +79,29 @@ SCOPE_SUBAGENT = "subagent"
 SCOPE_LABELS = {SOURCE_MAIN: SCOPE_MAIN, SOURCE_SUBAGENT: SCOPE_SUBAGENT}
 SCOPE_INCLUDES_BOTH = "main-thread + subagent"
 SCOPE_INCLUDES_MAIN_ONLY = "main-thread only"
+
+# #44: the same rule on a SECOND axis -- which PROJECTS a figure ranges over.
+# The plugin resolves its database from `${CLAUDE_PLUGIN_DATA}`, one directory
+# per INSTALL, so a user-scope install ingests every project the user opens
+# into the same file ("several projects can share one database" --
+# docs/plugin.md). Every headline figure is then a sum across projects, in the
+# vocabulary of one.
+#
+# No `project` column is added for this, and none is needed: the dimension is
+# already in the stored path, whose shape is the layout `discover_sources()`
+# globs for. Naming the set is a read.
+#
+# The directory that names the project sits one nesting level apart between
+# the two source kinds:
+#
+#   <project>/<session>.jsonl                        SOURCE_MAIN
+#   <project>/<session>/subagents/agent-<id>.jsonl   SOURCE_SUBAGENT
+#   <project>/<session>/tasks/<entry>                SOURCE_SUBAGENT ingested
+#                                                    from the harness task
+#                                                    index, which mirrors the
+#                                                    same project name under
+#                                                    the OS temp dir
+PROJECT_HOLDER_DIRS = frozenset({SUBAGENTS_DIR, TASKS_DIR})
 
 # A reaped run whose dispatch time could not be read. Distinct from
 # `unavailable` (a gap PROVEN to fall in this window) because "we cannot tell
@@ -245,6 +270,42 @@ def staleness_verdict(
     if age < 0:
         return None, STALE_UNKNOWN_RUN_IN_FUTURE
     return age > STALE_AFTER_SECONDS, None
+def project_of(source_path: str, source_kind: str) -> Optional[str]:
+    """Which PROJECT a stored source path belongs to, or None if it cannot say.
+
+    Not a second parser: the shapes are the ones `ingest.discover_sources()`
+    globs for, spelled with the ingester's own constants (see
+    `PROJECT_HOLDER_DIRS`), so a layout change has one owner and this follows
+    it rather than drifting from it.
+
+    The answer is the directory NAME, not its path. That name is Claude Code's
+    slug -- the absolute working directory with each separator folded to `-` --
+    which is what identifies a project; the harness mirrors the same slug under
+    the OS temp dir, so keying on the full path would split one project in two.
+
+    **Returns None rather than guessing.** A path that fits none of the shapes
+    has no project we can name, and the two available guesses are both wrong in
+    the direction this issue exists to prevent: the directory that happens to
+    sit above the file books one project's tokens under another's name, and a
+    synthesised "(unknown)" project inflates the count of a set the figure
+    ranges over. The caller counts these separately instead (rule #12).
+
+    Pure string work over `PurePath`: no filesystem is consulted, so a
+    transcript reaped months ago still resolves to its project.
+    """
+    path = PurePath(source_path)
+    if source_kind == SOURCE_MAIN:
+        holder = path.parent
+    elif source_kind == SOURCE_SUBAGENT:
+        if path.parent.name not in PROJECT_HOLDER_DIRS:
+            return None
+        holder = path.parent.parent.parent
+    else:
+        # A kind this version does not know is not a project it can locate.
+        return None
+    # An empty `.name` means the walk ran off the top into the anchor ('/' or
+    # a relative '.'), i.e. there is no project directory above this file.
+    return holder.name or None
 
 
 class Api:
@@ -390,8 +451,102 @@ class Api:
             "sources": [r["path"] for r in rows],
         }
 
+    def _projects(self, start: float, end: float) -> dict[str, Any]:
+        """Which PROJECTS the figures in this response range over (#44).
+
+        TWO sets, counted separately and never merged, because neither answers
+        the other's question:
+
+        * `in_window` ranges over exactly the rows every other figure here does
+          -- projects with at least one call in [start, end). It is what the
+          totals on screen actually cover, and it is the count that says
+          whether a headline number is one project's or several projects'.
+        * `in_database` ignores the window and ranges over everything this
+          database holds. A project that was ingested but is silent in this
+          window is a MEASURED ZERO, not an absent one (rule #12): reporting
+          only the window would quietly shrink the set as the reader narrows
+          the dates, and a cross-project database would look single-project on
+          any day only one project was used.
+
+        Both are named in the payload, so which one a reader is looking at is
+        never a matter of inference.
+
+        `unattributed_calls` / `unattributed_sources` count what `project_of()`
+        refused to place. Those calls stay in the totals -- their tokens were
+        measured -- but they belong to no project here and are NOT folded into
+        one, because the only available fold is a guess at a neighbour.
+        `unattributed_calls` is window-scoped like `in_window`;
+        `unattributed_sources` is database-wide like `in_database`.
+        """
+        # DISTINCT paths rather than a grouped COUNT: the SET is what the scope
+        # line ranges over, and per-path call counts are needed only for paths
+        # the layout could not place -- normally none.
+        #
+        # Measured 2026-08-05 on a synthetic 600k-call / 3,000-source /
+        # 18-project database (macOS, warm cache, best of 5), against a
+        # `summary()` of ~1.5 s: this block costs 283 ms as written and 422 ms
+        # when the window set came from a grouped COUNT. A corpus that DOES
+        # hold an unplaceable path pays 637 ms, because the second pass below
+        # then runs -- borne by the corpus that has the problem, not by every
+        # other one.
+        window: set[str] = set()
+        window_has_unplaceable = False
+        for row in self.conn.execute(
+            "SELECT DISTINCT source_path, source_kind FROM api_calls"
+            " WHERE ts >= ? AND ts < ?",
+            (start, end),
+        ):
+            name = project_of(row["source_path"], row["source_kind"])
+            if name is None:
+                window_has_unplaceable = True
+            else:
+                window.add(name)
+        unattributed_calls = 0
+        if window_has_unplaceable:
+            # Its own pass, run only when there is something to count, and
+            # counting CALLS: the number of unplaceable paths is a count of
+            # files, and reporting one as the other is this project's own
+            # defect class -- a plausible number for a different quantity.
+            unattributed_calls = sum(
+                row["calls"]
+                for row in self.conn.execute(
+                    "SELECT source_path, source_kind, COUNT(*) calls FROM api_calls"
+                    " WHERE ts >= ? AND ts < ? GROUP BY source_path, source_kind",
+                    (start, end),
+                )
+                if project_of(row["source_path"], row["source_kind"]) is None
+            )
+        database: set[str] = set()
+        unattributed_sources = 0
+        # UNION over BOTH tables, deliberately: `ingest_state` is the file
+        # ledger and `api_calls` is the measurements, and the durability block
+        # already depends on the two agreeing. Should they ever diverge, a
+        # union over-reports the set rather than silently shrinking it -- and
+        # under-reporting is what this issue is about. `UNION`, not `UNION
+        # ALL`: the same (path, kind) in both tables is one source.
+        for row in self.conn.execute(
+            "SELECT path source_path, source_kind FROM ingest_state"
+            " UNION SELECT DISTINCT source_path, source_kind FROM api_calls"
+        ):
+            name = project_of(row["source_path"], row["source_kind"])
+            if name is None:
+                unattributed_sources += 1
+            else:
+                database.add(name)
+        return {
+            "in_window": len(window),
+            "names_in_window": sorted(window),
+            "in_database": len(database),
+            "names_in_database": sorted(database),
+            "unattributed_calls": unattributed_calls,
+            "unattributed_sources": unattributed_sources,
+        }
+
     def _scope(self, start: float, end: float) -> dict[str, Any]:
         """Main-thread vs subagent breakdown + transcript COVERAGE (#4966).
+
+        Plus, on its own axis, the PROJECT set these figures range over (#44) --
+        see `_projects()`.
 
         `coverage` is what keeps a real zero distinguishable from an
         unmeasured one (rule #12): `subagent.calls == 0` with
@@ -475,6 +630,10 @@ class Api:
             "main_thread": bucket(SOURCE_MAIN),
             "subagent": bucket(SOURCE_SUBAGENT),
             "coverage": cov,
+            # A SECOND axis beside `includes`, never folded into it: "which
+            # source kinds" and "which projects" are different questions, and
+            # one string answering both would answer neither (#44).
+            "projects": self._projects(start, end),
         }
 
     def models(self, start: float, end: float) -> list[dict[str, Any]]:
