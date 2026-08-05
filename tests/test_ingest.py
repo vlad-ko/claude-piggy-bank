@@ -3054,27 +3054,37 @@ class SchemaVersionSetsAreDecidedTest(unittest.TestCase):
     difference between its shape and the CURRENT one can be applied without
     losing a measurement. This test cannot judge that for a future version --
     what it pins is that the set was re-read at the bump, by tying it to the
-    five hops (#20's added table, #30's dropped column, #15's added census
-    table, #36's uniqueness, #5's added diagnostics columns) that were actually
-    reasoned about.
+    six hops (#20's added table, #30's dropped column, #15's added census
+    table, #36's uniqueness, #5's added diagnostics columns, #84's added
+    per-TTL cache-write columns) that were actually reasoned about.
     """
 
-    def test_schema_version_is_11(self) -> None:
-        self.assertEqual(ingest_mod.SCHEMA_VERSION, 11)
+    def test_schema_version_is_12(self) -> None:
+        self.assertEqual(ingest_mod.SCHEMA_VERSION, 12)
 
-    def test_only_the_five_reasoned_hops_upgrade_in_place(self) -> None:
+    def test_only_the_six_reasoned_hops_upgrade_in_place(self) -> None:
         # v9 was re-checked against the CURRENT shape at the v10 bump, not
         # inherited: v9 -> v10 adds the UNIQUE index over `task_id`, which
         # needs the duplicates already stored resolved first. That deletes
         # rows, so the bar this set applies had to be RESTATED at that bump --
         # what the hop preserves is every DISPATCH, not every row.
         #
-        # v10 was decided at THIS bump against the same restated bar: v10 -> v11
-        # adds three nullable `api_calls` columns and deletes nothing, and NULL
-        # in them is a true statement about a row written before CPB ever read
-        # `message.diagnostics` -- it means unmeasured, which is what those rows
-        # are. The reasoning is written out above the constant.
-        self.assertEqual(ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7, 8, 9, 10}))
+        # v10 was decided at the v11 bump against the same restated bar: v10 ->
+        # v11 adds three nullable `api_calls` columns and deletes nothing, and
+        # NULL in them is a true statement about a row written before CPB ever
+        # read `message.diagnostics` -- it means unmeasured, which is what those
+        # rows are.
+        #
+        # v11 is decided at THIS bump, and its delta is two more nullable
+        # `api_calls` columns (#84). What earns it a place is as much what the
+        # hop leaves alone: `cache_write` keeps its meaning and its value, so
+        # no figure reading it changes, and the only value written to an
+        # existing row is NULL -- "this row predates CPB reading
+        # `usage.cache_creation`", which is true of every one of them. The
+        # reasoning is written out above the constant.
+        self.assertEqual(
+            ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7, 8, 9, 10, 11})
+        )
 
     def test_the_current_version_is_not_in_the_upgrade_set(self) -> None:
         # A no-op hop is not an upgrade; listing it would make the branch
@@ -3718,6 +3728,15 @@ class InPlaceRepairSetsAreDecidedTest(unittest.TestCase):
         # reader can write (`CacheMissDiagnosticsUpgradeTest`). A NOT NULL
         # column, or one whose NULL would be read as a measurement, cannot be
         # added this way at all.
+        #
+        # The two per-TTL cache-write columns (#84): NULL means "this row was
+        # written before CPB read `usage.cache_creation`" -- again unmeasured,
+        # and again true of every pre-v12 row by construction. Both plausible
+        # back-fills are FALSE rather than merely imprecise, which is what makes
+        # NULL the only admissible value: 0 would state the call wrote no cache
+        # at that TTL, and copying `cache_write` into `cache_write_5m` would
+        # assert a 1.25x write for the 26.86% of cache-write tokens measured as
+        # 1-hour 2x writes (`PerTtlCacheWriteUpgradeTest`).
         self.assertEqual(
             dict(ingest_mod.IN_PLACE_ADDABLE_COLUMNS),
             {
@@ -3725,6 +3744,8 @@ class InPlaceRepairSetsAreDecidedTest(unittest.TestCase):
                 ("api_calls", "cache_miss_outcome"): "TEXT",
                 ("api_calls", "cache_miss_reason"): "TEXT",
                 ("api_calls", "cache_missed_input_tokens"): "INTEGER",
+                ("api_calls", "cache_write_5m"): "INTEGER",
+                ("api_calls", "cache_write_1h"): "INTEGER",
             },
         )
 
@@ -6123,6 +6144,718 @@ class CacheMissDiagnosticsUpgradeTest(unittest.TestCase):
         self.assertEqual(
             self._outcomes()[ingest_mod.CACHE_DIAG_DIVERGENCE], 6
         )
+
+
+# PER-TTL CACHE-WRITE SPLIT FIXTURE (#84).
+#
+# Every number below is deliberately DISTINCT from every other, and from the
+# flat total, because the defect this guards against is a mapping error that a
+# fixture of equal values cannot see. Concretely: 5m != 1h, 5m + 1h != every
+# other call's flat total, and no TTL value equals `input_tokens`,
+# `cache_read_input_tokens` or `output_tokens` on the same record. A test that
+# passes with `cache_write_5m` and `cache_write_1h` swapped, or with either
+# reading the flat total, is not a test.
+#
+# Primes, so no value is a multiple or a sum of the others by accident.
+SPLIT_5M = 1013
+SPLIT_1H = 1019
+SPLIT_FLAT = SPLIT_5M + SPLIT_1H  # the RECONCILING case: 2032
+
+# The unreconciled case, measured on 8 of 170,079 deduped calls (2026-08-05)
+# and always in this direction -- the flat total 0 while the split is not, so
+# the flat total UNDERSTATES. Kept exactly as read, never summed into agreement.
+SPLIT_ORPHAN_1H = 1031
+
+# A third TTL, which the API does not currently emit: 0 of 342,850 assistant
+# records carried one. It stands for the release that adds one. CPB must
+# CENSUS it by name and must not fold it into either stored column.
+UNKNOWN_TTL_KEY = "ephemeral_3h_input_tokens"
+UNKNOWN_TTL_VALUE = 1039
+
+_NO_CACHE_CREATION = object()
+
+
+def split_line(
+    message_id: str,
+    input_tokens: int,
+    *,
+    flat: int,
+    cache_creation=_NO_CACHE_CREATION,
+    output_tokens: int = 3,
+    ts: str = "2026-08-05T13:00:00.000Z",
+) -> str:
+    """One assistant record, with `usage.cache_creation` present or ABSENT.
+
+    The default omits the key ENTIRELY, which is the shape a Claude Code
+    release that never wrote the split would produce, and a different fact from
+    an empty object. `flat` is passed independently of the split on purpose:
+    the two are separate readings and the fixture has to be able to state them
+    in disagreement.
+    """
+    usage: dict = {
+        "input_tokens": input_tokens,
+        "cache_creation_input_tokens": flat,
+        "cache_read_input_tokens": input_tokens * 7,
+        "output_tokens": output_tokens,
+    }
+    if cache_creation is not _NO_CACHE_CREATION:
+        usage["cache_creation"] = cache_creation
+    return json.dumps(
+        {
+            "type": "assistant",
+            "sessionId": "split-fixture",
+            "timestamp": ts,
+            "message": {
+                "id": message_id,
+                "model": "claude-sonnet-5-20260115",
+                "usage": usage,
+                "content": [{"type": "text", "text": "reply"}],
+            },
+        }
+    ) + "\n"
+
+
+def both_ttls(five: int = SPLIT_5M, hour: int = SPLIT_1H) -> dict:
+    return {
+        ingest_mod.CACHE_WRITE_5M_KEY: five,
+        ingest_mod.CACHE_WRITE_1H_KEY: hour,
+    }
+
+
+SPLIT_TRANSCRIPT = "".join(
+    [
+        # 1. BOTH keys present and reconciling -- the corpus's overwhelming
+        #    majority (170,071 of 170,079 deduped calls, 2026-08-05).
+        split_line("msg_both", 5, flat=SPLIT_FLAT, cache_creation=both_ttls()),
+        # 2. FLAT TOTAL, NO SPLIT. Not observed on this machine (0 of 342,850
+        #    records) but it is what a Claude Code release predating the field
+        #    wrote, and the acceptance rule for it is absolute: UNMEASURED for
+        #    both TTLs, never 0 and never "assume all 5-minute".
+        split_line("msg_flat_only", 7, flat=SPLIT_FLAT),
+        # 3. ONE key present, the other not. A real half-measurement: the
+        #    present one is READ, the absent one is unmeasured, and the pair
+        #    cannot be reconciled against the flat total at all.
+        split_line(
+            "msg_only_5m",
+            11,
+            flat=SPLIT_5M,
+            cache_creation={ingest_mod.CACHE_WRITE_5M_KEY: SPLIT_5M},
+        ),
+        split_line(
+            "msg_only_1h",
+            13,
+            flat=SPLIT_1H,
+            cache_creation={ingest_mod.CACHE_WRITE_1H_KEY: SPLIT_1H},
+        ),
+        # 4. A THIRD, unseen TTL key beside the two known ones. The known two
+        #    are still read; the third is censused by name and folded into
+        #    neither column.
+        split_line(
+            "msg_third_ttl",
+            17,
+            flat=SPLIT_FLAT + UNKNOWN_TTL_VALUE,
+            cache_creation=dict(both_ttls(), **{UNKNOWN_TTL_KEY: UNKNOWN_TTL_VALUE}),
+        ),
+        # 5. THE UNRECONCILED SHAPE, as measured: flat 0, split not. Stored as
+        #    read, counted, and never made to agree.
+        #
+        #    STREAMED, deliberately, and the reason is a fixture defect this
+        #    caught. Every counted shape below has to arrive on a MULTI-RECORD
+        #    call somewhere in this fixture, or moving the three counters back
+        #    in front of `_dedupe_calls` changes no number here and the
+        #    per-call grain is untested. Verified by mutation: with the
+        #    unreconciled and unreadable shapes on single-record calls only,
+        #    counting records instead of calls SURVIVED.
+        split_line(
+            "msg_unreconciled",
+            19,
+            flat=0,
+            cache_creation={
+                ingest_mod.CACHE_WRITE_5M_KEY: 0,
+                ingest_mod.CACHE_WRITE_1H_KEY: SPLIT_ORPHAN_1H,
+            },
+        ),
+        split_line(
+            "msg_unreconciled",
+            19,
+            flat=0,
+            cache_creation={
+                ingest_mod.CACHE_WRITE_5M_KEY: 0,
+                ingest_mod.CACHE_WRITE_1H_KEY: SPLIT_ORPHAN_1H,
+            },
+            output_tokens=8,
+        ),
+        # 6. Shapes the reader cannot trust: `cache_creation` that is not an
+        #    object, and a TTL value that is not an integer. Both must leave the
+        #    call's four measured token classes intact -- the usage was fine.
+        split_line("msg_not_an_object", 23, flat=SPLIT_FLAT, cache_creation=7),
+        split_line(
+            "msg_bad_value",
+            29,
+            flat=SPLIT_FLAT,
+            cache_creation={
+                ingest_mod.CACHE_WRITE_5M_KEY: SPLIT_5M,
+                ingest_mod.CACHE_WRITE_1H_KEY: "lots",
+            },
+        ),
+        # 7. `True` is an `int` in Python and would store as a plausible 1.
+        split_line(
+            "msg_bool_value",
+            31,
+            flat=SPLIT_FLAT,
+            cache_creation={
+                ingest_mod.CACHE_WRITE_5M_KEY: True,
+                ingest_mod.CACHE_WRITE_1H_KEY: SPLIT_1H,
+            },
+        ),
+        # 8. Two STREAMED records of one call (#2). The split is a property of
+        #    the CALL, so it must survive dedupe exactly once, carried by the
+        #    surviving WHOLE record.
+        split_line(
+            "msg_streamed",
+            37,
+            flat=SPLIT_FLAT,
+            cache_creation=both_ttls(),
+            output_tokens=5,
+        ),
+        split_line(
+            "msg_streamed",
+            37,
+            flat=SPLIT_FLAT,
+            cache_creation=both_ttls(),
+            output_tokens=9,
+        ),
+        # 9. Three streamed records of a call whose split is UNREADABLE, so the
+        #    "without a split" and "unreadable" counts both range over a
+        #    multi-record call too (see the note at 5). Three, not two, so the
+        #    per-record count differs from the per-call one by more than the
+        #    other shapes could mask.
+        split_line("msg_streamed_unreadable", 47, flat=SPLIT_FLAT,
+                   cache_creation=[SPLIT_5M], output_tokens=2),
+        split_line("msg_streamed_unreadable", 47, flat=SPLIT_FLAT,
+                   cache_creation=[SPLIT_5M], output_tokens=4),
+        split_line("msg_streamed_unreadable", 47, flat=SPLIT_FLAT,
+                   cache_creation=[SPLIT_5M], output_tokens=6),
+    ]
+)
+
+
+class PerTtlCacheWriteIngestTest(unittest.TestCase):
+    """`usage.cache_creation`, read onto the call at the `message.id` grain (#84).
+
+    `cache_creation_input_tokens` is a FLAT TOTAL over two writes that are
+    priced differently and repay after a different number of reads -- 1.25x
+    repaid by the first read, 2x needing the second (TA-8). So "did this write
+    repay?" has two answers and the flat total names neither.
+
+    What has to stay apart here, and why one nullable column pair is enough
+    only because NULL means exactly one thing:
+
+      1. both keys read -> two measurements, and the flat total UNCHANGED
+         beside them. It is what every existing figure reads.
+      2. no `cache_creation` at all -> both NULL. UNMEASURED, never 0 (which
+         would say this call wrote no cache at that TTL) and never a share of
+         the flat total (which would be an apportionment nobody observed).
+      3. one key only -> that one read, the other NULL. A half-measurement is
+         still a measurement; the absent half is censused by name.
+      4. a third key -> censused by name, folded into neither column.
+
+    And the finding the fixture exists to keep visible: the split and the flat
+    total DO NOT always sum, so nothing here reconciles them.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-ttl-split-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "split-fixture.jsonl"
+        self.transcript.write_text(SPLIT_TRANSCRIPT)
+        self.db = self.tmp / "usage.db"
+        self.summary = ingest(self.projects, self.db)
+        self.conn = sqlite3.connect(self.db)
+        self.addCleanup(self.conn.close)
+
+    def _rows(self) -> dict:
+        return {
+            row[0]: row[1:]
+            for row in self.conn.execute(
+                "SELECT message_id, cache_write, cache_write_5m, cache_write_1h"
+                " FROM api_calls"
+            )
+        }
+
+    def test_every_record_parsed_and_one_row_survives_per_call(self) -> None:
+        # 15 records, 11 calls: three ids are streamed over more than one
+        # record and are ONE call each. Nothing here is malformed as a RECORD
+        # -- an unreadable split is a refusal to measure a supplementary field,
+        # not a parse failure, and must never cost the call its four token
+        # classes.
+        self.assertEqual(self.summary["unparsed_records"], 0)
+        self.assertEqual(self.summary["records_parsed"], 15)
+        self.assertEqual(len(self._rows()), 11)
+
+    def test_each_shape_lands_on_its_call_with_the_flat_total_intact(self) -> None:
+        # The whole acceptance table in one assertion, and the reason the
+        # fixture's values are all distinct primes: every cell here would still
+        # be a legal-looking number under a swapped or duplicated mapping.
+        self.assertEqual(
+            self._rows(),
+            {
+                "msg_both": (SPLIT_FLAT, SPLIT_5M, SPLIT_1H),
+                # UNMEASURED, and the flat total survives untouched beside it.
+                "msg_flat_only": (SPLIT_FLAT, None, None),
+                "msg_only_5m": (SPLIT_5M, SPLIT_5M, None),
+                "msg_only_1h": (SPLIT_1H, None, SPLIT_1H),
+                # The third key changed neither stored column.
+                "msg_third_ttl": (SPLIT_FLAT + UNKNOWN_TTL_VALUE, SPLIT_5M, SPLIT_1H),
+                # As read. 0 + 1031 != 0, and it is stored that way.
+                "msg_unreconciled": (0, 0, SPLIT_ORPHAN_1H),
+                "msg_not_an_object": (SPLIT_FLAT, None, None),
+                # The readable half stands; the unreadable one is not invented.
+                "msg_bad_value": (SPLIT_FLAT, SPLIT_5M, None),
+                # `True` is an int in Python and must NOT store as 1.
+                "msg_bool_value": (SPLIT_FLAT, None, SPLIT_1H),
+                "msg_streamed": (SPLIT_FLAT, SPLIT_5M, SPLIT_1H),
+                "msg_streamed_unreadable": (SPLIT_FLAT, None, None),
+            },
+        )
+
+    def test_the_two_ttls_are_not_interchangeable(self) -> None:
+        # Stated on its own, because it is the assertion a swapped mapping has
+        # to fail. The fixture pins them unequal precisely so this can be said.
+        row = self._rows()["msg_both"]
+        self.assertNotEqual(SPLIT_5M, SPLIT_1H)
+        self.assertEqual(row[1], SPLIT_5M)
+        self.assertEqual(row[2], SPLIT_1H)
+        self.assertNotEqual(row[1], row[2])
+
+    def test_an_absent_split_is_unmeasured_and_is_not_the_flat_total(self) -> None:
+        # The rule this design exists for. The two wrong answers are named
+        # explicitly so that neither can pass as "close enough": 0 states the
+        # call wrote no cache at that TTL, and the flat total states it was all
+        # 5-minute -- which for 26.86% of measured cache-write tokens
+        # (2026-08-05) would apply a 1.25x break-even to a 2x write.
+        flat, five, hour = self._rows()["msg_flat_only"]
+        self.assertEqual(flat, SPLIT_FLAT)
+        self.assertIsNone(five)
+        self.assertIsNone(hour)
+        self.assertNotEqual(five, 0)
+        self.assertNotEqual(five, flat)
+
+    def test_a_call_with_no_split_is_not_reachable_by_asking_for_zero(self) -> None:
+        # The state change a reader actually depends on: SQL `= 0` must not
+        # return the unmeasured rows, and `IS NULL` must not return the real
+        # zero. `msg_unreconciled` carries a MEASURED 0 for 5-minute, so the
+        # two readings are both present in this database and must not collide.
+        def ids(where: str) -> set:
+            return {
+                row[0]
+                for row in self.conn.execute(
+                    f"SELECT message_id FROM api_calls WHERE {where}"
+                )
+            }
+
+        self.assertEqual(ids("cache_write_5m = 0"), {"msg_unreconciled"})
+        self.assertIn("msg_flat_only", ids("cache_write_5m IS NULL"))
+        self.assertNotIn("msg_unreconciled", ids("cache_write_5m IS NULL"))
+
+    def test_a_third_ttl_key_is_censused_by_name_and_not_folded_in(self) -> None:
+        # `source_shape` already censuses a `usage` key nobody has seen (#15),
+        # and this is exactly what it exists for -- so the name is QUALIFIED
+        # rather than a parallel mechanism, and a nested key can never be
+        # confused with a top-level one of the same spelling.
+        self.assertEqual(
+            census_rows(
+                self.db, ingest_mod.SHAPE_UNKNOWN_USAGE_KEY, self.transcript
+            ),
+            {f"{ingest_mod.CACHE_CREATION_KEY}.{UNKNOWN_TTL_KEY}": 1},
+        )
+        # ...and its tokens went into NEITHER stored column, because CPB does
+        # not know what they are. Folding them into 5-minute would price a
+        # token class at a multiplier nobody documented.
+        flat, five, hour = self._rows()["msg_third_ttl"]
+        self.assertEqual((five, hour), (SPLIT_5M, SPLIT_1H))
+        self.assertEqual(flat - (five + hour), UNKNOWN_TTL_VALUE)
+
+    def test_a_ttl_key_that_goes_missing_is_censused_by_name(self) -> None:
+        # The other direction, and it is counted even though it is SAFE: an
+        # absent key here yields NULL rather than a silent 0, so nothing is
+        # zeroed -- but a release that stopped writing one is still a format
+        # move, and a column that quietly went all-NULL is not something anyone
+        # spots in a chart. One record omits each key; the two records with no
+        # `cache_creation` at all are NOT counted here (there is no object for
+        # a key to be missing from), and neither is the non-object one.
+        self.assertEqual(
+            census_rows(
+                self.db, ingest_mod.SHAPE_MISSING_USAGE_KEY, self.transcript
+            ),
+            {
+                f"{ingest_mod.CACHE_CREATION_KEY}.{ingest_mod.CACHE_WRITE_5M_KEY}": 1,
+                f"{ingest_mod.CACHE_CREATION_KEY}.{ingest_mod.CACHE_WRITE_1H_KEY}": 1,
+            },
+        )
+
+    def test_the_split_and_the_flat_total_are_not_made_to_agree(self) -> None:
+        # The finding, pinned. Measured on 8 of 170,079 deduped calls
+        # (2026-08-05), every one of them flat-0 against a non-zero split, so
+        # the flat total understated. Normalising either value would delete the
+        # only evidence that they disagreed.
+        flat, five, hour = self._rows()["msg_unreconciled"]
+        self.assertEqual((flat, five, hour), (0, 0, SPLIT_ORPHAN_1H))
+        self.assertNotEqual(five + hour, flat)
+        # And a reader can find it in SQL, over the rows where BOTH TTLs are
+        # measured -- which is the only set the question can be asked of.
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.conn.execute(
+                    "SELECT message_id FROM api_calls"
+                    " WHERE cache_write_5m IS NOT NULL AND cache_write_1h IS NOT NULL"
+                    " AND cache_write_5m + cache_write_1h != cache_write"
+                )
+            },
+            {"msg_unreconciled", "msg_third_ttl"},
+        )
+
+    def test_a_partial_split_is_not_reported_as_a_disagreement(self) -> None:
+        # With one TTL unmeasured the sum of what is known is not the sum of
+        # what happened, so there is nothing to compare. Counting those calls
+        # as unreconciled would invent a finding in the field added to prevent
+        # exactly that -- `msg_only_5m` and `msg_only_1h` are half-measured,
+        # not in disagreement.
+        parsed = parse_file(self.transcript)
+        by_id = {call.message_id: call for call in parsed.calls}
+        for message_id in ("msg_only_5m", "msg_only_1h", "msg_bad_value"):
+            with self.subTest(call=message_id):
+                self.assertIsNone(by_id[message_id].cache_write_split_total)
+                self.assertFalse(by_id[message_id].cache_write_unreconciled)
+
+    def test_an_unreadable_split_costs_the_call_nothing_measured(self) -> None:
+        # The usage object was fine; only the supplementary field was not.
+        # Raising here -- as `tok()` does for a present non-numeric value --
+        # would trade four measured token classes for a fifth.
+        self.assertEqual(
+            {
+                row[0]: row[1:]
+                for row in self.conn.execute(
+                    "SELECT message_id, input_tokens, cache_read, cache_write,"
+                    " output_tokens FROM api_calls WHERE message_id IN"
+                    " ('msg_not_an_object', 'msg_bad_value')"
+                )
+            },
+            {
+                "msg_not_an_object": (23, 23 * 7, SPLIT_FLAT, 3),
+                "msg_bad_value": (29, 29 * 7, SPLIT_FLAT, 3),
+            },
+        )
+
+    def test_the_split_survives_dedupe_exactly_once(self) -> None:
+        # #2: one API call is many transcript records, each repeating the same
+        # `message.usage`. Counting records would inflate both TTL columns by
+        # however many content blocks Claude Code happened to stream.
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM api_calls WHERE message_id = 'msg_streamed'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT output_tokens, cache_write_5m, cache_write_1h FROM api_calls"
+                " WHERE message_id = 'msg_streamed'"
+            ).fetchone(),
+            (9, SPLIT_5M, SPLIT_1H),
+        )
+
+    def test_the_split_joins_the_dedupe_agreement_check(self) -> None:
+        # Measured 2026-08-05: 0 of 123,367 multi-record ids disagreed on the
+        # split alone, so this changes no number today. It is here so that
+        # stays a MEASURED fact -- a field CPB stores but does not compare is
+        # one `divergent_message_ids` silently does not range over.
+        self.assertIn("cache_write_5m", ingest_mod._STATIC_USAGE)
+        self.assertIn("cache_write_1h", ingest_mod._STATIC_USAGE)
+        source = self.projects / "divergent-split.jsonl"
+        source.write_text(
+            split_line("msg_split_drift", 41, flat=SPLIT_FLAT,
+                       cache_creation=both_ttls(), output_tokens=2)
+            + split_line("msg_split_drift", 41, flat=SPLIT_FLAT,
+                         cache_creation=both_ttls(SPLIT_1H, SPLIT_5M),
+                         output_tokens=6)
+        )
+        parsed = parse_file(source)
+        self.assertEqual(parsed.divergent_message_ids, 1)
+        # One WHOLE record survives -- never a per-field maximum, which would
+        # describe an API response that never happened.
+        self.assertEqual(len(parsed.calls), 1)
+        self.assertEqual(
+            (parsed.calls[0].cache_write_5m, parsed.calls[0].cache_write_1h),
+            (SPLIT_1H, SPLIT_5M),
+        )
+
+    def test_the_three_coverage_facts_are_counted_separately(self) -> None:
+        # Three questions, three counts. A single "problems" number would name
+        # none of them, and folding the partial calls into "without a split"
+        # would report a measurement as an absence.
+        #
+        # without: msg_flat_only, msg_not_an_object, msg_streamed_unreadable.
+        # unreadable: those last two, plus msg_bad_value and msg_bool_value.
+        # unreconciled: msg_unreconciled, msg_third_ttl.
+        #
+        # All three range over CALLS. Per RECORD they would read 5, 6 and 3
+        # respectively, because two of the counted shapes are streamed -- which
+        # is what makes the grain testable at all.
+        self.assertEqual(self.summary["calls_without_cache_write_split"], 3)
+        self.assertEqual(self.summary["calls_with_unreadable_cache_write_split"], 4)
+        self.assertEqual(self.summary["calls_with_unreconciled_cache_write"], 2)
+
+    def test_single_file_mode_reports_the_same_three_counts(self) -> None:
+        # The hook path measures the same file and must not report a quieter
+        # corpus than the directory path does.
+        summary = ingest_mod.ingest_transcript(self.transcript, self.tmp / "hook.db")
+        self.assertEqual(summary["calls_without_cache_write_split"], 3)
+        self.assertEqual(summary["calls_with_unreadable_cache_write_split"], 4)
+        self.assertEqual(summary["calls_with_unreconciled_cache_write"], 2)
+
+    def test_the_counts_are_said_out_loud(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ingest_mod.print_cache_write_split_note(self.summary)
+        note = out.getvalue()
+        self.assertIn("no `usage.cache_creation` split: 3", note)
+        self.assertIn("unreadable: 4", note)
+        self.assertIn("`cache_creation_input_tokens`: 2", note)
+        # And it says what the numbers MEAN, because a bare count invites the
+        # benign reading this whole design exists to refuse.
+        self.assertIn("UNMEASURED", note)
+        self.assertIn("assume all 5-minute", note)
+
+    def test_a_corpus_with_nothing_to_report_says_nothing(self) -> None:
+        # So that the note above MEANS something when it appears.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ingest_mod.print_cache_write_split_note(
+                {
+                    "calls_without_cache_write_split": 0,
+                    "calls_with_unreadable_cache_write_split": 0,
+                    "calls_with_unreconciled_cache_write": 0,
+                }
+            )
+        self.assertEqual(out.getvalue(), "")
+
+    def test_a_clean_split_names_nothing_in_the_census(self) -> None:
+        # The census must stay silent on the shape CPB expects, or every real
+        # corpus reports a shape change and the signal is worthless.
+        clean = self.projects / "clean-split.jsonl"
+        clean.write_text(
+            split_line("msg_clean", 43, flat=SPLIT_FLAT, cache_creation=both_ttls())
+        )
+        parsed = parse_file(clean)
+        self.assertEqual(
+            {
+                fact: name
+                for (fact, name) in parsed.shape
+                if fact != ingest_mod.SHAPE_VERSION
+            },
+            {},
+        )
+
+
+class PerTtlCacheWriteUpgradeTest(unittest.TestCase):
+    """v11 -> v12 adds the two columns without re-parsing anything (#84).
+
+    The rows a v11 database holds were written by a build that never looked
+    inside `usage.cache_creation`. They upgrade to NULL, which is UNMEASURED --
+    the only true statement about them.
+
+    The two back-fills that would have been convenient are both FALSE, and
+    falsely precise, which is what makes this hop's admission to
+    `IN_PLACE_UPGRADE_FROM` an argument rather than a habit:
+
+      * 0 states the call wrote no cache at that TTL. Wrong for 131,662 of
+        170,079 calls on the reference corpus (2026-08-05).
+      * `cache_write_5m = cache_write` -- "assume all 5-minute" -- is TA-8's
+        forbidden collapse applied to a whole corpus at once, and it errs in
+        the direction that makes a 2x write look like a 1.25x one, i.e. it
+        would report writes as repaid that were not. 26.86% of measured
+        cache-write tokens were 1-hour.
+
+    The alternative to an in-place hop is a rebuild, which the reaped-source
+    guard REFUSES on exactly the corpora whose database is the only copy of
+    their history. Two added nullable columns must not be the change that
+    strands those databases at v11.
+    """
+
+    # The v11 shape of `api_calls`, STATED rather than reached by DROP COLUMN.
+    # Same reasoning as `CacheMissDiagnosticsUpgradeTest.API_CALLS_AT_V10`: the
+    # DROP COLUMN statement is itself version-sensitive, and a fixture that
+    # differs across CI legs tests the fixture rather than the code.
+    API_CALLS_AT_V11 = """
+        CREATE TABLE api_calls_v11 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            agent_id TEXT,
+            turn_id INTEGER,
+            ts REAL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            cache_read INTEGER NOT NULL,
+            cache_write INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            context_size INTEGER NOT NULL,
+            is_sidechain INTEGER NOT NULL DEFAULT 0,
+            message_id TEXT,
+            cache_miss_outcome TEXT,
+            cache_miss_reason TEXT,
+            cache_missed_input_tokens INTEGER
+        )
+    """
+    V11_COLUMNS = (
+        "id, session_id, source_path, source_kind, agent_id, turn_id, ts, model,"
+        " input_tokens, cache_read, cache_write, output_tokens, context_size,"
+        " is_sidechain, message_id, cache_miss_outcome, cache_miss_reason,"
+        " cache_missed_input_tokens"
+    )
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-ttl-split-upgrade-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "split-fixture.jsonl"
+        self.transcript.write_text(SPLIT_TRANSCRIPT)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        return conn
+
+    def _snapshot(self) -> list:
+        return self._conn().execute(
+            f"SELECT {self.V11_COLUMNS} FROM api_calls ORDER BY id"
+        ).fetchall()
+
+    def _split_states(self) -> dict:
+        """How many rows are unmeasured, and how many carry a reading."""
+        conn = self._conn()
+        return {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT CASE WHEN cache_write_5m IS NULL AND cache_write_1h IS NULL"
+                " THEN '(unmeasured)' ELSE '(read)' END s, COUNT(*)"
+                " FROM api_calls GROUP BY s"
+            )
+        }
+
+    def _downgrade_to_v11(self) -> None:
+        conn = self._conn()
+        conn.execute(self.API_CALLS_AT_V11)
+        conn.execute(
+            f"INSERT INTO api_calls_v11 SELECT {self.V11_COLUMNS} FROM api_calls"
+        )
+        conn.execute("DROP TABLE api_calls")
+        conn.execute("ALTER TABLE api_calls_v11 RENAME TO api_calls")
+        conn.execute("PRAGMA user_version = 11")
+        conn.commit()
+        self.assertNotIn("cache_write_5m", ingest_mod._table_columns(conn, "api_calls"))
+
+    def test_a_fresh_ingest_reads_the_split_on_the_calls_that_carry_one(self) -> None:
+        # The baseline the upgrade must NOT reproduce.
+        self.assertEqual(self._split_states(), {"(read)": 8, "(unmeasured)": 3})
+
+    def test_the_upgrade_carries_the_rows_and_leaves_them_unmeasured(self) -> None:
+        self._downgrade_to_v11()
+        before = self._snapshot()
+        self.assertTrue(before, "the fixture must hold rows for this to mean anything")
+
+        summary = ingest(self.projects, self.db)
+
+        self.assertFalse(summary["schema_rebuilt"])
+        # A rebuild empties `ingest_state`, so every file would be re-parsed.
+        # Skipping them all is the observable proof the rows were carried.
+        self.assertEqual(summary["files_ingested"], 0)
+        self.assertEqual(summary["files_skipped"], summary["files_scanned"])
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(
+            self._conn().execute("PRAGMA user_version").fetchone()[0],
+            ingest_mod.SCHEMA_VERSION,
+        )
+        # EVERY carried row reads unmeasured -- not 0, not the flat total.
+        self.assertEqual(self._split_states(), {"(unmeasured)": len(before)})
+
+    def test_no_carried_row_is_back_filled_with_a_value(self) -> None:
+        # Stated as its own assertion because it is the one a "helpful"
+        # migration would break, and it would break it plausibly: every row
+        # would carry a number, and nothing on the page would say it was
+        # manufactured.
+        self._downgrade_to_v11()
+        ingest(self.projects, self.db)
+        self.assertEqual(
+            self._conn().execute(
+                "SELECT COUNT(*) FROM api_calls WHERE cache_write_5m IS NOT NULL"
+                " OR cache_write_1h IS NOT NULL"
+            ).fetchone()[0],
+            0,
+        )
+        # ...and specifically not from the column sitting right beside them.
+        self.assertEqual(
+            self._conn().execute(
+                "SELECT COUNT(*) FROM api_calls WHERE cache_write_5m = cache_write"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_the_flat_total_is_untouched_by_the_upgrade(self) -> None:
+        # The acceptance rule that makes this a non-breaking change: every
+        # existing figure reads `cache_write`, and the hop must not move one.
+        self._downgrade_to_v11()
+        before = {
+            row[0]: row[1]
+            for row in self._conn().execute(
+                "SELECT message_id, cache_write FROM api_calls"
+            )
+        }
+        ingest(self.projects, self.db)
+        self.assertEqual(
+            {
+                row[0]: row[1]
+                for row in self._conn().execute(
+                    "SELECT message_id, cache_write FROM api_calls"
+                )
+            },
+            before,
+        )
+
+    def test_the_upgrade_is_not_refused_over_a_reaped_source(self) -> None:
+        # Past Claude Code's retention window the database is the only copy of
+        # its measurements, and a rebuild would be REFUSED. Two added nullable
+        # columns must not be the change that strands those databases at v11.
+        self.transcript.unlink()
+        ingest(self.projects, self.db)  # archives it; rows retained
+        self._downgrade_to_v11()
+        before = self._snapshot()
+
+        ingest(self.projects, self.db)  # must not raise SystemExit
+
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self._split_states(), {"(unmeasured)": len(before)})
+
+    def test_re_ingesting_the_source_replaces_unmeasured_with_a_reading(self) -> None:
+        # The other half of "not back-filled with a guess": the answer arrives
+        # when the file is read again, which is exactly when it can be known.
+        self._downgrade_to_v11()
+        ingest(self.projects, self.db)
+        self.assertEqual(self._split_states(), {"(unmeasured)": 11})
+
+        self.transcript.write_text(SPLIT_TRANSCRIPT)  # changes mtime/size
+        os.utime(self.transcript, (time.time() + 2, time.time() + 2))
+        ingest(self.projects, self.db)
+
+        self.assertEqual(self._split_states(), {"(read)": 8, "(unmeasured)": 3})
 
 
 if __name__ == "__main__":
