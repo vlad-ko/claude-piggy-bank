@@ -55,11 +55,18 @@ from serve import (  # noqa: E402
     MEASURED_CONTEXT_MIN,
     PERCENTILES,
     RANKED_BY,
+    SCOPE_INCLUDES_BOTH,
+    SCOPE_MAIN,
+    SCOPE_ORDER,
+    SCOPE_SUBAGENT,
     STALE_AFTER_SECONDS,
     STALE_UNKNOWN_NO_RUN_RECORDED,
     STALE_UNKNOWN_NO_RUN_TABLE,
     STALE_UNKNOWN_RUN_IN_FUTURE,
     STATUS_ARCHIVED,
+    UTIL_NO_SAMPLE_NO_CALLS,
+    UTIL_NO_SAMPLE_NO_CONTEXT_MEASUREMENT,
+    UTIL_NO_SAMPLE_NO_DOCUMENTED_WINDOW,
     Api,
     clamp_limit,
     day_bounds,
@@ -3277,6 +3284,552 @@ class ContextUtilisationApiTest(unittest.TestCase):
     def test_the_block_is_window_scoped_like_every_other_figure(self) -> None:
         self.assertEqual(self.block(CONTEXT_DAY), self.block())
         self.assertNotEqual(self.block(CONTEXT_EMPTY_DAY), self.block())
+
+
+# ---------------------------------------------------------------------------
+# #61: the utilisation bands must name the set they range over.
+# ---------------------------------------------------------------------------
+#
+# The defect, measured 2026-08-05 over this project's own transcripts (44
+# sources, 8,163 records, 0 unparsed, 2,722 banded calls):
+#
+#     scope        calls   median ctx    peak     >=90%          50-90%
+#     main-thread    390      427,037   996,190   52 (13.3%)   100 (25.6%)
+#     subagent     2,332      104,727   374,816    0  (0.0%)     0  (0.0%)
+#     pooled       2,722            --        --   52  (1.9%)   100  (3.7%)
+#
+# Every red-band call was main-thread. The pooled figure is arithmetically
+# correct and moves the WRONG WAY under the condition it exists to detect: a
+# saturated orchestrator dispatches more subagents, whose healthy calls push
+# the pooled share down.
+#
+# The fixture is built so no dropped or swapped scope filter can pass:
+#
+#   * on the busy day the two scopes land in DIFFERENT bands, and their four
+#     band counts differ at EVERY index -- main [3, 1, 1, 0], subagent
+#     [0, 0, 4, 11] -- so pooling, swapping or dropping either filter changes
+#     a number this file names;
+#   * each scope has a band it has a REAL zero in (main has no under-25 call;
+#     the subagent has none in either of the two top bands), beside a scope
+#     that has NO SAMPLE at all -- so `share == 0.0` and `share is None` are
+#     both present and must stay distinguishable;
+#   * the subagent outnumbers the main thread 15:6, the dilution the issue is
+#     about in miniature: the top band is 60.0% of main-thread banded calls
+#     and 15.0% pooled, a 4x understatement;
+#   * one main-thread call sits at EXACTLY 90.0% of its window, so relaxing
+#     `>= 0.9` to `> 0.9` moves it and goes red;
+#   * `over_window_calls` is scoped too, pinned from BOTH sides: on the busy
+#     day the main thread has one and the subagent none, and a day of its own
+#     gives the main thread one and the subagent TWO -- so redirecting every
+#     over-window call into one scope changes a count either way. (One side
+#     alone did not: the mutation that pooled them into the main thread was
+#     GREEN against a fixture where every over-window call was already
+#     main-thread.);
+#   * the unknown-model call is main-thread ONLY, so a scope that borrowed the
+#     pooled `unknown_models` list would name a model its own calls never used;
+#   * three separate days each strand one scope in a DIFFERENT absence -- no
+#     calls, calls that measured nothing, and measured calls whose model has no
+#     documented window -- because all three render as four bands of zero.
+SU_SESSION = "scoped-utilisation-fixture"
+SU_AGENT = "agent-su61a"
+SU_EMPTY_DAY = "2026-06-09"        # nothing at all
+SU_BUSY_DAY = "2026-06-10"         # both scopes, deliberately different bands
+SU_MAIN_ONLY_DAY = "2026-06-11"    # the subagent ran no call
+SU_BLIND_DAY = "2026-06-12"        # the subagent ran calls that measured nothing
+SU_UNWINDOWED_DAY = "2026-06-13"   # the subagent's calls have no documented window
+SU_OVER_WINDOW_DAY = "2026-06-14"  # both scopes exceed their window, unequally
+
+SU_OPUS_1M = "claude-opus-5-20260101"
+SU_HAIKU_200K = "claude-haiku-4-5-20251001"
+SU_UNKNOWN_MODEL = "claude-nosuchtier-9-20260101"
+
+# (day, kind, model, context_size, expected band -- None = not banded)
+SU_MAIN = SOURCE_MAIN
+SU_SUB = SOURCE_SUBAGENT
+SU_CALLS: list[tuple[str, str, str, int, str | None]] = [
+    # --- the busy day, main thread: heavy, and nothing under 25% ---
+    (SU_BUSY_DAY, SU_MAIN, SU_OPUS_1M, 1_100_000, BAND_AT_LEAST_90),  # 110%: over
+    (SU_BUSY_DAY, SU_MAIN, SU_OPUS_1M, 950_000, BAND_AT_LEAST_90),    # 95%
+    (SU_BUSY_DAY, SU_MAIN, SU_OPUS_1M, 900_000, BAND_AT_LEAST_90),    # exactly 90.0%
+    (SU_BUSY_DAY, SU_MAIN, SU_OPUS_1M, 600_000, BAND_50_TO_90),       # 60%
+    (SU_BUSY_DAY, SU_MAIN, SU_OPUS_1M, 300_000, BAND_25_TO_50),       # 30%
+    (SU_BUSY_DAY, SU_MAIN, SU_UNKNOWN_MODEL, 500_000, None),          # no window
+    # --- the busy day, subagents: many, and none above half a window ---
+    *[
+        (SU_BUSY_DAY, SU_SUB, SU_HAIKU_200K, 60_000 + n, BAND_25_TO_50)  # 30%ish
+        for n in range(4)
+    ],
+    *[
+        (SU_BUSY_DAY, SU_SUB, SU_HAIKU_200K, 40_000 + n, BAND_UNDER_25)  # 20%ish
+        for n in range(11)
+    ],
+    # --- a day the subagent sat out entirely ---
+    (SU_MAIN_ONLY_DAY, SU_MAIN, SU_OPUS_1M, 950_000, BAND_AT_LEAST_90),
+    # --- a day the subagent ran calls that carried no prompt accounting ---
+    (SU_BLIND_DAY, SU_MAIN, SU_OPUS_1M, 300_000, BAND_25_TO_50),
+    (SU_BLIND_DAY, SU_SUB, SU_HAIKU_200K, 0, None),
+    (SU_BLIND_DAY, SU_SUB, SU_HAIKU_200K, 0, None),
+    # --- a day the subagent's measured calls have no documented window ---
+    (SU_UNWINDOWED_DAY, SU_MAIN, SU_OPUS_1M, 300_000, BAND_25_TO_50),
+    (SU_UNWINDOWED_DAY, SU_SUB, SU_UNKNOWN_MODEL, 111_111, None),
+    (SU_UNWINDOWED_DAY, SU_SUB, SU_UNKNOWN_MODEL, 222_222, None),
+    # --- a day both scopes run past their window, by DIFFERENT counts ---
+    (SU_OVER_WINDOW_DAY, SU_MAIN, SU_HAIKU_200K, 300_000, BAND_AT_LEAST_90),   # 150%
+    (SU_OVER_WINDOW_DAY, SU_SUB, SU_HAIKU_200K, 250_000, BAND_AT_LEAST_90),    # 125%
+    (SU_OVER_WINDOW_DAY, SU_SUB, SU_HAIKU_200K, 400_000, BAND_AT_LEAST_90),    # 200%
+]
+
+# Hand-written, then checked against the table above -- a count derived only
+# from the fixture would agree with a fixture that had drifted.
+SU_BUSY_MAIN_BANDS = {
+    BAND_AT_LEAST_90: 3,
+    BAND_50_TO_90: 1,
+    BAND_25_TO_50: 1,
+    BAND_UNDER_25: 0,
+}
+SU_BUSY_SUB_BANDS = {
+    BAND_AT_LEAST_90: 0,
+    BAND_50_TO_90: 0,
+    BAND_25_TO_50: 4,
+    BAND_UNDER_25: 11,
+}
+SU_BUSY_MAIN_CALLS = 6
+SU_BUSY_MAIN_BANDED = 5
+SU_BUSY_SUB_CALLS = 15
+SU_BUSY_SUB_BANDED = 15
+SU_BUSY_POOLED_BANDED = SU_BUSY_MAIN_BANDED + SU_BUSY_SUB_BANDED  # 20
+# The issue, as two numbers: 3/5 against 3/20.
+SU_BUSY_MAIN_TOP_SHARE = 3 / 5     # 0.60
+SU_BUSY_POOLED_TOP_SHARE = 3 / 20  # 0.15
+
+
+def build_scoped_utilisation_corpus(root: Path) -> Path:
+    """One session across five days, with subagent calls banded away from the
+    main thread's.
+
+    Returns the PROJECT directory, which is what `ingest()` scans.
+    """
+    project = root / "projects" / "-fixture-scoped-utilisation"
+    project.mkdir(parents=True)
+    subagents = project / SU_SESSION / "subagents"
+    subagents.mkdir(parents=True)
+
+    def record(n: int, day: str, kind: str, model: str, context: int) -> str:
+        if context:
+            # Three deliberately unequal classes summing to the target context,
+            # so a swapped column mapping cannot reproduce it.
+            usage = {
+                "input_tokens": 1_000,
+                "cache_creation_input_tokens": 2_000,
+                "cache_read_input_tokens": context - 3_000,
+                # Distinct per call and never zero, so the dedupe's
+                # greatest-output rule has an unambiguous survivor and an
+                # output-token mix-up cannot look like a context.
+                "output_tokens": n + 1,
+            }
+        else:
+            # The #25 population: the four keys PRESENT and valued zero, which
+            # is what the records on disk actually look like.
+            usage = {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+            }
+        payload: dict[str, object] = {
+            "type": "assistant",
+            "sessionId": SU_SESSION,
+            "timestamp": f"{day}T15:{n // 60:02d}:{n % 60:02d}.000Z",
+            "isSidechain": kind == SOURCE_SUBAGENT,
+            "message": {
+                "id": f"msg-su61-{n}",
+                "model": model,
+                "usage": usage,
+                "content": [{"type": "text", "text": f"su61 call {n}"}],
+            },
+        }
+        if kind == SOURCE_SUBAGENT:
+            payload["agentId"] = SU_AGENT
+        return json.dumps(payload) + "\n"
+
+    main_lines: list[str] = []
+    sub_lines: list[str] = []
+    for n, (day, kind, model, context, _band) in enumerate(SU_CALLS):
+        line = record(n, day, kind, model, context)
+        (sub_lines if kind == SOURCE_SUBAGENT else main_lines).append(line)
+    (project / f"{SU_SESSION}.jsonl").write_text("".join(main_lines))
+    (subagents / f"{SU_AGENT}.jsonl").write_text("".join(sub_lines))
+    return project
+
+
+class ScopedUtilisationBandTest(unittest.TestCase):
+    """#61: the bands are tallied per scope, and every tally names its set.
+
+    Asserted through the real ingest path, so the split is measured over rows
+    written the way production writes them -- including the `source_kind` the
+    split turns on, which the ingester derives from the source's own path.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-scoped-util-test-"))
+        projects = build_scoped_utilisation_corpus(cls.tmp)
+        db_path = cls.tmp / "usage.db"
+        ingest(projects, db_path, tasks_dir=cls.tmp / "no-task-index")
+        cls.api = Api(db_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def util(self, day: str | None = None) -> dict:
+        return self.api.summary(*day_bounds(day, day))["context"]["utilisation"]
+
+    def scope(self, name: str, day: str | None = None) -> dict:
+        found = [s for s in self.util(day)["by_scope"] if s["scope"] == name]
+        self.assertEqual(len(found), 1, f"{name} is not in by_scope exactly once")
+        return found[0]
+
+    @staticmethod
+    def counts(tally: dict) -> dict:
+        return {b["band"]: b["calls"] for b in tally["bands"]}
+
+    @staticmethod
+    def shares(tally: dict) -> dict:
+        return {b["band"]: b["share"] for b in tally["bands"]}
+
+    # --- the fixture holds what it claims to ---
+
+    def test_the_fixture_pins_the_two_scopes_into_different_bands(self) -> None:
+        # A fixture whose two scopes agreed anywhere would let a dropped filter
+        # through at that index.
+        counted: dict[str, dict[str, int]] = {SU_MAIN: {}, SU_SUB: {}}
+        for day, kind, _model, _context, band in SU_CALLS:
+            if day == SU_BUSY_DAY and band is not None:
+                counted[kind][band] = counted[kind].get(band, 0) + 1
+        for kind, expected in (
+            (SU_MAIN, SU_BUSY_MAIN_BANDS),
+            (SU_SUB, SU_BUSY_SUB_BANDS),
+        ):
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    {k: counted[kind].get(k, 0) for k in expected}, expected
+                )
+        for band in SU_BUSY_MAIN_BANDS:
+            with self.subTest(band=band):
+                self.assertNotEqual(
+                    SU_BUSY_MAIN_BANDS[band],
+                    SU_BUSY_SUB_BANDS[band],
+                    "the two scopes agree in this band, so a dropped scope "
+                    "filter would pass here",
+                )
+
+    # --- the split itself ---
+
+    def test_the_bands_are_tallied_per_scope(self) -> None:
+        # THE test. Pooled, both scopes would read [3, 1, 5, 11].
+        self.assertEqual(
+            self.counts(self.scope(SCOPE_MAIN, SU_BUSY_DAY)), SU_BUSY_MAIN_BANDS
+        )
+        self.assertEqual(
+            self.counts(self.scope(SCOPE_SUBAGENT, SU_BUSY_DAY)), SU_BUSY_SUB_BANDS
+        )
+
+    def test_every_scope_is_emitted_in_the_api_vocabulary_and_in_one_order(
+        self,
+    ) -> None:
+        # `source_kind` is the ingester's word; these are the labels that cross
+        # the API, and they are the SAME ones every other scoped figure uses.
+        util = self.util(SU_BUSY_DAY)
+        labels = [s["scope"] for s in util["by_scope"]]
+        self.assertEqual(labels, [SCOPE_MAIN, SCOPE_SUBAGENT])
+        self.assertEqual(list(SCOPE_ORDER), [SOURCE_MAIN, SOURCE_SUBAGENT])
+        # The SAME words every other scoped figure on this API uses -- not a
+        # second vocabulary for the same distinction.
+        self.assertEqual(
+            set(labels),
+            {
+                r["scope"]
+                for r in self.api.models(*day_bounds(SU_BUSY_DAY, SU_BUSY_DAY))
+            },
+        )
+        # `SOURCE_MAIN` is 'main' and its label is 'main-thread', so this one
+        # catches a raw `source_kind` crossing the boundary. (`SOURCE_SUBAGENT`
+        # and `SCOPE_SUBAGENT` are the same word, so it cannot be tested there
+        # -- which is why the label mapping is asserted above rather than by
+        # spot-checking strings.)
+        self.assertNotIn(
+            SOURCE_MAIN, labels, "the stored source_kind leaked across the API"
+        )
+
+    def test_the_pooled_tally_names_the_set_it_spans(self) -> None:
+        # Kept, because it is still the true answer to "of every call in this
+        # window, how many were red" -- but it may not sit there unnamed.
+        util = self.util(SU_BUSY_DAY)
+        self.assertEqual(util["includes"], SCOPE_INCLUDES_BOTH)
+        self.assertIn(SCOPE_MAIN, util["includes"])
+        self.assertIn(SCOPE_SUBAGENT, util["includes"])
+        self.assertNotIn(
+            "scope",
+            util,
+            "the pooled tally names one set twice, in two vocabularies",
+        )
+
+    def test_the_pooled_tally_is_the_sum_of_the_scoped_ones(self) -> None:
+        # Summed from the scopes rather than counted again, so the two can
+        # never disagree -- band by band, not just in total.
+        util = self.util(SU_BUSY_DAY)
+        scopes = util["by_scope"]
+        for band in SU_BUSY_MAIN_BANDS:
+            with self.subTest(band=band):
+                self.assertEqual(
+                    self.counts(util)[band],
+                    sum(self.counts(s)[band] for s in scopes),
+                )
+        for field in (
+            "calls", "sample_calls", "unmeasured_calls", "banded_calls",
+            "unknown_model_calls", "over_window_calls",
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(util[field], sum(s[field] for s in scopes))
+        self.assertEqual(util["banded_calls"], SU_BUSY_POOLED_BANDED)
+
+    def test_the_pooled_share_dilutes_the_scope_the_reader_can_act_on(self) -> None:
+        # The issue in one assertion. On the reference corpus the same
+        # arithmetic turned 13.3% of main-thread calls into 1.9% pooled; here
+        # it turns 60.0% into 15.0%.
+        util = self.util(SU_BUSY_DAY)
+        main = self.scope(SCOPE_MAIN, SU_BUSY_DAY)
+        self.assertAlmostEqual(
+            self.shares(main)[BAND_AT_LEAST_90], SU_BUSY_MAIN_TOP_SHARE
+        )
+        self.assertAlmostEqual(
+            self.shares(util)[BAND_AT_LEAST_90], SU_BUSY_POOLED_TOP_SHARE
+        )
+        self.assertLess(
+            self.shares(util)[BAND_AT_LEAST_90],
+            self.shares(main)[BAND_AT_LEAST_90],
+            "the fixture no longer reproduces the dilution this exists to fix",
+        )
+        # And the direction the issue is really about: the subagent scope, which
+        # supplies the dilution, has no red call at all.
+        self.assertEqual(
+            self.counts(self.scope(SCOPE_SUBAGENT, SU_BUSY_DAY))[BAND_AT_LEAST_90], 0
+        )
+
+    def test_each_scope_partitions_its_own_calls(self) -> None:
+        # Nothing is silently dropped from a scope's denominator: bands +
+        # unknown + unmeasured is that scope's whole call count, and the scopes
+        # together are the window's.
+        util = self.util(SU_BUSY_DAY)
+        for tally in util["by_scope"]:
+            with self.subTest(scope=tally["scope"]):
+                self.assertEqual(
+                    sum(b["calls"] for b in tally["bands"])
+                    + tally["unknown_model_calls"]
+                    + tally["unmeasured_calls"],
+                    tally["calls"],
+                )
+        self.assertEqual(
+            sum(s["calls"] for s in util["by_scope"]),
+            self.api.summary(*day_bounds(SU_BUSY_DAY, SU_BUSY_DAY))["calls"],
+        )
+        self.assertEqual(
+            self.scope(SCOPE_MAIN, SU_BUSY_DAY)["calls"], SU_BUSY_MAIN_CALLS
+        )
+        self.assertEqual(
+            self.scope(SCOPE_SUBAGENT, SU_BUSY_DAY)["calls"], SU_BUSY_SUB_CALLS
+        )
+
+    def test_a_band_boundary_is_lower_inclusive_inside_a_scope_too(self) -> None:
+        # One main-thread call sits at exactly 90.0% of its window. Relaxing
+        # `>= 0.9` to `> 0.9` moves it into the band below and turns the two
+        # counts here into 2 and 2.
+        main = self.scope(SCOPE_MAIN, SU_BUSY_DAY)
+        self.assertEqual(self.counts(main)[BAND_AT_LEAST_90], 3)
+        self.assertEqual(self.counts(main)[BAND_50_TO_90], 1)
+
+    def test_a_call_over_its_window_is_counted_inside_its_own_scope(self) -> None:
+        # Pinned from both sides. The busy day gives the main thread one and
+        # the subagent none; a day of its own gives the main thread one and the
+        # subagent TWO, so a mutation that funnels every over-window call into
+        # one scope changes a count whichever scope it picks. Mutation-checked:
+        # with the busy day alone, redirecting them all to the main thread was
+        # GREEN, because every over-window call in the fixture was already
+        # main-thread.
+        self.assertEqual(self.scope(SCOPE_MAIN, SU_BUSY_DAY)["over_window_calls"], 1)
+        self.assertEqual(
+            self.scope(SCOPE_SUBAGENT, SU_BUSY_DAY)["over_window_calls"], 0
+        )
+        self.assertEqual(
+            self.scope(SCOPE_MAIN, SU_OVER_WINDOW_DAY)["over_window_calls"], 1
+        )
+        self.assertEqual(
+            self.scope(SCOPE_SUBAGENT, SU_OVER_WINDOW_DAY)["over_window_calls"], 2
+        )
+        self.assertEqual(self.util(SU_OVER_WINDOW_DAY)["over_window_calls"], 3)
+
+    def test_an_unknown_model_stays_inside_the_scope_that_called_it(self) -> None:
+        # A scope that borrowed the pooled list would name a model its own
+        # calls never used -- an absence attributed to the wrong reader.
+        main = self.scope(SCOPE_MAIN, SU_BUSY_DAY)
+        sub = self.scope(SCOPE_SUBAGENT, SU_BUSY_DAY)
+        self.assertEqual(main["unknown_model_calls"], 1)
+        self.assertEqual(main["unknown_models"], [SU_UNKNOWN_MODEL])
+        self.assertEqual(sub["unknown_model_calls"], 0)
+        self.assertEqual(sub["unknown_models"], [])
+        # Still in that scope's sample: its size was measured, so dropping it
+        # from the denominator would be the silent removal this refuses.
+        self.assertEqual(main["sample_calls"], SU_BUSY_MAIN_CALLS)
+        self.assertEqual(
+            main["banded_calls"] + main["unknown_model_calls"], main["sample_calls"]
+        )
+
+    # --- the absences ---
+
+    def test_a_real_zero_share_and_an_absent_one_are_different_values(self) -> None:
+        # THE central rule of this repo, on this payload. A scope that ran
+        # calls and had none in a band measured a real 0; a scope with no
+        # banded sample measured nothing, and its share is null.
+        main = self.scope(SCOPE_MAIN, SU_BUSY_DAY)
+        sub = self.scope(SCOPE_SUBAGENT, SU_BUSY_DAY)
+        self.assertEqual(self.shares(main)[BAND_UNDER_25], 0.0)
+        self.assertEqual(self.shares(sub)[BAND_AT_LEAST_90], 0.0)
+        self.assertIsNone(main["no_sample_reason"])
+        self.assertIsNone(sub["no_sample_reason"])
+        absent = self.scope(SCOPE_SUBAGENT, SU_MAIN_ONLY_DAY)
+        for band, share in self.shares(absent).items():
+            with self.subTest(band=band):
+                self.assertIsNone(share, "a share of an empty set is not 0%")
+        self.assertIsNotNone(absent["no_sample_reason"])
+
+    def test_a_scope_that_ran_no_call_says_so_rather_than_banding_zero(self) -> None:
+        absent = self.scope(SCOPE_SUBAGENT, SU_MAIN_ONLY_DAY)
+        self.assertEqual(absent["calls"], 0)
+        self.assertEqual(absent["sample_calls"], 0)
+        self.assertEqual(absent["banded_calls"], 0)
+        self.assertEqual(absent["no_sample_reason"], UTIL_NO_SAMPLE_NO_CALLS)
+        # And the main thread that day is untouched by its neighbour's absence.
+        self.assertEqual(
+            self.counts(self.scope(SCOPE_MAIN, SU_MAIN_ONLY_DAY))[BAND_AT_LEAST_90], 1
+        )
+
+    def test_a_scope_whose_calls_measured_nothing_is_told_apart_from_one_that_ran_none(
+        self,
+    ) -> None:
+        # Both render as four bands of zero and have different remedies: one
+        # dispatched nothing, the other dispatched work whose records carry no
+        # prompt accounting.
+        blind = self.scope(SCOPE_SUBAGENT, SU_BLIND_DAY)
+        self.assertEqual(blind["calls"], 2)
+        self.assertEqual(blind["sample_calls"], 0)
+        self.assertEqual(blind["unmeasured_calls"], 2)
+        self.assertEqual(blind["banded_calls"], 0)
+        self.assertEqual(
+            blind["no_sample_reason"], UTIL_NO_SAMPLE_NO_CONTEXT_MEASUREMENT
+        )
+        self.assertNotEqual(blind["no_sample_reason"], UTIL_NO_SAMPLE_NO_CALLS)
+
+    def test_a_scope_with_no_documented_window_keeps_its_calls_in_view(self) -> None:
+        # The third way four zero bands can be true: the calls happened and
+        # were measured, and this tool has no denominator for their model.
+        # They must not vanish from the scope's own counts.
+        unwindowed = self.scope(SCOPE_SUBAGENT, SU_UNWINDOWED_DAY)
+        self.assertEqual(unwindowed["calls"], 2)
+        self.assertEqual(unwindowed["sample_calls"], 2)
+        self.assertEqual(unwindowed["unmeasured_calls"], 0)
+        self.assertEqual(unwindowed["banded_calls"], 0)
+        self.assertEqual(unwindowed["unknown_model_calls"], 2)
+        self.assertEqual(unwindowed["unknown_models"], [SU_UNKNOWN_MODEL])
+        self.assertEqual(
+            unwindowed["no_sample_reason"], UTIL_NO_SAMPLE_NO_DOCUMENTED_WINDOW
+        )
+
+    def test_an_empty_window_reports_both_scopes_as_absent(self) -> None:
+        util = self.util(SU_EMPTY_DAY)
+        self.assertEqual(
+            [s["scope"] for s in util["by_scope"]], [SCOPE_MAIN, SCOPE_SUBAGENT]
+        )
+        for tally in util["by_scope"]:
+            with self.subTest(scope=tally["scope"]):
+                self.assertEqual(tally["calls"], 0)
+                self.assertEqual(tally["no_sample_reason"], UTIL_NO_SAMPLE_NO_CALLS)
+                for band in tally["bands"]:
+                    self.assertEqual(band["calls"], 0)
+                    self.assertIsNone(band["share"])
+
+    def test_the_reason_is_given_exactly_when_there_is_no_banded_sample(self) -> None:
+        # Non-null exactly when `banded_calls` is 0 -- in both directions, over
+        # every day the fixture holds, so neither a missing reason nor a
+        # spurious one can pass.
+        days = [
+            SU_EMPTY_DAY, SU_BUSY_DAY, SU_MAIN_ONLY_DAY, SU_BLIND_DAY,
+            SU_UNWINDOWED_DAY, SU_OVER_WINDOW_DAY, None,
+        ]
+        seen = set()
+        for day in days:
+            util = self.util(day)
+            for tally in util["by_scope"] + [util]:
+                with self.subTest(day=day, scope=tally.get("scope", "pooled")):
+                    self.assertEqual(
+                        tally["no_sample_reason"] is None,
+                        bool(tally["banded_calls"]),
+                    )
+                    seen.add(tally["no_sample_reason"])
+        # All three absences are exercised, so no branch is asserted only in
+        # the abstract.
+        self.assertEqual(
+            seen - {None},
+            {
+                UTIL_NO_SAMPLE_NO_CALLS,
+                UTIL_NO_SAMPLE_NO_CONTEXT_MEASUREMENT,
+                UTIL_NO_SAMPLE_NO_DOCUMENTED_WINDOW,
+            },
+        )
+
+    # --- what survived the restructuring ---
+
+    def test_both_provenances_survive_the_split_intact(self) -> None:
+        util = self.util(SU_BUSY_DAY)
+        self.assertEqual(util["windows_as_of"], WINDOWS_AS_OF)
+        self.assertEqual(util["bands_as_of"], BANDS_AS_OF)
+        self.assertIn(WINDOW_SOURCE, util["window_provenance"])
+        self.assertIn("documented", util["window_provenance"])
+        self.assertIn("product-owner judgment", util["band_provenance"])
+        self.assertIn("not an Anthropic recommendation", util["band_provenance"])
+
+    def test_the_provenances_are_stated_once_and_not_per_scope(self) -> None:
+        # Which window a model has, and where the boundaries sit, are facts
+        # about `context_window.py` -- not about a scope. A per-scope copy
+        # would assert they could differ by scope, and would be a second place
+        # for one of the two dates to go stale in.
+        for tally in self.util(SU_BUSY_DAY)["by_scope"]:
+            for field in (
+                "windows_as_of", "window_provenance", "bands_as_of",
+                "band_provenance",
+            ):
+                with self.subTest(scope=tally["scope"], field=field):
+                    self.assertNotIn(field, tally)
+
+    def test_every_scope_carries_the_whole_band_table_labels_and_all(self) -> None:
+        # A declarative template renders these lists as-is, so a scoped band
+        # that lost its label or its boundaries would render a row the page
+        # would have to reconstruct -- and reconstructing it is exactly the
+        # copy of the judgment `context_window.py` owns.
+        for tally in self.util(SU_BUSY_DAY)["by_scope"]:
+            with self.subTest(scope=tally["scope"]):
+                self.assertEqual(
+                    [
+                        (b["band"], b["label"], b["lower"], b["upper"])
+                        for b in tally["bands"]
+                    ],
+                    [(key, label, lower, upper) for key, label, lower, upper in BANDS],
+                )
+
+    def test_the_split_is_window_scoped_like_every_other_figure(self) -> None:
+        self.assertNotEqual(self.util(SU_BUSY_DAY), self.util(SU_MAIN_ONLY_DAY))
+        self.assertNotEqual(self.util(SU_EMPTY_DAY), self.util(SU_BUSY_DAY))
 
 
 class VendoredAssetTest(unittest.TestCase):
