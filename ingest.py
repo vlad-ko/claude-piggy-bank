@@ -76,6 +76,14 @@ STATUS_UNAVAILABLE = "unavailable"
 
 AGENT_FILE_PREFIX = "agent-"
 
+# Named once and imported by `serve.py` rather than re-spelled there: the
+# stored vocabulary has one owner (same rule as SOURCE_MAIN / STATUS_*).
+INGEST_RUNS_TABLE = "ingest_runs"
+# The run stamp is ONE row, overwritten -- this is its fixed primary key, not
+# a magic number. A history of runs is a different feature; what the report
+# needs is "when did this database last look at the transcripts".
+INGEST_RUN_ROW_ID = 1
+
 # EVERY table this tool creates. ONE list, used by both the probe and the drop
 # loop in `_prepare_schema` -- two lists is how `subagent_runs` and
 # `task_index_sessions` were omitted from the rebuild in the first place.
@@ -87,13 +95,25 @@ DERIVED_TABLES = (
     "ingest_state",
     "subagent_runs",
     "task_index_sessions",
+    INGEST_RUNS_TABLE,
 )
 
 # Bumped whenever the shape below changes. The DB is a pure DERIVED rendering
 # of the transcripts (regenerable in full by re-running this script), so an
 # older shape is rebuilt from scratch rather than migrated in place -- see
-# `_prepare_schema`.
-SCHEMA_VERSION = 6
+# `_prepare_schema`, and `ADDITIVE_UPGRADE_FROM` below for the narrow case
+# where rebuilding would cost rows to arrive at the identical database.
+SCHEMA_VERSION = 7
+
+# Versions whose shape differs from the current one only by ADDITIONS that
+# `CREATE TABLE IF NOT EXISTS` supplies on its own, so they upgrade in place
+# instead of being dropped and rebuilt. v6 -> v7 adds `ingest_runs` and
+# changes nothing else: no column moves, no row rewrites.
+#
+# This set is not cumulative by default. Whoever bumps SCHEMA_VERSION next has
+# to re-decide it, because a version belongs here only while the delta to the
+# NEW shape is still purely additive.
+ADDITIVE_UPGRADE_FROM = frozenset({6})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -180,6 +200,21 @@ CREATE TABLE IF NOT EXISTS ingest_state (
     -- IRREPLACEABLE: Claude Code deletes transcripts after `cleanupPeriodDays`
     -- (default 30), so the rows derived from it can never be regenerated.
     archived_at REAL
+);
+-- WHEN this tool last ran (#20). One row, or NONE AT ALL -- an empty table is
+-- "no run has ever been recorded", which every database written before v7 is,
+-- and which the report renders as an unknown age rather than as an age of
+-- zero or an ingest at the epoch.
+--
+-- Deliberately not a column on `ingest_state`: that table is per SOURCE FILE
+-- and its `mtime` is the FILE's mtime, a different fact that reads like this
+-- one. A run is a fact about the ingester, so it gets its own row, and an
+-- all-skipped run -- which touches no `ingest_state` row -- still records it.
+-- `finished_at` dates COMPLETION: a run that raised never stamps, so a broken
+-- ingest ages visibly instead of claiming to have refreshed.
+CREATE TABLE IF NOT EXISTS ingest_runs (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    finished_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_api_calls_ts ON api_calls (ts);
 CREATE INDEX IF NOT EXISTS idx_api_calls_session ON api_calls (session_id);
@@ -1254,6 +1289,21 @@ def rebuild_sessions(conn: sqlite3.Connection) -> None:
     )
 
 
+def record_ingest_run(conn: sqlite3.Connection, finished_at: float) -> None:
+    """Stamp WHEN an ingest run completed (epoch seconds), replacing the last.
+
+    Called once per successful `ingest()`, INCLUDING a run that ingested
+    nothing: "we looked and everything was unchanged" is a completed run, and
+    conflating it with "nobody has looked" is the whole defect in #20. The
+    caller owns the transaction.
+    """
+    conn.execute(
+        f"INSERT OR REPLACE INTO {INGEST_RUNS_TABLE} (id, finished_at)"
+        " VALUES (?, ?)",
+        (INGEST_RUN_ROW_ID, finished_at),
+    )
+
+
 def _prepare_schema(conn: sqlite3.Connection) -> bool:
     """Create the schema, rebuilding from scratch if an older shape is present.
 
@@ -1262,6 +1312,11 @@ def _prepare_schema(conn: sqlite3.Connection) -> bool:
     re-ingest reproduces it exactly -- so an obsolete shape is dropped and
     rebuilt rather than migrated in place. This is CLAUDE.md rule #14 domain
     (4): a regenerable artifact, deleted through a legitimate capability.
+
+    Two exits from that default, both narrower than it: a shape listed in
+    `ADDITIVE_UPGRADE_FROM` is carried forward untouched (the new shape only
+    ADDS), and a rebuild that would destroy rows whose source file is gone is
+    refused outright (it would not be regenerable at all).
 
     The probe and the drop loop BOTH range over `DERIVED_TABLES` -- the same
     set, deliberately. When they were two hand-maintained lists, a table added
@@ -1281,6 +1336,24 @@ def _prepare_schema(conn: sqlite3.Connection) -> bool:
     )
     rebuilt = False
     if has_tables and version != SCHEMA_VERSION:
+        if version in ADDITIVE_UPGRADE_FROM:
+            # Nothing is dropped, altered or rewritten on this path: the
+            # `CREATE TABLE IF NOT EXISTS` script below supplies the added
+            # table and leaves every existing row where it is.
+            #
+            # It runs BEFORE the reaped-source guard on purpose, and does not
+            # route around it. That guard gates the DROP loop -- it refuses a
+            # REBUILD because a rebuild deletes rows no re-ingest can
+            # reproduce. Applied here it would refuse a change that deletes
+            # nothing, telling exactly the users whose database is the only
+            # copy of their history to stay on the old version. The refusal's
+            # own sentence ("a schema rebuild would delete them permanently")
+            # would be untrue, and an untrue refusal is the same class of
+            # defect as an untrue number.
+            conn.executescript(SCHEMA)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            return False
+
         # Is a rebuild LOSSY? The original justification -- "a re-ingest
         # reproduces the DB exactly" -- holds only while every source is still
         # readable. Ask the FILESYSTEM, not the schema: a tracked path with no
@@ -1492,6 +1565,12 @@ def ingest(
             "SELECT COUNT(DISTINCT session_id) FROM ingest_state WHERE source_kind = ?",
             (SOURCE_SUBAGENT,),
         ).fetchone()[0]
+        # LAST, and only on the success path (#20): the stamp claims "this
+        # database has seen the transcripts as of now", which is false if we
+        # never got here. Read fresh rather than reusing the `now` computed
+        # for archiving above, so it dates the run's END.
+        with conn:
+            record_ingest_run(conn, datetime.now(timezone.utc).timestamp())
         return summary
     finally:
         conn.close()

@@ -12,17 +12,25 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ingest import ingest  # noqa: E402
+from ingest import INGEST_RUNS_TABLE, ingest, record_ingest_run  # noqa: E402
 from test_ingest import build_corpus  # noqa: E402
 from pricing import RATES_AS_OF  # noqa: E402
-from serve import Api, clamp_limit, day_bounds, eastern_day  # noqa: E402
+from serve import (  # noqa: E402
+    STALE_AFTER_SECONDS,
+    Api,
+    clamp_limit,
+    day_bounds,
+    eastern_day,
+)
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "session-fixture.jsonl"
 DISPATCH_FIXTURE = (
@@ -612,6 +620,263 @@ class AgentAttributionApiTest(unittest.TestCase):
         self.assertEqual(key[("claude-opus-5-20260201", "subagent")]["calls"], 1)
 
 
+class DataStalenessTest(unittest.TestCase):
+    """How old the data is, as TWO facts that must never be conflated (#20).
+
+    `serve.py` reads whatever the database holds and `ingest.py` never runs on
+    its own, so a report left open serves older and older numbers with nothing
+    saying so -- the reference install was 1.2 h behind with the page reading
+    exactly as it does when current.
+
+    Two timestamps, because either alone lies:
+
+    * **last ingest run** -- when this tool last looked at the transcripts.
+    * **newest measured call** -- the most recent thing it found, CORPUS-WIDE
+      rather than window-scoped: it describes the database's freshness, not
+      the period on screen, and windowing it would report a 2025 window as
+      "months stale" when the ingest ran a minute ago.
+
+    A fresh run over an idle machine is healthy; a fresh run that found
+    nothing new is indistinguishable from no run unless both are shown.
+
+    The fixture pins them DELIBERATELY UNEQUAL -- the run stamp is seconds old
+    and the fixture's newest call is years older -- so a swapped mapping
+    cannot pass.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="usage-report-staleness-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db_path = self.tmp / "usage.db"
+        ingest(self.projects, self.db_path)
+        self.newest_call = self._scalar("SELECT MAX(ts) FROM api_calls")
+        self.assertIsNotNone(self.newest_call)
+
+    def _scalar(self, sql: str):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(sql).fetchone()[0]
+        finally:
+            conn.close()
+
+    def _write(self, sql: str, *params) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _set_run_stamp(self, finished_at: float) -> None:
+        """Stamp the run through the ingester's own writer, never a raw INSERT."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            record_ingest_run(conn, finished_at)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _ingest_block(self, frm=None, to=None) -> dict:
+        api = Api(self.db_path)
+        try:
+            return api.summary(*day_bounds(frm, to))["ingest"]
+        finally:
+            api.conn.close()
+
+    def test_staleness_does_not_displace_the_other_warnings(self) -> None:
+        # TWO alarming things are true at once. A payload that can only ever
+        # express one at a time -- or a reader that shows the milder -- is the
+        # same defect this feature exists to fix, one level up: the user sees
+        # one true statement with no sign that the other exists.
+        self.transcript.unlink()
+        ingest(self.projects, self.db_path)  # archives it; rows retained
+        self._set_run_stamp(time.time() - (STALE_AFTER_SECONDS + 3600))
+        api = Api(self.db_path)
+        try:
+            payload = api.summary(*day_bounds(None, None))
+        finally:
+            api.conn.close()
+        self.assertTrue(payload["ingest"]["stale"])
+        self.assertFalse(payload["durability"]["reproducible"])
+        self.assertGreater(payload["durability"]["archived_calls"], 0)
+        self.assertGreater(payload["calls"], 0, "the totals are still reported")
+
+    def test_both_timestamps_are_reported_as_separate_fields(self) -> None:
+        run_at = time.time() - 30.0
+        self._set_run_stamp(run_at)
+        block = self._ingest_block()
+        self.assertAlmostEqual(block["last_run_at"], run_at, places=3)
+        self.assertAlmostEqual(block["newest_call_ts"], self.newest_call, places=3)
+        self.assertNotAlmostEqual(
+            block["last_run_at"],
+            block["newest_call_ts"],
+            msg="the two facts are one field, or the mapping is swapped",
+        )
+
+    def test_the_newest_call_ranges_over_the_WHOLE_corpus(self) -> None:
+        # Freshness is a property of the database, not of the period on
+        # screen. Windowed, this figure would call a deliberately historical
+        # view stale and a narrow recent view fresh -- an aggregate answering
+        # about a set nobody asked about.
+        self._set_run_stamp(time.time())
+        block = self._ingest_block("2020-01-01", "2020-01-02")
+        self.assertAlmostEqual(block["newest_call_ts"], self.newest_call, places=3)
+
+    def test_a_database_that_never_recorded_a_run_says_so(self) -> None:
+        # Every database written before this landed is in this state, and it
+        # is NOT "ingested at epoch 0" and NOT "0 seconds ago". No sample.
+        self._write(f"DELETE FROM {INGEST_RUNS_TABLE}")
+        block = self._ingest_block()
+        self.assertIsNone(block["last_run_at"])
+        self.assertIsNone(block["stale"], "unknown age is not a stale verdict")
+        # The other fact is still measured and must still be reported.
+        self.assertAlmostEqual(block["newest_call_ts"], self.newest_call, places=3)
+
+    def test_a_v6_database_without_the_table_still_serves(self) -> None:
+        # serve.py never migrates -- it opens the database as ingest left it.
+        # A user who upgrades CPB and reads the report before re-running
+        # ingest.py has NO `ingest_runs` table at all, and the page must
+        # report an unknown age rather than 500 on every request.
+        self._write(f"DROP TABLE {INGEST_RUNS_TABLE}")
+        block = self._ingest_block()
+        self.assertIsNone(block["last_run_at"])
+        self.assertIsNone(block["stale"])
+        self.assertEqual(block["files"], 1)
+
+    def test_a_recent_run_is_not_stale(self) -> None:
+        self._set_run_stamp(time.time() - (STALE_AFTER_SECONDS - 60))
+        block = self._ingest_block()
+        self.assertFalse(block["stale"])
+
+    def test_a_run_older_than_the_threshold_is_stale(self) -> None:
+        self._set_run_stamp(time.time() - (STALE_AFTER_SECONDS + 60))
+        block = self._ingest_block()
+        self.assertTrue(block["stale"])
+
+    def test_the_threshold_and_the_clock_it_is_measured_against_are_published(
+        self,
+    ) -> None:
+        # The reader is told the rule, not just the verdict, and the age is
+        # computed against the SERVER's clock -- the machine that owns the
+        # data -- rather than left to the browser's.
+        self._set_run_stamp(time.time())
+        block = self._ingest_block()
+        self.assertEqual(block["stale_after_seconds"], STALE_AFTER_SECONDS)
+        self.assertGreater(STALE_AFTER_SECONDS, 0)
+        self.assertAlmostEqual(block["as_of"], time.time(), delta=5.0)
+
+    def test_a_corpus_with_no_calls_has_no_newest_call_timestamp(self) -> None:
+        empty_projects = self.tmp / "empty-projects"
+        empty_projects.mkdir()
+        empty_db = self.tmp / "empty.db"
+        ingest(empty_projects, empty_db)
+        api = Api(empty_db)
+        try:
+            block = api.summary(*day_bounds(None, None))["ingest"]
+        finally:
+            api.conn.close()
+        self.assertIsNone(block["newest_call_ts"], "no calls is not a call at epoch 0")
+        self.assertEqual(block["files"], 0)
+        # The run itself DID happen, and is a separate fact from what it found.
+        self.assertIsNotNone(block["last_run_at"])
+        self.assertFalse(block["stale"])
+
+
+def js_function_body(html: str, decl: str) -> str:
+    """The body of a JS function in `index.html`, comments stripped.
+
+    Brace-matched from the declaration rather than regexed, so a nested block
+    cannot end the match early.
+    """
+    start = html.index(decl)
+    depth, i = 0, html.index("{", start)
+    for end in range(i, len(html)):
+        if html[end] == "{":
+            depth += 1
+        elif html[end] == "}":
+            depth -= 1
+            if depth == 0:
+                body = html[i : end + 1]
+                break
+    else:  # pragma: no cover - unbalanced braces means the parse is wrong
+        raise AssertionError(f"could not find the end of {decl}")
+    body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+    return re.sub(r"^\s*//.*$", "", body, flags=re.M)
+
+
+class BannerPrecedenceTest(unittest.TestCase):
+    """Three writers, one banner element: the loudest true thing must win (#20).
+
+    `renderSummary` rebuilt the banner's whole text on every render and
+    `reportLoadFailure` overwrote it wholesale, so the later writer decided
+    which of two true statements the reader got -- and the staleness warning
+    added here would have been a third. A user shown "unpriced models" while a
+    load failure or a stale database goes unmentioned has been handed the
+    milder fact with no sign the harsher one exists, which is this repository's
+    core rule failing inside the feature built to enforce it.
+
+    These assertions are STRUCTURAL, and that is a real limit, not a stylistic
+    choice: the project ships no JS runtime (stdlib-only, no Node), so the
+    composition cannot be executed here. They pin the two properties that make
+    the defect unreachable -- one writer, and a fixed order -- and a renamed
+    binding still defeats them. `DataStalenessTest` covers the same
+    two-things-true-at-once case at the layer that CAN be executed.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+
+    def test_the_banner_element_has_exactly_one_writer(self) -> None:
+        writers = self.html.count('getElementById("banner")')
+        self.assertEqual(
+            writers,
+            1,
+            "every write to the banner goes through renderBanner(); a second "
+            "direct writer is how one warning silently replaces another",
+        )
+        self.assertIn('getElementById("banner")', js_function_body(self.html, "function renderBanner("))
+
+    def test_the_precedence_order_is_failure_then_stale_then_notices(self) -> None:
+        body = js_function_body(self.html, "function renderBanner(")
+        order = [body.index(k) for k in ("loadFailure", "stale", "notices")]
+        self.assertEqual(
+            order,
+            sorted(order),
+            "banner precedence is failure > stale > notices, by how badly the "
+            "figures on screen can mislead",
+        )
+
+    def test_a_load_failure_is_cleared_only_by_a_fully_successful_load(self) -> None:
+        # A failure that any later render can clear is a failure that can be
+        # hidden by a partial success.
+        self.assertEqual(self.html.count("bannerState.loadFailure = null"), 1)
+        self.assertIn(
+            "bannerState.loadFailure = null",
+            js_function_body(self.html, "async function loadAll("),
+        )
+
+    def test_only_a_true_staleness_verdict_raises_the_banner(self) -> None:
+        # `stale` is tri-state; the null case ("no ingest run was ever
+        # recorded") is an UNKNOWN age, and a banner it can never clear would
+        # train the reader to ignore the one that means something.
+        body = js_function_body(self.html, "function renderSummary(")
+        self.assertIn("s.ingest.stale === true", body)
+
+    def test_the_data_age_line_distinguishes_never_recorded_from_zero(self) -> None:
+        # The BRANCH, not a mention: `=== 0` reads a never-recorded run as an
+        # ingest at the epoch, and matching the bare substring elsewhere in the
+        # function let exactly that mutation survive.
+        body = js_function_body(self.html, "function renderDataAge(")
+        self.assertRegex(body, r"if \(ing\.last_run_at === null\) \{")
+        self.assertRegex(body, r"if \(ing\.newest_call_ts === null\) \{")
+        self.assertIn("not recorded", body)
+
+
 class SummaryPayloadIsWiredTest(unittest.TestCase):
     """Every field `/api/summary` computes must REACH a reader, or say why not.
 
@@ -673,20 +938,7 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
         binding, i.e. the Alpine rewrite) as a separate change rather than
         claiming this test is a guarantee.
         """
-        start = html.index("function renderSummary(")
-        depth, i = 0, html.index("{", start)
-        for end in range(i, len(html)):
-            if html[end] == "{":
-                depth += 1
-            elif html[end] == "}":
-                depth -= 1
-                if depth == 0:
-                    body = html[i : end + 1]
-                    break
-        else:  # pragma: no cover - unbalanced braces means the parse is wrong
-            raise AssertionError("could not find the end of renderSummary()")
-        body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
-        return re.sub(r"^\s*//.*$", "", body, flags=re.M)
+        return js_function_body(html, "function renderSummary(")
 
     def test_every_summary_field_is_rendered_or_declared_unrendered(self) -> None:
         payload = self.api.summary(*day_bounds(None, None))
