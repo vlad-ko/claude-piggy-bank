@@ -105,6 +105,108 @@ TASKS_DIR = "tasks"
 # every hook invocation.
 DB_ENV_VAR = "CPB_DB"
 
+# The per-source census of the transcript SHAPE (#15). Named once, like every
+# other stored vocabulary here, because `serve.py` will read it and a second
+# spelling is a second source of truth.
+#
+# Anthropic documents the format CPB parses as internal: "the entry format is
+# internal to Claude Code and changes between versions, so scripts that parse
+# these files directly can break on any release." CPB's premise is that direct
+# parse, so the answer is not to stop -- it is to COUNT what the format looks
+# like, per source file, so a change is loud at ingest time instead of showing
+# up as a quiet drop in a chart.
+SHAPE_TABLE = "source_shape"
+# The FACTS the census records. Each is "how many records of this source
+# carried <name>", and each is a different question -- kept apart rather than
+# summed into one "surprises" number, which would name nothing.
+#
+# `SHAPE_VERSION` ranges over the records CPB DERIVES NUMBERS FROM (assistant
+# and user), not over every line in the file. An aggregate must name the set it
+# ranges over: 10 of the 14 record types below never carry a `version` at all,
+# so counting them would bury the one case that matters -- a MEASURED record
+# with no version, of which there are 0 in 524,160 on the reference corpus.
+SHAPE_VERSION = "version"
+SHAPE_UNKNOWN_RECORD_TYPE = "unknown-record-type"
+SHAPE_UNKNOWN_USAGE_KEY = "unknown-usage-key"
+SHAPE_MISSING_USAGE_KEY = "missing-usage-key"
+# Those last three are the facts that mean "the format moved", and
+# `print_shape_note()` says each of them out loud. `SHAPE_VERSION` is
+# deliberately not one of them: a version is provenance, not a surprise.
+
+# REFERENCE CORPUS for every count in this region: one developer machine's
+# local transcripts -- 2,952 files over 18 projects, 638,813 records, checked
+# 2026-08-05. One operator's usage, not a sample of Claude Code users, and
+# live: re-measuring later will not reproduce these exactly.
+
+# The record types the parser READS. Everything CPB reports is derived from
+# these two.
+RECORD_TYPE_ASSISTANT = "assistant"
+RECORD_TYPE_USER = "user"
+PARSED_RECORD_TYPES = frozenset({RECORD_TYPE_ASSISTANT, RECORD_TYPE_USER})
+
+# The record types this tool has SEEN and deliberately does not read. That they
+# are irrelevant is MEASURED, not assumed: `message.usage` appears on 338,342 of
+# 338,342 `assistant` records and on 0 records of every type listed here, so
+# skipping them drops no spend (checked 2026-08-05 over the reference corpus).
+#
+# Listing them is what makes the 13th type -- the one a future release adds --
+# COUNTABLE. The ingest used to skip every non-assistant/user record on the
+# comment "known-irrelevant", which was true of exactly these and said nothing
+# about anything else: if a release renamed `assistant`, every total would drop
+# and no counter in this tool would move. Record counts in the order below:
+# 18,711 / 17,766 / 14,753 / 13,257 / 13,074 / 13,058 / 11,837 / 9,947 / 2,090 /
+# 165 / 102 / 38. Some are written by this operator's own plugins rather than by
+# Claude Code, which is exactly why the set is a MEASUREMENT of one corpus and
+# not a claim about the format.
+IGNORED_RECORD_TYPES = frozenset({
+    "attachment",
+    "queue-operation",
+    "pr-link",
+    "last-prompt",
+    "mode",
+    "ai-title",
+    "system",
+    "permission-mode",
+    "file-history-snapshot",
+    "file-history-delta",
+    "agent-name",
+    "frame-link",
+})
+KNOWN_RECORD_TYPES = PARSED_RECORD_TYPES | IGNORED_RECORD_TYPES
+
+# The `usage` keys observed on assistant records. Anything else is counted and
+# named: a new key can mean the token accounting itself has moved, which is a
+# question about whether CPB's numbers still mean what they say. The documented
+# `output_tokens_details` appears on 0 of 338,030 assistant records here, so its
+# arrival would be exactly this signal. Counts: the first seven on all 338,030,
+# the last three on 199,363 -- so ABSENCE of a key here is ordinary and is not
+# what is counted.
+KNOWN_USAGE_KEYS = frozenset({
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "output_tokens",
+    "service_tier",
+    "cache_creation",
+    "inference_geo",
+    "server_tool_use",
+    "iterations",
+    "speed",
+})
+
+# The four keys every token column is read from, named once. Their absence is
+# the dangerous direction: `tok()` reads an absent key as a real 0 -- correct
+# for a token class that did not occur, catastrophic if a release renames
+# `output_tokens`, because every figure would read zero and nothing would
+# raise. All four are present on 338,030 of 338,030 assistant records, so a
+# miss is a shape change and not a quiet session.
+USAGE_TOKEN_KEYS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "output_tokens",
+)
+
 # EVERY table this tool creates. ONE list, used by both the probe and the drop
 # loop in `_prepare_schema` -- two lists is how `subagent_runs` and
 # `task_index_sessions` were omitted from the rebuild in the first place.
@@ -117,6 +219,7 @@ DERIVED_TABLES = (
     "subagent_runs",
     "task_index_sessions",
     INGEST_RUNS_TABLE,
+    SHAPE_TABLE,
 )
 
 # Bumped whenever the shape below changes. The DB is a pure DERIVED rendering
@@ -124,25 +227,34 @@ DERIVED_TABLES = (
 # older shape is rebuilt from scratch rather than migrated in place -- see
 # `_prepare_schema`, and `IN_PLACE_UPGRADE_FROM` below for the narrow case
 # where rebuilding would cost rows to arrive at the identical database.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Versions whose difference from the current shape can be applied WITHOUT
 # deleting a row, so they upgrade in place instead of being dropped and
-# rebuilt. Two such hops exist, and a v6 database makes both at once:
+# rebuilt. Three such hops exist, and a v6 database makes all three at once:
 #
 #   v6 -> v7  ADDS `ingest_runs`, supplied by `CREATE TABLE IF NOT EXISTS`.
 #   v7 -> v8  DROPS `api_calls.cost_usd` (#30), applied by `ALTER TABLE ...
 #             DROP COLUMN`, which rewrites that table's storage in place --
 #             no rebuild, no DROP TABLE, no row deleted.
+#   v8 -> v9  ADDS `source_shape` (#15), supplied by the same
+#             `CREATE TABLE IF NOT EXISTS`.
 #
-# The set was RE-DECIDED at this bump rather than extended, and it is
-# deliberately no longer called "additive": v7 -> v8 removes a column, so the
-# property that admits a version here is "the delta preserves every row",
-# which is the property `_prepare_schema`'s refusal guard actually protects.
-# Whoever bumps SCHEMA_VERSION next has to re-decide it again -- a version
-# belongs here only while EVERY difference between its shape and the current
-# one is row-preserving, and that is not a property that accumulates.
-IN_PLACE_UPGRADE_FROM = frozenset({6, 7})
+# RE-DECIDED at this bump, not extended by habit -- the comment below has said
+# since v8 that this does not accumulate, so each member was re-checked against
+# the CURRENT shape rather than against the version it was admitted for:
+#
+#   * 6: needs `ingest_runs` created (empty is true of it), `cost_usd` dropped
+#     in place, `source_shape` created (empty is true of it -- see
+#     IN_PLACE_CREATABLE_TABLES). No row deleted.
+#   * 7: `cost_usd` dropped in place, `source_shape` created. No row deleted.
+#   * 8: `source_shape` created. No row deleted.
+#
+# The property that admits a version is "the delta preserves every row", which
+# is what `_prepare_schema`'s refusal guard protects. Whoever bumps
+# SCHEMA_VERSION next has to re-decide it AGAIN: v9 adds a table whose absence
+# is honestly readable, and the next delta may not be.
+IN_PLACE_UPGRADE_FROM = frozenset({6, 7, 8})
 
 # The two permissions an in-place upgrade needs, named and bounded, because
 # `CREATE TABLE IF NOT EXISTS` silently grants the first to EVERY table and
@@ -156,7 +268,17 @@ IN_PLACE_UPGRADE_FROM = frozenset({6, 7})
 # marks its source unchanged so it will never be re-read -- a confident empty
 # table beside a populated one, which is the failure this project exists to
 # prevent. Anything not listed here must be REFUSED, not conjured.
-IN_PLACE_CREATABLE_TABLES = frozenset({INGEST_RUNS_TABLE})
+#
+# `source_shape` (#15) clears the same bar, and only because of how it is
+# defined: a ROW in it is a POSITIVE observation about one source file, so NO
+# rows means "nothing has been censused yet" -- which is exactly a v8
+# database's state, since the census did not exist when it was written. What
+# keeps that honest rather than convenient is that "censused, and every record
+# named a version" is a row carrying a MEASURED ZERO, not an absent row: the
+# two readings cannot collapse into each other. The cost is real and is paid
+# out loud -- `ingest()` reports how many tracked sources are censused, because
+# an empty census must never read as a clean corpus.
+IN_PLACE_CREATABLE_TABLES = frozenset({INGEST_RUNS_TABLE, SHAPE_TABLE})
 
 # A column listed here may be ADDED to a table that already holds rows, with
 # its declared type. The bar is the same one: the value the existing rows get
@@ -339,6 +461,38 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     finished_at REAL NOT NULL
 );
+-- What the transcripts this source was parsed from actually LOOKED LIKE (#15).
+-- Anthropic documents the entry format as internal and changing between Claude
+-- Code releases, so every structural assumption CPB makes is counted here
+-- rather than assumed: which `version` wrote the measured records, and which
+-- record types and `usage` keys turned up that this tool has never seen.
+--
+-- One row per (source file, fact, name). `records` counts RECORDS, never
+-- files. Reading it:
+--
+--   * a row is a POSITIVE observation about that source. NO row for a path
+--     means it has not been censused -- it was ingested before this table
+--     existed and is unchanged, so it will be censused when it next changes.
+--     "Not censused" is not "clean", and `ingest()` prints the ratio.
+--   * `name IS NULL` means the field this fact is about was ABSENT: for
+--     `version`, records that carried none; for `unknown-record-type`, records
+--     with no usable `type` string. It is never a substituted value.
+--   * a `version` row with `records = 0` is a MEASURED zero -- this source was
+--     censused and every measured record named a version. That is a different
+--     fact from an absent row and must stay one.
+--
+-- No PRIMARY KEY and no UNIQUE index, deliberately: `name` is nullable by
+-- design, and SQLite treats two NULLs as distinct in a unique index, so the
+-- constraint would look like it enforced one row per (path, fact, name) while
+-- exempting exactly the rows that record an absence. Uniqueness comes from the
+-- writer instead -- `store_source()` deletes this source's rows and re-inserts
+-- one per distinct name, inside the same transaction as the rest of the parse.
+CREATE TABLE IF NOT EXISTS source_shape (
+    path TEXT NOT NULL,
+    fact TEXT NOT NULL,
+    name TEXT,
+    records INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_api_calls_ts ON api_calls (ts);
 CREATE INDEX IF NOT EXISTS idx_api_calls_session ON api_calls (session_id);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns (session_id);
@@ -360,6 +514,10 @@ CREATE INDEX IF NOT EXISTS idx_api_calls_agent_id ON api_calls (agent_id);
 CREATE INDEX IF NOT EXISTS idx_subagent_runs_dispatching
     ON subagent_runs (dispatching_session_id);
 CREATE INDEX IF NOT EXISTS idx_subagent_runs_status ON subagent_runs (status);
+-- #15: the census is read per SOURCE (the delete-and-replace on re-ingest, and
+-- "which file reported this version") and per FACT (the corpus-wide roll-up).
+CREATE INDEX IF NOT EXISTS idx_source_shape_path ON source_shape (path);
+CREATE INDEX IF NOT EXISTS idx_source_shape_fact ON source_shape (fact);
 """
 
 TASK_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
@@ -588,6 +746,19 @@ class ContentBlock:
     ts: Optional[float] = None
 
 
+def new_shape_census() -> dict[tuple[str, Optional[str]], int]:
+    """A census that already states the one thing an empty dict cannot (#15).
+
+    Seeded with `(SHAPE_VERSION, None) = 0`, so a parsed source ALWAYS carries
+    at least one census row. That is what makes "this source was censused and
+    every measured record named a version" (a measured zero) a different stored
+    fact from "this source has never been censused" (no rows at all) -- the
+    second is what a database upgraded from v8 holds, and reading it as the
+    first would report an unexamined corpus as a clean one.
+    """
+    return {(SHAPE_VERSION, None): 0}
+
+
 @dataclass
 class ParseResult:
     turns: list[Turn] = field(default_factory=list)
@@ -607,6 +778,23 @@ class ParseResult:
     # `output_tokens` -- the genuinely ambiguous case, ~1 in 19,000 on the
     # corpus this was measured against.
     divergent_message_ids: int = 0
+    # The transcript-SHAPE census for this file (#15): `(fact, name) -> records`,
+    # written to `source_shape` verbatim. See `new_shape_census()` for why it
+    # starts non-empty.
+    shape: dict[tuple[str, Optional[str]], int] = field(
+        default_factory=new_shape_census
+    )
+
+    def note_shape(self, fact: str, name: Optional[str]) -> None:
+        """Count one record under `(fact, name)`.
+
+        `dict.get(..., 0)` rather than a `Counter`: a Counter answers 0 for a
+        name it has never seen, which would make "this shape was never
+        observed" and "it was observed zero times" the same answer -- the
+        absence-as-a-value confusion this census exists to prevent.
+        """
+        key = (fact, name)
+        self.shape[key] = self.shape.get(key, 0) + 1
 
 
 def parse_ts(record: dict) -> Optional[float]:
@@ -1040,21 +1228,23 @@ def parse_file(path: Path, collect_turns: bool = True) -> ParseResult:
                 continue
 
             rtype = record.get("type")
+            _census_record(record, rtype, result)
             try:
-                if rtype == "assistant":
+                if rtype == RECORD_TYPE_ASSISTANT:
                     _parse_assistant(
                         record, result, current_turn, tool_use_meta, tool_names
                     )
                     result.records_parsed += 1
-                elif rtype == "user":
+                elif rtype == RECORD_TYPE_USER:
                     new_turn = _parse_user(
                         record, result, tool_use_meta, tool_names, collect_turns
                     )
                     if new_turn is not None:
                         current_turn = new_turn
                     result.records_parsed += 1
-                # Other record types (mode, attachment, queue-operation, ...)
-                # are known-irrelevant and skipped without counting.
+                # Every other type is in IGNORED_RECORD_TYPES and skipped
+                # deliberately -- or it is NOT, in which case `_census_record`
+                # above has just counted it by name (#15).
             except (KeyError, TypeError, ValueError, AttributeError) as exc:
                 result.unparsed_records += 1
                 result.unparsed_details.append(
@@ -1062,6 +1252,68 @@ def parse_file(path: Path, collect_turns: bool = True) -> ParseResult:
                 )
     result.calls = _dedupe_calls(result)
     return result
+
+
+def _census_record(record: dict, rtype: Any, result: ParseResult) -> None:
+    """Count what this record's STRUCTURE says, before anything reads it (#15).
+
+    Runs on every record that parsed as a JSON object, and BEFORE the parse
+    attempt, so a record that goes on to defeat the parser still reports which
+    Claude Code version wrote it -- losing that because of a value error is how
+    a breaking release would stay anonymous. A line that is not JSON at all is
+    NOT censused: it is already counted as unparsed, and inventing a
+    versionless measured record out of a line we could not read would be a
+    fabricated observation.
+
+    Two facts, and the split matters. A KNOWN type is provenance -- which
+    version wrote the records CPB derives numbers from. An UNKNOWN type is a
+    surprise, and is counted by name so a type introduced by a Claude Code
+    release is visible as itself rather than as a total quietly getting
+    smaller. Neither turns into the other: an unknown type contributes nothing
+    to any version's count, so it cannot make some other version look busier,
+    and it is not a parse failure either (we did not try to read it).
+
+    A `type` that is absent, or present but not a string, is counted with a
+    NULL name -- "this record does not declare a type we can name". The two
+    collapse into one bucket on purpose: neither can be looked up, and a
+    stringified non-string would collide with a real type of the same spelling.
+    A `version` that is absent, empty or not a string is read the same way, for
+    the same reason: it is an absence, and absence is not a value.
+    """
+    if isinstance(rtype, str) and rtype in KNOWN_RECORD_TYPES:
+        if rtype in PARSED_RECORD_TYPES:
+            version = record.get("version")
+            result.note_shape(
+                SHAPE_VERSION,
+                version if isinstance(version, str) and version else None,
+            )
+        return
+    result.note_shape(
+        SHAPE_UNKNOWN_RECORD_TYPE, rtype if isinstance(rtype, str) else None
+    )
+
+
+def _census_usage(usage: dict, result: ParseResult) -> None:
+    """Count the ways this `usage` object differs from the one CPB expects.
+
+    Both directions, because they fail differently:
+
+      * a key nobody here has seen -- the accounting may have moved, and the
+        name is what lets someone go and find out what it measures;
+      * one of `USAGE_TOKEN_KEYS` missing -- `tok()` reads that as a real 0,
+        which is right for a token class that did not occur and silently
+        catastrophic if a release renamed the key. Counting it is the only
+        thing that keeps the two apart.
+
+    Never raises. It is a census, not a validation: a record with a surprising
+    shape is still parsed exactly as before, and the surprise is recorded
+    beside the measurement rather than instead of it.
+    """
+    for key in sorted(set(usage) - KNOWN_USAGE_KEYS):
+        result.note_shape(SHAPE_UNKNOWN_USAGE_KEY, key)
+    for key in USAGE_TOKEN_KEYS:
+        if key not in usage:
+            result.note_shape(SHAPE_MISSING_USAGE_KEY, key)
 
 
 # The four token classes an API response reports. `output_tokens` is excluded
@@ -1138,6 +1390,10 @@ def _parse_assistant(
     usage = message.get("usage")
     if not isinstance(usage, dict):
         raise ValueError("assistant record without usage object")
+    # BEFORE `tok()` can raise: a record whose value defeats the parser still
+    # tells us what its `usage` was SHAPED like, and that is the half that
+    # names a release (#15).
+    _census_usage(usage, result)
     model = str(message.get("model") or "<unknown>")
 
     def tok(key: str) -> int:
@@ -1412,6 +1668,7 @@ def delete_source_rows(conn: sqlite3.Connection, source_path: str) -> None:
     conn.execute("DELETE FROM turns WHERE source_path = ?", (source_path,))
     conn.execute("DELETE FROM agent_dispatches WHERE source_path = ?", (source_path,))
     conn.execute("DELETE FROM ingest_state WHERE path = ?", (source_path,))
+    conn.execute(f"DELETE FROM {SHAPE_TABLE} WHERE path = ?", (source_path,))
 
 
 def store_source(
@@ -1439,6 +1696,18 @@ def store_source(
     conn.execute("DELETE FROM api_calls WHERE source_path = ?", (source_path,))
     conn.execute("DELETE FROM turns WHERE source_path = ?", (source_path,))
     conn.execute("DELETE FROM agent_dispatches WHERE source_path = ?", (source_path,))
+    # The census is REPLACED, never accumulated: this parse is the whole truth
+    # about the file's current contents, and adding to a previous run's counts
+    # would double-report which version wrote a corpus (#15).
+    conn.execute(f"DELETE FROM {SHAPE_TABLE} WHERE path = ?", (source_path,))
+    for (fact, name), records in sorted(
+        parsed.shape.items(), key=lambda item: (item[0][0], item[0][1] or "")
+    ):
+        conn.execute(
+            f"INSERT INTO {SHAPE_TABLE} (path, fact, name, records)"
+            " VALUES (?,?,?,?)",
+            (source_path, fact, name, records),
+        )
 
     timestamps = [t.ts for t in parsed.turns if t.ts is not None] + [
         c.ts for c in parsed.calls if c.ts is not None
@@ -1646,6 +1915,45 @@ def record_ingest_run(conn: sqlite3.Connection, finished_at: float) -> None:
         " VALUES (?, ?)",
         (INGEST_RUN_ROW_ID, finished_at),
     )
+
+
+def shape_census(conn: sqlite3.Connection, fact: str) -> dict[Optional[str], int]:
+    """Corpus-wide `{name: records}` for ONE shape fact (#15).
+
+    Read off the DATABASE rather than off this run's counters, deliberately.
+    A shape finding is a standing fact about a corpus, not an event: the file
+    that first carried an unknown record type is unchanged on every subsequent
+    run and therefore skipped, so a run-scoped count would announce the break
+    once and be silent forever after. `sessions_with_subagent_transcripts` is
+    read the same way for the same reason.
+
+    A `None` key is an absence the census recorded (see the `source_shape`
+    comment), never a name that failed to load.
+    """
+    return {
+        name: records
+        for name, records in conn.execute(
+            f"SELECT name, SUM(records) FROM {SHAPE_TABLE} WHERE fact = ?"
+            " GROUP BY name",
+            (fact,),
+        ).fetchall()
+    }
+
+
+def census_coverage(conn: sqlite3.Connection) -> tuple[int, int]:
+    """`(sources censused, sources tracked)` -- the census's own coverage.
+
+    Without this pair, "no unknown record types" is unreadable: it means
+    "nothing surprising in the corpus" on a database ingested at v9, and
+    "nothing has been looked at" on one upgraded from v8, whose sources are
+    unchanged and so will not be re-parsed until they change. Same empty
+    result, opposite meanings, so the ratio is reported next to it.
+    """
+    censused = conn.execute(
+        f"SELECT COUNT(DISTINCT path) FROM {SHAPE_TABLE}"
+    ).fetchone()[0]
+    tracked = conn.execute("SELECT COUNT(*) FROM ingest_state").fetchone()[0]
+    return censused, tracked
 
 
 def _sqlite_supports_drop_column(version: Optional[str] = None) -> bool:
@@ -2144,6 +2452,17 @@ def ingest(
             "calls_without_message_id": 0,
             "divergent_message_ids": 0,
             "unparsed_details": [],
+            # Transcript-shape census (#15), all read off the DB below so a
+            # run that skipped every file still reports the corpus's shape.
+            # `claude_code_versions` maps version -> records over the MEASURED
+            # records only; its `None` key counts measured records that carried
+            # no version at all, which is an absence and not a version.
+            "claude_code_versions": {},
+            "unknown_record_types": {},
+            "unknown_usage_keys": {},
+            "missing_usage_keys": {},
+            "sources_censused": 0,
+            "sources_tracked": 0,
         }
         index = discover_task_index(
             tasks_dir if tasks_dir is not None else default_tasks_dir(projects_dir)
@@ -2219,6 +2538,17 @@ def ingest(
             "SELECT COUNT(DISTINCT session_id) FROM ingest_state WHERE source_kind = ?",
             (SOURCE_SUBAGENT,),
         ).fetchone()[0]
+        # Same reasoning, applied to the shape census: a standing fact about
+        # the corpus, not an event of this run (#15).
+        summary["claude_code_versions"] = shape_census(conn, SHAPE_VERSION)
+        summary["unknown_record_types"] = shape_census(
+            conn, SHAPE_UNKNOWN_RECORD_TYPE
+        )
+        summary["unknown_usage_keys"] = shape_census(conn, SHAPE_UNKNOWN_USAGE_KEY)
+        summary["missing_usage_keys"] = shape_census(conn, SHAPE_MISSING_USAGE_KEY)
+        censused, tracked = census_coverage(conn)
+        summary["sources_censused"] = censused
+        summary["sources_tracked"] = tracked
         # LAST, and only on the success path (#20): the stamp claims "this
         # database has seen the transcripts as of now", which is false if we
         # never got here. Read fresh rather than reusing the `now` computed
@@ -2353,6 +2683,23 @@ def ingest_transcript(
             summary["calls_without_message_id"] = parsed.calls_without_message_id
             summary["divergent_message_ids"] = parsed.divergent_message_ids
             summary["unparsed_details"] = list(parsed.unparsed_details)
+            # THIS FILE's shape census, and only this file's (#15). Directory
+            # mode reads the corpus-wide roll-up off the database; doing that
+            # here would report a fact about sources this run never opened,
+            # which is the one thing this mode must never do. On the skip path
+            # the keys are absent entirely rather than empty -- an empty census
+            # would state that a file was examined and found unsurprising.
+            for fact, key in (
+                (SHAPE_VERSION, "claude_code_versions"),
+                (SHAPE_UNKNOWN_RECORD_TYPE, "unknown_record_types"),
+                (SHAPE_UNKNOWN_USAGE_KEY, "unknown_usage_keys"),
+                (SHAPE_MISSING_USAGE_KEY, "missing_usage_keys"),
+            ):
+                summary[key] = {
+                    name: records
+                    for (observed, name), records in parsed.shape.items()
+                    if observed == fact
+                }
 
         # Unconditional, including on the skip path: it is two statements over
         # a small table, and it makes the roll-up self-healing rather than
@@ -2523,6 +2870,77 @@ def print_dedupe_note(summary: dict[str, Any]) -> None:
         )
 
 
+def _named_counts(census: dict[Optional[str], int]) -> str:
+    """`name=count` pairs for a census, with the absence bucket named as one.
+
+    NULL is rendered as an explicit `(no name recorded)` rather than as an
+    empty string or a plausible label: what it counts is records the field was
+    ABSENT from, and a reader must not be able to mistake it for a value.
+    """
+    return ", ".join(
+        f"{'(no name recorded)' if name is None else name}={records}"
+        for name, records in sorted(
+            census.items(), key=lambda item: (item[0] is None, item[0] or "")
+        )
+    )
+
+
+def print_shape_note(summary: dict[str, Any]) -> None:
+    """The transcript-shape census, said out loud (#15).
+
+    Anthropic documents this format as internal and changing between Claude
+    Code releases. The whole point of counting its shape is that a change
+    arrives as a NAMED count here, on the run that first reads it, instead of
+    as a total that quietly got smaller.
+
+    Nothing is printed unless there is something to say -- except the coverage
+    ratio, which is printed exactly when it is INCOMPLETE, because a silent
+    census on a partly-examined corpus reads as a clean one.
+    """
+    # `.get(...) or {}`: single-file mode omits these keys entirely on the skip
+    # path, where nothing was examined. Both an absent key and an empty census
+    # print nothing, which is the right output for "no surprise to report" and
+    # for "we did not look" alike -- the DIFFERENCE between them is carried by
+    # the stored rows, not by this line.
+    surprises = (
+        ("record type(s) this tool does not know",
+         summary.get("unknown_record_types") or {}),
+        ("`usage` key(s) never seen before",
+         summary.get("unknown_usage_keys") or {}),
+        ("`usage` key(s) MISSING that every token column is read from",
+         summary.get("missing_usage_keys") or {}),
+    )
+    for label, census in surprises:
+        if census:
+            print(
+                f"SHAPE CHANGE: {label} -- {_named_counts(census)}."
+                " Claude Code's transcript format is documented as internal and"
+                " changes between releases; these records were NOT read, so"
+                " their spend is unmeasured rather than zero."
+            )
+    versions = summary.get("claude_code_versions") or {}
+    named = {name: n for name, n in versions.items() if name is not None}
+    unversioned = versions.get(None)
+    if named:
+        print(
+            f"claude code versions in the measured records: {_named_counts(named)}"
+            + (
+                f" | measured records carrying no version field: {unversioned}"
+                if unversioned
+                else ""
+            )
+        )
+    tracked = summary.get("sources_tracked")
+    censused = summary.get("sources_censused")
+    if tracked is not None and censused is not None and censused < tracked:
+        print(
+            f"NOTE: transcript-shape census covers {censused} of {tracked}"
+            " tracked source(s). The rest were ingested before the census"
+            " existed and are UNCENSUSED, not clean -- each is censused the"
+            " next time its file changes, or immediately if you re-ingest it."
+        )
+
+
 def print_inconclusive_note(summary: dict[str, Any]) -> None:
     """A parse failure is never silent, in either mode."""
     if summary["unparsed_records"]:
@@ -2561,6 +2979,7 @@ def run_transcript_mode(transcript: Path, db_path: Path) -> None:
         " no claim is made about any other source."
     )
     print_dedupe_note(summary)
+    print_shape_note(summary)
     print_inconclusive_note(summary)
 
 
@@ -2670,6 +3089,7 @@ def main() -> None:
             "sessions with subagent transcripts:"
             f" {summary['sessions_with_subagent_transcripts']}"
         )
+    print_shape_note(summary)
     print_inconclusive_note(summary)
 
 

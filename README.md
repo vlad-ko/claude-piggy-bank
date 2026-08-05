@@ -320,6 +320,55 @@ transcript has been reaped.
 Every `assistant` record carrying a `message.usage` block is one API call, with
 its four token classes: input, cache-read, cache-write, and output.
 
+### The format CPB reads is internal, and Anthropic says so
+
+This is the tool's central dependency and it should be stated plainly rather
+than discovered on a release day. Anthropic's own documentation of
+`~/.claude/projects/<project>/<session-id>.jsonl` says:
+
+> Each line is a JSON object for a message, tool use, or metadata entry. **The
+> entry format is internal to Claude Code and changes between versions, so
+> scripts that parse these files directly can break on any release.**
+
+CPB's entire ingest parses those files directly. That is its premise, not an
+oversight: the two supported alternatives cannot answer the questions CPB asks.
+`/export` produces a rendered transcript for a person to read, with no `usage`
+blocks at all, and `claude -p --resume <id> --output-format json` is structured
+output for *one run*, not for the historical corpus. So the direct parse stays,
+and the response is to make a break **loud and diagnosable** instead of silent.
+
+The shape has already moved within a single corpus: `usage` carries
+`output_tokens_details` on some model/version combinations and not others,
+`thinking` blocks persist with empty text plus a signature, and one API response
+is written as many records sharing one `message.id` (the defect at the top of
+this README).
+
+So ingest now **counts the shape it saw**, per source file, in a `source_shape`
+table:
+
+- which Claude Code **`version`** wrote the records each figure is derived
+  from — a file whose records span two versions says so, and a record that
+  carries no version is counted as an *absence*, never defaulted to a string;
+- any record **`type`** this tool has never seen, counted under its own name.
+  A new type introduced by a Claude Code release shows up as a named count on
+  the run that first reads it, instead of as a total that quietly got smaller;
+- any **`usage` key** never seen before, and any of the four keys the token
+  columns are read from going *missing*. An absent key reads as a real `0`,
+  which is right for a token class that did not occur and silently catastrophic
+  if a release renames `output_tokens`.
+
+A row in that table is a positive observation, so a source with no rows has not
+been censused rather than been found clean — `ingest.py` prints the ratio, and
+an upgraded database censuses each source the next time its file changes.
+
+One test in the suite reads a **real** transcript from `~/.claude/projects` at
+run time and fails if any of those assumptions has moved. It asserts only over
+the census — key names, type names and counts — and never over content, so no
+prompt, path or session id can reach a failure message. On a machine with no
+corpus (CI included) it skips **loudly**, printing why: it is the only test here
+that can see a format change, because every other one runs on fixtures this
+repository wrote, which agree with CPB's assumptions by construction.
+
 ### Transcripts expire — back up the database
 
 Claude Code deletes transcripts after `cleanupPeriodDays`, which **defaults to
@@ -385,6 +434,11 @@ Fixtures are hand-built and synthetic — no captured session content. They pin
 deliberately unequal values per token class so a swapped column mapping cannot
 pass, and include a deliberately malformed line asserting that parse failures
 are counted rather than swallowed.
+
+The one exception reads your own transcripts and commits nothing: the shape
+smoke test described above opens the most recently written files under
+`~/.claude/projects` at run time, asserts only over key names and counts, and
+skips loudly where there is no corpus.
 
 ## Documentation
 
