@@ -207,7 +207,45 @@ CREATE INDEX IF NOT EXISTS idx_subagent_runs_status ON subagent_runs (status);
 TASK_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 TOOL_USE_ID_RE = re.compile(r"<tool-use-id>([^<]+)</tool-use-id>")
 SUBAGENT_TOKENS_RE = re.compile(r"<subagent_tokens>(\d+)</subagent_tokens>")
-CRON_TICK_RE = re.compile(r"PR-cycle|cron|recurring tick", re.IGNORECASE)
+# Provenance markers, in match order. Each is a tag Claude Code itself writes
+# at the START of a turn's text, so its presence there PROVES who submitted the
+# turn.
+#
+# REFERENCE CORPUS for every count in this region: one developer machine's
+# local transcript corpus, 48 main-thread session files, 6,643
+# user turns, checked 2026-08-04. It is one operator's usage, not a sample of
+# Claude Code users, and it is live -- re-measuring later will not reproduce
+# these exactly. Every tag below sat at offset 0 of its turn in 100% of its
+# occurrences there: 1,992 task-notification, 45 system-reminder, 18
+# local-command-stdout, 32 local-command-caveat, 331 command-message/-name.
+#
+# `<command-message>` and `<command-name>` are BOTH listed because a slash
+# command that produces no stdout emits only those two (305 of the 331 turns
+# lead with the message, 26 with the name), and testing `"<local-command" in
+# text` missed every one -- which is how `/wizard` came to be a "cron tick".
+TURN_PROVENANCE_TAGS: tuple[tuple[str, str], ...] = (
+    ("<task-notification>", "task-notification"),
+    ("<system-reminder>", "system-reminder"),
+    ("<local-command-stdout>", "local-command"),
+    ("<local-command-caveat>", "local-command"),
+    ("<command-message>", "local-command"),
+    ("<command-name>", "local-command"),
+)
+
+# A scheduled tick opens with an ALL-CAPS sentinel ending in the word TICK and
+# closed by punctuation -- `PR-CYCLE TICK.`, `PIPELINE TICK —`. Anchored with
+# `.match()`, never searched: the sentinel is a claim about who spoke, and a
+# human sentence CONTAINING one of these words is not that speaker.
+#
+# This is weaker evidence than the tags above -- a scheduler submits ordinary
+# prompt text, so the sentinel is a CONVENTION of the scheduling tool, not
+# something Claude Code guarantees -- and it is deliberately a shape rather
+# than a list of literals, because an unlisted tick name fails SILENTLY into
+# `human`, which is exactly the bug being fixed here. Yield on the reference
+# corpus: 348 turns in four families -- PIPELINE TICK 259, PR-CYCLE TICK 69,
+# PRECEDENT-GARAGE COHORT TICK 18, RESOURCE-MANAGER TICK 2 -- and nothing else,
+# i.e. no all-caps human opener was swept up.
+CRON_TICK_RE = re.compile(r"[A-Z][A-Z0-9 +/&-]{0,40}\bTICK\b\s*[.:—-]")
 
 
 @dataclass(frozen=True)
@@ -366,17 +404,40 @@ def parse_ts(record: dict) -> Optional[float]:
 
 
 def classify_turn(text: str) -> str:
-    """Classify a turn from the first ~600 chars of its text."""
-    head = text[:600]
-    if "<task-notification>" in head:
-        return "task-notification"
-    if "<system-reminder>" in head:
-        return "system-reminder"
-    if "<local-command" in head:
-        return "local-command"
-    if "wakeup" in head.lower():
-        return "wakeup"
-    if CRON_TICK_RE.search(head):
+    """Classify a turn by PROVENANCE -- who submitted it -- from its opening.
+
+    Not by topic. The distinction is the whole point (#4): the previous version
+    searched `cron`, `PR-cycle` and `wakeup` anywhere in a 600-char window, so
+    it answered "what is this turn ABOUT", and a human asking whether the cron
+    tick was worth keeping was booked as the cron tick's own cost. On the
+    reference corpus above it erred in BOTH directions:
+
+      * 117 of 117 `wakeup` turns only MENTIONED the word -- it appeared at
+        offset >= 40 every time and at offset 0 never once, so the arm had a
+        100% false-positive rate and is gone. No start-anchored wakeup marker
+        exists in the corpus; a scheduled wakeup announces itself with a tick
+        sentinel and is classified `cron-tick`. The label is not kept as an
+        empty bucket, which would read as "measured, none found".
+      * 259 genuine `PIPELINE TICK` ticks were booked as `human`, because the
+        pattern happened to list other tick names. That bucket was larger than
+        all 145 turns the classifier did call `cron-tick`.
+
+    A marker only counts at the START of the text. Deeper in, it is quoted
+    content -- this turn's own text may end with an appended `<system-reminder>`
+    without the harness having spoken.
+
+    `human` is the residual: no provenance marker found. It is a weaker claim
+    than the labelled classes and callers should read it that way. Two shapes
+    are deliberately left in it rather than guessed at, pending evidence of who
+    emits them: `[auto-resume ...]` (1,573 turns) and `autonomous ...` (123).
+    """
+    # `.lstrip()` on a bounded slice: leading whitespace must not defeat the
+    # anchor, and the slice keeps this off the length of a large paste.
+    head = text[:600].lstrip()
+    for tag, turn_type in TURN_PROVENANCE_TAGS:
+        if head.startswith(tag):
+            return turn_type
+    if CRON_TICK_RE.match(head):
         return "cron-tick"
     return "human"
 
