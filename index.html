@@ -398,7 +398,19 @@ async function showDetail(id) {
   document.getElementById("detail-title").textContent = "Session " + id;
   const tt = d.turn_types.map(r => `<tr><td>${esc(r.turn_type)}</td><td>${r.turns}</td><td>${r.calls}</td>${tokenCols(r)}</tr>`).join("");
   const mm = d.models.map(r => `<tr><td>${esc(r.model)}</td><td></td><td>${r.calls}</td>${tokenCols(r)}</tr>`).join("");
-  const at = d.agent_types.map(r => `<tr><td>${esc(r.agent_type)}</td><td>${r.dispatches}</td><td>${r.subagent_tokens === null ? "—" : fmtTok(r.subagent_tokens)}${r.untotaled_dispatches ? ` (+${r.untotaled_dispatches} untotaled)` : ""}</td></tr>`).join("") || `<tr><td colspan="3">No agent dispatches recorded.</td></tr>`;
+  // #10: peak context and spend are two different quantities, side by side.
+  // The self-reported `<subagent_tokens>` tag is a HIGH-WATER MARK (how big
+  // the subagent's context got), so it is shown as the largest single
+  // dispatch, never summed; spend is measured from the subagent transcripts.
+  // A dispatch that reported no peak, or whose transcript was never measured,
+  // is counted beside the figure rather than folded into it -- a partial
+  // column must read as the lower bound it is, and never as a 0.
+  const at = d.agent_types.map(r =>
+    `<tr><td>${esc(r.agent_type)}</td><td>${r.dispatches}</td>` +
+    `<td>${fmtTok(r.peak_context_tokens)}${r.dispatches_without_peak ? ` (${r.dispatches_without_peak} unreported)` : ""}</td>` +
+    `<td>${fmtTok(r.measured_tokens)}${r.dispatches_without_spend ? ` (${r.dispatches_without_spend} unmeasured)` : ""}</td>` +
+    `<td>${fmtCost(r.cost_estimate_usd)}</td></tr>`
+  ).join("") || `<tr><td colspan="5">No agent dispatches recorded.</td></tr>`;
   const ot = d.outlier_turns.map(r => `<tr><td>${fmtTs(r.ts)}</td><td>${esc(r.turn_type)}</td><td>${r.calls}</td><td>${fmtTok(r.cache_read)}</td><td class="preview">${esc(r.preview)}</td></tr>`).join("");
   const sc = d.scopes.map(r => `<tr><td>${esc(r.scope)}</td><td>${r.calls}</td>${tokenCols(r)}</tr>`).join("")
     || `<tr><td colspan="7">No API calls recorded for this session.</td></tr>`;
@@ -409,8 +421,8 @@ async function showDetail(id) {
     <table><thead><tr><th>Turn type</th><th>Turns</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th title="List-rate ESTIMATE -- not a bill.">Cost estimate</th></tr></thead><tbody>${tt}</tbody></table>
     <h3>By model</h3>
     <table><thead><tr><th>Model</th><th></th><th>Calls</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th title="List-rate ESTIMATE -- not a bill.">Cost estimate</th></tr></thead><tbody>${mm}</tbody></table>
-    <h3>Agent dispatch spend (subagent-reported tokens)</h3>
-    <table><thead><tr><th>Agent type</th><th>Dispatches</th><th>Subagent tokens</th></tr></thead><tbody>${at}</tbody></table>
+    <h3>Agent dispatches: peak context vs measured spend</h3>
+    <table><thead><tr><th>Agent type</th><th>Dispatches</th><th title="The subagent-reported &lt;subagent_tokens&gt; figure is a PEAK CONTEXT high-water mark -- how big the subagent's context got, not what it cost. Shown for the largest single dispatch; summing high-water marks is meaningless. '(n unreported)' = dispatches that emitted no figure -- no sample, not zero.">Peak context (largest dispatch)</th><th title="Cumulative tokens measured from the subagent transcripts -- what these dispatches actually consumed. Typically ~50x the peak-context figure beside it. '(n unmeasured)' = dispatches with no transcript read, so this total is a LOWER BOUND.">Measured spend (tokens)</th><th title="List-rate ESTIMATE -- not a bill.">Cost estimate</th></tr></thead><tbody>${at}</tbody></table>
     <h3>Top turns by cache-read</h3>
     <table><thead><tr><th>When</th><th>Type</th><th>Calls</th><th>Cache read</th><th>Preview</th></tr></thead><tbody>${ot}</tbody></table>`;
   const panel = document.getElementById("detail");

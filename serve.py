@@ -535,14 +535,58 @@ class Api:
                 (session_id,),
             )
         ]
+        # Two DIFFERENT quantities per agent type, never one reconciled figure
+        # (#10). `agent_dispatches.subagent_tokens` -- the `<subagent_tokens>`
+        # tag the dispatching turn carries -- is the subagent's PEAK CONTEXT, a
+        # high-water mark, not what the dispatch cost.
+        #
+        # Measured 2026-08-02 on one machine's corpus (2026-06-06..2026-08-02,
+        # 45 sessions, 1,774 dispatches carrying both figures): the tag over
+        # `MAX(api_calls.context_size)` for the same agent has median 1.004
+        # (p5 1.001, p25 1.002, p75 1.006, p95 1.012), and 1,740 of 1,774 --
+        # 98.1% -- land within +-5% of 1.0. The same tag over transcript-
+        # measured tokens has median 0.011: measured spend is 51.6x larger.
+        # This is an EMPIRICAL finding about the harness's tag, not a documented
+        # contract, which is why tests/test_serve.py pins the relationship --
+        # a harness that changes the tag's meaning must go red, not re-diverge
+        # silently.
+        #
+        # Hence MAX, never SUM. Summing high-water marks yields a quantity that
+        # means nothing (265M summed against 23.4B measured on that corpus, an
+        # 88x artifact) -- and it was rendered under an "Agent dispatch spend"
+        # heading, understating dispatch spend by ~50x at the median.
+        #
+        # Spend comes from the transcripts instead, joined agent-side
+        # (`api_calls.agent_id` == the dispatch's `<task-id>`), pre-aggregated
+        # so the 1:1 join cannot fan out and inflate `dispatches`.
+        #
+        # Absence survives both columns: MAX() over an all-NULL group is NULL,
+        # and SUM() over unmatched LEFT JOIN rows is NULL, so "no dispatch
+        # reported a peak" and "no transcript was measured" stay distinct from
+        # a real 0 -- each with its own count so a PARTIAL figure reads as the
+        # lower bound it is.
         agent_types = [
             dict(r)
             for r in self.conn.execute(
-                "SELECT COALESCE(agent_type, '(unknown)') agent_type, COUNT(*) dispatches,"
-                " SUM(subagent_tokens) subagent_tokens,"
-                " SUM(subagent_tokens IS NULL) untotaled_dispatches"
-                " FROM agent_dispatches WHERE session_id = ?"
-                " GROUP BY agent_type ORDER BY subagent_tokens DESC",
+                "SELECT COALESCE(d.agent_type, '(unknown)') agent_type,"
+                " COUNT(*) dispatches,"
+                " MAX(d.subagent_tokens) peak_context_tokens,"
+                " SUM(d.subagent_tokens IS NULL) dispatches_without_peak,"
+                " SUM(m.tokens) measured_tokens,"
+                " SUM(m.cost) cost_estimate_usd,"
+                " SUM(m.agent_id IS NULL) dispatches_without_spend"
+                " FROM agent_dispatches d"
+                " LEFT JOIN (SELECT agent_id,"
+                "     SUM(input_tokens + cache_read + cache_write + output_tokens)"
+                "       tokens,"
+                "     SUM(cost_usd) cost"
+                "   FROM api_calls WHERE agent_id IS NOT NULL GROUP BY agent_id) m"
+                "   ON m.agent_id = d.task_id"
+                " WHERE d.session_id = ?"
+                " GROUP BY d.agent_type"
+                " ORDER BY measured_tokens IS NULL, measured_tokens DESC,"
+                "  peak_context_tokens IS NULL, peak_context_tokens DESC,"
+                "  agent_type",
                 (session_id,),
             )
         ]

@@ -9,6 +9,7 @@ reversed-range validation added in this cycle's review pass.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import sys
@@ -709,6 +710,244 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
         payload = self.api.summary(*day_bounds(None, None))
         stale = [k for k in self.NOT_RENDERED if k not in payload]
         self.assertEqual(stale, [], f"NOT_RENDERED names absent fields: {stale}")
+
+
+# --- #10: peak context is not spend --------------------------------------
+#
+# Fixture design (CLAUDE.md, "a fixture must not make the defect
+# undetectable"). Every token class of every call carries a DIFFERENT value,
+# and the two `backend-expert` dispatches carry deliberately unequal peaks so
+# that SUM (70,000) and MAX (40,000) cannot be confused. `pk1`'s peak call is
+# its THIRD of four, so an implementation that reads "the last call's context"
+# instead of the maximum is red too. Ordering has teeth as well: `reviewer`
+# has the largest self-reported peak (480,000) and NO measured spend at all,
+# so the old `ORDER BY SUM(subagent_tokens) DESC` ranked it first while spend
+# ranks it last.
+#
+# The self-reported/peak ratios are pinned near the corpus median: pk1
+# 40000/39840 = 1.0040, pk2 30000/29940 = 1.0020 (measured corpus median
+# 1.004 -- see the comment in serve.py:session_detail).
+PEAK_SESSION = "peak-fixture"
+# agent id (== <task-id>) -> (input, cache_write, cache_read, output) per call.
+PEAK_SUBAGENT_CALLS = {
+    "pk1": [
+        (1000, 2000, 3000, 400),      # ctx  6,000   spend  6,400
+        (1100, 2100, 16000, 500),     # ctx 19,200   spend 19,700
+        (1200, 2400, 36240, 600),     # ctx 39,840   spend 40,440  <- PEAK
+        (1300, 2500, 30000, 700),     # ctx 33,800   spend 34,500
+    ],
+    "pk2": [
+        (900, 1800, 2700, 300),       # ctx  5,400   spend  5,700
+        (940, 1900, 27100, 350),      # ctx 29,940   spend 30,290  <- PEAK
+    ],
+    "pk3": [
+        (510, 620, 730, 840),         # ctx  1,860   spend  2,700
+    ],
+}
+PK1_PEAK_CONTEXT = 39840
+PK1_SPEND = 101040
+PK2_PEAK_CONTEXT = 29940
+PK2_SPEND = 35990
+PK3_SPEND = 2700
+# task_id, tool_use_id, agent type, <subagent_tokens> value (None = no tag).
+PEAK_DISPATCHES = [
+    ("pk1", "toolu_A", "backend-expert", 40000),
+    ("pk2", "toolu_B", "backend-expert", 30000),
+    ("pk3", "toolu_C", "architect", None),        # no tag: NO SAMPLE, not 0
+    ("pk4", "toolu_D", "reviewer", 480000),       # no transcript: spend UNMEASURED
+]
+
+
+def build_peak_context_corpus(root: Path) -> Path:
+    """A session that dispatches four agents, three of which left transcripts."""
+    projects = root / "projects"
+    subagents = projects / PEAK_SESSION / "subagents"
+    subagents.mkdir(parents=True)
+
+    def rec(obj: dict) -> str:
+        return json.dumps(obj) + "\n"
+
+    lines = [
+        rec({"type": "user", "sessionId": PEAK_SESSION,
+             "timestamp": "2026-02-10T10:00:00.000Z",
+             "message": {"role": "user", "content": "Delegate four tasks"}}),
+        rec({"type": "assistant", "sessionId": PEAK_SESSION,
+             "timestamp": "2026-02-10T10:00:05.000Z", "isSidechain": False,
+             "message": {
+                 "id": "msg_peak_main",
+                 "model": "claude-sonnet-5-20260115",
+                 "usage": {"input_tokens": 11, "cache_creation_input_tokens": 22,
+                           "cache_read_input_tokens": 33, "output_tokens": 44},
+                 "content": [
+                     {"type": "tool_use", "id": tool_use_id, "name": "Agent",
+                      "input": {"subagent_type": agent_type,
+                                "description": f"work for {task_id}"}}
+                     for task_id, tool_use_id, agent_type, _ in PEAK_DISPATCHES
+                 ],
+             }}),
+    ]
+    for i, (task_id, tool_use_id, _, reported) in enumerate(PEAK_DISPATCHES):
+        usage = (
+            f"\n<usage><subagent_tokens>{reported}</subagent_tokens>"
+            "<tool_uses>3</tool_uses></usage>"
+            if reported is not None else ""
+        )
+        lines.append(rec({
+            "type": "user", "sessionId": PEAK_SESSION,
+            "timestamp": f"2026-02-10T10:1{i}:00.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": (
+                f"<task-notification>\n<task-id>{task_id}</task-id>\n"
+                f"<tool-use-id>{tool_use_id}</tool-use-id>\n"
+                f"<status>completed</status>\n<result>Done.</result>{usage}\n"
+                "</task-notification>"
+            )}]},
+        }))
+    (projects / f"{PEAK_SESSION}.jsonl").write_text("".join(lines))
+
+    for agent_id, calls in PEAK_SUBAGENT_CALLS.items():
+        (subagents / f"agent-{agent_id}.jsonl").write_text("".join(
+            rec({"type": "assistant", "sessionId": PEAK_SESSION,
+                 "agentId": f"agent-{agent_id}",
+                 "timestamp": f"2026-02-10T10:2{n}:00.000Z", "isSidechain": True,
+                 "message": {
+                     "id": f"msg_{agent_id}_{n}",
+                     "model": "claude-sonnet-5-20260115",
+                     "usage": {"input_tokens": inp,
+                               "cache_creation_input_tokens": cw,
+                               "cache_read_input_tokens": cr,
+                               "output_tokens": out},
+                     "content": [{"type": "text", "text": f"{agent_id} step {n}"}],
+                 }})
+            for n, (inp, cw, cr, out) in enumerate(calls)
+        ))
+    return projects
+
+
+class AgentDispatchPeakContextTest(unittest.TestCase):
+    """#10: `<subagent_tokens>` is PEAK CONTEXT, and was rendered as spend.
+
+    Measured 2026-08-02 over 1,774 dispatches carrying both figures: the tag
+    divided by `MAX(api_calls.context_size)` for the same agent has median
+    1.004 (98.1% within +-5% of 1.0), while the same tag divided by
+    transcript-measured tokens has median 0.011 -- measured spend is 51.6x
+    larger. The session-detail panel SUMMED the tag and titled the column
+    "Agent dispatch spend", understating dispatch spend by ~50x at the median.
+
+    These tests pin all three halves of the fix: the aggregate (MAX, never
+    SUM), the naming (`peak_context_tokens`), and the second, genuinely
+    different quantity beside it (cumulative measured spend).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-peak-context-test-"))
+        projects = build_peak_context_corpus(cls.tmp)
+        ingest(projects, cls.tmp / "usage.db")
+        cls.api = Api(cls.tmp / "usage.db")
+        cls.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def rows(self) -> dict[str, dict]:
+        detail = self.api.session_detail(PEAK_SESSION)
+        return {r["agent_type"]: r for r in detail["agent_types"]}
+
+    def test_fixture_ingested_the_shape_these_tests_assume(self) -> None:
+        # If the corpus did not land, every assertion below is vacuous.
+        rows = self.rows()
+        self.assertEqual(
+            {k: v["dispatches"] for k, v in rows.items()},
+            {"backend-expert": 2, "architect": 1, "reviewer": 1},
+        )
+
+    def test_peak_context_is_the_max_dispatch_not_the_sum(self) -> None:
+        # THE defect. SUM over the two backend-expert dispatches is 70,000 --
+        # a total of two high-water marks, which is not a quantity.
+        row = self.rows()["backend-expert"]
+        self.assertEqual(row["peak_context_tokens"], 40000)
+
+    def test_api_names_the_field_peak_context_not_subagent_tokens(self) -> None:
+        for row in self.rows().values():
+            self.assertIn("peak_context_tokens", row)
+            self.assertNotIn("subagent_tokens", row)
+
+    def test_reported_peak_tracks_max_context_size_not_measured_spend(self) -> None:
+        # The pinning test the issue asks for: if a future harness release
+        # changes what <subagent_tokens> counts, this goes red instead of the
+        # meaning silently re-diverging. Ratios come from the DB so the
+        # relationship is pinned at the source, not at the API's rounding.
+        rows = self.api.conn.execute(
+            "SELECT d.task_id, d.subagent_tokens reported,"
+            " (SELECT MAX(a.context_size) FROM api_calls a"
+            "    WHERE a.agent_id = d.task_id) peak,"
+            " (SELECT SUM(a.input_tokens + a.cache_read + a.cache_write"
+            "             + a.output_tokens) FROM api_calls a"
+            "    WHERE a.agent_id = d.task_id) spend"
+            " FROM agent_dispatches d"
+            " WHERE d.session_id = ? AND d.subagent_tokens IS NOT NULL",
+            (PEAK_SESSION,),
+        ).fetchall()
+        pinned = {r["task_id"]: r for r in rows if r["peak"] is not None}
+        self.assertEqual(set(pinned), {"pk1", "pk2"})
+        self.assertEqual(pinned["pk1"]["peak"], PK1_PEAK_CONTEXT)
+        self.assertEqual(pinned["pk2"]["peak"], PK2_PEAK_CONTEXT)
+        for task_id, r in pinned.items():
+            ratio = r["reported"] / r["peak"]
+            self.assertAlmostEqual(
+                ratio, 1.0, delta=0.05,
+                msg=f"{task_id}: <subagent_tokens>/MAX(context_size) = {ratio}; "
+                    "the tag is a peak-context high-water mark (98.1% of 1,774 "
+                    "real dispatches land within +-5%, measured 2026-08-02)",
+            )
+            # ...and it is emphatically NOT the spend figure beside it.
+            self.assertLess(r["reported"] / r["spend"], 0.9)
+
+    def test_measured_spend_is_reported_beside_the_peak(self) -> None:
+        row = self.rows()["backend-expert"]
+        self.assertEqual(row["measured_tokens"], PK1_SPEND + PK2_SPEND)
+        self.assertGreater(row["cost_estimate_usd"], 0.0)
+
+    def test_a_dispatch_with_no_tag_has_no_peak_sample_not_a_zero(self) -> None:
+        # architect's one dispatch emitted no <subagent_tokens>: absence must
+        # stay absent (CLAUDE.md), and it must not drag the spend column --
+        # which IS measured for that dispatch -- down with it.
+        row = self.rows()["architect"]
+        self.assertIsNone(row["peak_context_tokens"])
+        self.assertEqual(row["dispatches_without_peak"], 1)
+        self.assertEqual(row["measured_tokens"], PK3_SPEND)
+
+    def test_a_dispatch_with_no_transcript_has_no_spend_sample(self) -> None:
+        # reviewer reported a 480,000-token peak and left no transcript: its
+        # spend is UNMEASURED, which must never render as 0 (a free dispatch).
+        row = self.rows()["reviewer"]
+        self.assertEqual(row["peak_context_tokens"], 480000)
+        self.assertIsNone(row["measured_tokens"])
+        self.assertIsNone(row["cost_estimate_usd"])
+        self.assertEqual(row["dispatches_without_spend"], 1)
+
+    def test_rows_rank_by_measured_spend_with_unmeasured_last(self) -> None:
+        # Ranking by the self-reported peak put `reviewer` (480,000 reported,
+        # zero measured spend) at the top of a panel a reader consults to see
+        # what delegation cost.
+        detail = self.api.session_detail(PEAK_SESSION)
+        order = [r["agent_type"] for r in detail["agent_types"]]
+        self.assertEqual(order, ["backend-expert", "architect", "reviewer"])
+
+    def test_the_page_renders_peak_context_and_no_longer_calls_it_spend(self) -> None:
+        # The API being right while the page still says "spend" is the whole
+        # defect, so the label is asserted too (same posture as
+        # SummaryPayloadIsWiredTest).
+        self.assertIn("r.peak_context_tokens", self.html)
+        self.assertIn("r.measured_tokens", self.html)
+        # The page must no longer READ the old field. The literal string may
+        # still appear -- the column tooltip names the `<subagent_tokens>` tag
+        # it is explaining -- so this is asserted on the binding, not the text.
+        self.assertNotIn("r.subagent_tokens", self.html)
+        self.assertNotIn("Agent dispatch spend", self.html)
+        self.assertIn("Peak context", self.html)
 
 
 if __name__ == "__main__":
