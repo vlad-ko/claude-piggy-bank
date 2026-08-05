@@ -188,6 +188,26 @@ SCOPE_SUBAGENT = "subagent"
 SCOPE_LABELS = {SOURCE_MAIN: SCOPE_MAIN, SOURCE_SUBAGENT: SCOPE_SUBAGENT}
 SCOPE_INCLUDES_BOTH = "main-thread + subagent"
 SCOPE_INCLUDES_MAIN_ONLY = "main-thread only"
+# The order every per-scope list is emitted in, and -- more importantly -- the
+# set that is emitted WHETHER OR NOT the window holds any such call. A scope
+# that ran nothing must appear and say so; a missing key is an absence the
+# reader cannot see. `_scope()` makes the same guarantee through its `bucket()`.
+SCOPE_ORDER = (SOURCE_MAIN, SOURCE_SUBAGENT)
+
+# #61: why a per-scope band tally has no sample, spelled ONCE and non-null
+# exactly when that scope's `banded_calls` is 0. Three different states of
+# knowledge read identically as four bands of `calls: 0`, and they have three
+# different remedies -- so the payload names which one it is rather than
+# leaving the page to infer it from a zero (the same tri-state-with-a-reason
+# shape `stale_unknown_reason` uses).
+UTIL_NO_SAMPLE_NO_CALLS = "this scope ran no calls in this window"
+UTIL_NO_SAMPLE_NO_CONTEXT_MEASUREMENT = (
+    "this scope ran calls, none of which carried a context measurement"
+)
+UTIL_NO_SAMPLE_NO_DOCUMENTED_WINDOW = (
+    "every measured call in this scope ran on a model with no documented "
+    "context window, so none of them has a utilisation"
+)
 
 # #44: the same rule on a SECOND axis -- which PROJECTS a figure ranges over.
 # The plugin resolves its database from `${CLAUDE_PLUGIN_DATA}`, one directory
@@ -818,23 +838,83 @@ class Api:
         `banded_calls` is therefore the denominator of every band share, and it
         is published beside them: bands + unknown + unmeasured is the window's
         whole call count, which `tests/test_serve.py` asserts against the
-        summary card.
+        summary card. That partition holds PER SCOPE as well as pooled.
 
-        One pass over the window's `(model, context_size)` pairs, banded in
-        Python rather than in SQL, because the window lookup is a longest-prefix
-        match no `GROUP BY` can express. Measured 2026-08-05 on a synthetic
-        600k-call / 3,000-source database of the shape `_projects()` cites
-        (macOS, warm cache, best of 5): 470 ms, inside a `summary()` of 2.8 s.
-        The two shortcuts below are worth 480 ms of that -- the same loop costs
-        950 ms with a `sqlite3.Row` built per row and an unmemoised lookup --
-        and neither changes an answer.
+        **The bands are tallied per scope (#61).** Pooling main-thread and
+        subagent calls into one band tally is arithmetically correct and tells
+        the reader the wrong thing. Measured 2026-08-05 over this project's own
+        transcripts (44 sources, 8,163 records, 0 unparsed), 2,722 banded calls:
+
+            scope        calls   median ctx    peak     >=90%          50-90%
+            main-thread    390      427,037   996,190   52 (13.3%)   100 (25.6%)
+            subagent     2,332      104,727   374,816    0  (0.0%)     0  (0.0%)
+            pooled       2,722            --        --   52  (1.9%)   100  (3.7%)
+
+        Every red-band call was main-thread; not one was a subagent. 2,332
+        healthy subagent calls dilute 390 main-thread ones 6:1, so the pooled
+        share erases the one scope the reader can act on -- and it moves the
+        WRONG WAY under the condition it exists to detect, because a saturated
+        orchestrator dispatches more subagents, which pushes the pooled share
+        down. "13.3% of your main-thread calls ran at 90%+ of the window"
+        prompts an action; "1.9%" prompts none. This is CLAUDE.md's "an
+        aggregate must name the set it ranges over", which `SCOPE_*` already
+        applied to every token total and had never been extended to here.
+
+        `by_scope` therefore carries one entry per scope, in `SCOPE_ORDER`, in
+        the `SCOPE_LABELS` vocabulary the rest of the API uses -- and a scope
+        with no calls gets an entry all the same, because a missing key is an
+        absence nobody can see.
+
+        **The pooled tally is KEPT and LABELLED rather than deleted.** It is
+        still the honest answer to "of every call in this window, how many were
+        red" -- the denominator the `bands + unknown + unmeasured == calls`
+        partition is checked against -- so removing it would delete a true
+        figure to prevent a misreading. What was actually wrong was that it did
+        not name its set, so it now carries `includes`, and the page must lead
+        with the scoped tallies and render the pooled one as what `includes`
+        says it is. Provenance stays at the `utilisation` level and is NOT
+        repeated per scope: which window a model has, and where the band
+        boundaries sit, are properties of `context_window.py`. Copying them
+        into each scope would imply they could differ by scope, which is a
+        distinction nobody made.
+
+        **A scope with no banded calls is a named absence.** Four bands of
+        `calls: 0` is a true statement three different ways -- the scope ran
+        nothing; it ran calls that carried no context measurement; it ran
+        measured calls whose models have no documented window -- with three
+        different remedies. `no_sample_reason` says which, non-null exactly
+        when `banded_calls` is 0, and every `share` beside it is null rather
+        than 0.0 (a share of an empty set is not 0%).
+
+        One pass over the window's `(source_kind, model, context_size)` triples,
+        banded in Python rather than in SQL, because the window lookup is a
+        longest-prefix match no `GROUP BY` can express. Measured 2026-08-05 on a
+        synthetic 600k-call / 3,000-source database of the shape `_projects()`
+        cites (macOS, warm cache, best of 5): 470 ms, inside a `summary()` of
+        2.8 s. The two shortcuts below are worth 480 ms of that -- the same loop
+        costs 950 ms with a `sqlite3.Row` built per row and an unmemoised lookup
+        -- and neither changes an answer. Splitting by scope adds one column and
+        one dict lookup per row, not a second pass.
         """
         sizes: list[int] = []
-        banded = {key: 0 for key, *_ in BANDS}
-        unknown_models: set[str] = set()
-        unknown_model_calls = 0
-        unmeasured_calls = 0
-        over_window_calls = 0
+        # Tallies keyed on the STORED `source_kind`, never on the outward
+        # label: the label is this module's vocabulary and the key is the
+        # ingester's, and one is derived from the other exactly once, below.
+        scopes: dict[str, dict[str, Any]] = {}
+
+        def tally(kind: str) -> dict[str, Any]:
+            found = scopes.get(kind)
+            if found is None:
+                found = scopes[kind] = {
+                    "calls": 0,
+                    "sample_calls": 0,
+                    "banded": {key: 0 for key, *_ in BANDS},
+                    "unknown_model_calls": 0,
+                    "unknown_models": set(),
+                    "over_window_calls": 0,
+                }
+            return found
+
         # Windows per model id, resolved once. A window holds a handful of
         # distinct ids and hundreds of thousands of calls, and the lookup walks
         # the whole table per call otherwise. Misses are cached too -- an
@@ -842,14 +922,17 @@ class Api:
         # every row.
         windows: dict[str, Optional[int]] = {}
         # A cursor with the connection's `sqlite3.Row` factory turned OFF: this
-        # loop reads two columns positionally, and building a mapping per row
+        # loop reads three columns positionally, and building a mapping per row
         # is the single largest cost in the block at corpus scale.
         cursor = self.conn.cursor()
         cursor.row_factory = None
-        for model, size in cursor.execute(
-            "SELECT model, context_size FROM api_calls WHERE ts >= ? AND ts < ?",
+        for kind, model, size in cursor.execute(
+            "SELECT source_kind, model, context_size FROM api_calls"
+            " WHERE ts >= ? AND ts < ?",
             (start, end),
         ):
+            scope = tally(kind)
+            scope["calls"] += 1
             if not has_context_measurement(size):
                 # The SAME predicate the four SQL means use (#25), not a
                 # second spelling of it: this block and `summary()`'s
@@ -859,23 +942,52 @@ class Api:
                 # reachable from summed token counts, so a row carrying one is
                 # broken, and the one thing it must not do is band as the most
                 # frugal call on the report.
-                unmeasured_calls += 1
                 continue
+            scope["sample_calls"] += 1
             sizes.append(size)
             if model not in windows:
                 windows[model] = window_for_model(model)
             window = windows[model]
             if window is None:
-                unknown_model_calls += 1
-                unknown_models.add(model)
+                scope["unknown_model_calls"] += 1
+                scope["unknown_models"].add(model)
                 continue
             fraction = size / window
             if fraction > 1.0:
                 # The loud half of this feature's safety story: a window this
                 # table has let go stale shows up as calls over 100% of it,
                 # which is absurd on its face -- but only if someone counts it.
-                over_window_calls += 1
-            banded[band_for(fraction)] += 1
+                scope["over_window_calls"] += 1
+            scope["banded"][band_for(fraction)] += 1
+
+        # The pooled tally is SUMMED FROM the scoped ones rather than counted a
+        # second time. Two loops over the same rows would be two figures free
+        # to disagree, which is the defect this repo files as #4648; summing
+        # makes "pooled == main + subagent" true by construction, and
+        # `tests/test_serve.py` asserts it band by band anyway.
+        pooled = {
+            "calls": sum(s["calls"] for s in scopes.values()),
+            "sample_calls": sum(s["sample_calls"] for s in scopes.values()),
+            "banded": {
+                key: sum(s["banded"][key] for s in scopes.values())
+                for key, *_ in BANDS
+            },
+            "unknown_model_calls": sum(
+                s["unknown_model_calls"] for s in scopes.values()
+            ),
+            "unknown_models": set().union(
+                *(s["unknown_models"] for s in scopes.values())
+            ),
+            "over_window_calls": sum(s["over_window_calls"] for s in scopes.values()),
+        }
+        unmeasured_calls = pooled["calls"] - pooled["sample_calls"]
+        # Every kind the window actually holds, in a fixed order, with the two
+        # KNOWN kinds always present even when they ran nothing. An unforeseen
+        # kind is appended rather than dropped: dropping it would silently
+        # break `pooled == sum(by_scope)` and lose calls out of a denominator,
+        # which is the exact failure this block exists to prevent.
+        kinds = list(SCOPE_ORDER) + sorted(k for k in scopes if k not in SCOPE_ORDER)
+        by_scope = [self._scoped_utilisation(k, scopes.get(k)) for k in kinds]
         sizes.sort()
         percentiles = {f"p{p}": nearest_rank(sizes, p) for p in PERCENTILES}
         median = percentiles[f"p{MEDIAN_PERCENTILE}"]
@@ -884,7 +996,6 @@ class Api:
         calls_above_mean = (
             len(sizes) - bisect.bisect_right(sizes, mean) if mean is not None else None
         )
-        banded_calls = sum(banded.values())
         return {
             "sample_is": CONTEXT_SAMPLE,
             "sample_calls": len(sizes),
@@ -903,28 +1014,112 @@ class Api:
                 calls_above_mean / len(sizes) if calls_above_mean is not None else None
             ),
             "utilisation": {
+                # ONE provenance pair for the whole block, never repeated per
+                # scope: the documented window and the judged boundaries are
+                # facts about `context_window.py`, and a per-scope copy would
+                # assert they could differ by scope.
                 "windows_as_of": WINDOWS_AS_OF,
                 "window_provenance": WINDOW_PROVENANCE,
                 "bands_as_of": BANDS_AS_OF,
                 "band_provenance": BAND_PROVENANCE,
-                "banded_calls": banded_calls,
-                "bands": [
-                    {
-                        "band": key,
-                        "label": label,
-                        "lower": lower,
-                        "upper": upper,
-                        "calls": banded[key],
-                        # A share of an empty set is not 0% (rule #12).
-                        "share": (banded[key] / banded_calls) if banded_calls else None,
-                    }
-                    for key, label, lower, upper in BANDS
-                ],
-                "unknown_model_calls": unknown_model_calls,
-                "unknown_models": sorted(unknown_models),
-                "over_window_calls": over_window_calls,
+                # The POOLED tally, and the name of the set it ranges over
+                # (#61). `includes` is not decoration: without it this is a
+                # share of a set the reader cannot see, and the reader's own
+                # scope is diluted in it 6:1.
+                "includes": SCOPE_INCLUDES_BOTH,
+                **self._scoped_utilisation(None, pooled),
+                # The SCOPED tallies -- one entry per scope, always both known
+                # kinds, in `SCOPE_ORDER`.
+                "by_scope": by_scope,
             },
         }
+
+    @staticmethod
+    def _utilisation_bands(
+        banded: dict[str, int], banded_calls: int
+    ) -> list[dict[str, Any]]:
+        """`BANDS` with one set of calls counted into them, high to low.
+
+        One spelling, used by the pooled tally and by every scoped one, so a
+        band that gained a field in one place cannot be missing it in another.
+        """
+        return [
+            {
+                "band": key,
+                "label": label,
+                "lower": lower,
+                "upper": upper,
+                "calls": banded[key],
+                # A share of an empty set is not 0% (rule #12).
+                "share": (banded[key] / banded_calls) if banded_calls else None,
+            }
+            for key, label, lower, upper in BANDS
+        ]
+
+    @classmethod
+    def _scoped_utilisation(
+        cls, kind: Optional[str], tally: Optional[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """One band tally, named (#61).
+
+        `kind` is the STORED `source_kind` for a scoped tally, or None for the
+        pooled one -- which carries `includes` instead and so must not also
+        carry a `scope`, or the payload would name one set twice in two
+        vocabularies.
+
+        `tally` is None for a scope the window holds no row for at all. That is
+        a real absence and it is emitted, not omitted: `calls: 0` corroborated
+        by `no_sample_reason`, with every `share` null rather than 0.0.
+        """
+        if tally is None:
+            tally = {
+                "calls": 0,
+                "sample_calls": 0,
+                "banded": {key: 0 for key, *_ in BANDS},
+                "unknown_model_calls": 0,
+                "unknown_models": set(),
+                "over_window_calls": 0,
+            }
+        calls = tally["calls"]
+        sample_calls = tally["sample_calls"]
+        banded_calls = sum(tally["banded"].values())
+        named = {"scope": SCOPE_LABELS.get(kind, kind)} if kind is not None else {}
+        return {
+            **named,
+            "calls": calls,
+            "sample_calls": sample_calls,
+            # The REMAINDER, as in `context_aggregate_sql()`: the two counts
+            # partition `calls` by construction rather than by a second
+            # predicate free to drift from the first.
+            "unmeasured_calls": calls - sample_calls,
+            "banded_calls": banded_calls,
+            "bands": cls._utilisation_bands(tally["banded"], banded_calls),
+            "unknown_model_calls": tally["unknown_model_calls"],
+            "unknown_models": sorted(tally["unknown_models"]),
+            "over_window_calls": tally["over_window_calls"],
+            "no_sample_reason": cls._no_band_sample_reason(
+                calls, sample_calls, banded_calls
+            ),
+        }
+
+    @staticmethod
+    def _no_band_sample_reason(
+        calls: int, sample_calls: int, banded_calls: int
+    ) -> Optional[str]:
+        """Why this tally has no banded sample, or None if it has one (#61).
+
+        Non-null EXACTLY when `banded_calls` is 0, and the branches are ordered
+        from the widest absence inward, so the reason names the first thing
+        that was missing rather than the last: a scope that ran nothing is not
+        told it lacks a documented window.
+        """
+        if banded_calls:
+            return None
+        if not calls:
+            return UTIL_NO_SAMPLE_NO_CALLS
+        if not sample_calls:
+            return UTIL_NO_SAMPLE_NO_CONTEXT_MEASUREMENT
+        return UTIL_NO_SAMPLE_NO_DOCUMENTED_WINDOW
 
     def models(self, start: float, end: float) -> list[dict[str, Any]]:
         """Per-model token usage, split by scope -- the same model used by the
