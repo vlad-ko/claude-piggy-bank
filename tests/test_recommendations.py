@@ -117,15 +117,82 @@ CORPUS_2026_08_05 = {
     METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY: 4.0,
 }
 
+# #93: HOW MANY MEMBERS each of those readings was taken over.
+#
+# The VALUES above are measured and are quoted from the issue. These counts are
+# NOT -- they were never recorded beside them -- so they are CHOSEN, and saying
+# so matters more than the numbers: a sample size invented here and presented as
+# a measurement would be the defect this whole module is arranged against, in
+# the fixture that checks it.
+#
+# What they are chosen for: every one clears its metric's floor comfortably, so
+# a test about BANDING is not accidentally a test about sampling; and all five
+# are DELIBERATELY UNEQUAL, so a floor compared against some other metric's
+# count -- the "wrong denominator" mutation -- cannot pass by coincidence.
+#
+# The repayment metric's is 0 because its value is None: these figures predate
+# the per-TTL split, so no call behind them contributed a member.
+CORPUS_2026_08_05_SAMPLES = {
+    METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW: 12_007,
+    METRIC_CACHE_READS_PER_WRITE: 9_311,
+    METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL: 0,
+    METRIC_CACHE_WRITE_ONLY_SHARE: 8_452,
+    METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY: 3_489,
+}
 
-def synthetic_metric(key, worse_when, cuts, severities, unit=rec.METRIC_UNIT_RATIO):
+CORPUS_2026_08_05_READINGS = {
+    key: rec.Reading(value, CORPUS_2026_08_05_SAMPLES[key])
+    for key, value in CORPUS_2026_08_05.items()
+}
+
+# The #93 corpus: one session, three replies, no subagents -- what a fresh
+# install actually holds, and the state no issue in this project had ever been
+# measured against. Every value here is a TRUE reading; not one of them is over
+# a sample that can carry a verdict, which is the whole finding.
+FIRST_RUN_CORPUS_READINGS = {
+    METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW: rec.Reading(0.0, 3),
+    METRIC_CACHE_READS_PER_WRITE: rec.Reading(24.0, 3),
+    METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL: rec.Reading(None, 0),
+    METRIC_CACHE_WRITE_ONLY_SHARE: rec.Reading(0.0, 3),
+    METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY: rec.Reading(None, 0),
+}
+
+
+def synthetic_sample(minimum=1):
+    """The smallest sample spec `Metric` will accept, for a synthetic RATIO.
+
+    JUDGED, because the synthetics default to `METRIC_UNIT_RATIO` and the
+    band-granularity rule is refused for anything that is not a share -- which
+    is the guard (#93), so a helper that routed around it would hide it.
+
+    `minimum=1` by default so a synthetic built to test BANDING is not also
+    under-sampled: the floor and the range lookup are two different questions,
+    and a helper that entangled them would make every ranking test depend on a
+    sample size it never mentions. Tests about the floor pass their own.
+    """
+    return rec.Sample(
+        counts="synthetic contributing calls",
+        rule=rec.FLOOR_RULE_JUDGED,
+        minimum=minimum,
+        provenance=rec.judged("synthetic judged floor", decided="2026-08-07"),
+    )
+
+
+def synthetic_metric(
+    key,
+    worse_when,
+    cuts,
+    severities,
+    unit=rec.METRIC_UNIT_RATIO,
+    sample=None,
+):
     """A metric with `cuts` interior boundaries and one severity per range.
 
     Built the way the real table is built -- adjacent ranges SHARE a boundary
     object -- so a test using it is testing the same shape the module ships.
-    That now includes a reader sentence and a unit, because `Metric` refuses a
-    metric without either: a synthetic that could be built with less would be
-    testing a shape the module cannot ship.
+    That now includes a reader sentence, a unit and a sample floor, because
+    `Metric` refuses a metric without any of them: a synthetic that could be
+    built with less would be testing a shape the module cannot ship.
     """
     edges = [Boundary(0.0, structural("synthetic floor"))]
     edges += [Boundary(c, judged(f"synthetic cut at {c}")) for c in cuts]
@@ -152,6 +219,7 @@ def synthetic_metric(key, worse_when, cuts, severities, unit=rec.METRIC_UNIT_RAT
         unit=unit,
         worse_when=worse_when,
         ranges=tuple(ranges),
+        sample=synthetic_sample() if sample is None else sample,
     )
 
 
@@ -230,6 +298,7 @@ class RangesPartitionTheDomainTest(unittest.TestCase):
             measurement="synthetic measurement, long enough to be real",
             means="What this synthetic number means.",
             unit=rec.METRIC_UNIT_SHARE,
+            sample=synthetic_sample(),
             worse_when=WORSE_WHEN_HIGHER,
             ranges=(
                 Range(
@@ -258,6 +327,7 @@ class RangesPartitionTheDomainTest(unittest.TestCase):
             measurement="synthetic measurement, long enough to be real",
             means="What this synthetic number means.",
             unit=rec.METRIC_UNIT_SHARE,
+            sample=synthetic_sample(),
             worse_when=WORSE_WHEN_HIGHER,
             ranges=(
                 Range(
@@ -537,9 +607,18 @@ class UnmeasuredIsNotHealthyTest(unittest.TestCase):
                 self.assertNotEqual(assess(key, None), healthy.recommendation)
 
     def test_assess_all_names_the_unmeasured_metrics_rather_than_dropping_them(self):
-        values = dict(CORPUS_2026_08_05)
-        values[METRIC_CACHE_READS_PER_WRITE] = None
-        values[METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY] = None
+        values = dict(CORPUS_2026_08_05_READINGS)
+        # A value of None over the SAME sample the reading had. "Nobody
+        # measured it" and "too few to band it" are the two states this test
+        # has to keep apart, and a count of 0 here would reach `unmeasured` by
+        # the sample rather than by the absent value -- passing for the wrong
+        # reason, which is the mutation `sample_state`'s ordering exists for.
+        values[METRIC_CACHE_READS_PER_WRITE] = rec.Reading(
+            None, CORPUS_2026_08_05_SAMPLES[METRIC_CACHE_READS_PER_WRITE]
+        )
+        values[METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY] = rec.Reading(
+            None, CORPUS_2026_08_05_SAMPLES[METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY]
+        )
         result = assess_all(values)
         # Three, not two: the corpus fixture is already unmeasured on the
         # resolved cache metric, which is the state of every database ingested
@@ -565,23 +644,29 @@ class UnmeasuredIsNotHealthyTest(unittest.TestCase):
         self.assertIn("not the same as", rec.UNMEASURED_NOTE)
 
     def test_every_metric_unmeasured_gives_an_empty_ranking_not_an_ok_one(self):
-        result = assess_all({key: None for key in METRICS})
+        result = assess_all({key: rec.Reading(None, 0) for key in METRICS})
         self.assertEqual(result.ranked, ())
         self.assertEqual(result.unmeasured, tuple(sorted(METRICS)))
+        # And nothing lands in the third state either: an empty corpus is
+        # UNMEASURED, not under-sampled. #93's own finding was that the page
+        # already handled n = 0 impeccably and n = 3 wrongly, so a change that
+        # relabelled the empty case would have moved the defect rather than
+        # fixed it.
+        self.assertEqual(result.under_sampled, ())
 
     def test_a_metric_omitted_from_the_input_is_refused_not_assumed(self):
         # The refusal must be `assess_all`'s own and must say what to pass
         # instead. A bare dict lookup raises `KeyError` too, and a test that
         # accepted that would pass over a function which had stopped checking
         # -- which is exactly what a mutation of the guard showed it doing.
-        values = dict(CORPUS_2026_08_05)
+        values = dict(CORPUS_2026_08_05_READINGS)
         del values[METRIC_CACHE_READS_PER_WRITE]
         with self.assertRaises(KeyError) as caught:
             assess_all(values)
         message = str(caught.exception)
         self.assertIn(METRIC_CACHE_READS_PER_WRITE, message)
-        self.assertIn("no value supplied", message)
-        self.assertIn("pass None to say", message)
+        self.assertIn("no reading supplied", message)
+        self.assertIn("Reading(None, <sample size>)", message)
 
     def test_an_unknown_metric_key_raises_rather_than_returning_none(self):
         # `None` already means "measured nothing". Giving it a second meaning
@@ -589,7 +674,9 @@ class UnmeasuredIsNotHealthyTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             assess("main_thread_share", 0.5)
         with self.assertRaises(KeyError):
-            assess_all({**CORPUS_2026_08_05, "invented_metric": 1.0})
+            assess_all(
+                {**CORPUS_2026_08_05_READINGS, "invented_metric": rec.Reading(1.0, 99)}
+            )
 
 
 class RefusesValuesThatAreNotMeasurementsTest(unittest.TestCase):
@@ -1390,8 +1477,10 @@ class RankingIsDerivedNotAuthoredTest(unittest.TestCase):
         self.assertLess(SEVERITY_RANK[SEVERITY_WATCH], SEVERITY_RANK[SEVERITY_ACT])
 
     def test_assess_all_ignores_the_callers_dict_order(self):
-        forward = dict(CORPUS_2026_08_05)
-        backward = {k: CORPUS_2026_08_05[k] for k in reversed(list(forward))}
+        forward = dict(CORPUS_2026_08_05_READINGS)
+        backward = {
+            k: CORPUS_2026_08_05_READINGS[k] for k in reversed(list(forward))
+        }
         self.assertNotEqual(list(forward), list(backward))
         self.assertEqual(
             [a.metric for a in assess_all(forward).ranked],
@@ -1399,7 +1488,7 @@ class RankingIsDerivedNotAuthoredTest(unittest.TestCase):
         )
 
     def test_todays_corpus_ranks_the_two_firing_metrics_first(self):
-        result = assess_all(CORPUS_2026_08_05)
+        result = assess_all(CORPUS_2026_08_05_READINGS)
         self.assertEqual(
             [a.metric for a in result.ranked],
             [
@@ -1525,6 +1614,7 @@ class EveryMetricSpeaksToTheReaderTest(unittest.TestCase):
                 key="k",
                 measurement="a measurement, stated at length so it is real",
                 unit=rec.METRIC_UNIT_RATIO,
+                sample=synthetic_sample(),
                 worse_when=WORSE_WHEN_HIGHER,
                 ranges=METRICS[METRIC_CACHE_READS_PER_WRITE].ranges,
             )
@@ -1632,6 +1722,7 @@ def synthetic_metric_with_means(means):
         measurement=real.measurement,
         means=means,
         unit=real.unit,
+        sample=synthetic_sample(),
         worse_when=real.worse_when,
         ranges=real.ranges,
     )
@@ -1683,6 +1774,7 @@ class MetricUnitBelongsToTheMetricTest(unittest.TestCase):
                 key="k",
                 measurement="a measurement, stated at length so it is real",
                 means="What this number means.",
+                sample=synthetic_sample(),
                 worse_when=WORSE_WHEN_HIGHER,
                 ranges=METRICS[METRIC_CACHE_READS_PER_WRITE].ranges,
             )
@@ -1728,6 +1820,7 @@ class MetricUnitBelongsToTheMetricTest(unittest.TestCase):
                 measurement="a measurement, stated at length so it is real",
                 means="What this number means.",
                 unit=rec.METRIC_UNIT_RATIO,
+                sample=synthetic_sample(),
                 worse_when="sideways",
                 ranges=METRICS[METRIC_CACHE_READS_PER_WRITE].ranges,
             )
@@ -1739,6 +1832,7 @@ class MetricUnitBelongsToTheMetricTest(unittest.TestCase):
                 measurement="a measurement, stated at length so it is real",
                 means="What this number means.",
                 unit=rec.METRIC_UNIT_RATIO,
+                sample=synthetic_sample(),
                 worse_when=WORSE_WHEN_HIGHER,
                 ranges=(),
             )
@@ -1889,6 +1983,482 @@ class SyntheticTableBehavesLikeTheRealOneTest(unittest.TestCase):
             [(0.0, 0.2), (0.2, 0.8), (0.2, 0.8), (0.8, None)],
         )
         self.assertLess(metric.depth(0.3), metric.depth(0.6))
+
+
+def share_metric(cuts, severities, counts="synthetic members"):
+    """A SHARE whose floor the band-granularity rule derives from its own cuts."""
+    metric = synthetic_metric(
+        "synthetic_share",
+        WORSE_WHEN_HIGHER,
+        cuts=cuts,
+        severities=severities,
+        unit=rec.METRIC_UNIT_SHARE,
+        sample=rec.Sample(counts=counts, rule=rec.FLOOR_RULE_BAND_GRANULARITY),
+    )
+    return metric
+
+
+def smallest_n_the_hard_way(width):
+    """`smallest_sample_finer_than` restated as a search from 1.
+
+    Deliberately NOT the module's implementation. That one starts near
+    `floor(1/width)` to save iterations; this one grinds up from 1 and can
+    therefore agree with it only if the shortcut is right. A test that called
+    the module's own arithmetic would be checking that a function equals
+    itself.
+    """
+    n = 1
+    while 1.0 / n >= width:
+        n += 1
+    return n
+
+
+class SampleFloorIsDerivedFromTheTableTest(unittest.TestCase):
+    """#93: how many members a SHARE needs, and that nobody chose the number.
+
+    A share over `n` members moves in steps of `1/n`, so it can express a value
+    strictly inside a band only where `1/n` is finer than that band. The floor
+    is therefore whatever the metric's own narrowest bounded band requires --
+    arithmetic over boundaries the table already carries, moving by itself when
+    one of them is redlined.
+    """
+
+    def test_the_two_shares_floors_are_eleven_and_fifty_one(self):
+        # The numbers themselves, written out, so a change to either is a
+        # visible diff rather than a recomputation that agrees with itself.
+        self.assertEqual(
+            METRICS[METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW].sample_floor.minimum,
+            11,
+        )
+        self.assertEqual(
+            METRICS[METRIC_CACHE_WRITE_ONLY_SHARE].sample_floor.minimum, 51
+        )
+
+    def test_the_floor_is_computed_from_the_bands_and_not_written_down(self):
+        # THE mutation this class exists for: a floor hard-coded to the value
+        # the real table happens to produce. A synthetic share with a different
+        # narrowest band must get a different floor, and 21 is not 11 or 51.
+        self.assertEqual(
+            share_metric(
+                cuts=(0.05, 0.4), severities=(SEVERITY_OK, SEVERITY_WATCH, SEVERITY_ACT)
+            ).sample_floor.minimum,
+            21,
+        )
+
+    def test_it_is_the_narrowest_bounded_band_that_sets_the_floor(self):
+        # Not the first, not the healthy one, not the widest: the NARROWEST. A
+        # floor satisfying only a wide band would leave the narrow one
+        # reachable at its edges alone, which is exactly the defect --
+        # `cache_write_only_share`'s ok band was reachable only at literal zero.
+        # The narrow band is put LAST here so an implementation reading
+        # `ranges[0]` cannot pass: the first band is 0.5 wide and would give 3.
+        #
+        # The cuts are chosen to subtract EXACTLY in binary (0.75 - 0.5 = 0.25).
+        # That is a property of the fixture, not of the rule: a band of
+        # [0.5, 0.54) has a computed width of 0.04000000000000004, and the
+        # floor that follows from it is 25 rather than 26 -- correct for the
+        # width the table actually holds, and a distraction in a test about
+        # WHICH band is read. Both of the real table's narrowest bands start at
+        # 0.0, so neither carries that noise.
+        metric = share_metric(
+            cuts=(0.5, 0.75), severities=(SEVERITY_OK, SEVERITY_WATCH, SEVERITY_ACT)
+        )
+        self.assertEqual(metric.sample_floor.minimum, 5)
+
+    def test_the_unbounded_top_range_is_not_treated_as_a_band(self):
+        # It has no width to be finer than, and inventing a ceiling to give it
+        # one is the refusal `depth_in_band()` already makes. A metric whose
+        # only bounded band is wide gets a small floor, not an enormous one.
+        metric = share_metric(cuts=(0.5,), severities=(SEVERITY_OK, SEVERITY_ACT))
+        self.assertEqual(metric.sample_floor.minimum, 3)
+
+    def test_a_step_exactly_equal_to_the_band_is_not_fine_enough(self):
+        # The comparison is `>=`, and the boundary case is the whole reason:
+        # over ten calls a share moves in steps of 0.1, which reaches the edges
+        # of a 0.1-wide band and nothing between them. Eleven is the first
+        # sample that can land inside it.
+        self.assertEqual(rec.smallest_sample_finer_than(0.1), 11)
+        self.assertEqual(rec.smallest_sample_finer_than(0.02), 51)
+        # Off by one either side, so the boundary is pinned rather than
+        # approached: a rule using `>` would answer 10 and 50 here.
+        self.assertLess(1.0 / 11, 0.1)
+        self.assertEqual(1.0 / 10, 0.1)
+
+    def test_the_shortcut_start_agrees_with_a_search_from_one(self):
+        # `smallest_sample_finer_than` starts near `floor(1/width)` to save
+        # iterations, and `floor` on a float is exactly where an off-by-one
+        # would hide. Checked against a grind from 1 over widths that include
+        # both of the real table's and several that are not representable.
+        for width in (0.1, 0.02, 0.05, 0.3, 0.07, 1.0, 1.5, 0.25, 0.0125):
+            with self.subTest(width=width):
+                self.assertEqual(
+                    rec.smallest_sample_finer_than(width),
+                    smallest_n_the_hard_way(width),
+                )
+
+    def test_a_derived_floor_is_structural_and_carries_no_date(self):
+        # There is nothing to re-check: the number moves by itself when a
+        # boundary moves, so a date beside it would claim a currency it has
+        # not got. `Provenance` refuses a structural boundary with either.
+        floor = METRICS[METRIC_CACHE_WRITE_ONLY_SHARE].sample_floor
+        self.assertEqual(floor.rule, rec.FLOOR_RULE_BAND_GRANULARITY)
+        self.assertEqual(floor.provenance.kind, rec.PROVENANCE_STRUCTURAL)
+        self.assertIsNone(floor.provenance.checked)
+        self.assertIsNone(floor.provenance.source)
+        # And it says the band it came from may itself be a judgment, so a
+        # reader is not told the floor is beyond argument when its input is not.
+        self.assertIn("judgment", floor.provenance.statement)
+
+    def test_the_derived_statement_quotes_the_band_it_was_derived_from(self):
+        # A derivation nobody can follow is an assertion. The sentence carries
+        # the band, its width and the resulting floor, so the arithmetic can be
+        # checked from the page.
+        floor = METRICS[METRIC_CACHE_WRITE_ONLY_SHARE].sample_floor
+        statement = floor.provenance.statement
+        for fragment in ("[0, 0.02)", "0.02", "50", "51"):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, statement)
+
+
+class TheRatiosFloorIsJudgedAndSaysSoTest(unittest.TestCase):
+    """#93: the three ratios do NOT get the shares' derivation, or their number.
+
+    A ratio of two token sums has no `1/n` step -- one call contributes its own
+    token count, which is unbounded. So the argument that derives the shares'
+    floor does not apply, and the module refuses to let it be stretched rather
+    than trusting anybody to remember.
+    """
+
+    RATIOS = (
+        METRIC_CACHE_READS_PER_WRITE,
+        METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+        METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
+    )
+
+    def test_every_ratios_floor_is_judged_dated_and_sourceless(self):
+        for key in self.RATIOS:
+            with self.subTest(metric=key):
+                floor = METRICS[key].sample_floor
+                self.assertEqual(floor.rule, rec.FLOOR_RULE_JUDGED)
+                self.assertEqual(floor.provenance.kind, rec.PROVENANCE_JUDGED)
+                self.assertEqual(floor.provenance.checked, rec.SAMPLE_FLOOR_AS_OF)
+                # A judgment cannot carry a source -- `Provenance` refuses one
+                # -- and this asserts the state rather than the refusal.
+                self.assertIsNone(floor.provenance.source)
+
+    def test_the_judged_date_is_not_the_boundaries_date(self):
+        # Re-deciding where 0.25 sits does not re-decide how many calls a ratio
+        # needs. One date covering both would say that it had.
+        self.assertNotEqual(rec.SAMPLE_FLOOR_AS_OF, rec.RECOMMENDATIONS_AS_OF)
+
+    def test_the_statement_says_it_is_a_judgment_and_why_deriving_is_refused(self):
+        statement = rec.RATIO_SAMPLE_FLOOR_PROVENANCE.statement
+        self.assertIn("JUDGMENT", statement)
+        # It has to name what a derivation would have needed, or "judged" is a
+        # label rather than an argument.
+        self.assertIn("bound on how much of a period's tokens one call may carry",
+                      statement)
+
+    def test_the_share_rule_applied_to_a_ratio_returns_a_rubber_stamp(self):
+        # The evidence the statement rests on, computed rather than quoted: the
+        # band-granularity rule does not FAIL on these metrics, it succeeds and
+        # answers 2, 2 and 1. A floor that certifies a two-call sample while
+        # wearing arithmetic is worse than one that says it was decided, which
+        # is the whole argument for judging them.
+        got = {
+            key: rec.band_granularity_floor(
+                METRICS[key].ranges, "would-be members"
+            ).minimum
+            for key in self.RATIOS
+        }
+        self.assertEqual(
+            got,
+            {
+                METRIC_CACHE_READS_PER_WRITE: 2,
+                METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL: 2,
+                METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY: 1,
+            },
+        )
+        # And every one of those is below the judged floor actually used, so
+        # the refusal is protective rather than decorative.
+        for key, would_be in got.items():
+            with self.subTest(metric=key):
+                self.assertLess(would_be, METRICS[key].sample_floor.minimum)
+
+    def test_a_ratio_cannot_be_given_the_band_granularity_rule_at_all(self):
+        # Unrepresentable, not merely discouraged -- `lever()`'s treatment of
+        # "reduce your cache reads", one field over. The metric cannot be
+        # CONSTRUCTED, so no build can ship one.
+        with self.assertRaises(ValueError) as caught:
+            synthetic_metric(
+                "synthetic_stretched",
+                WORSE_WHEN_HIGHER,
+                cuts=(0.5,),
+                severities=(SEVERITY_OK, SEVERITY_ACT),
+                unit=rec.METRIC_UNIT_RATIO,
+                sample=rec.Sample(
+                    counts="members", rule=rec.FLOOR_RULE_BAND_GRANULARITY
+                ),
+            )
+        self.assertIn("only honest for a", str(caught.exception))
+        self.assertIn("steps of 1/n", str(caught.exception))
+
+    def test_the_ratios_do_not_share_the_shares_number(self):
+        # The instruction the issue gave in as many words. 10 is neither 11
+        # nor 51, and this fails if somebody reaches for whichever is to hand.
+        for key in self.RATIOS:
+            with self.subTest(metric=key):
+                self.assertEqual(
+                    METRICS[key].sample_floor.minimum, rec.RATIO_SAMPLE_FLOOR
+                )
+                self.assertNotIn(METRICS[key].sample_floor.minimum, (11, 51))
+
+
+class EveryFloorNamesItsOwnDenominatorTest(unittest.TestCase):
+    """#93: "51" means nothing until something says 51 of WHAT.
+
+    The floor counts the members of the metric's own denominator, which is not
+    the period's call count and is not the same set for any two of these
+    metrics.
+    """
+
+    def test_every_metric_says_what_its_floor_counts(self):
+        for key, metric in METRICS.items():
+            with self.subTest(metric=key):
+                self.assertTrue(metric.sample_floor.counts.strip())
+
+    def test_a_floor_that_names_nothing_is_refused(self):
+        for blank in ("", "   "):
+            with self.subTest(counts=repr(blank)):
+                with self.assertRaises(ValueError) as caught:
+                    rec.Sample(counts=blank, rule=rec.FLOOR_RULE_BAND_GRANULARITY)
+                self.assertIn("unnamed denominator", str(caught.exception))
+
+    def test_the_two_cache_metrics_over_one_set_still_need_different_amounts(self):
+        # `cache_reads_per_write` and `cache_write_only_share` both count the
+        # calls that wrote cache, and need 10 and 51 of them. How many members
+        # a reading needs is the TABLE's question, not the query's, so one
+        # shared count does not imply one shared floor.
+        reads = METRICS[METRIC_CACHE_READS_PER_WRITE].sample_floor
+        write_only = METRICS[METRIC_CACHE_WRITE_ONLY_SHARE].sample_floor
+        self.assertEqual(reads.counts, write_only.counts)
+        self.assertNotEqual(reads.minimum, write_only.minimum)
+
+    def test_the_reply_ratio_counts_the_thinner_scope_not_the_pool(self):
+        counts = METRICS[METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY].sample_floor.counts
+        self.assertIn("fewer", counts)
+
+    def test_the_per_ttl_metric_does_not_borrow_the_flat_ratios_set(self):
+        # Different sets, so different floors' denominators -- the #84 defect
+        # arriving through the sample instead of through the numerator.
+        self.assertNotEqual(
+            METRICS[METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL].sample_floor.counts,
+            METRICS[METRIC_CACHE_READS_PER_WRITE].sample_floor.counts,
+        )
+
+
+class AReadingCarriesItsOwnSampleSizeTest(unittest.TestCase):
+    """#93: a value cannot be supplied without saying what it was measured over."""
+
+    def test_a_number_over_an_empty_sample_is_refused(self):
+        # It cannot happen -- every one of the five values is None exactly when
+        # its denominator is empty -- so if it arrives, a caller has paired a
+        # value with the wrong counter. That is a wrong number that reads right,
+        # which is the one thing this repository refuses to let pass.
+        with self.assertRaises(ValueError) as caught:
+            rec.Reading(0.5, 0)
+        self.assertIn("do not describe", str(caught.exception))
+
+    def test_a_negative_sample_is_refused(self):
+        with self.assertRaises(ValueError):
+            rec.Reading(None, -1)
+
+    def test_a_sample_size_that_is_not_a_count_is_refused(self):
+        for bad in (1.5, "3", True, None):
+            with self.subTest(size=repr(bad)):
+                with self.assertRaises(ValueError):
+                    rec.Reading(None, bad)
+
+    def test_no_value_over_a_large_sample_is_unmeasured_not_under_sampled(self):
+        # THE ORDER OF THE TWO REFUSALS. A metric can have members in its
+        # denominator and still produce nothing, and calling that "not enough
+        # data yet" would promise the reader more sessions will fix something
+        # arithmetic will not.
+        self.assertEqual(
+            rec.sample_state(METRIC_CACHE_READS_PER_WRITE, rec.Reading(None, 5_000)),
+            rec.SAMPLE_UNMEASURED,
+        )
+
+    def test_a_bare_float_is_refused_rather_than_read_as_a_reading(self):
+        with self.assertRaises(TypeError) as caught:
+            rec.sample_state(METRIC_CACHE_READS_PER_WRITE, 3.0)
+        self.assertIn("cannot say what it was measured over", str(caught.exception))
+
+
+class TheThreeStatesAreThreeTest(unittest.TestCase):
+    """#93: a real 0, an unmeasured metric and an under-sampled one differ.
+
+    The fresh install is the case: every figure individually correct, and the
+    composition asserting a clean bill of health on evidence that cannot
+    support one.
+    """
+
+    def test_a_first_run_bands_nothing_and_names_every_reason(self):
+        result = assess_all(FIRST_RUN_CORPUS_READINGS)
+        # Not one verdict. Before #93 all three of these were `ranked`, and
+        # `cache_reads_per_write` read "Do not change this." over three calls.
+        self.assertEqual(result.ranked, ())
+        self.assertEqual(
+            [u.metric for u in result.under_sampled],
+            [
+                METRIC_CACHE_READS_PER_WRITE,
+                METRIC_CACHE_WRITE_ONLY_SHARE,
+                METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,
+            ],
+        )
+        self.assertEqual(
+            result.unmeasured,
+            (
+                METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+                METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
+            ),
+        )
+
+    def test_an_under_sampled_reading_keeps_its_value_and_loses_its_verdict(self):
+        under = {
+            u.metric: u
+            for u in assess_all(FIRST_RUN_CORPUS_READINGS).under_sampled
+        }
+        reading = under[METRIC_CACHE_READS_PER_WRITE]
+        # The number was measured and is true, so it survives...
+        self.assertEqual(reading.value, 24.0)
+        # ...and every claim ABOUT it does not. `UnderSampled` carries no
+        # severity, no lever and no recommendation text: there is no field on
+        # it that could render as a verdict.
+        for banned in ("severity", "lever", "recommendation"):
+            with self.subTest(field=banned):
+                self.assertFalse(hasattr(reading, banned))
+
+    def test_the_shortfall_is_derived_from_the_two_numbers_it_separates(self):
+        under = next(
+            u
+            for u in assess_all(FIRST_RUN_CORPUS_READINGS).under_sampled
+            if u.metric == METRIC_CACHE_WRITE_ONLY_SHARE
+        )
+        self.assertEqual(under.sample_size, 3)
+        self.assertEqual(under.floor.minimum, 51)
+        self.assertEqual(under.shortfall, 48)
+
+    def test_one_more_member_crosses_the_floor_and_earns_a_verdict(self):
+        # The floor is a floor and not a ban: at exactly its minimum the
+        # reading bands. Asserted at the boundary from both sides, because a
+        # `<=` where a `<` belongs is invisible anywhere else.
+        floor = METRICS[METRIC_CACHE_READS_PER_WRITE].sample_floor.minimum
+        self.assertEqual(
+            rec.sample_state(
+                METRIC_CACHE_READS_PER_WRITE, rec.Reading(24.0, floor - 1)
+            ),
+            rec.SAMPLE_UNDER_SAMPLED,
+        )
+        self.assertEqual(
+            rec.sample_state(METRIC_CACHE_READS_PER_WRITE, rec.Reading(24.0, floor)),
+            rec.SAMPLE_MEASURED,
+        )
+
+    def test_the_under_sampled_note_is_not_the_unmeasured_one(self):
+        self.assertNotEqual(rec.UNDER_SAMPLED_NOTE, rec.UNMEASURED_NOTE)
+        # It says what to do, which is the one genuinely useful thing the
+        # report can tell a new user...
+        self.assertIn("come back after a few more sessions", rec.UNDER_SAMPLED_NOTE)
+        # ...and says plainly that it is not a verdict, so the sentence cannot
+        # be read as a mild all-clear.
+        self.assertIn("not a clean bill of health", rec.UNDER_SAMPLED_NOTE)
+
+    def test_the_three_states_are_three_distinct_names(self):
+        self.assertEqual(len(set(rec.SAMPLE_STATES)), 3)
+        self.assertIn(rec.SAMPLE_MEASURED, rec.SAMPLE_STATES)
+        self.assertIn(rec.SAMPLE_UNDER_SAMPLED, rec.SAMPLE_STATES)
+        self.assertIn(rec.SAMPLE_UNMEASURED, rec.SAMPLE_STATES)
+
+    def test_the_partition_is_total_over_every_metric(self):
+        for readings in (FIRST_RUN_CORPUS_READINGS, CORPUS_2026_08_05_READINGS):
+            with self.subTest(corpus=sorted(readings)[0]):
+                result = assess_all(readings)
+                landed = (
+                    [a.metric for a in result.ranked]
+                    + list(result.unmeasured)
+                    + [u.metric for u in result.under_sampled]
+                )
+                self.assertEqual(sorted(landed), sorted(METRICS))
+                self.assertEqual(len(landed), len(set(landed)))
+
+    def test_every_supplied_sample_size_is_published_on_the_run(self):
+        result = assess_all(CORPUS_2026_08_05_READINGS)
+        self.assertEqual(result.sample_sizes, CORPUS_2026_08_05_SAMPLES)
+
+
+class SampleSpecRefusesEveryBlurringTest(unittest.TestCase):
+    """#93: the two floor rules cannot wear each other's clothes."""
+
+    def test_a_judged_floor_without_a_number_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            rec.Sample(
+                counts="members",
+                rule=rec.FLOOR_RULE_JUDGED,
+                provenance=rec.judged("decided", decided="2026-08-07"),
+            )
+        self.assertIn("must state its own minimum", str(caught.exception))
+
+    def test_a_judged_floor_below_one_member_is_refused(self):
+        # A floor of zero admits a reading over nothing, which is the state the
+        # whole change exists to stop being a verdict.
+        with self.assertRaises(ValueError):
+            rec.Sample(
+                counts="members",
+                rule=rec.FLOOR_RULE_JUDGED,
+                minimum=0,
+                provenance=rec.judged("decided", decided="2026-08-07"),
+            )
+
+    def test_a_judged_floor_wearing_a_structural_provenance_is_refused(self):
+        # The blurring that matters: a decided number presented as arithmetic
+        # nobody could have chosen otherwise.
+        with self.assertRaises(ValueError) as caught:
+            rec.Sample(
+                counts="members",
+                rule=rec.FLOOR_RULE_JUDGED,
+                minimum=10,
+                provenance=structural("looks like arithmetic"),
+            )
+        self.assertIn("has to say so", str(caught.exception))
+
+    def test_a_derived_floor_carrying_its_own_number_is_refused(self):
+        # A typed number could drift from the bands it claims to come from,
+        # which is the entire property the derivation buys.
+        with self.assertRaises(ValueError) as caught:
+            rec.Sample(
+                counts="members",
+                rule=rec.FLOOR_RULE_BAND_GRANULARITY,
+                minimum=51,
+            )
+        self.assertIn("neither number nor", str(caught.exception))
+
+    def test_an_unknown_rule_is_refused(self):
+        with self.assertRaises(ValueError):
+            rec.Sample(counts="members", rule="whatever-seems-right")
+
+    def test_a_metric_with_no_sample_cannot_be_built(self):
+        # `sample` has no default, so a metric whose first call earns it a
+        # verdict is not constructible.
+        with self.assertRaises(TypeError):
+            Metric(
+                key="k",
+                measurement="a measurement, stated at length so it is real",
+                means="What this number means.",
+                unit=rec.METRIC_UNIT_RATIO,
+                worse_when=WORSE_WHEN_HIGHER,
+                ranges=METRICS[METRIC_CACHE_READS_PER_WRITE].ranges,
+            )
 
 
 if __name__ == "__main__":

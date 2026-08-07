@@ -76,10 +76,16 @@ from recommendations import (
     RANKING_PROVENANCE,
     RECOMMENDATION_PROVENANCE,
     RECOMMENDATIONS_AS_OF,
+    SAMPLE_FLOOR_AS_OF,
+    SAMPLE_MEASURED,
+    SAMPLE_STATES,
+    SAMPLE_UNDER_SAMPLED,
+    SAMPLE_UNMEASURED,
     SEVERITY_ACT,
     SEVERITY_OK,
     SEVERITY_RANK,
     SEVERITY_WATCH,
+    UNDER_SAMPLED_NOTE,
     UNMEASURED_NOTE,
     WORSE_WHEN_HIGHER,
     Assessment,
@@ -87,6 +93,8 @@ from recommendations import (
     Lever,
     Metric,
     Provenance,
+    Reading,
+    UnderSampled,
     assess_all,
     cache_write_repayment,
     depth_in_band,
@@ -658,6 +666,18 @@ STRIP_FROM_SEVERITY: dict[str, tuple[str, str]] = {
 # rather than defaulted, because "no cache reading in this window" is a
 # statement and an empty dot is not.
 STRIP_CACHE_UNMEASURED = "Not measured"
+# ... and what it says when they have readings that are too thin to band (#93).
+# A THIRD PHRASE, not a reuse of the one above: "nobody measured this" and
+# "this was measured over too little" send a reader to two different remedies,
+# and only one of them is "come back later".
+STRIP_CACHE_UNDER_SAMPLED = "Not enough data yet"
+# The knobs dot, where NO knob has a basis. "0 of 5" is arithmetic over an
+# empty set wearing the look of five checks passed -- the exact composition
+# defect #93 is about, in four characters. Where SOME have a basis the dot
+# still counts, and names the rest rather than quietly narrowing its own
+# denominator.
+STRIP_KNOBS_NO_BASIS = "Not enough data yet"
+STRIP_KNOBS_SHORT_SUFFIX = "{short} not yet measurable"
 
 # The four questions, in the order they are read. Chosen so the strip runs from
 # "is it broken" to "is the discount working": a reader who stops after one dot
@@ -2453,7 +2473,7 @@ class Api:
         defect `avg_context` and `context.mean` were joined at the hip to stop
         (#25).
         """
-        values: dict[str, Optional[float]] = {
+        readings: dict[str, Reading] = {
             METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW: (
                 self._main_thread_over_half_window_share(context)
             ),
@@ -2465,7 +2485,7 @@ class Api:
                 self._main_vs_subagent_tokens_per_call(start, end)
             ),
         }
-        assessed = assess_all(values)
+        assessed = assess_all(readings)
         return {
             # Two fields, as `context.utilisation` carries `bands_as_of` beside
             # `band_provenance`: the date the judgments were last decided is a
@@ -2478,7 +2498,15 @@ class Api:
             # by) at the point where the key is a derived depth rather than a
             # column.
             "ranking_provenance": RANKING_PROVENANCE,
+            # #93's third state, said once. A DIFFERENT DATE from `as_of`
+            # above, because the ratios' floor is a judgment taken on its own
+            # day and the boundaries' date must not be made to cover it -- the
+            # `bands_as_of` / `band_provenance` separation (#31), one axis over.
+            # The shares' floors carry no date at all: they are arithmetic over
+            # boundaries this table already dates, and they move when those do.
+            "sample_floor_as_of": SAMPLE_FLOOR_AS_OF,
             "unmeasured_note": UNMEASURED_NOTE,
+            "under_sampled_note": UNDER_SAMPLED_NOTE,
             "ranked": [self._assessment_payload(a) for a in assessed.ranked],
             # #89's summary level, in the SAME order and off the SAME
             # `Assessment` objects the diagnosis one level down reads. One row
@@ -2496,12 +2524,38 @@ class Api:
             "unmeasured": {
                 key: METRICS[key].measurement for key in assessed.unmeasured
             },
+            # THE THIRD STATE, AND IT IS NOT A SECOND `unmeasured`. Same shape
+            # -- a mapping the page consumes whole, so every member reaches a
+            # reader however many there are -- and a different sentence,
+            # because these metrics HAVE a reading. What each says is how much
+            # of its own denominator this period holds against how much the
+            # bands it would be compared with require, which is the only thing
+            # that makes "51" mean anything.
+            "under_sampled": {
+                u.metric: self._shortfall_sentence(u) for u in assessed.under_sampled
+            },
         }
+
+    @staticmethod
+    def _shortfall_sentence(under: UnderSampled) -> str:
+        """How short one metric's sample is, in the floor's own words.
+
+        COMPOSED HERE AND NOT IN THE PAGE, for the reason no advice on that
+        page is authored there: the sentence names a number, and a number
+        rendered beside a noun the page chose would be a second statement of
+        what the floor counts. `SampleFloor.counts` is the table's own phrase
+        and this only puts it in a sentence.
+        """
+        return (
+            f"{under.sample_size} of the {under.floor.minimum} "
+            f"{under.floor.counts} this reading needs before its bands mean "
+            f"anything -- {under.shortfall} short"
+        )
 
     @staticmethod
     def _main_thread_over_half_window_share(
         context: dict[str, Any],
-    ) -> Optional[float]:
+    ) -> Reading:
         """`METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW`, off the rendered tally.
 
         Numerator: main-thread banded calls in `OVER_HALF_WINDOW_BANDS`.
@@ -2518,19 +2572,24 @@ class Api:
         "over half the window", free to drift from the one the reader is
         looking at and from the one the ranking used. That is the same reason
         `context` is passed into `_recommendations()` rather than rebuilt.
+
+        **The sample size is that same denominator** (#93), read off the same
+        row: `banded_calls`, not the period's call count and not this scope's.
+        A window of a thousand main-thread calls of which nine were banded is a
+        share over nine, and the floor is owed the nine.
         """
         for scope in context["utilisation"]["by_scope"]:
             if scope["scope"] != SCOPE_MAIN:
                 continue
-            return scope["over_half_window_share"]
+            return Reading(
+                scope["over_half_window_share"], scope["banded_calls"]
+            )
         # Unreachable while `_context()` emits every scope in `SCOPE_ORDER`,
         # and None rather than 0.0 if that ever changes: a main-thread share
         # this function could not find is not a main-thread share of nothing.
-        return None
+        return Reading(None, 0)
 
-    def _cache_reuse_metrics(
-        self, start: float, end: float
-    ) -> dict[str, Optional[float]]:
+    def _cache_reuse_metrics(self, start: float, end: float) -> dict[str, Reading]:
         """`METRIC_CACHE_READS_PER_WRITE` and `METRIC_CACHE_WRITE_ONLY_SHARE`.
 
         One pass, because both range over the same rows and a second query
@@ -2550,6 +2609,15 @@ class Api:
         `_cache_write_repayment_at_own_ttl()` one method down: that one ranges
         over the calls whose per-TTL split was measured and must not borrow
         this denominator, nor lend it these reads (#84).
+
+        **ONE SAMPLE COUNT SERVES BOTH, AND IT IS `writing_calls`** (#93). It is
+        `cache_write_only_share`'s literal denominator; for
+        `cache_reads_per_write` the denominator is TOKENS, and the calls that
+        contributed them are these same rows -- a period where one call wrote
+        cache has one call setting the whole ratio, however many tokens it
+        wrote. The two floors over that one count are still different numbers
+        (51 derived against 10 judged), because how many members each needs is
+        the table's question and not this query's.
         """
         row = self.conn.execute(
             "SELECT SUM(cache_read) reads, SUM(cache_write) writes,"
@@ -2560,19 +2628,20 @@ class Api:
             (start, end),
         ).fetchone()
         writes = row["writes"]
-        writing_calls = row["writing_calls"]
+        # `SUM` over no rows is SQL NULL; the count of a set with no members is
+        # a real 0, and the two must not both arrive as None.
+        writing_calls = row["writing_calls"] or 0
         return {
-            METRIC_CACHE_READS_PER_WRITE: (
-                (row["reads"] / writes) if writes else None
+            METRIC_CACHE_READS_PER_WRITE: Reading(
+                (row["reads"] / writes) if writes else None, writing_calls
             ),
-            METRIC_CACHE_WRITE_ONLY_SHARE: (
-                (row["write_only_calls"] / writing_calls) if writing_calls else None
+            METRIC_CACHE_WRITE_ONLY_SHARE: Reading(
+                (row["write_only_calls"] / writing_calls) if writing_calls else None,
+                writing_calls,
             ),
         }
 
-    def _cache_write_repayment_at_own_ttl(
-        self, start: float, end: float
-    ) -> Optional[float]:
+    def _cache_write_repayment_at_own_ttl(self, start: float, end: float) -> Reading:
         """`METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL`, over ONE set of calls.
 
         A THIRD query rather than two more columns on `_cache_reuse_metrics()`'s
@@ -2605,20 +2674,31 @@ class Api:
         in that function and is deliberately not written into this query:
         which multiplier goes with which TTL is the CITED boundary, and a
         `2 *` here would be free to drift from the citation justifying it.
+
+        **The sample is counted inside the same `WHERE`** (#93), and counts the
+        calls that actually WROTE at one of the two TTLs -- not every call whose
+        split was readable. A call with a measured split of 0 and 0 contributes
+        nothing to the denominator, so counting it would report a sample that
+        is not holding the ratio up. Borrowing `_cache_reuse_metrics()`'
+        `writing_calls` would be worse still: those are a different set of rows,
+        which is the whole reason this is a third query.
         """
         row = self.conn.execute(
             "SELECT SUM(cache_read) reads, SUM(cache_write_5m) write_5m,"
-            " SUM(cache_write_1h) write_1h"
+            " SUM(cache_write_1h) write_1h,"
+            " SUM(CASE WHEN cache_write_5m + cache_write_1h > 0 THEN 1 ELSE 0 END)"
+            "   writing_calls"
             " FROM api_calls"
             " WHERE ts >= ? AND ts < ?"
             " AND cache_write_5m IS NOT NULL AND cache_write_1h IS NOT NULL",
             (start, end),
         ).fetchone()
-        return cache_write_repayment(row["reads"], row["write_5m"], row["write_1h"])
+        return Reading(
+            cache_write_repayment(row["reads"], row["write_5m"], row["write_1h"]),
+            row["writing_calls"] or 0,
+        )
 
-    def _main_vs_subagent_tokens_per_call(
-        self, start: float, end: float
-    ) -> Optional[float]:
+    def _main_vs_subagent_tokens_per_call(self, start: float, end: float) -> Reading:
         """`METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY`, per the measurement.
 
         Mean total tokens per main-thread API CALL over mean total tokens per
@@ -2632,8 +2712,18 @@ class Api:
         `inf` `assess()` refuses. None too if the subagent mean is 0, which is
         a real reading (calls that reported no tokens at all) but still a zero
         denominator, and so still not a ratio.
+
+        **THE SAMPLE IS THE SMALLER SCOPE, NEVER THE POOLED COUNT** (#93). Both
+        means are means over their own scope, so the reading is only as sampled
+        as its thinner side: a window with 4,000 main-thread calls and one
+        subagent reply has a DEFINED ratio whose whole subagent term is that one
+        reply, and a pooled 4,001 would wave it through with room to spare. The
+        refusal already in this method is a different absence -- a scope with no
+        call has no ratio rather than an under-sampled one -- and neither
+        substitutes for the other.
         """
         means: dict[str, float] = {}
+        calls: dict[str, int] = {}
         for row in self.conn.execute(
             f"SELECT source_kind, COUNT(*) calls, SUM({TOTAL_TOKENS_SQL}) total"
             " FROM api_calls WHERE ts >= ? AND ts < ? GROUP BY source_kind",
@@ -2641,15 +2731,51 @@ class Api:
         ):
             if row["calls"]:
                 means[row["source_kind"]] = (row["total"] or 0) / row["calls"]
+                calls[row["source_kind"]] = row["calls"]
+        sample = min(calls.get(SOURCE_MAIN, 0), calls.get(SOURCE_SUBAGENT, 0))
         main = means.get(SOURCE_MAIN)
         subagent = means.get(SOURCE_SUBAGENT)
         if main is None or not subagent:
-            return None
-        return main / subagent
+            return Reading(None, sample)
+        return Reading(main / subagent, sample)
 
     # ----------------------------------------------------------------------
     # #89: the same table, drawn -- the summary level's knobs and gauges
     # ----------------------------------------------------------------------
+
+    @classmethod
+    def _sample_block(
+        cls, metric_key: str, state: str, size: int, note: Optional[str]
+    ) -> dict[str, Any]:
+        """What this window holds of one metric's denominator, and what it needs.
+
+        THE FLOOR AND ITS VOICE TRAVEL TOGETHER. `rule`, `provenance_kind` and
+        `provenance_statement` are the floor's own, so a derived floor and a
+        judged one are distinguishable on the page without a reader leaving it
+        -- `band_provenance` beside `window_provenance` (#31), and the
+        per-boundary `Provenance` (#78), at the grain of the sample size. A
+        judged floor that reached the page in the derived one's voice would be
+        exactly the borrowed authority both of those exist to refuse.
+
+        `note` is non-null EXACTLY when the state is under-sampled -- the
+        tri-state-with-a-reason shape `no_sample_reason` and
+        `stale_unknown_reason` already use. A measured metric has no shortfall
+        to explain and an unmeasured one has no reading to explain it about.
+        """
+        floor = METRICS[metric_key].sample_floor
+        return {
+            "state": state,
+            # HOW MANY, and OF WHAT. The count alone is meaningless: "3" is a
+            # different fact against 51 cache-writing calls than against 51
+            # calls, and `counts` is the table's own phrase for the set.
+            "size": size,
+            "minimum": floor.minimum,
+            "counts": floor.counts,
+            "rule": floor.rule,
+            "provenance_kind": floor.provenance.kind,
+            "provenance_statement": floor.provenance.statement,
+            "note": note,
+        }
 
     @classmethod
     def _knobs(cls, assessed: Assessments) -> list[dict[str, Any]]:
@@ -2669,6 +2795,21 @@ class Api:
         vanished would be indistinguishable from a healthy one -- the defect
         the table's explicit healthy entry exists to prevent, at the level
         where it is hardest to see.
+
+        THREE STATES, THREE ROWS, AND EVERY ROW SAYS WHICH (#93). Between the
+        two above sits the under-sampled one: it HAS a reading, so it is not
+        unmeasured, and its sample cannot carry a verdict, so it has no
+        severity and no directive. It keeps its `value` -- the number was
+        measured and is true, and withholding it would be its own small
+        dishonesty -- and it gets NO NEEDLE. A needle sitting under the green
+        arc IS the verdict, drawn; `cache_reads_per_write` reading 24.0 over
+        three calls would otherwise say "do not change this" in a picture after
+        the words had stopped saying it.
+
+        Every row carries `sample`, measured ones included. "51 of 51" is the
+        evidence that a green row earned its green, and a page that showed the
+        count only where it was short would make the floor look like an error
+        message rather than a standing condition.
 
         EVERY FIGURE IS READ OFF THE SAME `Assessment` THE LEVEL BELOW READS.
         Not recomputed, not re-derived: `_assessment_payload()` and this method
@@ -2700,9 +2841,43 @@ class Api:
                 # unrepresentable rather than merely absent.
                 "directive": None if a.lever is None else a.lever.directive,
                 "gauge": cls._gauge(METRICS[a.metric], a.value),
+                "sample": cls._sample_block(
+                    a.metric,
+                    SAMPLE_MEASURED,
+                    assessed.sample_sizes[a.metric],
+                    None,
+                ),
             }
             for a in assessed.ranked
         ]
+        rows.extend(
+            {
+                "metric": u.metric,
+                "measurement": u.measurement,
+                "means": METRICS[u.metric].means,
+                "unit": METRICS[u.metric].unit,
+                # THE READING SURVIVES; THE VERDICT DOES NOT. `value` is the
+                # number this window actually measured and `severity` is None
+                # beside it, which is the whole of the third state: a figure
+                # the reader may look at, and no claim about whether it is
+                # good. `directive` is None for the same reason -- an
+                # instruction is the strongest claim on this page and the last
+                # thing a short sample may buy.
+                "value": u.value,
+                "severity": None,
+                "directive": None,
+                # No needle. See the class docstring: the needle's position
+                # under a coloured arc is the verdict in a second notation.
+                "gauge": cls._gauge(METRICS[u.metric], None),
+                "sample": cls._sample_block(
+                    u.metric,
+                    SAMPLE_UNDER_SAMPLED,
+                    u.sample_size,
+                    cls._shortfall_sentence(u),
+                ),
+            }
+            for u in assessed.under_sampled
+        )
         rows.extend(
             {
                 "metric": key,
@@ -2723,6 +2898,15 @@ class Api:
                 "severity": None,
                 "directive": None,
                 "gauge": cls._gauge(METRICS[key], None),
+                # An unmeasured metric still HAS a floor, and its sample size is
+                # a real count rather than an absence -- usually 0, and not
+                # always: a period can hold twenty calls whose per-TTL split was
+                # read and whose writes were all zero, which is a denominator of
+                # nothing over a sample of nothing. Published either way, so the
+                # reader is never left inferring the count from the state.
+                "sample": cls._sample_block(
+                    key, SAMPLE_UNMEASURED, assessed.sample_sizes[key], None
+                ),
             }
             for key in assessed.unmeasured
         )
@@ -2884,13 +3068,16 @@ class Api:
             context_answer = f"{context_answer} — {utilisation['worst_scope']}"
         knobs = recommendations["knobs"]
         turnable = [k for k in knobs if k["directive"]]
-        knob_state, _ = cls._worst_strip_state(
-            [k["severity"] for k in knobs if k["severity"] is not None]
-        )
-        cache = [k["severity"] for k in knobs if k["metric"] in CACHE_METRICS]
-        cache_state, cache_answer = cls._worst_strip_state(
-            [severity for severity in cache if severity is not None]
-        )
+        # EVERY KNOB, INCLUDING THE ONES WITH NO SEVERITY (#93). This used to
+        # filter the severity-less rows out and take the worst of what was
+        # left, which is how a dot went green over readings nobody could take:
+        # on a fresh install all five were severity-less and the strip reported
+        # four good dots. A missing severity is now `STRIP_UNKNOWN` and joins
+        # the comparison, where `STRIP_ORDER` already says what it does --
+        # weaken a clean answer, never soften a bad one.
+        knob_state = cls._worst_strip_state([k["severity"] for k in knobs])
+        cache = [k for k in knobs if k["metric"] in CACHE_METRICS]
+        cache_state = cls._worst_strip_state([k["severity"] for k in cache])
         answers = {
             STRIP_DOT_BROKEN: (health_state, health_answer),
             STRIP_DOT_CONTEXT: (context_state, context_answer),
@@ -2898,15 +3085,8 @@ class Api:
             # knobs are worth turning and how many exist, and the second half
             # is what stops a page of two rows reading as a page of two
             # problems.
-            STRIP_DOT_KNOBS: (
-                knob_state,
-                f"{len(turnable)} of {len(knobs)}",
-            ),
-            STRIP_DOT_CACHE: (
-                cache_state,
-                cache_answer if cache_state != STRIP_UNKNOWN
-                else STRIP_CACHE_UNMEASURED,
-            ),
+            STRIP_DOT_KNOBS: (knob_state, cls._knobs_answer(knobs, turnable)),
+            STRIP_DOT_CACHE: (cache_state, cls._cache_answer(cache, cache_state)),
         }
         return {
             "dots": [
@@ -2921,21 +3101,87 @@ class Api:
         }
 
     @staticmethod
-    def _worst_strip_state(severities: list[str]) -> tuple[str, str]:
+    def _worst_strip_state(severities: list[Optional[str]]) -> str:
         """The worst of a run of table severities, as a strip state.
 
         NO SEVERITY ORDERING IS SPELLED HERE. `SEVERITY_RANK` is the module's
         own explicit ordering -- not alphabetical and not declaration order --
-        and this reads it.
+        and this reads it; the comparison across the FOUR strip states is
+        `STRIP_ORDER`'s, for the same reason.
+
+        A `None` SEVERITY IS `STRIP_UNKNOWN` AND IS COMPARED, NOT DROPPED
+        (#93). It used to be filtered out by every caller, so a dot took the
+        worst of whatever happened to be measured and went green over a set
+        whose other members had no basis at all -- at the limit, over a set
+        where none of them did. `STRIP_ORDER` already fixes what an unknown
+        does when it meets a verdict: it sits between `watch` and `good`, so it
+        weakens a clean answer and never softens a bad one. This function now
+        applies that rule instead of leaving the caller to discard the case.
 
         An EMPTY run is `STRIP_UNKNOWN`, never `STRIP_GOOD`. No reading is not
         a clean reading, and a dot that went green because nothing was measured
         is the exact failure this project is arranged against.
+
+        Returns the STATE ALONE. It used to return the state and an answer, and
+        the answer for the empty case was a cache-specific string -- one dot's
+        wording living inside the helper every dot shares. Each caller composes
+        its own words now, off the state this returns.
         """
-        if not severities:
-            return STRIP_UNKNOWN, STRIP_CACHE_UNMEASURED
-        worst = max(severities, key=lambda s: SEVERITY_RANK[s])
-        return STRIP_FROM_SEVERITY[worst]
+        states = [
+            STRIP_UNKNOWN
+            if severity is None
+            else STRIP_FROM_SEVERITY[severity][0]
+            for severity in severities
+        ]
+        if not states:
+            return STRIP_UNKNOWN
+        return min(states, key=STRIP_ORDER.index)
+
+    @staticmethod
+    def _knobs_answer(
+        knobs: list[dict[str, Any]], turnable: list[dict[str, Any]]
+    ) -> str:
+        """The knobs dot's words: how many are worth turning, of how many.
+
+        THE DENOMINATOR IS NEVER QUIETLY NARROWED. Where every knob has a
+        basis this is the count it always was. Where some do not, the count
+        stays over ALL of them and the shortfall is named beside it -- reporting
+        "0 of 1" on a page showing five rows would be a second, smaller truth
+        told in place of the first.
+
+        Where NONE has a basis there is no count worth printing: "0 of 5" is
+        arithmetic over an empty set, and it reads exactly like five checks
+        that passed. That is the sentence a fresh install saw, and it is
+        replaced by one that says what is actually true.
+        """
+        without_basis = [k for k in knobs if k["severity"] is None]
+        if knobs and len(without_basis) == len(knobs):
+            return STRIP_KNOBS_NO_BASIS
+        answer = f"{len(turnable)} of {len(knobs)}"
+        if without_basis:
+            suffix = STRIP_KNOBS_SHORT_SUFFIX.format(short=len(without_basis))
+            return f"{answer} — {suffix}"
+        return answer
+
+    @staticmethod
+    def _cache_answer(cache: list[dict[str, Any]], state: str) -> str:
+        """The cache dot's words, distinguishing the two absences (#93).
+
+        A severity's own phrase where there is one. Where there is not, WHICH
+        absence it is: a cache metric with a reading too thin to band sends the
+        reader to "come back later", and one with no reading at all does not.
+        Both were `STRIP_CACHE_UNMEASURED` before, which made a first run and a
+        project that never cached look identical.
+        """
+        if state != STRIP_UNKNOWN:
+            worst = max(
+                (k["severity"] for k in cache if k["severity"] is not None),
+                key=lambda s: SEVERITY_RANK[s],
+            )
+            return STRIP_FROM_SEVERITY[worst][1]
+        if any(k["sample"]["state"] == SAMPLE_UNDER_SAMPLED for k in cache):
+            return STRIP_CACHE_UNDER_SAMPLED
+        return STRIP_CACHE_UNMEASURED
 
     # ----------------------------------------------------------------------
     # #89: the model mix -- an observation, and deliberately not advice

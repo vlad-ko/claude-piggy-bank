@@ -77,12 +77,17 @@ from recommendations import (  # noqa: E402
     READ_TOKENS_TO_REPAY_A_5M_WRITE_TOKEN,
     RECOMMENDATION_PROVENANCE,
     RECOMMENDATIONS_AS_OF,
+    SAMPLE_FLOOR_AS_OF,
+    SEVERITY_ACT,
     SEVERITY_OK,
     SEVERITY_RANK,
+    SEVERITY_WATCH,
+    UNDER_SAMPLED_NOTE,
     UNMEASURED_NOTE,
     WORSE_WHEN_HIGHER,
     WORSE_WHEN_LOWER,
     Lever,
+    Reading,
     assess_all,
 )
 import serve  # noqa: E402
@@ -131,6 +136,9 @@ from serve import (  # noqa: E402
     PERCENTILES,
     RANKED_BY,
     RECOMMENDED_METRICS,
+    SAMPLE_MEASURED,
+    SAMPLE_UNDER_SAMPLED,
+    SAMPLE_UNMEASURED,
     SATURATION_RANKED_BY,
     SCOPE_INCLUDES_BOTH,
     SCOPE_LABELS,
@@ -142,7 +150,9 @@ from serve import (  # noqa: E402
     STALE_UNKNOWN_NO_RUN_TABLE,
     STALE_UNKNOWN_RUN_IN_FUTURE,
     STATUS_ARCHIVED,
+    STRIP_CACHE_UNDER_SAMPLED,
     STRIP_CACHE_UNMEASURED,
+    STRIP_BAD,
     STRIP_DOTS,
     STRIP_DOT_BROKEN,
     STRIP_DOT_CACHE,
@@ -152,8 +162,10 @@ from serve import (  # noqa: E402
     STRIP_FROM_HEALTH,
     STRIP_FROM_SEVERITY,
     STRIP_GOOD,
+    STRIP_KNOBS_NO_BASIS,
     STRIP_ORDER,
     STRIP_QUESTIONS,
+    STRIP_WATCH,
     STRIP_UNKNOWN,
     UTIL_NO_SAMPLE_NO_CALLS,
     UTIL_NO_SAMPLE_NO_CONTEXT_MEASUREMENT,
@@ -2435,6 +2447,20 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
         subagents.mkdir(parents=True)
         shutil.copy(SUBAGENT_FIXTURE, subagents / "agent-atest1.jsonl")
         ingest(projects, cls.tmp / "usage.db")
+        # #93: THE RECOMMENDATION CORPUS TOO, and the walk is why. This class
+        # adjudicates the SHAPE of every payload field, and it can only see the
+        # fields of a list it finds a row in -- `_walk_rows` refuses an empty
+        # one rather than passing over it. The session fixture above holds a
+        # handful of calls, which is now correctly BELOW every metric's sample
+        # floor, so on its own it produces `ranked: []` and the whole
+        # recommendation subtree becomes unwalkable. A second, larger source
+        # gives the walk a banded row to read without touching the first, whose
+        # scope, coverage and model figures the rest of this class reads.
+        ingest(
+            build_recommendation_corpus(cls.tmp / "rec"),
+            cls.tmp / "usage.db",
+            tasks_dir=cls.tmp / "no-task-index",
+        )
         cls.api = Api(cls.tmp / "usage.db")
         cls.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
 
@@ -6270,7 +6296,7 @@ def _split(five_m: Optional[int] = None, one_h: Optional[int] = None) -> dict:
 # `context_size` is input + cache_write + cache_read, which is how `ingest.py`
 # derives it, so the main-thread contexts below are engineered to sit in known
 # bands against a 1M window: 600k (50-90), 950k (>=90), 300k, 100k, 38k.
-REC_CALLS: list[tuple[str, str, str, int, int, int, int, Optional[dict]]] = [
+REC_BASE_CALLS: list[tuple[str, str, str, int, int, int, int, Optional[dict]]] = [
     # --- the full day, main thread: two of five calls over half the window ---
     # SPLIT MEASURED, both TTLs, unequal: 100,000 + 20,000 = the flat 120,000.
     (
@@ -6350,39 +6376,71 @@ REC_CALLS: list[tuple[str, str, str, int, int, int, int, Optional[dict]]] = [
     ),
 ]
 
+# #93: HOW MANY TIMES THE PATTERN ABOVE IS RUN, and why it is a replication
+# rather than more hand-written rows.
+#
+# Every metric now refuses to band a reading whose sample is below its floor,
+# and the largest of those floors is 51 -- `cache_write_only_share`'s, derived
+# from its own narrowest band. The pattern above holds 7 cache-writing calls on
+# its full day, so as written it is a corpus that CANNOT support the verdicts
+# this class asserts, and asserting them over it was testing the defect #93
+# names: a band placement earned by a sample too thin to place anything.
+#
+# REPLICATING THE PATTERN IS THE ONE WAY TO GROW IT THAT MOVES NO FIGURE. Every
+# count multiplies by `REC_REPLICAS` and every token sum multiplies with it, so
+# every SHARE and every RATIO -- which are the readings under test -- comes out
+# bit-identical to the eight-call original. Hand-writing forty more rows would
+# have moved each of the five readings by whatever those rows happened to
+# contain, and every expectation below with them.
+#
+# EIGHT, and it is the smallest factor that clears every floor rather than a
+# comfortable round number: 7 x 7 = 49 cache-writing calls, one short of 51.
+# `test_the_fixture_clears_every_floor_it_is_asserted_against` pins that the
+# corpus is above the floors and `test_seven_replicas_would_not_have_cleared_
+# them` pins that the margin is real, so a floor raised later fails here loudly
+# instead of silently turning these assertions into assertions about absence.
+REC_REPLICAS = 8
+REC_CALLS: list[tuple[str, str, str, int, int, int, int, Optional[dict]]] = [
+    call for _ in range(REC_REPLICAS) for call in REC_BASE_CALLS
+]
+
 # Hand-written from the table above, then checked against it by
 # `test_the_fixture_holds_what_the_expectations_claim`. Derived-only
-# expectations would agree with a fixture that had drifted.
-REC_FULL_MAIN_CALLS = 5
-REC_FULL_MAIN_TOTAL = 2_000_000
-REC_FULL_MAIN_BANDED = 5
-REC_FULL_MAIN_OVER_HALF = 2
-REC_FULL_SUB_CALLS = 3
-REC_FULL_SUB_TOTAL = 58_700
-REC_FULL_CACHE_READS = 1_525_000
-REC_FULL_CACHE_WRITES = 422_100
-REC_FULL_WRITING_CALLS = 7
-REC_FULL_WRITE_ONLY_CALLS = 2
-# The per-TTL metric's set (#84): the three full-day calls carrying BOTH TTL
-# keys, and the reads from those same three. Every figure here is hand-written
-# from the table above and checked against it below.
-REC_FULL_SPLIT_CALLS = 3
-REC_FULL_SPLIT_READS = 541_000        # 470,000 + 64,000 + 7,000
-REC_FULL_SPLIT_5M = 109_000           # 100,000 + 3,000 + 6,000
-REC_FULL_SPLIT_1H = 40_000            # 20,000 + 20,000 + 0
-# HAND-WRITTEN, not derived from the module's weights: 1 x 109,000 + 2 x 40,000.
+# expectations would agree with a fixture that had drifted -- so these are the
+# eight-replica totals written out, NOT `8 * <base>` expressions, which would
+# recompute themselves around a changed `REC_REPLICAS` and assert nothing.
+REC_FULL_MAIN_CALLS = 40
+REC_FULL_MAIN_TOTAL = 16_000_000
+REC_FULL_MAIN_BANDED = 40
+REC_FULL_MAIN_OVER_HALF = 16
+REC_FULL_SUB_CALLS = 24
+REC_FULL_SUB_TOTAL = 469_600
+REC_FULL_CACHE_READS = 12_200_000
+REC_FULL_CACHE_WRITES = 3_376_800
+REC_FULL_WRITING_CALLS = 56
+REC_FULL_WRITE_ONLY_CALLS = 16
+# The per-TTL metric's set (#84): the full-day calls carrying BOTH TTL keys,
+# and the reads from those same calls. Every figure here is hand-written from
+# the table above and checked against it below.
+REC_FULL_SPLIT_CALLS = 24
+REC_FULL_SPLIT_READS = 4_328_000      # 8 x (470,000 + 64,000 + 7,000)
+REC_FULL_SPLIT_5M = 872_000           # 8 x (100,000 + 3,000 + 6,000)
+REC_FULL_SPLIT_1H = 320_000           # 8 x (20,000 + 20,000 + 0)
+# HAND-WRITTEN, not derived from the module's weights: 1 x 872,000 + 2 x 320,000.
 # An expectation computed from `READ_TOKENS_TO_REPAY_A_*` would move with them,
 # so a release that swapped the two multipliers would pass every assertion below
 # -- the "fixture that makes the defect undetectable" failure, arriving through
 # a constant instead of through a value. The weights are checked AGAINST this
 # literal in `test_the_fixtures_split_holds_what_the_expectations_claim`.
-REC_FULL_REQUIRED = 189_000
-# 541,000 / 189,000 = 2.8624...
+REC_FULL_REQUIRED = 1_512_000
+# 4,328,000 / 1,512,000 = 2.8624..., which is the base pattern's own
+# 541,000/189,000 unchanged -- replication moves no ratio, which is why it was
+# chosen over more hand-written rows (see `REC_REPLICAS`).
 # Deliberately unlike its four neighbours, none of which may reproduce it:
-#   whole-window reads over the same denominator  1,525,000/189,000 = 8.069
-#   the weights swapped                             541,000/258,000 = 2.097
-#   the half-split call counted as 5-minute only    541,000/195,100 = 2.773
-#   the flat reads-per-write ratio                1,525,000/422,100 = 3.613
+#   whole-window reads over the same denominator 12,200,000/1,512,000 = 8.069
+#   the weights swapped                           4,328,000/2,064,000 = 2.097
+#   the half-split call counted as 5-minute only  4,328,000/1,560,800 = 2.773
+#   the flat reads-per-write ratio               12,200,000/3,376,800 = 3.613
 REC_FULL_REPAYMENT = REC_FULL_SPLIT_READS / REC_FULL_REQUIRED
 
 
@@ -6544,7 +6602,8 @@ class RecommendationApiTest(unittest.TestCase):
             if c[7] is not None
             and (CACHE_WRITE_5M_KEY in c[7]) != (CACHE_WRITE_1H_KEY in c[7])
         ]
-        self.assertEqual(len(half), 1)
+        # One per replica of the pattern, and the pattern carries exactly one.
+        self.assertEqual(len(half), REC_REPLICAS)
         self.assertGreater(
             half[0][4],
             0,
@@ -6567,11 +6626,18 @@ class RecommendationApiTest(unittest.TestCase):
 
     # --- every metric is computed, and computed from its `measurement` ---
 
-    def test_every_metric_in_the_table_is_assessed_or_named_unmeasured(self) -> None:
+    def test_every_metric_in_the_table_lands_in_exactly_one_state(self) -> None:
         # `assess_all()` refuses a partial mapping, so a forgotten metric would
         # raise rather than pass -- but only if `_recommendations()` keeps
-        # passing every key. This asserts the state that proves it did: the two
-        # halves of the payload partition `METRICS` exactly, on every window.
+        # passing every key. This asserts the state that proves it did: the
+        # THREE parts of the payload partition `METRICS` exactly, on every
+        # window.
+        #
+        # #93 made it three rather than two, and the third is not decoration:
+        # every window below except the full day has at least one metric in it,
+        # because a fixture small enough to be readable is a fixture small
+        # enough to be under-sampled. Before the third part existed those
+        # metrics were `ranked`, with severities.
         for day in (
             REC_FULL_DAY,
             REC_SOLO_DAY,
@@ -6584,14 +6650,22 @@ class RecommendationApiTest(unittest.TestCase):
                 block = self.block(day)
                 ranked = {a["metric"] for a in block["ranked"]}
                 unmeasured = set(block["unmeasured"])
-                self.assertEqual(ranked | unmeasured, set(METRICS))
+                under = set(block["under_sampled"])
+                self.assertEqual(ranked | unmeasured | under, set(METRICS))
+                # Pairwise disjoint, all three ways: a metric in two states is
+                # the collapse this change exists to prevent, and "the union is
+                # everything" alone would not catch it.
                 self.assertEqual(ranked & unmeasured, set())
+                self.assertEqual(ranked & under, set())
+                self.assertEqual(unmeasured & under, set())
                 # And against what `serve` DECLARES it computes (#84). The
                 # import-time guard compares that declaration with the table;
                 # this compares it with what a served payload actually holds,
                 # so a declaration that had drifted from the mapping below it
                 # cannot pass by agreeing with the table alone.
-                self.assertEqual(ranked | unmeasured, set(RECOMMENDED_METRICS))
+                self.assertEqual(
+                    ranked | unmeasured | under, set(RECOMMENDED_METRICS)
+                )
 
     def test_cache_reads_per_write_divides_the_tokens_its_measurement_names(
         self,
@@ -6892,7 +6966,14 @@ class RecommendationApiTest(unittest.TestCase):
     def test_a_structural_boundary_carries_neither_source_nor_check_date(self) -> None:
         # There is nothing to re-check about "a share cannot be negative", and a
         # date beside it would claim a currency it does not have.
-        lower = self.reading(REC_SOLO_DAY, METRIC_CACHE_WRITE_ONLY_SHARE)[
+        #
+        # #93 moved this off `cache_write_only_share` on the solo day, whose 16
+        # cache-writing calls are below that metric's derived floor of 51 -- so
+        # it has no banded reading there any more, which is the correct answer
+        # and not one this test can read a boundary off. The saturation share on
+        # the same day sits in the same FIRST range, whose lower edge is the
+        # same kind of domain floor, over 16 banded calls against a floor of 11.
+        lower = self.reading(REC_SOLO_DAY, METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW)[
             "lower_provenance"
         ]
         self.assertEqual(lower["kind"], PROVENANCE_STRUCTURAL)
@@ -7042,6 +7123,468 @@ class RecommendationApiTest(unittest.TestCase):
                 self.assertNotIn(token, blob)
 
 
+# ---------------------------------------------------------------------------
+# #93: what a fresh install actually renders.
+# ---------------------------------------------------------------------------
+#
+# THE ONE STATE NOBODY TESTED. Every issue in this project was measured against
+# a corpus with thousands of calls; the first thirty seconds of the beta are
+# spent here. Built through the real ingest path rather than by handing values
+# to `assess_all()`, because the defect was never in the table -- every figure
+# it produced was individually correct -- and lived entirely in what the layers
+# above did with a sample too small to carry them.
+FIRST_RUN_SESSION = "first-run-fixture"
+FIRST_RUN_MODEL = REC_OPUS_1M
+# Three assistant replies. Deliberately shaped to reproduce the issue's own
+# reading: 7,200 read tokens over 300 written is 24.0 reads per write, which is
+# what the report told a three-reply project not to change.
+FIRST_RUN_REPLIES = 3
+FIRST_RUN_READ = 2_400
+FIRST_RUN_WRITE = 100
+FIRST_RUN_READS_PER_WRITE = 24.0
+
+
+def build_first_run_corpus(root: Path, replies: int = FIRST_RUN_REPLIES) -> Path:
+    """One session, `replies` assistant replies, NO subagents.
+
+    The zero-subagent half matters as much as the small count: it is what makes
+    `main_vs_subagent_tokens_per_reply` UNMEASURED rather than under-sampled,
+    so one corpus strands the table in both absences at once and a page that
+    rendered them alike cannot pass.
+    """
+    project = root / "projects" / "-fixture-first-run"
+    project.mkdir(parents=True)
+    lines = [json.dumps({"type": "mode", "mode": "normal",
+                         "sessionId": FIRST_RUN_SESSION})]
+    for n in range(replies):
+        ts = f"2026-08-06T10:{n // 60:02d}:{n % 60:02d}.000Z"
+        lines.append(json.dumps({
+            "type": "user", "sessionId": FIRST_RUN_SESSION, "timestamp": ts,
+            "message": {"role": "user", "content": "do a thing"},
+        }))
+        lines.append(json.dumps({
+            "type": "assistant",
+            "sessionId": FIRST_RUN_SESSION,
+            "timestamp": ts,
+            "isSidechain": False,
+            "message": {
+                "id": f"msg-first-run-{n}",
+                "model": FIRST_RUN_MODEL,
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": FIRST_RUN_WRITE,
+                    "cache_read_input_tokens": FIRST_RUN_READ,
+                    "output_tokens": 50,
+                },
+                "content": [{"type": "text", "text": f"reply {n}"}],
+            },
+        }))
+    (project / f"{FIRST_RUN_SESSION}.jsonl").write_text("\n".join(lines) + "\n")
+    return project
+
+
+class FirstRunRendersNoVerdictTest(unittest.TestCase):
+    """#93: five green verdicts over three calls, and what replaced them.
+
+    Reproduced from the issue: one session, three replies, no subagents. The
+    report said health `ok`, four green dots, four knobs reading "Nothing to
+    turn here" and one "No reading" -- and `cache_reads_per_write` did not
+    merely show green, it said "Do not change this." An instruction, in the
+    product owner's voice, derived from three calls.
+
+    Every figure was correct. The COMPOSITION asserted a clean bill of health
+    on evidence that could not support one, which is this repository's central
+    rule failing one level above the level it had been applied to.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-93-test-"))
+        db_path = cls.tmp / "usage.db"
+        ingest(
+            build_first_run_corpus(cls.tmp),
+            db_path,
+            tasks_dir=cls.tmp / "no-task-index",
+        )
+        cls.api = Api(db_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def summary(self) -> dict:
+        return self.api.summary(*day_bounds(None, None))
+
+    def block(self) -> dict:
+        return self.summary()["recommendations"]
+
+    def dot(self, key: str) -> dict:
+        return next(d for d in self.summary()["status"]["dots"] if d["key"] == key)
+
+    # --- the corpus is the one the issue described -------------------------
+
+    def test_the_fixture_is_a_first_run_and_reproduces_the_issues_reading(self):
+        # If this corpus quietly grew, every assertion below would be about
+        # some other state. The reading is pinned too: 24.0 is the figure the
+        # report told a three-reply project not to change.
+        payload = self.summary()
+        self.assertEqual(payload["calls"], FIRST_RUN_REPLIES)
+        self.assertEqual(payload["sessions"], 1)
+        knob = next(
+            k
+            for k in payload["recommendations"]["knobs"]
+            if k["metric"] == METRIC_CACHE_READS_PER_WRITE
+        )
+        self.assertEqual(knob["value"], FIRST_RUN_READS_PER_WRITE)
+
+    # --- no verdict is reached over it -------------------------------------
+
+    def test_not_one_knob_is_banded(self):
+        block = self.block()
+        self.assertEqual(block["ranked"], [])
+        self.assertEqual(
+            [
+                k["metric"]
+                for k in block["knobs"]
+                if k["sample"]["state"] == SAMPLE_MEASURED
+            ],
+            [],
+        )
+
+    def test_no_knob_carries_a_severity_or_a_directive(self):
+        # "ok" is the one that matters. A green severity over three calls is
+        # the defect; a `watch` would have been wrong in the same way and is
+        # refused by the same code, so this asserts the absence of ALL of them.
+        for knob in self.block()["knobs"]:
+            with self.subTest(metric=knob["metric"]):
+                self.assertIsNone(knob["severity"])
+                self.assertIsNone(knob["directive"])
+
+    def test_no_dial_carries_a_needle(self):
+        # The verdict in its second notation. A needle under the green arc says
+        # "do not change this" in a picture after the words have stopped.
+        for knob in self.block()["knobs"]:
+            with self.subTest(metric=knob["metric"]):
+                self.assertIsNone(knob["gauge"]["needle"])
+
+    def test_the_true_readings_survive_the_withheld_verdicts(self):
+        # The numbers were measured and are true, so they are shown. What is
+        # withheld is the claim ABOUT them. A change that hid the figures too
+        # would be answering a composition defect by deleting measurements.
+        under = self.block()["under_sampled"]
+        values = {
+            k["metric"]: k["value"]
+            for k in self.block()["knobs"]
+            if k["metric"] in under
+        }
+        self.assertEqual(values[METRIC_CACHE_READS_PER_WRITE], 24.0)
+        self.assertEqual(values[METRIC_CACHE_WRITE_ONLY_SHARE], 0.0)
+
+    # --- the three states are three ----------------------------------------
+
+    def test_the_two_absences_are_told_apart(self):
+        block = self.block()
+        # Under-sampled: a reading exists and the sample cannot carry it.
+        self.assertEqual(
+            sorted(block["under_sampled"]),
+            [
+                METRIC_CACHE_READS_PER_WRITE,
+                METRIC_CACHE_WRITE_ONLY_SHARE,
+                METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW,
+            ],
+        )
+        # Unmeasured: no reading at all, and no number of further sessions
+        # changes that for a project that never dispatches a subagent.
+        self.assertEqual(
+            sorted(block["unmeasured"]),
+            [
+                METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
+                METRIC_MAIN_VS_SUBAGENT_TOKENS_PER_REPLY,
+            ],
+        )
+
+    def test_each_under_sampled_row_says_how_short_it_is_and_of_what(self):
+        block = self.block()
+        for metric, sentence in block["under_sampled"].items():
+            with self.subTest(metric=metric):
+                floor = METRICS[metric].sample_floor
+                # The count it has, the count it needs, and the NOUN -- "51" is
+                # a different fact against cache-writing calls than against
+                # calls, and a sentence with only the number says neither.
+                self.assertIn(str(FIRST_RUN_REPLIES), sentence)
+                self.assertIn(str(floor.minimum), sentence)
+                self.assertIn(floor.counts, sentence)
+                self.assertIn(str(floor.minimum - FIRST_RUN_REPLIES), sentence)
+
+    def test_the_note_tells_a_new_user_what_to_do(self):
+        # The one genuinely useful thing the report can say to somebody who has
+        # just installed it.
+        self.assertEqual(self.block()["under_sampled_note"], UNDER_SAMPLED_NOTE)
+        self.assertIn("come back", self.block()["under_sampled_note"])
+
+    def test_the_two_notes_are_not_one_note(self):
+        block = self.block()
+        self.assertNotEqual(block["under_sampled_note"], block["unmeasured_note"])
+
+    # --- the strip cannot go green over it ---------------------------------
+
+    def test_the_knob_dot_is_not_green_and_does_not_count_to_five(self):
+        dot = self.dot(STRIP_DOT_KNOBS)
+        self.assertEqual(dot["state"], STRIP_UNKNOWN)
+        # "0 of 5" is arithmetic over an empty set that reads exactly like five
+        # checks passing. That sentence is what a fresh install saw.
+        self.assertNotIn("of 5", dot["answer"])
+        self.assertEqual(dot["answer"], STRIP_KNOBS_NO_BASIS)
+
+    def test_the_cache_dot_is_not_green_and_names_the_right_absence(self):
+        dot = self.dot(STRIP_DOT_CACHE)
+        self.assertEqual(dot["state"], STRIP_UNKNOWN)
+        # Under-sampled, not unmeasured: two of the three cache metrics have
+        # readings here. A dot that said "Not measured" would send the reader
+        # to the wrong remedy.
+        self.assertEqual(dot["answer"], STRIP_CACHE_UNDER_SAMPLED)
+        self.assertNotEqual(dot["answer"], STRIP_CACHE_UNMEASURED)
+
+    def test_no_dot_backed_by_the_table_is_good(self):
+        # GREEN MEANS MEASURED AND HEALTHY. The two dots that summarise the
+        # recommendation table have no basis here and may not wear the colour
+        # of one that has. The other two -- "anything broken?" and "wasting
+        # context?" -- answer questions whose basis IS these three calls, and
+        # are deliberately not asserted: nothing was unparsed and no call came
+        # near half its window, and both of those are complete answers over the
+        # period rather than rates estimated from a sample.
+        for key in (STRIP_DOT_KNOBS, STRIP_DOT_CACHE):
+            with self.subTest(dot=key):
+                self.assertNotEqual(self.dot(key)["state"], STRIP_GOOD)
+
+    # --- growing out of it -------------------------------------------------
+
+    def test_enough_sessions_earn_the_verdicts_back(self):
+        # The floor is a floor and not a wall: the same corpus, longer, bands
+        # what it could not band at three. Without this the change would be
+        # indistinguishable from one that simply stopped assessing.
+        tmp = Path(tempfile.mkdtemp(prefix="usage-report-93-grown-"))
+        try:
+            db_path = tmp / "usage.db"
+            ingest(
+                build_first_run_corpus(tmp, replies=60),
+                db_path,
+                tasks_dir=tmp / "no-task-index",
+            )
+            api = Api(db_path)
+            try:
+                block = api.summary(*day_bounds(None, None))["recommendations"]
+            finally:
+                api.conn.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        banded = {a["metric"] for a in block["ranked"]}
+        self.assertIn(METRIC_CACHE_READS_PER_WRITE, banded)
+        self.assertIn(METRIC_CACHE_WRITE_ONLY_SHARE, banded)
+        self.assertIn(METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW, banded)
+        self.assertEqual(block["under_sampled"], {})
+        # The reading is the SAME reading -- 24.0 at three replies and at 60 --
+        # so what changed is only whether it may be banded, which is the whole
+        # claim this change makes.
+        reads = next(
+            a for a in block["ranked"] if a["metric"] == METRIC_CACHE_READS_PER_WRITE
+        )
+        self.assertEqual(reads["value"], FIRST_RUN_READS_PER_WRITE)
+
+
+class SampleFloorIsPerPeriodTest(unittest.TestCase):
+    """#93: the floor binds on the WINDOW, never on the database.
+
+    Every figure on this report ranges over a period, so the sample a reading
+    rests on is the period's and not the corpus's. A floor applied per database
+    would wave a seven-day window through on the strength of history it does
+    not describe -- the same wrong-set defect `SCOPE_*` labelling exists for,
+    on the time axis.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-93-period-"))
+        db_path = cls.tmp / "usage.db"
+        ingest(
+            build_recommendation_corpus(cls.tmp),
+            db_path,
+            tasks_dir=cls.tmp / "no-task-index",
+        )
+        cls.api = Api(db_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def block(self, day):
+        return self.api.summary(*day_bounds(day, day))["recommendations"]
+
+    def sample(self, day, metric):
+        return next(
+            k for k in self.block(day)["knobs"] if k["metric"] == metric
+        )["sample"]
+
+    def test_a_metric_banded_over_the_database_is_under_sampled_in_one_day(self):
+        # THE mutation: a floor compared against a count taken over the whole
+        # `api_calls` table. `cache_write_only_share` clears 51 across this
+        # corpus and does not clear it on the solo day, so a per-database floor
+        # would band the solo day's reading -- a verdict about two calls'
+        # worth of history, drawn from history outside the window.
+        whole = self.sample(None, METRIC_CACHE_WRITE_ONLY_SHARE)
+        solo = self.sample(REC_SOLO_DAY, METRIC_CACHE_WRITE_ONLY_SHARE)
+        self.assertEqual(whole["state"], SAMPLE_MEASURED)
+        self.assertEqual(solo["state"], SAMPLE_UNDER_SAMPLED)
+        self.assertGreater(whole["size"], solo["size"])
+        self.assertGreaterEqual(whole["size"], whole["minimum"])
+        self.assertLess(solo["size"], solo["minimum"])
+        self.assertIn(
+            METRIC_CACHE_WRITE_ONLY_SHARE, self.block(REC_SOLO_DAY)["under_sampled"]
+        )
+        self.assertNotIn(
+            METRIC_CACHE_WRITE_ONLY_SHARE, self.block(None)["under_sampled"]
+        )
+
+    def test_the_same_metric_is_still_banded_on_the_day_that_has_the_sample(self):
+        # The other direction, so the test above cannot pass by the floor
+        # simply refusing everything narrow. The full day holds 56 of them.
+        full = self.sample(REC_FULL_DAY, METRIC_CACHE_WRITE_ONLY_SHARE)
+        self.assertEqual(full["state"], SAMPLE_MEASURED)
+
+    def test_a_windows_count_is_the_windows_own(self):
+        # Every published size is strictly a slice of the whole, and the days
+        # do not all agree -- a fixture where they did could not tell a
+        # per-window count from a per-database one.
+        sizes = {
+            day: self.sample(day, METRIC_CACHE_WRITE_ONLY_SHARE)["size"]
+            for day in (None, REC_FULL_DAY, REC_SOLO_DAY, REC_NO_CACHE_DAY)
+        }
+        self.assertEqual(len(set(sizes.values())), len(sizes))
+        for day, size in sizes.items():
+            if day is not None:
+                with self.subTest(day=day):
+                    self.assertLess(size, sizes[None])
+
+    def test_the_published_floor_is_the_tables_and_not_a_copy(self):
+        # A minimum spelled in `serve.py` would be a second enumeration of a
+        # number the table derives, free to drift the moment a band moves --
+        # which is `RECOMMENDED_METRICS`' whole subject, at the grain of a
+        # count.
+        for metric in METRICS:
+            with self.subTest(metric=metric):
+                sample = self.sample(None, metric)
+                floor = METRICS[metric].sample_floor
+                self.assertEqual(sample["minimum"], floor.minimum)
+                self.assertEqual(sample["counts"], floor.counts)
+                self.assertEqual(sample["rule"], floor.rule)
+                self.assertEqual(sample["provenance_kind"], floor.provenance.kind)
+                self.assertEqual(
+                    sample["provenance_statement"], floor.provenance.statement
+                )
+
+    def test_a_judged_floor_reaches_the_page_saying_it_is_judged(self):
+        # Both provenances stay separate and dated. A judged floor rendered in
+        # the derived one's voice is the borrowed authority `band_provenance`
+        # was introduced to refuse (#31), one field over.
+        judged_floor = self.sample(None, METRIC_CACHE_READS_PER_WRITE)
+        derived_floor = self.sample(None, METRIC_CACHE_WRITE_ONLY_SHARE)
+        self.assertEqual(judged_floor["provenance_kind"], PROVENANCE_JUDGED)
+        self.assertEqual(derived_floor["provenance_kind"], PROVENANCE_STRUCTURAL)
+        self.assertNotEqual(
+            judged_floor["provenance_statement"],
+            derived_floor["provenance_statement"],
+        )
+        self.assertEqual(self.block(None)["sample_floor_as_of"], SAMPLE_FLOOR_AS_OF)
+        # ...and that date is NOT the boundaries' date, which crosses the API
+        # beside it.
+        self.assertNotEqual(
+            self.block(None)["sample_floor_as_of"], self.block(None)["as_of"]
+        )
+
+
+class GreenMeansMeasuredAndHealthyTest(unittest.TestCase):
+    """#93: a strip dot may not be green over a reading nobody could take.
+
+    The corpus is a first run grown to twelve replies -- deliberately chosen
+    over three. At twelve, two of the five metrics HAVE cleared their floors
+    and both read `ok`, so the old code's "worst of the severities that exist"
+    produced a green dot with three severity-less knobs standing beside it.
+    That is the harder half of the defect: at three calls every knob was
+    absent and the strip at least had nothing to be green about.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-93-green-"))
+        db_path = cls.tmp / "usage.db"
+        ingest(
+            build_first_run_corpus(cls.tmp, replies=12),
+            db_path,
+            tasks_dir=cls.tmp / "no-task-index",
+        )
+        cls.api = Api(db_path)
+        cls.payload = cls.api.summary(*day_bounds(None, None))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def dot(self, key):
+        return next(d for d in self.payload["status"]["dots"] if d["key"] == key)
+
+    def test_the_fixture_is_the_awkward_case_it_claims_to_be(self):
+        # Without this the class could pass over a corpus where something read
+        # `watch`, and the green dot would never have been reachable.
+        knobs = self.payload["recommendations"]["knobs"]
+        severities = [k["severity"] for k in knobs if k["severity"] is not None]
+        self.assertTrue(severities, "no knob is banded; this is not the case")
+        self.assertEqual(set(severities), {SEVERITY_OK})
+        self.assertTrue(
+            [k for k in knobs if k["severity"] is None],
+            "every knob is banded; there is nothing for the dot to be green over",
+        )
+
+    def test_the_knob_dot_is_unknown_rather_than_green(self):
+        # An unknown may WEAKEN a clean answer and may never soften a bad one
+        # -- `STRIP_ORDER`'s own rule, which the strip published and did not
+        # apply, because every caller filtered the unknowns out before
+        # comparing.
+        self.assertEqual(self.dot(STRIP_DOT_KNOBS)["state"], STRIP_UNKNOWN)
+
+    def test_the_cache_dot_is_unknown_rather_than_green(self):
+        self.assertEqual(self.dot(STRIP_DOT_CACHE)["state"], STRIP_UNKNOWN)
+
+    def test_the_count_still_ranges_over_every_knob_and_names_the_rest(self):
+        knobs = self.payload["recommendations"]["knobs"]
+        answer = self.dot(STRIP_DOT_KNOBS)["answer"]
+        # The denominator is not quietly narrowed to the measured ones: a
+        # smaller true statement told in place of the first is its own defect.
+        self.assertTrue(answer.startswith(f"0 of {len(knobs)}"))
+        self.assertIn(str(len([k for k in knobs if k["severity"] is None])), answer)
+
+    def test_an_unknown_does_not_soften_a_bad_reading(self):
+        # The other direction of `STRIP_ORDER`, checked directly so the change
+        # cannot have turned every dot into an unknown.
+        self.assertEqual(
+            Api._worst_strip_state([SEVERITY_ACT, None, SEVERITY_OK]), STRIP_BAD
+        )
+        self.assertEqual(
+            Api._worst_strip_state([SEVERITY_WATCH, None]), STRIP_WATCH
+        )
+        # ...and a run with nothing but verdicts is still green.
+        self.assertEqual(
+            Api._worst_strip_state([SEVERITY_OK, SEVERITY_OK]), STRIP_GOOD
+        )
+        # ...while one unknown among them is enough to withhold it.
+        self.assertEqual(
+            Api._worst_strip_state([SEVERITY_OK, None]), STRIP_UNKNOWN
+        )
+        self.assertEqual(Api._worst_strip_state([]), STRIP_UNKNOWN)
+
+
 class ThreeLevelPayloadTest(unittest.TestCase):
     """#89: three levels, one payload, and no way for them to disagree.
 
@@ -7128,8 +7671,15 @@ class ThreeLevelPayloadTest(unittest.TestCase):
         for day in self.ALL_DAYS:
             with self.subTest(day=day):
                 block = self.block(day)
+                # BY THE SAMPLE'S OWN STATE, not by "has a value" (#93). An
+                # under-sampled knob HAS a value -- the reading is true and is
+                # shown -- and has no severity, so it is not in `ranked` and
+                # must not be expected there. Selecting on the value would put
+                # it in this list and turn a correct refusal into a failure.
                 measured = [
-                    k["metric"] for k in block["knobs"] if k["value"] is not None
+                    k["metric"]
+                    for k in block["knobs"]
+                    if k["sample"]["state"] == SAMPLE_MEASURED
                 ]
                 self.assertEqual(measured, [a["metric"] for a in block["ranked"]])
 
@@ -7331,6 +7881,14 @@ class ThreeLevelPayloadTest(unittest.TestCase):
         # "2 of 5", never "2": the second half is what stops a page of two rows
         # reading as a page of two problems, and it is what makes a dimmed knob
         # information rather than clutter.
+        #
+        # #93 added the other half of the sentence. Where some knob has no
+        # basis the count still ranges over ALL of them -- narrowing the
+        # denominator to the measured ones would be a second, smaller truth
+        # told in place of the first -- and the shortfall is named beside it.
+        # Where NONE has a basis there is no count worth printing at all: "0 of
+        # 5" is arithmetic over an empty set that reads exactly like five
+        # checks passing, which is the sentence a fresh install saw.
         for day in self.ALL_DAYS:
             with self.subTest(day=day):
                 payload = self.summary(day)
@@ -7339,7 +7897,18 @@ class ThreeLevelPayloadTest(unittest.TestCase):
                     d for d in payload["status"]["dots"] if d["key"] == STRIP_DOT_KNOBS
                 )
                 turnable = len([k for k in knobs if k["directive"]])
-                self.assertEqual(dot["answer"], f"{turnable} of {len(knobs)}")
+                without_basis = [k for k in knobs if k["severity"] is None]
+                if len(without_basis) == len(knobs):
+                    self.assertEqual(dot["answer"], STRIP_KNOBS_NO_BASIS)
+                    continue
+                self.assertTrue(
+                    dot["answer"].startswith(f"{turnable} of {len(knobs)}"),
+                    f"{dot['answer']!r} does not count against every knob",
+                )
+                if without_basis:
+                    self.assertIn(str(len(without_basis)), dot["answer"])
+                else:
+                    self.assertEqual(dot["answer"], f"{turnable} of {len(knobs)}")
 
     def test_the_cache_dot_is_unknown_rather_than_healthy_with_no_sample(self) -> None:
         # The one substitution this repository refuses, in a new place: a dot
@@ -7525,6 +8094,199 @@ class ThreeLevelPayloadTest(unittest.TestCase):
                 )
 
 
+class ThreeStatesGetThreeRenderingsTest(unittest.TestCase):
+    """#93 (page side): a real 0, an unmeasured metric and an under-sampled one.
+
+    THE LIMIT, STATED PLAINLY, as everywhere else on this page: nothing here
+    executes Alpine or measures a pixel. These assert which binding sits where
+    and that no floor is spelled in this file. Whether the compact rows READ as
+    "come back later" rather than as "broken", and what the page actually
+    measures on a screen, is the human-eye half and is not claimed.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+        cls.html = strip_comments(cls.raw)
+        cls.knobs = html_element(cls.raw, 'id="knobs-note"')
+        cls.rows = cls.knobs[: cls.knobs.index('id="knobs-provenance"')]
+        cls.full_rows = cls.rows[: cls.rows.index('x-if="unbandedKnobs.length"')]
+        cls.thin = cls.rows[cls.rows.index('x-if="unbandedKnobs.length"'):]
+        cls.disclosure = html_element(cls.raw, 'id="knobs-provenance"')
+
+    def test_no_sample_floor_is_written_into_the_page(self):
+        # `test_no_boundary_of_the_table_appears_in_the_page`'s rule, for the
+        # other kind of number the table now owns. A floor typed here would be
+        # a threshold with no date, no provenance and nothing to redline --
+        # and, worse than a boundary, one that could not move when the band it
+        # is derived from moved.
+        floors = {metric.sample_floor.minimum for metric in METRICS.values()}
+        self.assertTrue(floors)
+        for floor in sorted(floors):
+            with self.subTest(floor=floor):
+                self.assertNotRegex(
+                    self.rows,
+                    r"(?<![\w.-])" + str(floor) + r"(?![\d\w])",
+                    f"{floor} is a sample floor and is written into index.html",
+                )
+
+    def test_the_page_names_one_sample_state_and_derives_the_rest(self):
+        # A page-side copy of `SAMPLE_STATES` would be a second enumeration of
+        # a vocabulary in the one file no import guard reaches. It needs the
+        # name of the state that CAN be banded and nothing else.
+        self.assertIn('const SAMPLE_MEASURED = "measured";', self.html)
+        for never in (SAMPLE_UNDER_SAMPLED, SAMPLE_UNMEASURED):
+            with self.subTest(state=never):
+                self.assertNotIn(f'"{never}"', self.html)
+
+    def test_an_unrecognised_state_falls_to_the_form_that_withholds_a_verdict(self):
+        # `!== SAMPLE_MEASURED` rather than `=== 'unmeasured'`: a fourth state
+        # added upstream renders COMPACT, with no dial and no severity, instead
+        # of falling through to the full row and being drawn as a verdict. Same
+        # direction as every other fallback on this page.
+        self.assertIn(
+            "!== SAMPLE_MEASURED", js_function_body(self.raw, "get unbandedKnobs(")
+        )
+
+    def test_the_full_row_is_reached_only_by_a_banded_knob(self):
+        # The needle, the target and the severity tag all live in the full row,
+        # so a row with no basis reaching it would be drawn as a verdict
+        # whatever its fields said.
+        self.assertIn('x-for="k in bandedKnobs"', self.full_rows)
+        self.assertIn('class="needle"', self.full_rows)
+        self.assertNotIn('x-for="k in unbandedKnobs"', self.full_rows)
+
+    def test_the_compact_block_carries_no_dial(self):
+        # The 60x40 instrument is what the row with no reading was paying for.
+        for drawn in ("<svg", "class=\"needle\"", "arcPathsFor", "gauge"):
+            with self.subTest(part=drawn):
+                self.assertNotIn(drawn, self.thin)
+
+    def test_the_compact_block_tells_the_two_absences_apart(self):
+        # Two tags and two footers, on two conditions. One tag over both, or
+        # one footer, would be the collapse this whole change undoes.
+        self.assertIn("'TOO FEW'", self.thin)
+        self.assertIn("'NO READING'", self.thin)
+        self.assertIn("tag-thin", self.thin)
+        self.assertIn("tag-none", self.thin)
+        self.assertIn("under_sampled_note", self.thin)
+        self.assertIn("unmeasured_note", self.thin)
+        self.assertIn('x-if="underSampledKnobs.length"', self.thin)
+        self.assertIn('x-if="unmeasuredKnobs.length"', self.thin)
+
+    def test_the_two_tags_are_styled_apart_and_neither_is_the_healthy_one(self):
+        # Three states may not share a look, and neither absence may wear the
+        # colour of a clean reading.
+        self.assertRegex(self.html, r"\.tag-thin\s*\{[^}]*background")
+        self.assertRegex(self.html, r"\.tag-none\s*\{[^}]*background")
+        thin = re.search(r"\.tag-thin\s*\{([^}]*)\}", self.html).group(1)
+        none = re.search(r"\.tag-none\s*\{([^}]*)\}", self.html).group(1)
+        fine = re.search(r"\.tag-fine\s*\{([^}]*)\}", self.html).group(1)
+        self.assertNotEqual(thin.strip(), none.strip())
+        self.assertNotEqual(thin.strip(), fine.strip())
+        self.assertNotEqual(none.strip(), fine.strip())
+
+    def test_every_compact_row_states_its_own_shortfall(self):
+        # The count it has and the count it needs, with the noun behind them:
+        # "3 of 51" says nothing until something says 51 of WHAT.
+        self.assertIn('x-text="k.sample.size"', self.thin)
+        self.assertIn('x-text="k.sample.minimum"', self.thin)
+        self.assertIn("k.sample.counts", self.thin)
+
+    def test_a_banded_row_shows_the_sample_that_earned_its_verdict(self):
+        # "over 51 of 51 needed" is the evidence a green row earned its green.
+        self.assertIn('x-text="k.sample.size"', self.full_rows)
+        self.assertIn('x-text="k.sample.minimum"', self.full_rows)
+
+    def test_the_floor_states_its_own_voice_in_the_disclosure(self):
+        # A judged floor and a derived one wear the same voice classes the cut
+        # points do, through the page's existing `provenanceVoice` -- which
+        # means the page classifies neither and reads the kind the API sent.
+        self.assertIn("k.sample.provenance_kind", self.disclosure)
+        self.assertIn('x-text="k.sample.provenance_statement"', self.disclosure)
+        self.assertIn('x-text="k.sample.rule"', self.disclosure)
+        self.assertIn(
+            'provenanceVoice({ kind: k.sample.provenance_kind })', self.disclosure
+        )
+        # And the floors' own date, which is NOT the boundaries'.
+        self.assertIn("recommendations.sample_floor_as_of", self.disclosure)
+
+    def test_the_disclosure_still_states_every_metric_whatever_its_state(self):
+        # The boundaries and the floor of a metric with no reading are as true
+        # as any other's, and a reader auditing an absence needs them most.
+        self.assertIn(
+            'x-for="k in (summary ? summary.recommendations.knobs : [])"',
+            self.disclosure,
+        )
+
+
+class AFirstRunIsShorterThanABusyOneTest(unittest.TestCase):
+    """#93: a first run must not be TALLER than a corpus with something to say.
+
+    Measured as ROWS OF EACH KIND, not in pixels. Nothing in this suite renders
+    a page, so a pixel figure here would be a number this project cannot check
+    -- the exact thing it refuses elsewhere. What is checkable is the count of
+    full-height instrument rows a payload asks the page to draw, which is what
+    the height is made of: the issue measured 976px against 924px, and the
+    difference was five 61px rows of dial with no needle in them.
+
+    THE PIXEL CLAIM IS NOT MADE HERE and needs a browser to confirm.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-93-height-"))
+        first = cls.tmp / "first"
+        ingest(
+            build_first_run_corpus(first),
+            first / "usage.db",
+            tasks_dir=cls.tmp / "no-task-index",
+        )
+        cls.first_api = Api(first / "usage.db")
+        busy = cls.tmp / "busy"
+        busy.mkdir()
+        ingest(
+            build_recommendation_corpus(busy),
+            busy / "usage.db",
+            tasks_dir=cls.tmp / "no-task-index",
+        )
+        cls.busy_api = Api(busy / "usage.db")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.first_api.conn.close()
+        cls.busy_api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @staticmethod
+    def rows(api):
+        knobs = api.summary(*day_bounds(None, None))["recommendations"]["knobs"]
+        full = [k for k in knobs if k["sample"]["state"] == SAMPLE_MEASURED]
+        return len(full), len(knobs) - len(full)
+
+    def test_a_first_run_asks_the_page_to_draw_no_full_rows(self):
+        full, compact = self.rows(self.first_api)
+        self.assertEqual(full, 0)
+        self.assertEqual(compact, len(METRICS))
+
+    def test_a_busy_corpus_still_gets_every_full_row(self):
+        # The other half, so the change cannot be "draw fewer rows everywhere".
+        full, compact = self.rows(self.busy_api)
+        self.assertEqual(full, len(METRICS))
+        self.assertEqual(compact, 0)
+
+    def test_the_first_run_draws_strictly_fewer_instruments(self):
+        self.assertLess(self.rows(self.first_api)[0], self.rows(self.busy_api)[0])
+
+    def test_no_knob_is_lost_to_the_shortening(self):
+        # Shorter by rendering each row smaller, never by dropping one: every
+        # metric still reaches the screen at both extremes. "Dimmed, not
+        # hidden" was never a claim about the height of the row.
+        for name, api in (("first-run", self.first_api), ("busy", self.busy_api)):
+            with self.subTest(corpus=name):
+                self.assertEqual(sum(self.rows(api)), len(METRICS))
+
+
 class SummaryLevelRenderTest(unittest.TestCase):
     """#89: the summary draws the table and decides nothing (page side).
 
@@ -7553,6 +8315,13 @@ class SummaryLevelRenderTest(unittest.TestCase):
         # containment check over the whole panel would be satisfied by
         # evidence from a place the reader is not looking.
         cls.rows = cls.knobs[: cls.knobs.index('id="knobs-provenance"')]
+        # #93: the FULL rows alone -- the banded template, stopping where the
+        # compact block for the knobs with no basis begins. Several assertions
+        # below are about what a row of ADVICE may carry, and a compact line
+        # that carries no advice is held to different rules: it has no
+        # directive to identify itself by, so the metric key is the only handle
+        # it has.
+        cls.full_rows = cls.rows[: cls.rows.index('x-if="unbandedKnobs.length"')]
         cls.strip = html_element(cls.raw, 'id="status-strip"')
         cls.observations = html_element(cls.raw, 'id="observations-note"')
 
@@ -7564,25 +8333,38 @@ class SummaryLevelRenderTest(unittest.TestCase):
     # --- nothing is filtered off the screen --------------------------------
 
     def test_the_knob_list_is_iterated_whole(self) -> None:
-        # A KNOB THAT DOES NOT APPLY IS DIMMED, NOT HIDDEN. A filter in this
-        # loop is the mutation: the page would then show only what is wrong,
-        # "already fine" and "never measured" would both be absence, and a
-        # reader could not tell a short list from a healthy project.
-        # EVERY loop over the list, not just the first: the rows and the
-        # provenance disclosure below them both iterate it, and a filter on
-        # either would hide a knob from one of the two places it is stated.
+        # A KNOB THAT DOES NOT APPLY IS DIMMED, NOT HIDDEN. Dropping one is the
+        # mutation: the page would then show only what is wrong, "already fine"
+        # and "never measured" would both be absence, and a reader could not
+        # tell a short list from a healthy project.
+        #
+        # #93 SPLIT THE ROWS AND DID NOT NARROW THEM. The panel renders two
+        # loops where it rendered one -- the banded knobs as full rows, the
+        # rest as one line each -- so "iterates the API's whole list" is now a
+        # claim about the two together. It is checked as a PARTITION, which is
+        # stronger than the old containment check: the two getters must select
+        # on the same field, with complementary comparisons, so no knob can
+        # fall into neither and none can appear in both.
         loops = re.findall(r'x-for="[^"]*\bin\s*([^"]+)"', self.knobs)
-        knobs = [
-            iterated.strip()
-            for iterated in loops
-            if "recommendations.knobs" in iterated
-        ]
-        self.assertEqual(len(knobs), 2, "the rows and the disclosure iterate it")
-        self.assertEqual(
-            set(knobs),
-            {"(summary ? summary.recommendations.knobs : [])"},
-            "a knob loop iterates something other than the API's whole list",
-        )
+        iterated = {expr.strip() for expr in loops}
+        self.assertIn("bandedKnobs", iterated)
+        self.assertIn("unbandedKnobs", iterated)
+        # The disclosure still iterates the whole list directly, so every
+        # metric's boundaries and floor are stated whatever its state.
+        self.assertIn("(summary ? summary.recommendations.knobs : [])", iterated)
+        banded = js_function_body(self.raw, "get bandedKnobs(")
+        unbanded = js_function_body(self.raw, "get unbandedKnobs(")
+        for name, body in (("bandedKnobs", banded), ("unbandedKnobs", unbanded)):
+            with self.subTest(getter=name):
+                self.assertIn("summary.recommendations.knobs", body)
+                # On the STATE the API decided, never on a value or a key: a
+                # split on `k.value !== null` would put an under-sampled knob
+                # -- which has a value -- into the full rows and hand it a dial.
+                self.assertIn("k.sample.state", body)
+                self.assertNotIn("k.value", body)
+                self.assertNotIn(".sort(", body)
+        self.assertIn("=== SAMPLE_MEASURED", banded)
+        self.assertIn("!== SAMPLE_MEASURED", unbanded)
 
     def test_a_knob_with_nothing_to_turn_is_dimmed_and_not_dropped(self) -> None:
         # Dimming is a CLASS on a row that is still rendered. The mutation this
@@ -7607,8 +8389,16 @@ class SummaryLevelRenderTest(unittest.TestCase):
             "needlePath computes before it answers absence",
         )
         self.assertLess(body.index("return \"\""), body.index("gaugePoint"))
-        self.assertIn('x-if="k.value === null"', self.knobs)
+        # And the row with no reading says so in the API's own words. #93 moved
+        # where that happens: a knob with no reading no longer reaches the full
+        # template at all -- it has no needle BECAUSE it has no row with a dial
+        # on it -- so the note is rendered on the compact block those rows now
+        # form. The old `x-if="k.value === null"` inside the full row is gone
+        # rather than merely unused, because a branch that cannot fire is a
+        # claim about the payload that has stopped being true.
+        self.assertNotIn('x-if="k.value === null"', self.knobs)
         self.assertIn("summary.recommendations.unmeasured_note", self.knobs)
+        self.assertIn("summary.recommendations.under_sampled_note", self.knobs)
 
     # --- the page holds no threshold, no order and no verdict ---------------
 
@@ -7689,7 +8479,11 @@ class SummaryLevelRenderTest(unittest.TestCase):
         # traceability, so it MOVED rather than went -- to the panel's
         # provenance disclosure, and to the details level, where a reader has
         # already asked why.
-        self.assertNotIn('x-text="k.metric"', self.rows)
+        # THE FULL ROWS, which are the rows of advice this is about. #93's
+        # compact lines carry no directive and no dial, so the key is the only
+        # handle they have -- exactly as it is for the unmeasured rows at the
+        # details level, which have always shown it.
+        self.assertNotIn('x-text="k.metric"', self.full_rows)
         disclosure = html_element(self.raw, 'id="knobs-provenance"')
         self.assertIn('x-text="k.metric"', disclosure)
         self.assertIn('x-text="a.metric"', html_element(self.raw, 'id="advice-note"'))
@@ -8222,7 +9016,7 @@ class RecommendationVersionTest(unittest.TestCase):
         # bumped without the field and a field shipped without the bump each
         # fail here.
         knobs = Api._knobs(
-            assess_all({key: None for key in METRICS})
+            assess_all({key: Reading(None, 0) for key in METRICS})
         )
         self.assertEqual(len(knobs), len(METRICS))
         for knob in knobs:
@@ -8434,6 +9228,15 @@ SHARED_READINGS = {
         "`recommendations.py`. The summary renders it where a gauge has no "
         "needle and the diagnosis card renders it against the metric; a second "
         "copy would tell two stories about one absence."
+    ),
+    "recommendations.under_sampled_note": (
+        "#93: what a reading measured over too little means, and what to do "
+        "about it -- the one genuinely useful thing the report can tell a new "
+        "user, so both the level they land on and the level they drill into "
+        "have to be able to say it. Shared for exactly `unmeasured_note`'s "
+        "reason and held to the same rule: it is the table's sentence, said "
+        "once, and a copy on either level would let 'come back after a few "
+        "more sessions' drift into two different promises."
     ),
 }
 
