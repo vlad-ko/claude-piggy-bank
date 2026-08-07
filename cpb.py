@@ -59,7 +59,28 @@ from typing import NamedTuple, Optional, Sequence
 # manifest below repeats it because Claude Code's plugin loader reads that JSON
 # without running Python and uses the version as its update cache key: an
 # unbumped manifest means installed users are never offered the change.
-VERSION = "1.6.0"
+#
+# 1.6.0 -> 2.0.0 (#92): THE FIRST MAJOR SINCE 1.0.0, and it is the CLI clause
+# rather than the payload clause that forces it. Two changes landed together
+# and they take different bumps, so the larger one governs:
+#
+#   * `/api/summary` gained `build.version` -- a new payload field, nothing
+#     removed or redefined. MINOR on its own, exactly as #78 was.
+#   * `--prune-missing` now prints what it would delete and requires
+#     confirmation, with `--yes` for scripts and `--dry-run` for a preview.
+#     `--yes` and `--dry-run` are new flags whose absence preserves nothing:
+#     `ingest.py --prune-missing` in a cron job or a pipe used to exit 0 having
+#     deleted, and now exits non-zero having deleted nothing. That is a
+#     CHANGED EXIT STATUS on an existing flag, which `docs/versioning.md`
+#     names as breaking "by definition rather than by convention".
+#
+# It would have been comfortable to call the second a patch, on the grounds
+# that it only makes a destructive command safer. The rule does not have that
+# exemption and should not grow one: the "correction is not redefinition"
+# carve-out is about FIGURES that were wrong, not about behaviour a script
+# depends on. Someone's nightly prune stops working, and they are entitled to
+# learn that from the version number rather than from a silent pipeline.
+VERSION = "2.0.0"
 
 PROG = "cpb"
 

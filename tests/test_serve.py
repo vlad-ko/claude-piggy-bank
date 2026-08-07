@@ -25,6 +25,7 @@ from datetime import date
 from http.server import HTTPServer
 from pathlib import Path
 from typing import Optional
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -11120,6 +11121,112 @@ class OverviewRestingStateTest(unittest.TestCase):
         for figure in ("input", "cache_read", "cache_write", "output", "sessions"):
             with self.subTest(figure=figure):
                 self.assertIn(f"this.summary.{figure}", deck)
+
+
+class ReportNamesTheBuildTest(unittest.TestCase):
+    """A figure on this page can be traced to the build that computed it (#92).
+
+    #21's last open acceptance criterion, and the cheapest thing in that issue:
+    `grep -c VERSION serve.py index.html` returned **0 and 0**, so the report
+    could not say which build produced a number and neither could a bug filed
+    against it. Every corrected figure in this project's record -- the 2.36x
+    dedupe fix, the mean displaced by the median -- is a number that changed
+    between builds; a screenshot with no build on it is a number nobody can
+    place.
+
+    The rule that shapes the implementation is the SECOND copy, not the first.
+    `cpb.VERSION` is the authority and the docs have drifted from it twice
+    (1.0.0 -> 1.1.0, then 1.1.0 -> 1.2.0), which is why
+    `DocsStateTheShippedVersionTest` exists. A literal in `serve.py` would
+    drift the same way while looking authoritative in a payload, so the payload
+    READS the constant per request and the tests below can move it.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="cpb-build-version-test-"))
+        projects = cls.tmp / "projects"
+        projects.mkdir()
+        shutil.copy(FIXTURE, projects / "session-fixture.jsonl")
+        ingest(projects, cls.tmp / "usage.db")
+        cls.api = Api(cls.tmp / "usage.db")
+        cls.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def payload(self) -> dict:
+        return self.api.summary(*day_bounds(None, None))
+
+    def test_the_summary_carries_the_shipped_version(self) -> None:
+        self.assertEqual(self.payload()["build"]["version"], cpb.VERSION)
+
+    def test_the_version_is_READ_from_cpb_and_not_restated(self) -> None:
+        # THE test with teeth, and the mutation it survives is the obvious
+        # implementation: `"build": {"version": "1.6.0"}`. Moving `cpb.VERSION`
+        # must move the payload, so a literal anywhere in the chain fails here
+        # rather than at the next release.
+        with mock.patch.object(cpb, "VERSION", "99.98.97-test"):
+            self.assertEqual(self.payload()["build"]["version"], "99.98.97-test")
+        self.assertEqual(self.payload()["build"]["version"], cpb.VERSION)
+
+    def test_a_build_that_cannot_be_read_is_unknown_not_a_guess(self) -> None:
+        # `serve.py` is a supported entry point in its own right and needs no
+        # `cpb.py` to run (`docs/versioning.md` clause 1). Where the constant
+        # cannot be read the field is null -- absence, not a plausible string
+        # that would send a bug report at the wrong build.
+        with mock.patch.object(serve, "_cpb", None):
+            self.assertIsNone(self.payload()["build"]["version"])
+        self.assertEqual(self.payload()["build"]["version"], cpb.VERSION)
+
+    def test_a_cpb_without_the_constant_is_also_unknown(self) -> None:
+        # The same absence by a different route: an import that succeeded over
+        # a module that carries no VERSION. `getattr` with a default must not
+        # be the only thing standing between that and an AttributeError 500.
+        class Nameless:
+            pass
+
+        with mock.patch.object(serve, "_cpb", Nameless()):
+            self.assertIsNone(serve.cpb_version())
+
+    def test_serve_restates_no_version_literal(self) -> None:
+        # The static half. A copy of the shipped string in either file is the
+        # drift this whole arrangement exists to prevent, and it would pass
+        # every payload test above on the day it was written.
+        for path in ("serve.py", "index.html"):
+            with self.subTest(file=path):
+                source = (Path(__file__).resolve().parent.parent / path).read_text()
+                self.assertNotIn(
+                    f'"{cpb.VERSION}"', source,
+                    f"{path} restates the version instead of reading it",
+                )
+
+    def test_the_page_renders_the_build(self) -> None:
+        page = strip_comments(self.html)
+        self.assertIn("summary.build.version", page)
+        self.assertIn("Build:", page)
+
+    def test_the_page_states_UNKNOWN_for_a_build_it_cannot_read(self) -> None:
+        # Absence is never rendered as a value, in the one field whose whole
+        # job is to make a report checkable. A null that rendered as a blank
+        # would read as "no build", which is a claim; UNKNOWN is the truth.
+        page = strip_comments(self.html)
+        self.assertIn("summary.build.version === null", page)
+        self.assertIn("UNKNOWN", page)
+
+    def test_the_build_is_chrome_and_is_rendered_once(self) -> None:
+        # It qualifies every figure in every view, so it is rendered where the
+        # banner and the data-age line are: outside all three levels, one
+        # element, nothing to drift from.
+        page = strip_comments(self.html)
+        self.assertEqual(page.count("summary.build.version"), 3)
+        for view in ("summary", "overview", "details"):
+            with self.subTest(view=view):
+                self.assertNotIn(
+                    "summary.build.version", view_section(self.html, view)
+                )
 
 
 if __name__ == "__main__":

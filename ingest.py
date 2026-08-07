@@ -72,6 +72,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2331,6 +2332,54 @@ def is_unchanged(state: Optional[tuple], stat: os.stat_result) -> bool:
     return state is not None and state[0] == stat.st_size and state[1] == stat.st_mtime
 
 
+# --- The prune's ONE definition of "the rows derived from a source" (#92) ---
+#
+# Every table a prune deletes from, with the column each one keys the source
+# file on. It is a single definition because it has THREE readers -- the delete
+# itself, the census that tells a user what they are about to lose, and the
+# date range on that census -- and this project's recurring defect is exactly
+# the shape those three would otherwise take: a count computed by one query and
+# a deletion performed by another, free to range over different sets, with the
+# heading and the work order agreeing only by the author's care. `RANKED_BY` in
+# `serve.py` is the same tie one layer up.
+#
+# `subagent_runs` is deliberately absent, and its absence is not an oversight:
+# that ledger is rebuilt wholesale by `store_subagent_runs()` on every
+# directory run, so it is not derived from one source file the way these five
+# are. Adding it here would make the census promise a deletion that
+# `delete_source_rows()` does not perform.
+PRUNE_TABLES: tuple[tuple[str, str], ...] = (
+    ("api_calls", "source_path"),
+    ("turns", "source_path"),
+    ("agent_dispatches", "source_path"),
+    ("ingest_state", "path"),
+    (SHAPE_TABLE, "path"),
+)
+
+#: The table whose rows carry a timestamp, so the census can say WHEN the
+#: measurements it is about to delete were taken. Its key column is read out of
+#: `PRUNE_TABLES` rather than spelled a second time here.
+PRUNE_DATED_TABLE = "api_calls"
+
+
+def census_source_rows(
+    conn: sqlite3.Connection, source_path: str
+) -> dict[str, int]:
+    """How many rows `delete_source_rows()` would remove for ONE source.
+
+    The same iteration over `PRUNE_TABLES`, with the same key column and the
+    same bound parameter as the delete below -- a COUNT where that one has a
+    DELETE. Two functions rather than one because a count must not delete, but
+    one definition of the set, which is the property that matters.
+    """
+    return {
+        table: conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {column} = ?", (source_path,)
+        ).fetchone()[0]
+        for table, column in PRUNE_TABLES
+    }
+
+
 def delete_source_rows(conn: sqlite3.Connection, source_path: str) -> None:
     """Remove every row derived from ONE transcript file.
 
@@ -2338,11 +2387,111 @@ def delete_source_rows(conn: sqlite3.Connection, source_path: str) -> None:
     transcript plus N subagent transcripts, all sharing a session_id, so a
     session-scoped delete would destroy sibling sources' rows (#4966).
     """
-    conn.execute("DELETE FROM api_calls WHERE source_path = ?", (source_path,))
-    conn.execute("DELETE FROM turns WHERE source_path = ?", (source_path,))
-    conn.execute("DELETE FROM agent_dispatches WHERE source_path = ?", (source_path,))
-    conn.execute("DELETE FROM ingest_state WHERE path = ?", (source_path,))
-    conn.execute(f"DELETE FROM {SHAPE_TABLE} WHERE path = ?", (source_path,))
+    for table, column in PRUNE_TABLES:
+        conn.execute(f"DELETE FROM {table} WHERE {column} = ?", (source_path,))
+
+
+@dataclass(frozen=True)
+class PrunePlan:
+    """What a prune would delete, and the set it would delete it FROM.
+
+    One object carries both halves on purpose (#92). `plan_prune()` builds it
+    by counting exactly the paths it was handed, and `execute_prune()` deletes
+    `plan.paths` and nothing else -- so the summary a user reads and the rows
+    that go are the same set by construction rather than by two queries kept in
+    agreement. A caller cannot approve one description and execute another
+    without first building a second plan.
+
+    Absence is carried, never rounded off. `first_call_ts` / `last_call_ts` are
+    None when no row in the set carries a timestamp, which is a DIFFERENT fact
+    from a set with no `api_calls` rows at all -- `rows_by_table['api_calls']`
+    tells the two apart -- and `dated_calls` says how many of those rows the
+    range actually ranges over, so a range drawn from 3 of 400 calls cannot
+    read as a range over all 400.
+    """
+
+    db_path: str
+    paths: tuple[str, ...]
+    rows_by_table: dict[str, int]
+    dated_calls: int
+    first_call_ts: Optional[float]
+    last_call_ts: Optional[float]
+
+    @property
+    def sources(self) -> int:
+        """How many source files would be deleted."""
+        return len(self.paths)
+
+    @property
+    def rows(self) -> int:
+        """How many rows would be deleted, across every table."""
+        return sum(self.rows_by_table.values())
+
+
+def plan_prune(
+    conn: sqlite3.Connection, db_path: Path, paths: Sequence[str]
+) -> PrunePlan:
+    """Census exactly the sources in `paths`; delete nothing.
+
+    Per path rather than by an `IN (...)` over the whole list, for the same
+    reason `delete_source_rows()` is per path: one shape of query, no parameter
+    chunking to get subtly wrong on a large corpus, and the census loop is
+    visibly the delete loop.
+    """
+    dated_key = dict(PRUNE_TABLES)[PRUNE_DATED_TABLE]
+    rows_by_table = {table: 0 for table, _ in PRUNE_TABLES}
+    dated_calls = 0
+    first: Optional[float] = None
+    last: Optional[float] = None
+    for path in paths:
+        for table, count in census_source_rows(conn, path).items():
+            rows_by_table[table] += count
+        # COUNT(ts) counts the NON-NULL timestamps, which is the sample the
+        # range below is drawn from. `ts` is nullable, so COUNT(*) here would
+        # claim a range over rows that carry no date.
+        n_dated, lo, hi = conn.execute(
+            f"SELECT COUNT(ts), MIN(ts), MAX(ts) FROM {PRUNE_DATED_TABLE}"
+            f" WHERE {dated_key} = ?",
+            (path,),
+        ).fetchone()
+        dated_calls += n_dated
+        if lo is not None:
+            first = lo if first is None else min(first, lo)
+        if hi is not None:
+            last = hi if last is None else max(last, hi)
+    return PrunePlan(
+        db_path=str(db_path),
+        paths=tuple(paths),
+        rows_by_table=rows_by_table,
+        dated_calls=dated_calls,
+        first_call_ts=first,
+        last_call_ts=last,
+    )
+
+
+def execute_prune(conn: sqlite3.Connection, plan: PrunePlan) -> int:
+    """Delete the plan's OWN path list. Returns the number of sources deleted.
+
+    It takes a `PrunePlan` and not a list of paths so that the only way to
+    reach this deletion is through a set somebody was shown. One transaction
+    per source, so the database never sits half-pruned.
+
+    **The census and this deletion are deliberately NOT one transaction**, and
+    the gap is bounded rather than ignored. A single transaction spanning both
+    would hold a write lock across a human answering a prompt -- for minutes,
+    against a database three Claude Code hooks and any concurrent session also
+    want, and `hooks/cpb_ingest_hook.py` gives up after 5 seconds. What the gap
+    could cost is a row arriving for one of these paths between the count and
+    the delete, and it cannot: every path here is a file already gone from
+    disk, so no ingest of any kind has anything to write for it. The set is
+    frozen on the plan, so a source that reappeared mid-prompt would be deleted
+    anyway rather than silently re-scoped -- which is the safe direction of the
+    two, because it is the set the user read.
+    """
+    for path in plan.paths:
+        with conn:
+            delete_source_rows(conn, path)
+    return plan.sources
 
 
 @dataclass
@@ -3242,6 +3391,7 @@ def ingest(
     db_path: Path,
     tasks_dir: Optional[Path] = None,
     prune_missing: bool = False,
+    approve_prune: Optional[Callable[["PrunePlan"], bool]] = None,
 ) -> dict[str, Any]:
     """Ingest every transcript under projects_dir into db_path. Returns a summary.
 
@@ -3254,6 +3404,21 @@ def ingest(
     here -- `ingest()` is a library function and must not perform I/O as a
     side effect (CodeRabbit finding). `main()` prints them after this
     returns.
+
+    **`prune_missing` asks; it does not decide (#92).** It says a prune was
+    REQUESTED. Whether one happens is `approve_prune`, which is handed the
+    `PrunePlan` -- the census of exactly the rows that would go -- and returns
+    True to permit it. This function still performs no I/O: the approver is the
+    caller's, and `main()`'s prints the plan and reads an answer.
+
+    Consent is a positive observation, like every other reading in this tool.
+    **No approver means none was obtained, never that one was given**, so
+    `prune_missing=True` with `approve_prune=None` archives and deletes
+    nothing. That is deliberately the awkward default for a library caller: the
+    rows a prune removes are, past Claude Code's `cleanupPeriodDays`, the only
+    surviving copy of that history, and a destructive default reached by
+    forgetting an argument is exactly the accident the durability rules exist
+    to prevent.
     """
     if not projects_dir.is_dir():
         # A typo'd --projects-dir must never render as a silent empty run
@@ -3405,12 +3570,30 @@ def ingest(
             row[0] for row in conn.execute("SELECT path FROM ingest_state").fetchall()
         }
         now = datetime.now(timezone.utc).timestamp()
-        for stale_path in sorted(tracked_paths - current_path_strs):
-            if prune_missing:
-                with conn:
-                    delete_source_rows(conn, stale_path)
-                summary["files_pruned"] += 1
-            else:
+        stale_paths = sorted(tracked_paths - current_path_strs)
+        # Tri-state, and each state is a different fact (#92). None: no prune
+        # was requested, so nothing was censused and this run says nothing
+        # about what one would cost. A plan with `prune_approved` False: it was
+        # censused and REFUSED, declined or dry-run. True: it was carried out.
+        summary["prune_plan"] = None
+        summary["prune_approved"] = None
+        approved = False
+        if prune_missing:
+            # The census runs BEFORE anything is deleted and over the same list
+            # `execute_prune()` will delete -- see `PrunePlan`.
+            plan = plan_prune(conn, db_path, stale_paths)
+            summary["prune_plan"] = plan
+            approved = bool(approve_prune is not None and approve_prune(plan))
+            summary["prune_approved"] = approved
+            if approved:
+                summary["files_pruned"] = execute_prune(conn, plan)
+        if not approved:
+            # Every stale source that was NOT deleted is archived, whether
+            # pruning was never asked for or was asked for and refused. A
+            # refused prune must leave the database in the safe state, not in
+            # an unmarked one -- `archived_at` is what tells the report its
+            # totals are no longer reproducible.
+            for stale_path in stale_paths:
                 with conn:
                     conn.execute(
                         "UPDATE ingest_state SET archived_at = COALESCE(archived_at, ?)"
@@ -3985,6 +4168,202 @@ def run_transcript_mode(transcript: Path, db_path: Path) -> None:
     print_inconclusive_note(summary)
 
 
+# --- #92: the destructive command shows its work and asks ------------------
+#
+# The word that has to be typed. Not `y`, and not a default-yes prompt: this is
+# the one operation in CPB that destroys measurements nothing can regenerate,
+# and a single keystroke answered by reflex is not consent to that. Typing a
+# word is cheap once and is the difference between a deliberate act and a
+# half-remembered flag.
+PRUNE_CONFIRM_WORD = "delete"
+
+# Why a prune did or did not happen. Named rather than left as a bare bool
+# because the reasons are NOT interchangeable: a dry run did exactly what was
+# asked, a declined prompt is the user's own answer, and a refusal is this tool
+# declining to guess -- and only the last of those may report a status of 0
+# over a deletion the user asked for and did not get.
+PRUNE_NOTHING_MISSING = "nothing-missing"
+PRUNE_DRY_RUN = "dry-run"
+PRUNE_ASSUMED_YES = "assumed-yes"
+PRUNE_CONFIRMED = "confirmed"
+PRUNE_DECLINED = "declined"
+PRUNE_NOT_INTERACTIVE = "not-interactive"
+PRUNE_NO_ANSWER = "no-answer"
+
+#: The outcomes where the user ASKED to delete and this tool refused to decide
+#: for them. `main()` exits non-zero on these: a 0 would report a run that
+#: deleted nothing as a run that deleted zero, which is the distinction
+#: `cpb._exit_status()` exists to preserve.
+PRUNE_REFUSALS = frozenset({PRUNE_NOT_INTERACTIVE, PRUNE_NO_ANSWER})
+
+
+def _fmt_prune_ts(ts: float) -> str:
+    """One timestamp on the prune census, in UTC and saying so.
+
+    UTC rather than the report's America/New_York: this line exists to be
+    pasted into a bug report or read on a server, where an unlabelled local
+    time is a date nobody can check.
+    """
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def format_prune_plan(plan: PrunePlan) -> str:
+    """State what a prune would delete, before it deletes it (#92).
+
+    Every figure here is read off the ONE `PrunePlan` that `execute_prune()`
+    takes its path list from, so the summary a user reads cannot range over a
+    different set from the deletion they approve.
+
+    The date range is not decoration. A count says how much history goes; only
+    a range says WHICH history, and "412 rows" reads very differently once it
+    says "2026-06-06 .. 2026-07-02". Where the range cannot be drawn it says so
+    -- an unmeasured range is never rendered as an empty one.
+    """
+    lines = [
+        "",
+        "PRUNE PLAN -- what --prune-missing would DELETE, and cannot undo:",
+        f"  database: {plan.db_path}",
+        f"  sources no longer on disk: {plan.sources}",
+    ]
+    lines += [f"    {path}" for path in plan.paths]
+    lines.append(f"  rows to delete: {plan.rows}")
+    lines += [
+        f"    {table}: {plan.rows_by_table[table]}" for table, _ in PRUNE_TABLES
+    ]
+    calls = plan.rows_by_table[PRUNE_DATED_TABLE]
+    if calls == 0:
+        lines.append(
+            f"  date range of the calls involved: none -- no {PRUNE_DATED_TABLE}"
+            " row is in this set"
+        )
+    elif plan.first_call_ts is None or plan.last_call_ts is None:
+        lines.append(
+            "  date range of the calls involved: UNKNOWN -- none of the"
+            f" {calls} call(s) carries a timestamp. Unknown, not empty."
+        )
+    else:
+        undated = calls - plan.dated_calls
+        lines.append(
+            "  date range of the calls involved:"
+            f" {_fmt_prune_ts(plan.first_call_ts)}"
+            f" .. {_fmt_prune_ts(plan.last_call_ts)}"
+            f" (over the {plan.dated_calls} of {calls} call(s) that carry a"
+            " timestamp"
+            + (f"; {undated} carry none)" if undated else ")")
+        )
+    lines += [
+        "",
+        "  Claude Code deletes transcripts after cleanupPeriodDays (default"
+        " 30). For any source already reaped, these rows are the ONLY"
+        " surviving copy of that history -- re-ingesting cannot bring them"
+        " back. Leaving them alone marks them archived and keeps every"
+        " historical total.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _can_be_asked(stream: Any) -> bool:
+    """Is `stream` something a person is sitting at?
+
+    A stream that cannot answer the question is not a stream that answered
+    yes. A closed or exotic object raises rather than reporting, and that is
+    counted as "cannot ask" for the same reason every other unreadable
+    measurement in this tool is counted as unmeasured.
+    """
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+class PruneConfirmation:
+    """Print the plan, decide whether the prune happens, and record why.
+
+    Handed to `ingest()` as its `approve_prune`, so this is the ONE place
+    consent is decided and the one place the plan is printed -- which is why
+    `--dry-run` and a real run show byte-identical summaries: they are the same
+    call to `format_prune_plan()` over the same `PrunePlan`.
+
+    `outcome` is None until it has been asked. It is set on every path,
+    including the ones that return False, because "nothing was deleted" is four
+    different facts and `main()`'s exit status turns on which.
+    """
+
+    def __init__(
+        self,
+        *,
+        assume_yes: bool,
+        dry_run: bool,
+        stdin: Any = None,
+        out: Callable[[str], None] = print,
+    ) -> None:
+        self.assume_yes = assume_yes
+        self.dry_run = dry_run
+        self._stdin = stdin
+        self._out = out
+        self.outcome: Optional[str] = None
+
+    @property
+    def stdin(self) -> Any:
+        # Resolved on use, not in __init__: `sys.stdin` is rebound by test
+        # harnesses and by anything that redirects, and capturing it at
+        # construction would ask a stream nobody is going to type into.
+        return sys.stdin if self._stdin is None else self._stdin
+
+    def __call__(self, plan: PrunePlan) -> bool:
+        self._out(format_prune_plan(plan))
+        if plan.sources == 0:
+            self.outcome = PRUNE_NOTHING_MISSING
+            self._out(
+                "Nothing to prune: every tracked source is still on disk."
+            )
+            return False
+        if self.dry_run:
+            self.outcome = PRUNE_DRY_RUN
+            self._out(
+                "--dry-run: NOTHING was deleted. The sources above are"
+                " archived, and their measurements are kept in every"
+                " historical total."
+            )
+            return False
+        if self.assume_yes:
+            self.outcome = PRUNE_ASSUMED_YES
+            self._out("--yes given: deleting the rows above.")
+            return True
+        if not _can_be_asked(self.stdin):
+            self.outcome = PRUNE_NOT_INTERACTIVE
+            self._out(
+                "REFUSED: --prune-missing needs confirmation and stdin is not a"
+                " terminal, so nobody can be asked. NOTHING was deleted."
+                " Re-run with --yes if you mean it, or with --dry-run to see"
+                " this summary again."
+            )
+            return False
+        self._out(
+            f"Type {PRUNE_CONFIRM_WORD} to delete the rows above."
+            " Anything else keeps them: "
+        )
+        answer = self.stdin.readline()
+        if answer == "":
+            # EOF, which is not an answer. A prompt that read end-of-input as
+            # agreement would be the non-interactive hole with an extra step.
+            self.outcome = PRUNE_NO_ANSWER
+            self._out(
+                "REFUSED: stdin ended without an answer. NOTHING was deleted."
+            )
+            return False
+        if answer.strip() != PRUNE_CONFIRM_WORD:
+            self.outcome = PRUNE_DECLINED
+            self._out(
+                f"Declined (you did not type {PRUNE_CONFIRM_WORD}). NOTHING"
+                " was deleted; the sources above are archived."
+            )
+            return False
+        self.outcome = PRUNE_CONFIRMED
+        return True
+
+
 def main() -> None:
     default_db = Path(__file__).resolve().parent / "db" / "usage.db"
     parser = argparse.ArgumentParser(description="Ingest Claude Code transcripts into SQLite")
@@ -4026,10 +4405,39 @@ def main() -> None:
             "DELETE the measurements for any source no longer on disk. Off by "
             "default: Claude Code reaps transcripts after ~30 days, and those "
             "rows are then the only surviving copy. Use only to discard a "
-            "source you removed deliberately."
+            "source you removed deliberately. Prints what it would delete and "
+            f"asks you to type {PRUNE_CONFIRM_WORD} first; see --yes and "
+            "--dry-run."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Answer the --prune-missing confirmation in advance, for scripts. "
+            "The plan is still printed. Requires --prune-missing."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Print exactly what --prune-missing would delete and delete "
+            "nothing. Requires --prune-missing."
         ),
     )
     args = parser.parse_args()
+    # A flag that silently does nothing is the CLI's form of absence rendered
+    # as a value: the user stated an intent about a prune and there is no prune
+    # for it to be about. Say so rather than accept it.
+    for flag, given in (("--yes", args.yes), ("--dry-run", args.dry_run)):
+        if given and not args.prune_missing:
+            parser.error(f"{flag} means nothing without --prune-missing")
+    if args.yes and args.dry_run:
+        parser.error(
+            "--yes and --dry-run contradict each other: one approves the "
+            "deletion, the other performs none"
+        )
     db_path = resolve_db_path(args.db, os.environ.get(DB_ENV_VAR), default_db)
 
     if args.transcript is not None:
@@ -4042,12 +4450,22 @@ def main() -> None:
         run_transcript_mode(args.transcript.expanduser(), db_path)
         return
 
+    # Built whenever a prune was ASKED for -- including for --dry-run, which is
+    # the same census down the same code path with the answer fixed at no.
+    # `db_path` here is whatever `--db` or CPB_DB resolved to, so the guard
+    # travels with the database rather than with the default one.
+    confirmation = (
+        PruneConfirmation(assume_yes=args.yes, dry_run=args.dry_run)
+        if args.prune_missing
+        else None
+    )
     default_projects = default_projects_dir()
     summary = ingest(
         (args.projects_dir if args.projects_dir is not None else default_projects)
         .expanduser(),
         db_path,
         prune_missing=args.prune_missing,
+        approve_prune=confirmation,
     )
     for detail in summary["unparsed_details"]:
         print(f"  unparsed: {detail}")
@@ -4095,6 +4513,17 @@ def main() -> None:
     print_cache_write_split_note(summary)
     print_shape_note(summary)
     print_inconclusive_note(summary)
+    # LAST, after every count is on screen, and a refusal is a non-zero status
+    # (#92). The ingest itself succeeded and its figures are worth printing;
+    # what failed is the deletion the user asked for, and reporting that as 0
+    # would say "pruned nothing" in the same voice as "there was nothing to
+    # prune". A dry run and a declined prompt are not refusals -- both did
+    # exactly what they were told.
+    if confirmation is not None and confirmation.outcome in PRUNE_REFUSALS:
+        raise SystemExit(
+            f"--prune-missing was requested and REFUSED ({confirmation.outcome});"
+            " nothing was deleted and every stale source is archived."
+        )
 
 
 if __name__ == "__main__":

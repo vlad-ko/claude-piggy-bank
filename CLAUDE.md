@@ -36,7 +36,7 @@ anyone who has it in a script. `_exit_status()` reproduces CPython's own
 report a run that measured nothing as a run that measured zero. `VERSION` lives
 in `cpb.py`; `.claude-plugin/plugin.json` repeats it as a literal because the
 plugin loader reads that JSON without running Python, and `tests/test_cpb.py`
-pins the two equal. CPB is **<!--cpb:version-->1.6.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
+pins the two equal. CPB is **<!--cpb:version-->2.0.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
 authority; this line lagged a release once already and may again), and what a
 bump *means* is `docs/versioning.md` — see Commits and PRs below.
 
@@ -319,6 +319,25 @@ Consequences encoded in the code, which must be preserved:
 - A source that vanishes is **archived, not deleted**: excluded from
   "currently on disk" coverage, kept in every historical total. Deletion is
   opt-in via `--prune-missing`.
+- **Opt-in was not enough, so the destructive command shows its work and asks**
+  (#92). Opt-in protects against the default; it does not protect against a
+  typo or a half-remembered flag, and this is the one operation that destroys
+  measurements nothing can regenerate. `--prune-missing` now prints the census
+  — sources, rows per table, and the **date range of the calls involved**,
+  because a count with no range does not say *which* history goes — and then
+  requires the word `delete`. `--yes` is the scripted answer, `--dry-run`
+  prints the identical census and prunes nothing, and a **non-interactive
+  stdin refuses**: a stream that cannot be asked has not said yes, so a hook or
+  a pipe exits non-zero having deleted nothing rather than reporting 0 over a
+  deletion that did not happen. The structural half is the part to preserve:
+  `plan_prune()` censuses a path list, `execute_prune()` deletes **that
+  `PrunePlan`'s own list**, and both iterate one `PRUNE_TABLES` with one key
+  column per table — so the summary somebody approves and the rows that go
+  cannot range over different sets. That divergence, not the missing prompt, is
+  this project's recurring defect (`RANKED_BY`, one layer up). In the library,
+  `prune_missing=True` says a prune was *requested*; `approve_prune` is
+  consent, and **no approver means none was obtained**, never that one was
+  given.
 - `_prepare_schema()` **refuses to run** (`SystemExit`) if a schema rebuild
   would drop rows whose source file no longer exists. It asks the filesystem,
   not `archived_at`, because that column postdates the older DBs the guard has
