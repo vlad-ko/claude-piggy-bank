@@ -91,6 +91,51 @@ from recommendations import (
     cache_write_repayment,
     depth_in_band,
 )
+
+# WHICH BUILD PRODUCED THESE NUMBERS (#92, closing #21's last criterion).
+#
+# The report renders figures a reader may file a bug about, and until now
+# neither the page nor the payload could say which build computed them --
+# `grep -c VERSION serve.py index.html` returned 0 and 0.
+#
+# It is IMPORTED, never restated. A second copy of a version string is the
+# defect `DocsStateTheShippedVersionTest` already exists for, twice over: the
+# docs drifted from `cpb.VERSION` at 1.0.0 -> 1.1.0 and again at 1.1.0 ->
+# 1.2.0, and a copy in the payload would drift the same way while looking
+# authoritative.
+#
+# **No import cycle, checked rather than assumed.** `cpb.py` imports only
+# `importlib`, `sys` and `typing` at module level; it reaches `ingest` and
+# `serve` through `importlib.import_module` inside `_dispatch()`, at call time.
+# So `serve -> cpb` closes no loop. (Under `python3 cpb.py serve` the entry
+# point is `__main__` and this import loads `cpb.py` a second time under its
+# own name -- an extra module object holding one string literal, with no
+# side effects at import.)
+#
+# The module is held rather than the constant, and read per request, so a test
+# can patch `cpb.VERSION` and see the payload move. Binding the string here
+# would make a restated literal indistinguishable from a read one.
+try:
+    import cpb as _cpb
+except ImportError:  # pragma: no cover -- see `cpb_version()`
+    _cpb = None  # type: ignore[assignment]
+
+
+def cpb_version() -> Optional[str]:
+    """The build that produced these figures, or None if it cannot be read.
+
+    None is not a benign default and is not swallowing anything: it is the
+    honest reading when `cpb.py` is not beside this file. `serve.py` is a
+    supported entry point in its own right (`docs/versioning.md` clause 1) and
+    ran without `cpb.py` before this constant existed, so a checkout that
+    carries `serve.py`, `ingest.py`, `context_window.py` and
+    `recommendations.py` still serves -- and says its build is UNKNOWN rather
+    than naming a plausible one. A version invented for a bug report is worse
+    than no version, because the reader cannot see the error.
+    """
+    return getattr(_cpb, "VERSION", None) if _cpb is not None else None
+
+
 EASTERN = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
 VENDOR_DIR = (HERE / "vendor").resolve()
@@ -3211,6 +3256,10 @@ class Api:
         recommendations = self._recommendations(start, end, context)
         return {
             **dict(row),
+            # #92: which build computed everything below it. Read from
+            # `cpb.VERSION` per request, never restated here -- and `null`
+            # where it cannot be read, which the page states as UNKNOWN.
+            "build": {"version": cpb_version()},
             "ingest": ingest,
             # #64: the VERDICT over the figures below, derived from the two
             # blocks either side of it and from the census -- never computed a
