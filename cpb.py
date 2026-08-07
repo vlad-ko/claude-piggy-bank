@@ -80,7 +80,39 @@ from typing import NamedTuple, Optional, Sequence
 # carve-out is about FIGURES that were wrong, not about behaviour a script
 # depends on. Someone's nightly prune stops working, and they are entitled to
 # learn that from the version number rather than from a silent pipeline.
-VERSION = "2.2.0"
+#
+# 2.1.0 -> 3.0.0 (#96, #97). Three changes landed together; the largest
+# governs, and two of the three are major on their own:
+#
+#   * `--projects-dir` pointed at a directory that holds no transcript now
+#     REFUSES. `--projects-dir ~/.claude/projects` -- the most natural thing to
+#     type -- used to print "files scanned: 0 ... records parsed: 0" and exit 0
+#     over a machine holding 2,988 transcripts. A CHANGED EXIT STATUS on an
+#     existing flag, which `docs/versioning.md` names as breaking by definition.
+#     The same paragraph that forced 2.0.0 forces this, and for the same reason:
+#     a cron job that scanned the wrong depth silently now fails loudly.
+#   * `files_archived` is REDEFINED, from "stale sources this run found" to
+#     "sources this run newly archived". A source reaped months ago is stale on
+#     every run, so the old figure counted one gone file once per run that
+#     noticed it -- which only became visible when `--all-projects` made
+#     several runs one operation. A stable name over a changed definition is
+#     clause 3, breaking even though nothing fails to parse.
+#   * `--all-projects [ROOT]` is a NEW flag whose absence preserves everything.
+#     MINOR on its own.
+#
+# The archiving CORRECTION that rides along is not what forces this: a run over
+# one project used to archive -- and with `--prune-missing`, delete -- another
+# project's still-present sources, and `docs/versioning.md`'s "correction is not
+# redefinition" covers exactly that. It is recorded here because a user whose
+# database was pruned by it is owed the note, not because it moves the number.
+#
+# 3.0.0 -> 3.1.0 (#93). A metric now carries a sample floor: below it a
+# reading keeps its value and loses its verdict, so a fresh install stops
+# certifying a corpus it cannot yet judge. New payload fields, nothing
+# removed, renamed or redefined -- minor. The floors themselves are read
+# from the table's own boundaries for shares and judged for ratios, which
+# is argued in recommendations.py rather than here.
+VERSION = "3.1.0"
 
 PROG = "cpb"
 

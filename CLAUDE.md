@@ -22,6 +22,7 @@ python3 cpb.py --version                   # `cpb <VERSION>` -- the build that p
 python3 cpb.py --help                      # the command list, generated from COMMANDS
 
 python3 ingest.py --projects-dir ~/.claude/projects/<name>   # ingest a different project
+python3 ingest.py --all-projects           # backfill EVERY project on the machine into one DB (#97)
 python3 ingest.py --transcript ~/.claude/projects/<name>/<session-id>.jsonl  # exactly one file
 python3 ingest.py --prune-missing          # DELETE rows for sources gone from disk (see Durability)
 python3 serve.py --port 9000 --db path.db
@@ -36,7 +37,7 @@ anyone who has it in a script. `_exit_status()` reproduces CPython's own
 report a run that measured nothing as a run that measured zero. `VERSION` lives
 in `cpb.py`; `.claude-plugin/plugin.json` repeats it as a literal because the
 plugin loader reads that JSON without running Python, and `tests/test_cpb.py`
-pins the two equal. CPB is **<!--cpb:version-->2.2.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
+pins the two equal. CPB is **<!--cpb:version-->3.1.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
 authority; this line lagged a release once already and may again), and what a
 bump *means* is `docs/versioning.md` — see Commits and PRs below.
 
