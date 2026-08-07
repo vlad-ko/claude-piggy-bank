@@ -56,6 +56,11 @@ migrated in place, and where that cannot be done without losing a measurement
 CPB refuses rather than rebuilding over it. The rule, and the exact condition
 that exclusion depends on, is in [`docs/versioning.md`](docs/versioning.md).
 
+**What each release changed for you, and anything you have to do about it, is
+in [`docs/releases.md`](docs/releases.md)** — including the one break so far,
+in 2.0.0, and its migration. A release with nothing to migrate says so there
+too.
+
 The defect that once made its headline numbers wrong is
 fixed, and the whole correction is kept on the record below under
 [The record](#the-record-the-defect-that-made-the-headline-numbers-wrong) —
@@ -666,6 +671,11 @@ like this one is **not** a breaking change — the figure always claimed to coun
 API calls and had been counting transcript records — which is a distinction
 [`docs/versioning.md`](docs/versioning.md) draws deliberately.
 
+This section is corrections only. A **break** — behaviour a script depended on
+that no longer holds — is announced per release in
+[`docs/releases.md`](docs/releases.md) instead, because someone whose script
+stopped working is not reading a record of corrected figures.
+
 `api_calls` used to count transcript *records*. Claude Code writes one record
 per streamed content block, and each repeats the same `message.usage` object,
 so a single API response was counted many times. On one real corpus:
@@ -750,7 +760,13 @@ Longer-form reference lives in [`docs/`](docs/), indexed by
   families against 200K on Haiku 4.5.
 - [Versioning](docs/versioning.md) — what the version number promises: the
   three surfaces SemVer governs here, why the database schema is excluded and
-  the condition that exclusion rests on, and which part to bump.
+  the condition that exclusion rests on, which part to bump, and where a break
+  is announced.
+- [Release record](docs/releases.md) — what each release changed for a user and
+  what to do about it. The one break so far is 2.0.0's:
+  `ingest.py --prune-missing` used to delete and exit 0 in a pipe and now
+  refuses and exits 1, with `--yes` as the migration. Where a release carries
+  nothing to migrate, it says so.
 - [The Claude Code plugin](docs/plugin.md) — why the packaging looks the way it
   does: which three hooks fire and why `SubagentStop` is load-bearing, why every
   timeout is explicit, where the database lives and when the hook refuses to
