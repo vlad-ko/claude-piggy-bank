@@ -44,6 +44,49 @@ a check becomes something people route around.
 
 ## 3.3.0 — 2026-08-07
 
+**No migration.** An existing database upgrades in place; nothing you run
+changes.
+
+**What changed for a user:** if you use CPB as a plugin, the report stops
+telling you your ingest may have failed. The plugin's hooks ingest one
+transcript at a time, and that mode never recorded that it had run — so every
+plugin install reported *"no ingest.py run has ever COMPLETED… a failing
+ingest looks exactly like this"*, permanently, on a working install. It now
+records the run, and a hook-kept database reads as current.
+
+**A genuinely failed run still reads as unknown.** Both modes stamp last and
+only on success, so an ingest that raises leaves no stamp and the INCONCLUSIVE
+banner still fires. The alarm was right; it was firing at the wrong thing.
+
+**Why this is a correction rather than a redefinition.** The field's published
+meaning already covered it: `serve.py` said *"when `ingest.py` last
+COMPLETED"*, the schema comment said *"when this tool last ran"*, and the
+staleness threshold spoke of *"the last ingest run"*. None said "full scan".
+The implementation was narrower than the documented meaning, and widening it
+brings the two together.
+
+**What a single-file run still does not tell you** is kept rather than
+discarded: a new `ingest.last_full_scan_at` records when the whole corpus was
+last swept, with a stated reason when that is unknown. A database kept only by
+hooks has never been swept — that is its normal state, not a fault, so it
+annotates the data-age line and never raises a banner.
+
+**Also in this release:** `--all-projects` pointed at a single project reported
+`0 transcript file(s)` and called it *"a real answer about the machine"*. It
+was the wrong scope, not an empty machine. Both directions are now recognised,
+and a genuinely empty machine keeps its confident zero.
+
+**Schema 12 → 13**, one nullable column, applied in place. Existing stamps were
+**not** back-filled: every pre-13 stamp *was* a corpus run, so filling the new
+column would have been true — and writing it would make an inference
+indistinguishable from an observation.
+
+Merged as [PR #109](https://github.com/vlad-ko/claude-piggy-bank/pull/109),
+closing [#105](https://github.com/vlad-ko/claude-piggy-bank/issues/105) and
+[#108](https://github.com/vlad-ko/claude-piggy-bank/issues/108).
+
+## 3.3.0 — 2026-08-07
+
 **No migration.** Every command, flag, exit status and payload field behaves as
 it did; the database upgrades in place on the next run (`SCHEMA_VERSION` 12 →
 13, one nullable column added, no row touched).
