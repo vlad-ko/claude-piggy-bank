@@ -179,19 +179,33 @@ Four modules, one direction of flow: `ingest.py` (transcripts → SQLite) →
 subcommand is asked for and nothing else. `context_window.py` is a leaf that
 only `serve.py` reads.
 
-**Packaging.** The repository *is* the Claude Code plugin — same code path, no
-build step. `.claude-plugin/plugin.json` is the manifest; `hooks/hooks.json`
-declares three triggers (`SubagentStop`, `Stop`, `SessionEnd`) that each run
+**Packaging.** The repository *is* the Claude Code plugin *and* its marketplace
+— same code path, no build step. `.claude-plugin/plugin.json` is the manifest
+and `.claude-plugin/marketplace.json` the catalog, whose single entry points
+back at the repository with `"source": "./"`; `hooks/hooks.json` declares three
+triggers (`SubagentStop`, `Stop`, `SessionEnd`) that each run
 `hooks/cpb_ingest_hook.py`, which spawns `ingest.py --transcript` for **exactly
-one file**; `commands/cpb.md` is the `/cpb` command. Its decided behaviour
+one file**; `skills/cpb/SKILL.md` is the `/cpb` skill (it was `commands/cpb.md`
+until #73 — `commands/` is the legacy flat-file layout and the reference says
+to use `skills/` for new plugins). Its decided behaviour
 ([#79](https://github.com/vlad-ko/claude-piggy-bank/issues/79)): **summarise,
 then always link to the report — never become the only path to a number.** The
 page is the reproducible artifact; two model runs produce two different
 summaries, and a measurement has to be reproducible where a conversation does
-not. `${CLAUDE_PLUGIN_DATA}`
+not. Every database-touching invocation in that file names its database with
+`--db`, both `serve.py` **and** `ingest.py`
+([#94](https://github.com/vlad-ko/claude-piggy-bank/issues/94)): only the serve
+half was pinned by a test, and the ingest half quietly wrote the user's only
+copy of their history into `${CLAUDE_PLUGIN_ROOT}/db/` while the report kept
+serving an empty file. `${CLAUDE_PLUGIN_DATA}`
 holds the database because `${CLAUDE_PLUGIN_ROOT}` is replaced on every update
-and the DB is not regenerable. The reasoning, with its sources, is in
-`docs/plugin.md` — read it before changing any of those files.
+and the DB is not regenerable — *measured* on 2026-08-07 across a real install
+and update, not inferred. **`version` in `plugin.json` is the cache key Claude
+Code decides updates by**, so a merged change with an unbumped version reaches
+nobody while looking shipped; `.github/scripts/check_plugin_version_bump.py`
+fails any change to a shipped path that leaves it alone. The reasoning, with
+its sources, is in `docs/plugin.md` — read it before changing any of those
+files.
 
 **Sources.** Two globs are data — `<project>/<session>.jsonl` (main thread) and
 `<project>/<session>/subagents/agent-<id>.jsonl` (subagents). A third path, the

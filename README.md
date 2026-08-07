@@ -30,7 +30,7 @@ understanding what your sessions consume; it would be a poor one if
 *measuring* consumed anything. Measuring is free.
 
 **One place a model is involved, and the line is drawn precisely.** `/cpb`, the
-in-session command, reads the finished report and summarises it — so it spends
+in-session skill, reads the finished report and summarises it — so it spends
 tokens, in a session you are already paying for. Claude Code shows that as a
 per-plugin *context cost* in the `/plugin` panel, so you can see it before you
 use it. (That is how the panel behaves as reported to this project on
@@ -71,6 +71,7 @@ nothing is compiled, and there are no dependencies either way.
 | | **as a Claude Code plugin** | **as a plain checkout** |
 |---|---|---|
 | suits | using CPB on your own ongoing work | reading the code before trusting it with your history; analysing one project on demand; developing on CPB |
+| install | `/plugin install` from CPB's own marketplace, or a clone into your skills directory | `git clone` |
 | ingest | automatic — three hooks ingest each transcript as it is written | manual — you run `cpb.py ingest` when you want it |
 | database | `${CLAUDE_PLUGIN_DATA}/usage.db`, one per install, survives updates | `db/usage.db` beside the checkout |
 | report | `/cpb` from inside a session | `python3 cpb.py serve` |
@@ -81,19 +82,48 @@ spend and losing it — see [What the hooks do](#what-the-hooks-do). Prefer the
 checkout if you want to look first; you can enable the plugin later over the
 same clone.
 
-### As a plugin
+### As a plugin, from the marketplace
 
-There is no marketplace, so install by cloning into your personal skills
-directory. Claude Code loads any folder there that contains a
-`.claude-plugin/plugin.json` as a plugin on the next session — no install step,
-no copy into a cache:
+CPB is its own marketplace: the repository is both the catalog and the plugin.
+From inside Claude Code:
+
+```
+/plugin marketplace add vlad-ko/claude-piggy-bank
+/plugin install claude-piggy-bank@claude-piggy-bank
+```
+
+or, without starting a session:
+
+```bash
+claude plugin marketplace add vlad-ko/claude-piggy-bank
+claude plugin install claude-piggy-bank@claude-piggy-bank
+```
+
+The name is doubled because the marketplace and the plugin are the same
+repository — `<plugin>@<marketplace>` is the form Claude Code installs by. If
+the install summary says `Run /reload-plugins to activate.`, run it.
+
+Updates arrive through `/plugin update`, and your database is not in the plugin
+directory, so an update cannot disturb it — see [Where the plugin keeps your
+database](#where-the-plugin-keeps-your-database).
+
+### As a plugin, from a clone you read first
+
+The marketplace install copies the code into a cache. If you would rather read
+it before it runs on your machine — which, for a tool that reads your
+transcripts, is a reasonable thing to want — clone into your personal skills
+directory instead. Claude Code loads any folder there that contains a
+`.claude-plugin/plugin.json` as a plugin on the next session, in place, with no
+install step and no copy into a cache. The reference calls these
+*skills-directory plugins*, and they are as documented as the marketplace path:
 
 ```bash
 git clone https://github.com/vlad-ko/claude-piggy-bank.git \
   ~/.claude/skills/claude-piggy-bank
 ```
 
-Restart Claude Code and it loads as `claude-piggy-bank@skills-dir`.
+Restart Claude Code and it loads as `claude-piggy-bank@skills-dir`. Update it
+with `git pull`; there is nothing to uninstall.
 
 To load it for one session without installing it anywhere:
 
@@ -141,19 +171,40 @@ it did not do. The reasoning, and the plugin design generally, is in
 
 ### Where the plugin keeps your database
 
-`${CLAUDE_PLUGIN_DATA}/usage.db` — a directory that survives plugin updates.
+`${CLAUDE_PLUGIN_DATA}/usage.db` — a directory that survives plugin updates,
+which is the whole reason it is there rather than beside the plugin's code.
 Set `CPB_DB` yourself to override it; the hooks will not touch a value you have
 chosen.
 
-`/cpb` opens that database for you. If you run the server by hand instead, pass
-it explicitly — `serve.py` reads only `--db`, not `CPB_DB`, so without the flag
-it opens its own default and shows you an empty report rather than an error:
+That is not only the documented behaviour; it was measured. Installing from the
+marketplace, running a session, bumping the version, publishing and updating
+(2026-08-07, Claude Code 2.1.223; the two versions below are that throwaway
+install's, not a release plan): the plugin directory moved from
+`…/plugins/cache/claude-piggy-bank/claude-piggy-bank/1.6.0` to `…/1.7.0`, the
+data directory did not move at all, and `usage.db` came through the update
+byte-identical. The session recorded before the update was still in it
+afterwards, next to the one recorded after.
+
+`/cpb` opens that database for you. If you run either script by hand instead,
+pass it explicitly — `serve.py` reads only `--db`, not `CPB_DB`, and while
+`ingest.py` does read `CPB_DB`, nothing sets it in a session you started
+yourself. Without the flag each falls back to its own default beside the code,
+so you would fill one database and read another:
 
 ```bash
-python3 cpb.py serve --db ~/.claude/plugins/data/<plugin-id>/usage.db
+python3 cpb.py serve  --db ~/.claude/plugins/data/<plugin-id>/usage.db
+python3 cpb.py ingest --db ~/.claude/plugins/data/<plugin-id>/usage.db
 ```
 
 ### Upgrade
+
+Installed from the marketplace:
+
+```
+/plugin update claude-piggy-bank@claude-piggy-bank
+```
+
+Cloned into your skills directory:
 
 ```bash
 git -C ~/.claude/skills/claude-piggy-bank pull
@@ -162,21 +213,33 @@ git -C ~/.claude/skills/claude-piggy-bank pull
 Then `/reload-plugins`, or restart — hook changes are not picked up mid-session.
 Your database is not in the plugin directory, so an upgrade cannot disturb it.
 
+**An update only reaches you when CPB's version number moves.** Claude Code
+keys its plugin cache on the `version` in the plugin manifest, so a fix
+published without a bump would leave `/plugin update` reporting you were
+already current. CI fails any change to the shipped plugin that leaves that
+field alone; the mechanism is in [`docs/versioning.md`](docs/versioning.md).
+
 ### Uninstall
 
-Delete the folder; nothing was installed from a marketplace, so there is no
-uninstall step. To stop loading it without deleting:
+Installed from the marketplace:
+
+```bash
+claude plugin uninstall claude-piggy-bank@claude-piggy-bank --keep-data
+```
+
+**Pass `--keep-data`, or back the database up first.** Without it,
+uninstalling from the last scope deletes the plugin's data directory — and past
+Claude Code's ~30-day transcript retention that database is the only copy of
+your history. See
+[Transcripts expire](#transcripts-expire--back-up-the-database).
+
+Cloned into your skills directory, delete the folder; nothing was installed, so
+there is no uninstall step, and your database is not in the folder you are
+deleting. To stop loading it without deleting:
 
 ```bash
 claude plugin disable claude-piggy-bank@skills-dir
 ```
-
-**Back up the database first.** It is not in the folder you are deleting, but
-if you ever install from a marketplace instead, `claude plugin uninstall`
-deletes the plugin's data directory by default unless you pass `--keep-data` —
-and past Claude Code's ~30-day transcript retention that database is the only
-copy of your history. See
-[Transcripts expire](#transcripts-expire--back-up-the-database).
 
 ## Use
 
@@ -185,6 +248,9 @@ From inside Claude Code, once the plugin is enabled:
 ```
 /cpb
 ```
+
+It is a plugin skill, so its full name is `/claude-piggy-bank:cpb`; `/cpb`
+reaches it while nothing else you have installed ships that name.
 
 That starts the report server, summarises what it found, and **always gives you
 the URL**. The summary is a way in, not a substitute for the page: two runs of a

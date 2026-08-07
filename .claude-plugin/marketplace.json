@@ -1,0 +1,14 @@
+{
+  "name": "claude-piggy-bank",
+  "description": "Claude Piggy Bank: a local, standard-library-only report on where a project's Claude Code context and token spend actually went.",
+  "owner": {
+    "name": "Vlad Ko",
+    "url": "https://github.com/vlad-ko"
+  },
+  "plugins": [
+    {
+      "name": "claude-piggy-bank",
+      "source": "./"
+    }
+  ]
+}

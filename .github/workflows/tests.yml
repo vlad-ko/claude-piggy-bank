@@ -207,6 +207,39 @@ jobs:
           )
           PY
 
+  plugin-version:
+    # Claude Code keys its plugin cache on `version` in
+    # `.claude-plugin/plugin.json`, and `.claude-plugin/marketplace.json` lists
+    # the plugin with `"source": "./"` -- so the marketplace IS this repository
+    # and the ref users resolve is the default branch. Every merge to `main` is
+    # a release, and a merged change with an unbumped version reaches nobody
+    # while looking shipped. That has been missed twice here.
+    #
+    # It runs on both events so it always reports a result: the fan-in below
+    # demands `success` from every dependency, and a job that skipped on one
+    # event would fail the fan-in rather than quietly not apply.
+    name: plugin version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The check diffs against the base commit, which a shallow clone
+          # does not have. Fetching nothing would make it refuse.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: The shipped plugin may not change without the version moving
+        # On a pull request the base is the branch being merged into; on a push
+        # to main it is the previous tip, so the same rule is re-checked
+        # against what was actually published. The script refuses -- non-zero,
+        # loudly -- rather than passing when it cannot resolve either end.
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: python .github/scripts/check_plugin_version_bump.py --base "$BASE"
+
   # Fan-in. Branch protection requires THIS one check, so the matrix can grow
   # or shrink without anyone editing the protection settings -- and a matrix
   # leg that never ran cannot be mistaken for one that passed, because a
@@ -214,16 +247,18 @@ jobs:
   suite:
     name: suite
     if: always()
-    needs: [test, stdlib-only]
+    needs: [test, stdlib-only, plugin-version]
     runs-on: ubuntu-latest
     steps:
       - name: Require every dependency to have succeeded
         run: |
           set -euo pipefail
-          echo "test        = ${{ needs.test.result }}"
-          echo "stdlib-only = ${{ needs.stdlib-only.result }}"
+          echo "test           = ${{ needs.test.result }}"
+          echo "stdlib-only    = ${{ needs.stdlib-only.result }}"
+          echo "plugin-version = ${{ needs.plugin-version.result }}"
           if [ "${{ needs.test.result }}" != "success" ] \
-          || [ "${{ needs.stdlib-only.result }}" != "success" ]; then
+          || [ "${{ needs.stdlib-only.result }}" != "success" ] \
+          || [ "${{ needs.plugin-version.result }}" != "success" ]; then
             echo "A required job did not succeed."
             exit 1
           fi

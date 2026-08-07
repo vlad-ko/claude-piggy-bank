@@ -9,6 +9,66 @@ as a literal because Claude Code's plugin loader reads that JSON without
 running any Python, and `tests/test_cpb.py` pins the two equal so they cannot
 drift.
 
+## The manifest version gates whether users receive anything
+
+Read this before the rest of the file. Everything below is about what a version
+number *means*; this section is about what it *does*, and it is the part that
+breaks a user rather than confusing one.
+
+Claude Code resolves a plugin's version from the first of these that is set
+([Plugins reference § Version
+management](https://code.claude.com/docs/en/plugins-reference#version-management),
+checked 2026-08-07):
+
+1. `version` in `.claude-plugin/plugin.json`
+2. `version` in the marketplace entry
+3. the git commit SHA of the plugin's source
+4. `unknown`, for npm sources and local directories outside a git repository
+
+CPB sets the first. **That string is the cache key Claude Code decides updates
+by**, and because `.claude-plugin/marketplace.json` lists the plugin with
+`"source": "./"`, the marketplace is this repository and the ref users resolve
+is the default branch — so every merge to `main` is a release, with no tag in
+between.
+
+The consequence, *measured here* on 2026-08-07 against Claude Code 2.1.223 with
+a throwaway marketplace and an isolated `CLAUDE_CONFIG_DIR`:
+
+| published | `claude plugin update` said | what the install received |
+|---|---|---|
+| a shipped file changed, `version` 1.6.0 → 1.7.0 | `updated from 1.6.0 to 1.7.0` | the change, from a new cache directory named `1.7.0` |
+| a shipped file changed, `version` left at 1.7.0 | `already at the latest version (1.7.0)` | nothing; the marketplace clone had it, the installed copy did not |
+
+Those digits are the throwaway install's, not a plan: what the next release is
+numbered is decided by the rules further down this file, and `cpb.VERSION` is
+the only place to read the current one.
+
+So a merged fix with an unbumped version **is invisible to every existing
+install**. It looks shipped and is not, and no test of the code would notice.
+Had CPB left `version` unset, every commit would have counted as a new version
+and this trap would not exist — but then `cpb.py --version` could not name the
+build that produced a number, which is a load-bearing property here.
+
+The bump is therefore enforced rather than remembered.
+`.github/scripts/check_plugin_version_bump.py` fails any change that touches a
+path reaching an installed user — the manifest, `hooks/`, `skills/`,
+`vendor/`, `index.html`, any top-level module — while `version` stays where it
+was, or moves backwards. A changed path it cannot classify is a **refusal**,
+not a pass: a new plugin component directory has to be classified deliberately
+rather than slip through a set nobody re-read. Prose changes, `tests/`, `docs/`
+and the catalog itself are not shipped behaviour and need no release.
+
+Five places state the version and move together:
+
+| where | pinned by |
+|---|---|
+| `cpb.VERSION` | the authority; everything else is compared to it |
+| `.claude-plugin/plugin.json` | `tests/test_cpb.py`, asserted equal to `cpb.VERSION` |
+| `README.md`, `CLAUDE.md`, this file | `DocsStateTheShippedVersionTest`, via the `cpb:version` HTML-comment marks |
+
+The marketplace entry deliberately declares **no** version: `plugin.json` wins
+silently over it, so a sixth copy could only ever be a copy free to disagree.
+
 This file exists because the number is meaningless without it. A version says
 "this release did not break you" only if something states what *break* covers,
 and for a measurement tool the obvious reading — the schema changed, therefore
@@ -47,11 +107,19 @@ redefinition is worse than a removed field, because a removed field raises
 where a redefined one just reads differently. This is the compatibility form of
 the rule that an aggregate must name the set it ranges over.
 
-The plugin's behaviour is covered under (1): which hooks fire, and the fact
-that the database resolves to `${CLAUDE_PLUGIN_DATA}` (a directory that
-survives plugin updates) rather than somewhere a reinstall would take with it.
-Moving it would strand a database that, past Claude Code's transcript
-retention, is the only copy of a user's history.
+The plugin's behaviour is covered under (1): which hooks fire, the name `/cpb`
+resolves under, and the fact that the database resolves to
+`${CLAUDE_PLUGIN_DATA}` (a directory that survives plugin updates) rather than
+somewhere a reinstall would take with it. Moving it would strand a database
+that, past Claude Code's transcript retention, is the only copy of a user's
+history.
+
+Moving `/cpb` from `commands/cpb.md` to `skills/cpb/SKILL.md` (#73) is **not**
+a change to that surface: a plugin namespaces both layouts the same way, so the
+command was `/claude-piggy-bank:cpb` before the move and is after it. The file
+that ships changed; nothing a user types did. It is still a release, because
+the shipped plugin changed and an install that did not receive it would be
+running a layout the docs no longer describe.
 
 ### Correction is not redefinition
 
