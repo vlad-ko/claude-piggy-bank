@@ -7602,5 +7602,1066 @@ class PerTtlCacheWriteUpgradeTest(unittest.TestCase):
         self.assertEqual(self._split_states(), {"(read)": 8, "(unmeasured)": 3})
 
 
+# ---------------------------------------------------------------------------
+# #96: --projects-dir one level up, and #97: the backfill
+# ---------------------------------------------------------------------------
+
+
+def write_transcript(path: Path) -> Path:
+    """One hand-built main-thread transcript. Never captured session content."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(FIXTURE, path)
+    return path
+
+
+def build_projects_root(root: Path, projects: int = 2, empty: int = 3) -> Path:
+    """A miniature `~/.claude/projects`: N project directories and M empty ones.
+
+    The ratio is deliberate rather than decorative. On the machine measured for
+    #97 on 2026-08-07, 12 of 19 directories under `~/.claude/projects` held no
+    transcript at all -- 63% -- so a fixture with none of them would let a walk
+    that silently skipped the empty ones pass.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    for i in range(projects):
+        name = f"-tmp-project-{i}"
+        write_transcript(root / name / f"session-{i}.jsonl")
+    for i in range(empty):
+        (root / f"-tmp-idle-{i}").mkdir()
+    return root
+
+
+class UnreadableDirectory:
+    """A directory this process cannot read, restored on exit.
+
+    A context manager rather than a helper call so the mode is always put back
+    -- a leaked 0o000 directory makes `shutil.rmtree` in someone else's
+    tearDown fail, several tests later, for no visible reason.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.mode = path.stat().st_mode
+
+    def __enter__(self) -> Path:
+        os.chmod(self.path, 0o000)
+        return self.path
+
+    def __exit__(self, *exc) -> None:
+        os.chmod(self.path, self.mode)
+
+
+def cannot_drop_permissions() -> bool:
+    """Root reads a 0o000 directory anyway, so the unreadable cases cannot run."""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+class ProjectsDirClassificationTest(unittest.TestCase):
+    """The three shapes #96 names, plus the two it implies.
+
+    `--projects-dir ~/.claude/projects` scanned zero files and exited 0. The
+    refusal for a MISSING directory has shipped since the beginning and was
+    never extended to a directory that exists and matches nothing -- which is
+    the path a user actually types.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-classify-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_a_path_that_is_not_a_directory_is_MISSING(self) -> None:
+        verdict = ingest_mod.classify_projects_dir(self.tmp / "nowhere")
+        self.assertEqual(verdict.outcome, ingest_mod.PROJECTS_DIR_MISSING)
+
+    def test_a_directory_holding_a_main_transcript_is_a_PROJECT(self) -> None:
+        project = self.tmp / "-tmp-one"
+        write_transcript(project / "session-a.jsonl")
+        verdict = ingest_mod.classify_projects_dir(project)
+        self.assertEqual(verdict.outcome, ingest_mod.PROJECTS_DIR_PROJECT)
+
+    def test_a_directory_holding_only_subagent_transcripts_is_a_PROJECT(self) -> None:
+        # The second glob on its own is enough. A session whose main transcript
+        # was reaped while its `subagents/` tree survived is a real corpus, and
+        # refusing it would discard measurable spend.
+        project = self.tmp / "-tmp-sub"
+        (project / "session-a" / "subagents").mkdir(parents=True)
+        shutil.copy(
+            SUBAGENT_FIXTURE, project / "session-a" / "subagents" / "agent-a1.jsonl"
+        )
+        verdict = ingest_mod.classify_projects_dir(project)
+        self.assertEqual(verdict.outcome, ingest_mod.PROJECTS_DIR_PROJECT)
+
+    def test_a_directory_whose_CHILDREN_hold_transcripts_is_a_PARENT(self) -> None:
+        # #96 itself: `~/.claude/projects`. The verdict NAMES the children, so
+        # the message can tell the reader the fix is one level down.
+        root = build_projects_root(self.tmp / "projects", projects=2, empty=3)
+        verdict = ingest_mod.classify_projects_dir(root)
+        self.assertEqual(verdict.outcome, ingest_mod.PROJECTS_DIR_PARENT)
+        self.assertEqual(
+            [p.name for p in verdict.child_projects],
+            ["-tmp-project-0", "-tmp-project-1"],
+            "only the children that HOLD transcripts belong in the list -- the"
+            " three idle ones would each be refused in turn",
+        )
+
+    def test_a_directory_with_nothing_anywhere_beneath_it_is_EMPTY(self) -> None:
+        lonely = self.tmp / "lonely"
+        (lonely / "not-a-session").mkdir(parents=True)
+        verdict = ingest_mod.classify_projects_dir(lonely)
+        self.assertEqual(verdict.outcome, ingest_mod.PROJECTS_DIR_EMPTY)
+        self.assertEqual(verdict.child_projects, ())
+
+    def test_a_project_directory_wins_over_its_children(self) -> None:
+        # Order is asserted, not assumed: a directory that holds transcripts of
+        # its own is a PROJECT whatever sits below it, so the answer does not
+        # depend on Claude Code's session directories continuing to match
+        # neither glob.
+        project = self.tmp / "-tmp-both"
+        write_transcript(project / "session-a.jsonl")
+        write_transcript(project / "nested" / "session-b.jsonl")
+        self.assertEqual(
+            ingest_mod.classify_projects_dir(project).outcome,
+            ingest_mod.PROJECTS_DIR_PROJECT,
+        )
+
+    @unittest.skipIf(cannot_drop_permissions(), "root reads a 0o000 directory")
+    def test_an_unreadable_directory_is_UNKNOWN_and_never_EMPTY(self) -> None:
+        # The mutation this exists for: `Path.glob` swallows the OSError and
+        # yields nothing, so a `glob`-only presence test reports an unreadable
+        # directory as an empty one -- absence rendered as a value at the front
+        # door. `transcript_presence()` probes with `os.scandir`, which raises.
+        blocked = self.tmp / "blocked"
+        blocked.mkdir()
+        with UnreadableDirectory(blocked):
+            verdict = ingest_mod.classify_projects_dir(blocked)
+            presence, reason = ingest_mod.transcript_presence(blocked)
+        self.assertEqual(verdict.outcome, ingest_mod.PROJECTS_DIR_UNREADABLE)
+        self.assertEqual(presence, ingest_mod.TRANSCRIPTS_UNKNOWN)
+        self.assertIsNotNone(reason, "the OS error is carried, not discarded")
+
+    @unittest.skipIf(cannot_drop_permissions(), "root reads a 0o000 directory")
+    def test_an_unreadable_CHILD_is_counted_as_unreadable_not_as_empty(self) -> None:
+        # Same rule one level down, and the case the brief names: a directory
+        # that could not be read must not be folded into "held nothing".
+        root = build_projects_root(self.tmp / "projects", projects=1, empty=1)
+        blocked = root / "-tmp-blocked"
+        blocked.mkdir()
+        with UnreadableDirectory(blocked):
+            verdict = ingest_mod.classify_projects_dir(root)
+        self.assertEqual(verdict.outcome, ingest_mod.PROJECTS_DIR_PARENT)
+        self.assertEqual([p.name for p in verdict.unreadable_children], ["-tmp-blocked"])
+        self.assertNotIn(blocked, verdict.child_projects)
+
+
+class ProjectCandidateListingTest(unittest.TestCase):
+    """A refusal may not call a directory with no transcripts a recorded one.
+
+    The MISSING refusal used to print `available_projects()` under the heading
+    "Transcripts ARE recorded for these projects". On the machine measured for
+    #97, 12 of 19 of those directories held none -- so the message named twelve
+    paths each of which would itself have been refused.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-candidates-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = self.tmp / "home"
+        build_projects_root(
+            self.home / ".claude" / "projects", projects=2, empty=3
+        )
+
+    def test_the_count_of_holders_is_stated_and_the_empties_are_marked(self) -> None:
+        block = "\n".join(ingest_mod.format_project_candidates(home=self.home))
+        self.assertIn("5 project directories recorded", block)
+        self.assertIn("2 holding transcripts", block)
+        self.assertEqual(
+            block.count("(no transcripts)"),
+            3,
+            "each directory that holds nothing says so; the count and the marks"
+            " must range over the same set",
+        )
+
+    def test_a_home_with_no_projects_says_so_rather_than_listing_nothing(self) -> None:
+        block = "\n".join(
+            ingest_mod.format_project_candidates(home=self.tmp / "unused-home")
+        )
+        self.assertIn("No project directories exist", block)
+
+
+class ProjectsDirRefusalCliTest(unittest.TestCase):
+    """#96 as a user meets it: three cases, three messages, three statuses.
+
+    Subprocess, because the exit status is part of the governed CLI surface
+    (`docs/versioning.md` clause 1) and the whole defect was a status of 0.
+    """
+
+    INGEST = str(Path(__file__).resolve().parent.parent / "ingest.py")
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-refusal-cli-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = self.tmp / "home"
+        (self.home / ".claude" / "projects").mkdir(parents=True)
+        self.root = build_projects_root(self.tmp / "projects", projects=2, empty=3)
+        self.db = self.tmp / "usage.db"
+
+    def run_ingest(self, *args: str):
+        environ = dict(os.environ)
+        environ.pop("CPB_DB", None)
+        environ["PYTHONDONTWRITEBYTECODE"] = "1"
+        environ["HOME"] = str(self.home)
+        return subprocess.run(
+            [sys.executable, "-B", self.INGEST, *args],
+            capture_output=True, text=True, env=environ, input="",
+            cwd=str(self.tmp),
+        )
+
+    def test_a_missing_directory_refuses(self) -> None:
+        proc = self.run_ingest(
+            "--projects-dir", str(self.tmp / "nowhere"), "--db", str(self.db)
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("projects dir not found", proc.stderr)
+
+    def test_the_parent_directory_case_never_reports_zero_again(self) -> None:
+        # THE defect, stated as the state change: pointed one level up, the
+        # command must not exit 0 and must not print the counts. The
+        # `files scanned: 0` line is the sentence this issue exists to delete,
+        # so its ABSENCE is asserted rather than only the status.
+        proc = self.run_ingest("--projects-dir", str(self.root), "--db", str(self.db))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("files scanned", proc.stdout)
+        self.assertNotIn("records parsed", proc.stdout)
+        self.assertFalse(
+            self.db.exists(),
+            "a refusal at the wrong depth must not leave a database behind",
+        )
+
+    def test_the_parent_case_names_the_children_and_the_way_out(self) -> None:
+        proc = self.run_ingest("--projects-dir", str(self.root), "--db", str(self.db))
+        self.assertIn("CHILDREN are project directories", proc.stderr)
+        self.assertIn("-tmp-project-0", proc.stderr)
+        self.assertIn("-tmp-project-1", proc.stderr)
+        self.assertNotIn(
+            "-tmp-idle-0",
+            proc.stderr,
+            "the idle directories hold nothing and are not a next step",
+        )
+        self.assertIn("--all-projects", proc.stderr)
+
+    def test_a_directory_with_no_transcripts_anywhere_refuses_and_says_what_it_looked_for(
+        self,
+    ) -> None:
+        lonely = self.tmp / "lonely"
+        lonely.mkdir()
+        proc = self.run_ingest("--projects-dir", str(lonely), "--db", str(self.db))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("no transcripts anywhere under", proc.stderr)
+        self.assertIn("<session-id>.jsonl", proc.stderr)
+        self.assertIn("subagents/agent-<id>.jsonl", proc.stderr)
+        self.assertNotIn("files scanned", proc.stdout)
+
+    def test_a_project_with_one_session_and_zero_replies_stays_a_legitimate_zero(
+        self,
+    ) -> None:
+        # The half of #96 that is easy to break while fixing the other half.
+        # This directory HAS a transcript; the transcript has a user turn and
+        # no assistant reply, so the run measures zero API calls -- a real zero
+        # from a real sample, which must ingest and exit 0. Refusing on any zero
+        # would be the same defect pointing the other way.
+        project = self.tmp / "-tmp-quiet"
+        project.mkdir()
+        (project / "session-quiet.jsonl").write_text(
+            '{"type":"user","sessionId":"session-quiet",'
+            '"timestamp":"2026-07-28T15:00:00.000Z",'
+            '"message":{"role":"user","content":"hello"}}\n'
+        )
+        proc = self.run_ingest("--projects-dir", str(project), "--db", str(self.db))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("files scanned: 1", proc.stdout)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0], 0
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM ingest_state").fetchone()[0], 1
+            )
+        finally:
+            conn.close()
+
+    def test_a_project_whose_transcripts_were_all_reaped_is_not_refused(self) -> None:
+        # The other legitimate empty directory: Claude Code reaped everything
+        # after `cleanupPeriodDays` and this database is now the only copy.
+        # That run has archiving to do, so refusing it would strand exactly the
+        # corpus the durability rules exist for.
+        project = self.tmp / "-tmp-reaped"
+        transcript = write_transcript(project / "session-r.jsonl")
+        first = self.run_ingest(
+            "--projects-dir", str(project), "--db", str(self.db)
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        transcript.unlink()
+        second = self.run_ingest(
+            "--projects-dir", str(project), "--db", str(self.db)
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("archived (source gone, rows KEPT): 1", second.stdout)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertGreater(
+                conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0],
+                0,
+                "the measurements survive the transcript",
+            )
+        finally:
+            conn.close()
+
+
+class SourceGoneTest(unittest.TestCase):
+    """"Gone" is a measurement, and it has three answers rather than two.
+
+    `os.path.exists()` swallows every OSError and returns False, so an
+    unreadable parent, an unmounted volume or an I/O error would all read as
+    "the file is gone" -- on the one code path in this file that can delete a
+    measurement nothing can regenerate.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-gone-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_a_file_on_disk_is_not_gone(self) -> None:
+        path = self.tmp / "here.jsonl"
+        path.write_text("{}\n")
+        self.assertIs(ingest_mod.source_gone(str(path)), False)
+
+    def test_a_file_that_was_deleted_is_gone(self) -> None:
+        self.assertIs(ingest_mod.source_gone(str(self.tmp / "never.jsonl")), True)
+
+    @unittest.skipIf(cannot_drop_permissions(), "root reads a 0o000 directory")
+    def test_a_file_behind_an_unreadable_parent_is_UNKNOWN(self) -> None:
+        blocked = self.tmp / "blocked"
+        blocked.mkdir()
+        target = blocked / "maybe.jsonl"
+        target.write_text("{}\n")
+        with UnreadableDirectory(blocked):
+            self.assertIsNone(
+                ingest_mod.source_gone(str(target)),
+                "unknown, never gone: archiving or pruning this would act on a"
+                " question that was not answered",
+            )
+
+
+class CrossProjectStalenessTest(unittest.TestCase):
+    """One database, several projects: a run may only speak for what it scanned.
+
+    Measured on this branch before the fix, 2026-08-07: two projects ingested
+    into one database, `ingest()` over the second ARCHIVED the first's
+    transcript while the file was still on disk, and with `--prune-missing`
+    approved it DELETED that project's five `api_calls` rows. Past
+    `cleanupPeriodDays` those rows are the only surviving copy.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-cross-project-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.alpha = self.tmp / "projects" / "-tmp-alpha"
+        self.beta = self.tmp / "projects" / "-tmp-beta"
+        self.alpha_file = write_transcript(self.alpha / "session-alpha.jsonl")
+        self.beta_file = write_transcript(self.beta / "session-beta.jsonl")
+        self.db = self.tmp / "usage.db"
+        self.no_tasks = self.tmp / "no-tasks"
+
+    def rows_for(self, project: Path) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM api_calls WHERE source_path LIKE ?",
+                (f"{project}%",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def archived_for(self, project: Path) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM ingest_state"
+                " WHERE path LIKE ? AND archived_at IS NOT NULL",
+                (f"{project}%",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def ingest_one(self, project: Path, **kwargs):
+        return ingest(project, self.db, tasks_dir=self.no_tasks, **kwargs)
+
+    def test_scanning_one_project_does_not_archive_another(self) -> None:
+        self.ingest_one(self.alpha)
+        before = self.rows_for(self.alpha)
+        self.assertGreater(before, 0)
+        summary = self.ingest_one(self.beta)
+        self.assertEqual(
+            self.archived_for(self.alpha),
+            0,
+            "alpha's transcript is still on disk; this run never looked at it",
+        )
+        self.assertEqual(self.rows_for(self.alpha), before)
+        self.assertEqual(summary["sources_present_unscanned"], 1)
+        self.assertEqual(summary["sources_unknown_unscanned"], 0)
+
+    def test_scanning_one_project_does_not_PRUNE_another(self) -> None:
+        # The destructive half, and the reason this is a durability bug rather
+        # than a cosmetic one.
+        self.ingest_one(self.alpha)
+        before = self.rows_for(self.alpha)
+        summary = self.ingest_one(
+            self.beta, prune_missing=True, approve_prune=approve_this_prune
+        )
+        self.assertEqual(summary["files_pruned"], 0)
+        self.assertEqual(
+            self.rows_for(self.alpha),
+            before,
+            "a prune deletes sources that are GONE, and alpha's is on disk",
+        )
+
+    def test_a_source_that_really_did_go_is_still_archived(self) -> None:
+        # The teeth: the fix narrows what counts as gone, and must not stop
+        # archiving what has actually gone.
+        self.ingest_one(self.alpha)
+        self.ingest_one(self.beta)
+        self.alpha_file.unlink()
+        summary = self.ingest_one(self.alpha)
+        self.assertEqual(summary["files_archived"], 1)
+        self.assertEqual(self.archived_for(self.alpha), 1)
+        self.assertGreater(
+            self.rows_for(self.alpha), 0, "archived is not deleted"
+        )
+
+    def test_a_source_that_really_did_go_is_still_prunable(self) -> None:
+        self.ingest_one(self.alpha)
+        self.ingest_one(self.beta)
+        self.alpha_file.unlink()
+        summary = self.ingest_one(
+            self.alpha, prune_missing=True, approve_prune=approve_this_prune
+        )
+        self.assertEqual(summary["files_pruned"], 1)
+        self.assertEqual(self.rows_for(self.alpha), 0)
+        self.assertGreater(
+            self.rows_for(self.beta), 0, "beta was never scanned and never touched"
+        )
+
+    def test_neither_project_borrows_the_other_source_paths(self) -> None:
+        self.ingest_one(self.alpha)
+        self.ingest_one(self.beta)
+        conn = sqlite3.connect(self.db)
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT source_path FROM api_calls"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(
+            sorted(r[0] for r in rows),
+            sorted([str(self.alpha_file), str(self.beta_file)]),
+            "the project is carried by source_path; a row filed under the wrong"
+            " one would put a project's tokens in another project's name",
+        )
+
+
+class BackfillPlanTest(unittest.TestCase):
+    """What the walk states BEFORE it starts, and over which set (#97)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-backfill-plan-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = build_projects_root(self.tmp / "projects", projects=2, empty=3)
+        (self.root / "stray.txt").write_text("not a directory")
+        self.db = self.tmp / "usage.db"
+        self.no_tasks = lambda project: self.tmp / "no-tasks"
+
+    def plan(self) -> "ingest_mod.BackfillPlan":
+        return ingest_mod.plan_backfill(
+            self.root, self.db, tasks_dir_for=self.no_tasks
+        )
+
+    def test_it_reports_what_it_found_including_the_directories_that_held_nothing(
+        self,
+    ) -> None:
+        plan = self.plan()
+        self.assertEqual(len(plan.projects), 2)
+        self.assertEqual(len(plan.empty), 3)
+        self.assertEqual(len(plan.unreadable), 0)
+        self.assertEqual(plan.unexpected, ())
+        self.assertEqual(plan.non_directories, 1)
+
+    def test_the_size_is_bytes_on_disk_and_not_a_file_count(self) -> None:
+        plan = self.plan()
+        on_disk = sum(
+            p.stat().st_size for p in self.root.glob("*/*.jsonl")
+        )
+        self.assertEqual(plan.bytes, on_disk)
+        self.assertGreater(plan.bytes, plan.files, "bytes, not files")
+
+    def test_the_estimate_ranges_over_the_SAME_set_the_walk_ingests(self) -> None:
+        # The tie this project's defects keep breaking: a plan computed by one
+        # glob and a walk performed by another are free to disagree. Both sides
+        # go through `project_sources()`, so the assertion is that the bytes the
+        # plan called pending are exactly the bytes of the files the walk
+        # actually ingested.
+        plan = self.plan()
+        report = ingest_mod.backfill(plan, self.db, tasks_dir_for=self.no_tasks)
+        conn = sqlite3.connect(self.db)
+        try:
+            ingested_bytes = conn.execute(
+                "SELECT COALESCE(SUM(size), 0) FROM ingest_state"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(plan.pending_bytes, ingested_bytes)
+        self.assertEqual(plan.pending_files, report["totals"]["files_ingested"])
+
+    def test_a_resumed_plan_reports_nothing_pending_and_a_zero_estimate(self) -> None:
+        plan = self.plan()
+        ingest_mod.backfill(plan, self.db, tasks_dir_for=self.no_tasks)
+        again = self.plan()
+        self.assertEqual(again.files, plan.files, "the corpus did not shrink")
+        self.assertEqual(again.pending_files, 0)
+        self.assertEqual(again.pending_bytes, 0)
+        self.assertEqual(again.estimated_seconds, 0.0)
+        self.assertTrue(again.pending_known)
+
+    def test_an_unreadable_ledger_makes_nothing_KNOWN_to_be_skippable(self) -> None:
+        plan = self.plan()
+        ingest_mod.backfill(plan, self.db, tasks_dir_for=self.no_tasks)
+        self.db.write_bytes(b"this is not a database")
+        blind = self.plan()
+        self.assertFalse(blind.pending_known)
+        self.assertEqual(
+            blind.pending_bytes,
+            blind.bytes,
+            "an unreadable ledger is UNKNOWN, so no file may be claimed as"
+            " already ingested",
+        )
+
+    @unittest.skipIf(cannot_drop_permissions(), "root reads a 0o000 directory")
+    def test_an_unreadable_project_directory_is_not_counted_as_empty(self) -> None:
+        blocked = self.root / "-tmp-blocked"
+        blocked.mkdir()
+        with UnreadableDirectory(blocked):
+            plan = self.plan()
+        self.assertEqual([p.name for p in plan.unreadable], ["-tmp-blocked"])
+        self.assertEqual(len(plan.empty), 3, "the blocked one is not an empty one")
+
+    def test_the_estimate_is_derived_from_bytes_and_published_with_its_source(
+        self,
+    ) -> None:
+        plan = self.plan()
+        self.assertAlmostEqual(
+            plan.estimated_seconds,
+            plan.pending_bytes / ingest_mod.INGEST_BYTES_PER_SECOND,
+        )
+        text = ingest_mod.format_backfill_plan(plan)
+        self.assertIn(ingest_mod.INGEST_RATE_AS_OF, text)
+        self.assertIn("ONE machine", text)
+        self.assertIn("I/O bound", text)
+        self.assertIn("interrupting is safe", text)
+
+
+class BackfillWalkTest(unittest.TestCase):
+    """Every project on the machine, in one run, into one database (#97)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-backfill-walk-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = build_projects_root(self.tmp / "projects", projects=3, empty=2)
+        self.db = self.tmp / "usage.db"
+        self.no_tasks = lambda project: self.tmp / "no-tasks"
+
+    def walk(self, **kwargs) -> dict:
+        plan = ingest_mod.plan_backfill(
+            self.root, self.db, tasks_dir_for=self.no_tasks
+        )
+        return ingest_mod.backfill(
+            plan, self.db, tasks_dir_for=self.no_tasks, **kwargs
+        )
+
+    def test_every_project_lands_and_none_archives_another(self) -> None:
+        report = self.walk()
+        self.assertEqual(report["projects_completed"], 3)
+        self.assertFalse(report["interrupted"])
+        self.assertEqual(report["totals"]["files_ingested"], 3)
+        self.assertEqual(report["totals"]["files_archived"], 0)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM ingest_state WHERE archived_at IS NOT NULL"
+                ).fetchone()[0],
+                0,
+            )
+            paths = [
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT source_path FROM api_calls"
+                )
+            ]
+        finally:
+            conn.close()
+        self.assertEqual(
+            sorted(Path(p).parent.name for p in paths),
+            ["-tmp-project-0", "-tmp-project-1", "-tmp-project-2"],
+            "each project's calls stay under its own directory",
+        )
+
+    def test_a_backfilled_row_is_indistinguishable_from_a_live_ingested_one(
+        self,
+    ) -> None:
+        # No `imported` flag, no second code path: the backfill runs the same
+        # `ingest()`. The assertion is that a project ingested by the walk and
+        # the same project ingested directly produce byte-identical rows.
+        self.walk()
+        direct_db = self.tmp / "direct.db"
+        ingest(
+            self.root / "-tmp-project-0",
+            direct_db,
+            tasks_dir=self.tmp / "no-tasks",
+        )
+        columns = (
+            "session_id, source_path, source_kind, model, input_tokens,"
+            " cache_read, cache_write, output_tokens, context_size"
+        )
+        walked = sqlite3.connect(self.db).execute(
+            f"SELECT {columns} FROM api_calls WHERE source_path LIKE ?"
+            " ORDER BY source_path, ts",
+            (f"{self.root / '-tmp-project-0'}%",),
+        ).fetchall()
+        alone = sqlite3.connect(direct_db).execute(
+            f"SELECT {columns} FROM api_calls ORDER BY source_path, ts"
+        ).fetchall()
+        self.assertEqual(walked, alone)
+        self.assertGreater(len(walked), 0)
+
+    def test_the_report_names_the_directories_that_held_nothing(self) -> None:
+        report = self.walk()
+        self.assertEqual(len(report["empty_directories"]), 2)
+        text = ingest_mod.format_backfill_report(report)
+        self.assertIn("2 directories held no transcripts", text)
+        self.assertIn("-tmp-idle-0", text)
+        self.assertIn("a real answer, not an error", text)
+
+    def test_progress_is_reported_in_bytes_and_records_every_file(self) -> None:
+        events: list = []
+        self.walk(progress=lambda position, project, event: events.append(event))
+        self.assertEqual(len(events), 3, "one event per source examined")
+        self.assertEqual([e.files_done for e in events], [1, 1, 1])
+        for event in events:
+            self.assertGreater(event.size, 0)
+            self.assertGreater(event.bytes_total, 0)
+            self.assertTrue(event.ingested)
+            # The numerator is the bytes examined so far, and each project here
+            # holds one file -- so at its only event the run is complete and
+            # `bytes_done` must equal both the file's size and the denominator.
+            # A numerator that drifted from the sizes it sums would draw a bar
+            # past 100%, which is a wrong number even in a progress line.
+            self.assertEqual(event.bytes_done, event.size)
+            self.assertEqual(event.bytes_done, event.bytes_total)
+        # A resumed walk still reports every file, marked as skipped -- a
+        # progress bar that went silent on a resume would look like a hang.
+        again: list = []
+        self.walk(progress=lambda position, project, event: again.append(event))
+        self.assertEqual(len(again), 3)
+        self.assertEqual([e.ingested for e in again], [False, False, False])
+
+    def test_the_walk_never_prunes_even_when_a_source_has_gone(self) -> None:
+        self.walk()
+        (self.root / "-tmp-project-0" / "session-0.jsonl").unlink()
+        report = self.walk()
+        self.assertEqual(report["totals"]["files_pruned"], 0)
+        self.assertEqual(report["totals"]["files_archived"], 1)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertGreater(
+                conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0], 0
+            )
+        finally:
+            conn.close()
+
+
+class BackfillTotalsPartitionTest(unittest.TestCase):
+    """Every summary field is folded exactly one way, and none is dropped.
+
+    Four sets, because the fields answer four different questions: a per-run
+    event adds up, a whole-database read does not (each run already covers
+    every project ingested so far, so summing multiplies the corpus by the
+    number of projects), a per-run *state* figure is meaningless added up at
+    all, and an answer about one directory belongs beside that directory.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-backfill-totals-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = build_projects_root(self.tmp / "projects", projects=2, empty=0)
+        self.db = self.tmp / "usage.db"
+        self.no_tasks = self.tmp / "no-tasks"
+        self.summary = ingest(
+            self.root / "-tmp-project-0", self.db, tasks_dir=self.no_tasks
+        )
+
+    def test_the_four_sets_partition_every_summary_field(self) -> None:
+        sets = (
+            ingest_mod.BACKFILL_SUMMED_FIELDS,
+            ingest_mod.BACKFILL_CORPUS_FIELDS,
+            ingest_mod.BACKFILL_RECOMPUTED_FIELDS,
+            ingest_mod.BACKFILL_PER_PROJECT_FIELDS,
+        )
+        named: list[str] = []
+        for group in sets:
+            named.extend(group)
+        self.assertEqual(
+            len(named), len(set(named)), "a field may be folded exactly one way"
+        )
+        self.assertEqual(
+            sorted(named),
+            sorted(self.summary),
+            "a field added to ingest()'s summary and not classified here would"
+            " be silently dropped from the walk's total, or wrongly summed",
+        )
+
+    def test_a_corpus_wide_field_is_taken_from_the_last_run_not_summed(self) -> None:
+        # `sources_tracked` counts every row in `ingest_state`, so after two
+        # projects each run reports the running total. Summing them would
+        # report 1 + 2 = 3 sources for a corpus of 2.
+        second = ingest(
+            self.root / "-tmp-project-1", self.db, tasks_dir=self.no_tasks
+        )
+        totals = ingest_mod.backfill_totals([self.summary, second])
+        self.assertEqual(totals["sources_tracked"], second["sources_tracked"])
+        self.assertEqual(totals["sources_tracked"], 2)
+        self.assertEqual(
+            totals["files_scanned"],
+            self.summary["files_scanned"] + second["files_scanned"],
+            "a per-run event IS summed",
+        )
+
+    def test_no_completed_project_leaves_the_corpus_fields_UNKNOWN(self) -> None:
+        # A walk interrupted before its first project finished has not censused
+        # anything. An empty census would claim a clean corpus nobody opened.
+        totals = ingest_mod.backfill_totals([])
+        for name in ingest_mod.BACKFILL_CORPUS_FIELDS:
+            self.assertIsNone(totals[name], name)
+        self.assertEqual(totals["files_scanned"], 0)
+
+
+class BackfillInterruptionTest(unittest.TestCase):
+    """Stopping halfway loses nothing, and resuming skips what landed (#97).
+
+    The claim is checked, not assumed: `is_unchanged()` keys on size+mtime and
+    every source commits in its own transaction, so the property should hold --
+    but "should" is what this project's rules exist to distrust.
+    """
+
+    FILES_PER_PROJECT = 3
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-backfill-interrupt-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = self.tmp / "projects"
+        for name in ("-tmp-a", "-tmp-b", "-tmp-c"):
+            for i in range(self.FILES_PER_PROJECT):
+                write_transcript(self.root / name / f"session-{name}-{i}.jsonl")
+        self.db = self.tmp / "usage.db"
+        self.no_tasks = lambda project: self.tmp / "no-tasks"
+
+    def walk(self, progress=None) -> dict:
+        plan = ingest_mod.plan_backfill(
+            self.root, self.db, tasks_dir_for=self.no_tasks
+        )
+        return ingest_mod.backfill(
+            plan, self.db, progress=progress, tasks_dir_for=self.no_tasks
+        )
+
+    def calls(self) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_an_interrupt_keeps_what_landed_and_a_rerun_skips_exactly_those(
+        self,
+    ) -> None:
+        landed: list = []
+
+        def stop_after_four(position, project, event) -> None:
+            landed.append(event.source)
+            if len(landed) == 4:
+                raise KeyboardInterrupt
+
+        report = self.walk(progress=stop_after_four)
+        self.assertTrue(report["interrupted"])
+        self.assertLess(report["projects_completed"], 3)
+        partial = self.calls()
+        self.assertGreater(partial, 0, "what landed is committed")
+
+        resumed = self.walk()
+        self.assertFalse(resumed["interrupted"])
+        totals = resumed["totals"]
+        self.assertEqual(
+            totals["files_skipped"],
+            len(landed),
+            "a resumed run re-reads nothing that already landed",
+        )
+        self.assertEqual(
+            totals["files_ingested"], 3 * self.FILES_PER_PROJECT - len(landed)
+        )
+        self.assertEqual(totals["files_scanned"], 3 * self.FILES_PER_PROJECT)
+
+    def test_the_resumed_corpus_equals_an_uninterrupted_one(self) -> None:
+        # The state change, not the counters: an interrupted-then-resumed
+        # database must hold exactly what one clean walk would, with no
+        # duplicated call and nothing missing.
+        landed: list = []
+
+        def stop_after_four(position, project, event) -> None:
+            landed.append(event.source)
+            if len(landed) == 4:
+                raise KeyboardInterrupt
+
+        self.walk(progress=stop_after_four)
+        self.walk()
+        resumed_calls = self.calls()
+
+        clean_db = self.tmp / "clean.db"
+        plan = ingest_mod.plan_backfill(
+            self.root, clean_db, tasks_dir_for=self.no_tasks
+        )
+        ingest_mod.backfill(plan, clean_db, tasks_dir_for=self.no_tasks)
+        conn = sqlite3.connect(clean_db)
+        try:
+            clean_calls = conn.execute(
+                "SELECT COUNT(*) FROM api_calls"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(resumed_calls, clean_calls)
+        self.assertEqual(clean_calls, 3 * self.FILES_PER_PROJECT * 5)
+
+    def test_an_interrupt_archives_nothing_it_did_not_look_at(self) -> None:
+        # The interrupted walk stopped inside project A. Projects B and C were
+        # never scanned, and this run may not conclude anything about them --
+        # least of all that their sources have gone.
+        landed: list = []
+
+        def stop_after_one(position, project, event) -> None:
+            landed.append(event.source)
+            raise KeyboardInterrupt
+
+        self.walk(progress=stop_after_one)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM ingest_state WHERE archived_at IS NOT NULL"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            conn.close()
+
+
+class BackfillCliTest(unittest.TestCase):
+    """`--all-projects` as a user meets it, including its exit statuses."""
+
+    INGEST = str(Path(__file__).resolve().parent.parent / "ingest.py")
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-backfill-cli-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = build_projects_root(self.tmp / "projects", projects=2, empty=3)
+        self.db = self.tmp / "usage.db"
+
+    def run_ingest(self, *args: str):
+        environ = dict(os.environ)
+        environ.pop("CPB_DB", None)
+        environ["PYTHONDONTWRITEBYTECODE"] = "1"
+        return subprocess.run(
+            [sys.executable, "-B", self.INGEST, *args],
+            capture_output=True, text=True, env=environ, input="",
+            cwd=str(self.tmp),
+        )
+
+    def test_it_ingests_every_project_and_states_the_plan_before_it_starts(
+        self,
+    ) -> None:
+        proc = self.run_ingest(
+            "--all-projects", str(self.root), "--db", str(self.db)
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout
+        self.assertIn("2 hold transcripts, 3 hold none", out)
+        self.assertLess(
+            out.index("estimate ~"),
+            out.index("backfill complete"),
+            "the estimate is stated BEFORE the walk, not with the result",
+        )
+        self.assertIn("3 directories held no transcripts", out)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(DISTINCT source_path) FROM api_calls"
+                ).fetchone()[0],
+                2,
+            )
+        finally:
+            conn.close()
+
+    def test_prune_missing_is_refused_rather_than_run_across_every_project(
+        self,
+    ) -> None:
+        proc = self.run_ingest(
+            "--all-projects", str(self.root), "--db", str(self.db),
+            "--prune-missing",
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertFalse(self.db.exists())
+
+    def test_a_root_holding_no_project_refuses_rather_than_reporting_zero(
+        self,
+    ) -> None:
+        barren = self.tmp / "barren"
+        (barren / "-tmp-idle").mkdir(parents=True)
+        proc = self.run_ingest(
+            "--all-projects", str(barren), "--db", str(self.db)
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("nothing to ingest", proc.stderr)
+        self.assertNotIn("files scanned", proc.stdout)
+
+    def test_all_projects_and_projects_dir_cannot_both_be_given(self) -> None:
+        proc = self.run_ingest(
+            "--all-projects", str(self.root),
+            "--projects-dir", str(self.root / "-tmp-project-0"),
+            "--db", str(self.db),
+        )
+        self.assertEqual(proc.returncode, 2)
+
+    def test_the_default_root_is_derived_and_not_a_literal(self) -> None:
+        # Same rule `DefaultProjectsDirTest` applies one level down: the CLI
+        # default must be DERIVED, so the assertion is that `main()` obtains it
+        # by calling `default_projects_root()`.
+        src = (Path(__file__).resolve().parent.parent / "ingest.py").read_text()
+        self.assertIn("default_projects_root()", src)
+        self.assertIn("ALL_PROJECTS_DEFAULT_ROOT", src)
+
+
+class BackfillReporterTest(unittest.TestCase):
+    """The progress line, and which rate it quotes.
+
+    Two rates with two provenances: `INGEST_BYTES_PER_SECOND` sized the plan
+    and describes ONE machine on one day, while the line drawn during the walk
+    is arithmetic over this run's own measured bytes and seconds. Presenting
+    the first as the second is the `band_provenance` failure one layer down.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-reporter-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = build_projects_root(self.tmp / "projects", projects=1, empty=0)
+        self.db = self.tmp / "usage.db"
+        self.plan = ingest_mod.plan_backfill(
+            self.root, self.db, tasks_dir_for=lambda p: self.tmp / "no-tasks"
+        )
+
+    def drive(self, ticks: list[float], events: int) -> list[str]:
+        clock = iter(ticks)
+        reporter = ingest_mod.BackfillReporter(
+            self.plan, clock=lambda: next(clock), interval=2.0
+        )
+        project = self.plan.projects[0]
+        printed: list[str] = []
+        with mock.patch("builtins.print", side_effect=printed.append):
+            for i in range(1, events + 1):
+                reporter(
+                    1,
+                    project,
+                    ingest_mod.ScanProgress(
+                        source=project.path / f"f{i}.jsonl",
+                        kind=ingest_mod.SOURCE_MAIN,
+                        ingested=True,
+                        size=self.plan.bytes // events,
+                        files_done=i,
+                        files_total=events,
+                        bytes_done=0,
+                        bytes_total=self.plan.bytes,
+                    ),
+                )
+        return printed
+
+    def test_it_throttles_but_always_draws_the_last_file_of_a_project(self) -> None:
+        # 4 events, a clock that never advances: only the final one -- which
+        # completes the project -- gets through the throttle. Without that
+        # exception a fast project would never print a line at all.
+        printed = self.drive([0.0] + [0.1] * 4, events=4)
+        self.assertEqual(len(printed), 1)
+        self.assertIn("4/4 files", printed[0])
+
+    def test_the_remaining_time_is_this_runs_own_rate_not_the_published_one(
+        self,
+    ) -> None:
+        printed = self.drive([0.0, 10.0], events=1)
+        self.assertIn("at this run's rate", printed[0])
+        self.assertIn("elapsed", printed[0])
+
+    def test_no_remaining_time_is_quoted_before_enough_has_landed(self) -> None:
+        # Below `PROGRESS_RATE_FLOOR` the observed rate is whichever file came
+        # first, and a confident "8h left" on a five-minute walk is worse than
+        # no figure at all.
+        clock = iter([0.0, 1.0])
+        reporter = ingest_mod.BackfillReporter(
+            self.plan, clock=lambda: next(clock), interval=0.0
+        )
+        printed: list[str] = []
+        with mock.patch("builtins.print", side_effect=printed.append):
+            reporter(
+                1,
+                self.plan.projects[0],
+                ingest_mod.ScanProgress(
+                    source=self.plan.projects[0].path / "f.jsonl",
+                    kind=ingest_mod.SOURCE_MAIN,
+                    ingested=True,
+                    size=1,
+                    files_done=1,
+                    files_total=99,
+                    bytes_done=1,
+                    bytes_total=self.plan.bytes,
+                ),
+            )
+        self.assertNotIn("left at this run's rate", printed[0])
+
+
+class IngestRateProvenanceTest(unittest.TestCase):
+    """The estimate's rate is a dated single-machine reading, and says so."""
+
+    def test_the_rate_carries_its_date_its_sample_and_its_caveat(self) -> None:
+        provenance = ingest_mod.INGEST_RATE_PROVENANCE
+        self.assertIn(ingest_mod.INGEST_RATE_AS_OF, provenance)
+        self.assertIn("ONE machine", provenance)
+        self.assertIn("2,914", provenance)
+        self.assertIn("281 s", provenance)
+        self.assertIn("I/O bound", provenance)
+
+    def test_the_rate_matches_the_measurement_it_cites(self) -> None:
+        # 1.96 GB in 281 s. Pinned to within 1%, so a hand-edited constant that
+        # no longer follows from the numbers in its own provenance goes red.
+        self.assertAlmostEqual(
+            ingest_mod.INGEST_BYTES_PER_SECOND / (1.96e9 / 281),
+            1.0,
+            delta=0.01,
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()

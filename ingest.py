@@ -3,10 +3,17 @@
 Usage:
     python3 ingest.py [--projects-dir <dir>] [--db db/usage.db]
     python3 ingest.py --transcript <path-to-jsonl> [--db db/usage.db]
+    python3 ingest.py --all-projects [<root>] [--db db/usage.db]
 
 `--projects-dir` defaults to this project's own transcript directory, derived
 from the working directory via Claude Code's naming convention -- see
-`default_projects_dir()`.
+`default_projects_dir()`. It takes ONE project's directory, and pointed one
+level up -- at `~/.claude/projects`, whose CHILDREN are the project
+directories -- it matches neither glob. That used to scan zero files and exit
+0; it now refuses and names what it found (#96). `--all-projects` is the mode
+that really does take that path: the backfill, one run over every project on
+the machine, with a stated estimate before it starts and progress in bytes
+(#97).
 
 `--transcript` ingests EXACTLY ONE file and is the mode a Claude Code hook
 uses: the hook is handed the path that just changed, so re-scanning the tree
@@ -73,9 +80,10 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable, Optional, Sequence
 
 SOURCE_MAIN = "main"
@@ -2332,6 +2340,77 @@ def is_unchanged(state: Optional[tuple], stat: os.stat_result) -> bool:
     return state is not None and state[0] == stat.st_size and state[1] == stat.st_mtime
 
 
+def already_tracks(db_path: Path, roots: Sequence[Path]) -> bool:
+    """Does this database already hold sources beneath any of `roots`?
+
+    The one question that separates the two meanings of "this directory holds
+    no transcripts":
+
+    * nothing was ever ingested from here -- `--projects-dir` is pointed at the
+      wrong depth, or at a directory Claude Code has never written to. Nothing
+      to measure, and #96's refusal is the right answer.
+    * everything here has been REAPED. Claude Code deletes transcripts after
+      `cleanupPeriodDays`, so a long-idle project legitimately ends up with an
+      empty directory and a database full of its history. That run has real
+      work to do -- it archives, and `--prune-missing` acts on it -- and
+      refusing it would strand the exact corpus the durability rules exist for.
+
+    Read-only and schema-free ON PURPOSE. It runs before `_prepare_schema()`,
+    so it must not create the database, migrate it, or rebuild it: a rebuild
+    followed by the refusal below would empty the file and re-derive nothing.
+
+    A database that cannot be read answers **True** -- "cannot tell", resolved
+    towards proceeding, so `_prepare_schema()` reaches the problem and reports
+    it in its own vocabulary. Refusing here would blame the projects directory
+    for a fault in the database.
+    """
+    if not db_path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return True
+    try:
+        rows = conn.execute("SELECT path FROM ingest_state").fetchall()
+    except sqlite3.Error:
+        return True
+    finally:
+        conn.close()
+    prefixes = [PurePath(root) for root in roots]
+    return any(
+        any(PurePath(row[0]).is_relative_to(prefix) for prefix in prefixes)
+        for row in rows
+    )
+
+
+def source_gone(path_str: str) -> Optional[bool]:
+    """Is this tracked source file gone from disk? `None` when unknowable.
+
+    Tri-state, and every caller has to handle the third, because the two-state
+    version of this question is what makes a durability bug. `archived_at` and
+    `--prune-missing` both mean "the source is no longer on disk", and archiving
+    is what tells the report its totals are no longer reproducible while a prune
+    DELETES rows that, past `cleanupPeriodDays`, are the only copy that exists.
+
+    `os.path.exists()` is deliberately not used: it swallows every OSError and
+    returns False, so an unmounted volume, an unreadable parent or an I/O error
+    would all read as "the file is gone" -- absence rendered as a value, on the
+    one code path in this file that can destroy a measurement. `os.stat` raises,
+    so the three answers stay apart.
+
+    `NotADirectoryError` is `True` and not `None`: a path component that is no
+    longer a directory means there is no file at this path, which is the same
+    observation `FileNotFoundError` makes one level down.
+    """
+    try:
+        os.stat(path_str)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return None
+    return False
+
+
 # --- The prune's ONE definition of "the rows derived from a source" (#92) ---
 #
 # Every table a prune deletes from, with the column each one keys the source
@@ -3392,6 +3471,7 @@ def ingest(
     tasks_dir: Optional[Path] = None,
     prune_missing: bool = False,
     approve_prune: Optional[Callable[["PrunePlan"], bool]] = None,
+    progress: Optional[Callable[["ScanProgress"], None]] = None,
 ) -> dict[str, Any]:
     """Ingest every transcript under projects_dir into db_path. Returns a summary.
 
@@ -3419,6 +3499,14 @@ def ingest(
     surviving copy of that history, and a destructive default reached by
     forgetting an argument is exactly the accident the durability rules exist
     to prevent.
+
+    **`progress` is the caller's, for the same reason.** A cold backfill of one
+    real project took 281 seconds (#97, measured 2026-08-07), which is far too
+    long to be silent -- but a library function that printed would be doing I/O
+    as a side effect, so what it does instead is call back with a
+    `ScanProgress` per source examined and let `main()` decide what a terminal
+    should see. `None` costs nothing, including the extra `stat()` pass the
+    byte denominator needs.
     """
     if not projects_dir.is_dir():
         # A typo'd --projects-dir must never render as a silent empty run
@@ -3430,29 +3518,70 @@ def ingest(
         # expected to recognise -- "not found" alone is a dead end. Listing the
         # recorded projects turns it into a next step at the cost of one
         # `iterdir`, which matters most for the first run on a new machine.
+        #
+        # The list is rendered by `format_project_candidates()`, which MARKS
+        # each entry with what it holds. This block used to print the bare
+        # `available_projects()` list under the heading "Transcripts ARE
+        # recorded for these projects", and that heading was false for most of
+        # it -- 12 of 19 directories on the machine measured for #97 held no
+        # transcript, so the refusal named twelve paths each of which would
+        # have been refused in turn.
+        #
+        # The paths themselves stay BARE, one per line -- deliberately NOT a
+        # copy-paste-ready shell command. An earlier revision emitted
+        # `--projects-dir <shlex.quote(path)>`, and CodeRabbit pointed out that
+        # `shlex.quote` produces POSIX single quotes, which `cmd.exe` does not
+        # treat as delimiters: on Windows the "safe" form is the unsafe one.
+        # Quoting correctly would mean detecting the reader's shell, which this
+        # tool cannot do and should not guess at. So the shell is removed from
+        # the problem rather than guarded (rule #13).
         lines = [f"projects dir not found: {projects_dir}"]
-        found = available_projects()
-        if found:
-            lines.append("")
-            lines.append("Transcripts ARE recorded for these projects:")
-            # BARE paths, one per line -- deliberately NOT a copy-paste-ready
-            # shell command. An earlier revision emitted
-            # `--projects-dir <shlex.quote(path)>`, and CodeRabbit pointed out
-            # that `shlex.quote` produces POSIX single quotes, which `cmd.exe`
-            # does not treat as delimiters: on Windows the "safe" form is the
-            # unsafe one. Quoting correctly would mean detecting the reader's
-            # shell, which this tool cannot do and should not guess at.
-            #
-            # So the shell is removed from the problem rather than guarded
-            # (rule #13). A bare path is unambiguous on every platform, and the
-            # reader quotes it the way their own shell requires.
-            lines.extend(f"  {p}" for p in found)
-        else:
-            lines.append("")
-            lines.append(
-                "No project transcripts found at all under ~/.claude/projects."
-            )
+        lines.extend(format_project_candidates())
         raise SystemExit("\n".join(lines))
+    # Discovery runs BEFORE the database is opened, so a refusal below cannot
+    # leave a half-prepared schema behind: `_prepare_schema()` may rebuild, and
+    # a rebuild followed by a refusal would discard rows and then re-derive
+    # nothing.
+    resolved_tasks_dir = (
+        tasks_dir if tasks_dir is not None else default_tasks_dir(projects_dir)
+    )
+    index = discover_task_index(resolved_tasks_dir)
+    sources, inconclusive = discover_sources(projects_dir, index)
+    # #96, the front door. `default_projects_dir()` has refused a MISSING
+    # directory since it shipped; the guard was never extended to a directory
+    # that exists and matches neither glob, which is what
+    # `--projects-dir ~/.claude/projects` is -- the most natural thing a user
+    # types, scanning zero files and exiting 0.
+    #
+    # The condition is "this run found no FILE to scan", NOT "this run measured
+    # no tokens". A project directory holding one session with zero replies has
+    # a transcript, produces a source, and is a LEGITIMATE ZERO that must still
+    # be ingested; refusing on any zero would be the same defect pointing the
+    # other way.
+    #
+    # `already_tracks()` is the second half of the condition: an empty
+    # directory whose history is already in this database is the REAPED case,
+    # which has archiving to do and must not be refused.
+    refusal: Optional[str] = None
+    verdict = ProjectsDirVerdict(PROJECTS_DIR_PROJECT, projects_dir)
+    if not sources and not already_tracks(db_path, (projects_dir, resolved_tasks_dir)):
+        verdict = classify_projects_dir(projects_dir)
+        refusal = format_projects_dir_refusal(verdict, inconclusive)
+        if verdict.outcome != PROJECTS_DIR_EMPTY:
+            # PARENT and UNREADABLE are PROVEN wrong inputs -- the first is a
+            # path at the wrong depth, the second a directory this process
+            # cannot read -- so they refuse here, before the database is
+            # touched at all.
+            raise SystemExit(refusal)
+        # EMPTY is the one genuinely ambiguous shape: a project directory whose
+        # transcripts Claude Code has reaped and that CPB never ingested looks
+        # exactly like one Claude Code has never written to. The run therefore
+        # completes -- "we looked and there was nothing" is a real observation,
+        # and `record_ingest_run()` exists to record exactly that -- and the
+        # refusal travels in the summary for `main()` to print and exit
+        # non-zero over. Absence still never renders as a value; it renders as
+        # the loud operator-visible message CLAUDE.md names as the third form
+        # of a refusal, rather than as `files scanned: 0` and status 0.
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
@@ -3512,20 +3641,45 @@ def ingest(
             "missing_usage_keys": {},
             "sources_censused": 0,
             "sources_tracked": 0,
+            # Tracked sources this run did NOT scan, split by what the
+            # filesystem said about them. Neither is archived and neither is
+            # pruned: this run has no evidence that either has gone, and once
+            # one database can hold several projects (#97) the old inference --
+            # "not in this scan, therefore gone" -- was actively false.
+            "sources_present_unscanned": 0,
+            "sources_unknown_unscanned": 0,
+            # What shape `projects_dir` turned out to be (#96), named on EVERY
+            # run rather than only on the failing ones -- a summary that
+            # carried the field only when something went wrong would make its
+            # absence the signal, which is the shape this project avoids.
+            # `projects_dir_refusal` is None unless this run found nothing to
+            # scan and nothing already tracked here; it is a MESSAGE, and
+            # `main()` prints it and exits non-zero.
+            "projects_dir_verdict": verdict.outcome,
+            "projects_dir_refusal": refusal,
         }
-        index = discover_task_index(
-            tasks_dir if tasks_dir is not None else default_tasks_dir(projects_dir)
-        )
         summary["task_index_available"] = index.available
         summary["subagent_transcripts_unavailable"] = len(index.unavailable)
-        sources, inconclusive = discover_sources(projects_dir, index)
         summary["candidates_scan_truncated"] = inconclusive[CARRIES_TRUNCATED]
         summary["candidates_unreadable"] = inconclusive[CARRIES_UNREADABLE]
-        for source in sources:
+        # The denominator for `progress`, and it is paid for ONLY when someone
+        # is watching. A backfill of 2,914 files took 281 s of wall clock and
+        # 23 s of CPU on the machine measured for #97, so it is I/O bound and an
+        # unconditional extra `stat()` per file would be per-file work added for
+        # a caller who asked for nothing.
+        bytes_total = _total_bytes(sources) if progress is not None else 0
+        bytes_done = 0
+        for scanned, source in enumerate(sources, 1):
             summary["files_scanned"] += 1
             is_subagent = source.kind == SOURCE_SUBAGENT
             if is_subagent:
                 summary["subagent_files_scanned"] += 1
+            # Re-stat here rather than reuse the plan's stat, deliberately. This
+            # is the value written to `ingest_state`, and a backfill runs for
+            # minutes while live sessions append to their transcripts: storing a
+            # size+mtime read before the parse would claim the file was
+            # ingested at a state it never had, and the appended records would
+            # be invisible until it changed again.
             stat = source.path.stat()
             state = conn.execute(
                 "SELECT size, mtime, unparsed_records FROM ingest_state WHERE path = ?",
@@ -3534,6 +3688,20 @@ def ingest(
             if is_unchanged(state, stat):
                 summary["files_skipped"] += 1
                 summary["unparsed_records"] += state[2]
+                bytes_done += stat.st_size
+                if progress is not None:
+                    progress(
+                        ScanProgress(
+                            source=source.path,
+                            kind=source.kind,
+                            ingested=False,
+                            size=stat.st_size,
+                            files_done=scanned,
+                            files_total=len(sources),
+                            bytes_done=bytes_done,
+                            bytes_total=bytes_total,
+                        )
+                    )
                 continue
             parsed = parse_file(source.path, collect_turns=not is_subagent)
             with conn:
@@ -3561,6 +3729,24 @@ def ingest(
                 parsed.calls_with_unreconciled_cache_write
             )
             summary["unparsed_details"].extend(parsed.unparsed_details)
+            bytes_done += stat.st_size
+            if progress is not None:
+                # AFTER the commit, never before: the event says "this file has
+                # landed", and a resumed run skips exactly the files this
+                # callback has already reported. Reporting first would let an
+                # interrupt land between the claim and the fact.
+                progress(
+                    ScanProgress(
+                        source=source.path,
+                        kind=source.kind,
+                        ingested=True,
+                        size=stat.st_size,
+                        files_done=scanned,
+                        files_total=len(sources),
+                        bytes_done=bytes_done,
+                        bytes_total=bytes_total,
+                    )
+                )
 
         # Reconcile: a transcript deleted/renamed on disk must not leave its
         # rows behind to keep appearing in the UI forever (Qodo finding).
@@ -3570,7 +3756,32 @@ def ingest(
             row[0] for row in conn.execute("SELECT path FROM ingest_state").fetchall()
         }
         now = datetime.now(timezone.utc).timestamp()
-        stale_paths = sorted(tracked_paths - current_path_strs)
+        # ASK THE FILESYSTEM, do not infer from the scan (#97). This used to be
+        # `tracked_paths - current_path_strs`, i.e. "this run did not see it,
+        # therefore it is gone" -- an inference that is only sound while one
+        # database holds exactly one project's scan.
+        #
+        # Measured on this branch, 2026-08-07, before the change: two projects
+        # ingested into one database, `ingest()` over the second ARCHIVED the
+        # first's transcript while the file was still on disk, and with
+        # `--prune-missing` approved it DELETED that project's five `api_calls`
+        # rows. Past `cleanupPeriodDays` those rows are the only surviving copy,
+        # so the old rule destroyed non-regenerable measurements on the strength
+        # of a question this run never asked.
+        #
+        # `source_gone()` asks it directly, and answers `None` where it cannot,
+        # which is why the split below is three ways and not two.
+        unscanned = sorted(tracked_paths - current_path_strs)
+        gone_paths: list[str] = []
+        for path_str in unscanned:
+            gone = source_gone(path_str)
+            if gone is True:
+                gone_paths.append(path_str)
+            elif gone is False:
+                summary["sources_present_unscanned"] += 1
+            else:
+                summary["sources_unknown_unscanned"] += 1
+        stale_paths = gone_paths
         # Tri-state, and each state is a different fact (#92). None: no prune
         # was requested, so nothing was censused and this run says nothing
         # about what one would cost. A plan with `prune_approved` False: it was
@@ -3595,12 +3806,25 @@ def ingest(
             # totals are no longer reproducible.
             for stale_path in stale_paths:
                 with conn:
-                    conn.execute(
-                        "UPDATE ingest_state SET archived_at = COALESCE(archived_at, ?)"
-                        " WHERE path = ?",
+                    # `AND archived_at IS NULL` does the work the old
+                    # `COALESCE(archived_at, ?)` did -- the first mark is the
+                    # one that stands -- and it also makes `rowcount` mean
+                    # "newly archived by THIS run".
+                    #
+                    # Which is what `files_archived` now counts, and the change
+                    # matters once a backfill walks several projects into one
+                    # database (#97). A source reaped months ago is stale on
+                    # every run; counting it each time made the walk's total
+                    # report one gone file as N, once per project it happened to
+                    # visit afterwards. A run event, counted the way
+                    # `duplicate_dispatches_resolved` is counted: what THIS run
+                    # did, with the standing fact left in `ingest_state`.
+                    cursor = conn.execute(
+                        "UPDATE ingest_state SET archived_at = ?"
+                        " WHERE path = ? AND archived_at IS NULL",
                         (now, stale_path),
                     )
-                summary["files_archived"] += 1
+                summary["files_archived"] += cursor.rowcount
         # A source that came BACK is live again -- the mark describes current
         # state, not a one-way latch (a remounted worktree, a restore).
         with conn:
@@ -3831,18 +4055,799 @@ def project_root(start: Optional[Path] = None) -> Path:
     return here
 
 
+def default_projects_root(home: Optional[Path] = None) -> Path:
+    """`~/.claude/projects` -- the directory that HOLDS every project directory.
+
+    One level ABOVE `default_projects_dir()`, and the distinction is the whole
+    of #96: this is the path a user types, and it matches neither glob, so
+    `--projects-dir` pointed here scanned nothing and reported success.
+
+    Named once because three callers need it -- the candidate listing in a
+    refusal, `available_projects()`, and `--all-projects`' default root -- and a
+    literal repeated three times is three chances to disagree.
+    """
+    return (home or Path.home()) / ".claude" / "projects"
+
+
 def available_projects(home: Optional[Path] = None) -> list[Path]:
-    """Every project directory Claude Code has recorded transcripts for.
+    """Every project DIRECTORY Claude Code has recorded, transcripts or not.
 
     Used to turn a missing-directory refusal into something actionable: the
     derived default is a path the user has never typed, so "not found" alone
     leaves them with nowhere to go. A missing `~/.claude/projects` is an empty
     list, not an error -- having never run Claude Code is a legitimate state.
+
+    **A directory here is not a promise of transcripts.** On the machine
+    measured for #97 on 2026-08-07, 12 of 19 held none. So this answers "which
+    project directories exist", and `transcript_presence()` answers the
+    separate question of which of them hold anything -- see
+    `format_project_candidates()`, which renders both rather than letting the
+    first read as the second.
     """
-    root = (home or Path.home()) / ".claude" / "projects"
+    root = default_projects_root(home)
     if not root.is_dir():
         return []
     return sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name)
+
+
+# Does a directory hold transcripts at either documented depth? THREE values,
+# for the same reason `carries_api_calls()` has four: "we read the directory and
+# there is nothing there" is a measurement, and "we could not read it" is not.
+# Collapsing the second into the first would report an unreadable directory as
+# an empty one -- absence rendered as a value, at the front door.
+TRANSCRIPTS_PRESENT = "present"
+TRANSCRIPTS_ABSENT = "absent"
+TRANSCRIPTS_UNKNOWN = "unknown"
+
+
+def transcript_presence(directory: Path) -> tuple[str, Optional[str]]:
+    """`(verdict, reason)` for one directory. UNKNOWN is never ABSENT.
+
+    The verdict is one of `TRANSCRIPTS_*`; `reason` is the OS error text when
+    the verdict is UNKNOWN and `None` otherwise.
+
+    Two steps, and the first is why this is not one `glob()` call.
+    `Path.glob` walks with `os.scandir` and SWALLOWS the OSError, yielding
+    nothing -- so a directory whose permissions forbid reading is
+    indistinguishable from one that is genuinely empty. `os.scandir` raises, so
+    the probe below is what keeps the two apart. It only covers this
+    directory's own read; a session subdirectory that cannot be read still
+    reads as holding nothing, which is documented here rather than claimed
+    otherwise.
+
+    The presence test itself delegates to `discover_sources()`, so the layout
+    has ONE owner: this cannot drift from the globs the ingest actually uses.
+    The task index is deliberately not consulted -- the question is about what
+    is at the two documented depths under THIS directory.
+    """
+    try:
+        with os.scandir(directory) as entries:
+            for _ in entries:
+                break
+    except OSError as exc:
+        return TRANSCRIPTS_UNKNOWN, str(exc)
+    sources, _ = discover_sources(directory)
+    return (TRANSCRIPTS_PRESENT if sources else TRANSCRIPTS_ABSENT), None
+
+
+# What `--projects-dir` was actually pointed at (#96). Five outcomes, because
+# the three the issue names are three DIFFERENT next steps for the reader and a
+# single "found nothing" would make them guess which they had hit.
+PROJECTS_DIR_MISSING = "missing"  # not a directory at all
+PROJECTS_DIR_UNREADABLE = "unreadable"  # a directory this process cannot read
+PROJECTS_DIR_PROJECT = "project"  # transcripts at the expected depth: proceed
+PROJECTS_DIR_PARENT = "parent-of-projects"  # ITS CHILDREN are project dirs
+PROJECTS_DIR_EMPTY = "no-transcripts"  # readable, and nothing anywhere beneath
+
+
+@dataclass(frozen=True)
+class ProjectsDirVerdict:
+    """What `classify_projects_dir()` found, and the evidence for it."""
+
+    outcome: str
+    path: Path
+    # Children that DO hold transcripts. Populated for PARENT, which is the
+    # case where the tool knows the fix and can name it.
+    child_projects: tuple[Path, ...] = ()
+    # Children whose contents could not be read. Carried on EVERY outcome that
+    # looked at children, including EMPTY: "nothing here" alongside "and two
+    # directories I could not open" is a different statement from "nothing
+    # here", and the reader is entitled to both.
+    unreadable_children: tuple[Path, ...] = ()
+    # The OS error, for UNREADABLE only.
+    reason: Optional[str] = None
+
+
+def classify_projects_dir(path: Path) -> ProjectsDirVerdict:
+    """Which of the five shapes `path` is (#96).
+
+    Order matters and is not arbitrary: a directory that holds transcripts of
+    its own is a PROJECT whatever its children look like. Claude Code's layout
+    makes that unambiguous -- a project's children are session directories,
+    whose transcripts sit under `<session>/subagents/` and so match neither
+    glob when the session directory is treated as a project root -- but
+    deciding the directory's own contents first means the answer does not
+    depend on that staying true.
+
+    Consults the filesystem and nothing else; it never opens the database.
+    """
+    if not path.is_dir():
+        return ProjectsDirVerdict(PROJECTS_DIR_MISSING, path)
+    own, reason = transcript_presence(path)
+    if own == TRANSCRIPTS_UNKNOWN:
+        return ProjectsDirVerdict(PROJECTS_DIR_UNREADABLE, path, reason=reason)
+    if own == TRANSCRIPTS_PRESENT:
+        return ProjectsDirVerdict(PROJECTS_DIR_PROJECT, path)
+    try:
+        children = sorted(p for p in path.iterdir() if p.is_dir())
+    except OSError as exc:
+        # The probe above succeeded and this did not (a race, or a directory
+        # readable but not listable to the end). Still UNKNOWN, never empty.
+        return ProjectsDirVerdict(PROJECTS_DIR_UNREADABLE, path, reason=str(exc))
+    holders: list[Path] = []
+    unreadable: list[Path] = []
+    for child in children:
+        verdict, _ = transcript_presence(child)
+        if verdict == TRANSCRIPTS_UNKNOWN:
+            unreadable.append(child)
+        elif verdict == TRANSCRIPTS_PRESENT:
+            holders.append(child)
+    outcome = PROJECTS_DIR_PARENT if holders else PROJECTS_DIR_EMPTY
+    return ProjectsDirVerdict(
+        outcome, path, tuple(holders), tuple(unreadable)
+    )
+
+
+# How many paths a refusal lists before it summarises the rest. A refusal that
+# printed 2,900 lines is a refusal nobody reads.
+REFUSAL_LIST_LIMIT = 20
+
+
+def _listing(
+    paths: Sequence[Path], limit: int = REFUSAL_LIST_LIMIT, indent: str = "  "
+) -> list[str]:
+    """Indented BARE paths, truncated with a count of what was not shown.
+
+    Bare, deliberately, and the reasoning is `ingest()`'s original: a
+    copy-paste-ready shell command would have to guess the reader's shell, and
+    `shlex.quote`'s POSIX single quotes are not delimiters to `cmd.exe`. The
+    trailing count exists so a truncated list is never mistaken for the whole
+    set.
+    """
+    lines = [f"{indent}{p}" for p in paths[:limit]]
+    if len(paths) > limit:
+        lines.append(f"{indent}... and {len(paths) - limit} more")
+    return lines
+
+
+# The two globs, spelled once, for every message that has to say what was
+# looked for. `TRANSCRIPT_SUFFIX`/`SUBAGENTS_DIR`/`AGENT_FILE_PREFIX` are the
+# same constants `discover_sources()` globs with, so a layout change cannot
+# leave the refusal describing the old one.
+EXPECTED_LAYOUT = (
+    f"  <projects-dir>/<session-id>{TRANSCRIPT_SUFFIX}"
+    "                       (main thread)\n"
+    f"  <projects-dir>/<session-id>/{SUBAGENTS_DIR}/"
+    f"{AGENT_FILE_PREFIX}<id>{TRANSCRIPT_SUFFIX}  (one per subagent)"
+)
+
+
+def format_project_candidates(home: Optional[Path] = None) -> list[str]:
+    """The recorded project directories, each MARKED with what it holds.
+
+    An earlier revision printed this list under the heading "Transcripts ARE
+    recorded for these projects". That heading was false for most of it: 12 of
+    19 directories on the machine measured for #97 held no transcript at all,
+    so the refusal named twelve paths that would each have been refused in
+    turn. The count and the marks are the fix -- "no transcripts" and "could
+    not be read" are different answers and neither is the blank.
+    """
+    found = available_projects(home)
+    if not found:
+        return [
+            "",
+            f"No project directories exist under {default_projects_root(home)}"
+            " at all.",
+        ]
+    marks: list[str] = []
+    holders = 0
+    for project in found:
+        verdict, _ = transcript_presence(project)
+        if verdict == TRANSCRIPTS_PRESENT:
+            holders += 1
+            marks.append(f"  {project}")
+        elif verdict == TRANSCRIPTS_ABSENT:
+            marks.append(f"  {project}   (no transcripts)")
+        else:
+            marks.append(f"  {project}   (could not be read -- unknown, not empty)")
+    return [
+        "",
+        f"{len(found)} project director{'y' if len(found) == 1 else 'ies'} recorded"
+        f" under {default_projects_root(home)}, {holders} holding transcripts:",
+        *marks[:REFUSAL_LIST_LIMIT],
+        *(
+            [f"  ... and {len(marks) - REFUSAL_LIST_LIMIT} more"]
+            if len(marks) > REFUSAL_LIST_LIMIT
+            else []
+        ),
+    ]
+
+
+def format_projects_dir_refusal(
+    verdict: ProjectsDirVerdict,
+    inconclusive: Optional[dict[str, int]] = None,
+    home: Optional[Path] = None,
+) -> str:
+    """The message for a `--projects-dir` that yielded nothing to scan (#96).
+
+    Every branch says WHAT WAS LOOKED FOR, because "found nothing" without the
+    shape it was looking for leaves the reader unable to tell a wrong path from
+    an empty one. The PARENT branch goes further and names the fix, since the
+    tool has already computed it: the projects are one level down, and it can
+    list them.
+    """
+    lines: list[str]
+    if verdict.outcome == PROJECTS_DIR_UNREADABLE:
+        return "\n".join(
+            [
+                f"projects dir could not be read: {verdict.path}",
+                f"  {verdict.reason}",
+                "",
+                "That is UNKNOWN, not empty. Reporting a scan of zero files"
+                " over a directory this process cannot open would state that"
+                " there is nothing there, which has not been measured.",
+            ]
+        )
+    if verdict.outcome == PROJECTS_DIR_PARENT:
+        lines = [
+            f"no transcripts in {verdict.path}, but its CHILDREN are project"
+            " directories.",
+            "",
+            "--projects-dir takes ONE project's directory. The layout it globs"
+            " for is:",
+            EXPECTED_LAYOUT,
+            "",
+            f"{len(verdict.child_projects)} director"
+            f"{'y' if len(verdict.child_projects) == 1 else 'ies'} one level"
+            " down hold transcripts:",
+            *_listing(verdict.child_projects),
+            "",
+            "Point --projects-dir at the one you want, or ingest every one of"
+            " them in a single run:",
+            f"  python3 ingest.py --all-projects {verdict.path}",
+        ]
+    else:
+        lines = [
+            f"no transcripts anywhere under {verdict.path}.",
+            "",
+            "It is a directory and it was read; nothing in it matches either"
+            " transcript shape:",
+            EXPECTED_LAYOUT,
+            "",
+            "and no directory below it holds either. A scan of it would report"
+            " zero files, which would read as a measured zero rather than as"
+            " nothing to measure.",
+            *format_project_candidates(home),
+        ]
+    if verdict.unreadable_children:
+        lines += [
+            "",
+            f"{len(verdict.unreadable_children)} director"
+            f"{'y' if len(verdict.unreadable_children) == 1 else 'ies'} below it"
+            " could NOT be read, so whether they hold transcripts is unknown"
+            " rather than no:",
+            *_listing(verdict.unreadable_children),
+        ]
+    if inconclusive and (
+        inconclusive.get(CARRIES_TRUNCATED) or inconclusive.get(CARRIES_UNREADABLE)
+    ):
+        lines += [
+            "",
+            "Task-index candidates excluded WITHOUT a verdict -- scan"
+            f" truncated: {inconclusive.get(CARRIES_TRUNCATED, 0)}, unreadable:"
+            f" {inconclusive.get(CARRIES_UNREADABLE, 0)}. Their spend is"
+            " unmeasured, not zero.",
+        ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Backfill: every project on this machine, in one run (#97)
+# ---------------------------------------------------------------------------
+#
+# WHY, before what. Claude Code deletes transcripts after `cleanupPeriodDays`
+# (default 30), so INSTALL IS THE MOMENT OF MAXIMUM AVAILABLE HISTORY and every
+# day CPB runs without a backfill loses tail permanently -- past that window
+# `db/usage.db` is the only copy there is. A tool whose first screen is a
+# verdict over three replies, on a machine holding 61.5 days of evidence, is
+# reporting a corpus it declined to read.
+#
+# WHAT A BACKFILLED CORPUS IS: identical to a live-ingested one. There is no
+# `imported` column and there must never be one. The same `ingest()` runs over
+# the same globs and writes the same rows, so no figure can come to mean one
+# thing for history and another for today.
+#
+# ON POOLING SEVERAL PROJECTS INTO ONE DATABASE, which is the question worth
+# more than the feature: `serve.py` is already project-aware. #44 added
+# `project_of()` and the `scope.projects` block to `/api/summary`, which names
+# the set every figure ranges over on a second axis -- `in_window` and
+# `in_database`, with `unattributed_*` for a path the layout cannot place. The
+# dimension is the stored `source_path` and no column was needed for it. Session
+# ids are UUIDs, so `rebuild_sessions()`' GROUP BY cannot collide across
+# projects, and `default_tasks_dir()` is already keyed on the project directory
+# name. What was NOT safe was `ingest()`'s staleness rule -- see `source_gone()`
+# and the block that calls it; that was fixed here rather than shipped around.
+
+
+# Bytes per second of cold ingest. Measured ONCE, on one machine, on 2026-08-07
+# (#97): 2,914 files and 1.96 GB in 281 s of wall clock, of which 23 s was CPU.
+#
+# It is an ESTIMATE and it is labelled as one everywhere it is shown, with its
+# date and its sample size, because a single-machine reading is not a constant
+# and this project does not present a judged number in a measured one's voice
+# (`band_provenance` in `serve.py` is the same rule one layer up). The 23 s of
+# CPU is the load-bearing part of the provenance: the walk is I/O bound, so the
+# reader's disk decides, and this figure is an order of magnitude rather than a
+# promise.
+INGEST_BYTES_PER_SECOND = 6_975_000
+INGEST_RATE_AS_OF = "2026-08-07"
+INGEST_RATE_PROVENANCE = (
+    f"measured on ONE machine on {INGEST_RATE_AS_OF}: 1.96 GB across 2,914"
+    " files in 281 s wall clock, 23 s of it CPU. I/O bound, so your disk"
+    " decides -- an order of magnitude, not a promise"
+)
+
+
+@dataclass(frozen=True)
+class ScanProgress:
+    """One source examined, and where that leaves the run.
+
+    `ingested` False means the file was SKIPPED as unchanged, which is what
+    makes an interrupted backfill cheap to resume; both are progress, and both
+    are reported, so a resumed run does not look stalled while it re-walks
+    files it already has.
+
+    `bytes_total` is 0 when nobody asked for progress -- the denominator costs a
+    `stat()` pass, and `ingest()` does not pay for it unheard.
+    """
+
+    source: Path
+    kind: str
+    ingested: bool
+    size: int
+    files_done: int
+    files_total: int
+    bytes_done: int
+    bytes_total: int
+
+
+def _total_bytes(sources: Sequence[Source]) -> int:
+    """Bytes on disk for `sources`. A file that vanished mid-walk contributes 0.
+
+    Contributing 0 is right here and would be wrong almost anywhere else in
+    this file: this is a DENOMINATOR for a progress bar, not a measurement, and
+    a file that has gone will also contribute no records. It cannot make a
+    reported figure wrong; the worst it does is finish the bar early.
+    """
+    total = 0
+    for source in sources:
+        try:
+            total += source.path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def project_sources(
+    projects_dir: Path, tasks_dir: Optional[Path] = None
+) -> tuple[list[Source], dict[str, int]]:
+    """Exactly the sources ONE `ingest()` of this directory would scan.
+
+    One call with two readers -- the plan that estimates and the run that does
+    the work -- so the estimate cannot range over a different set than the
+    walk. That divergence is this project's recurring defect (`RANKED_BY` in
+    `serve.py`, `PrunePlan` above), and an estimate computed from a *second*
+    glob would be free to disagree with the first: it would miss the task-index
+    extras, which are sources `ingest()` really does read.
+    """
+    resolved = tasks_dir if tasks_dir is not None else default_tasks_dir(projects_dir)
+    return discover_sources(projects_dir, discover_task_index(resolved))
+
+
+def tracked_state(db_path: Path) -> Optional[dict[str, tuple[int, float]]]:
+    """`{path: (size, mtime)}` from `ingest_state`, or None if it cannot be read.
+
+    `None` is not `{}`. An empty mapping says "this database tracks nothing",
+    which makes every file pending; `None` says the question could not be
+    answered, and `plan_backfill()` then declines to claim any file will be
+    skipped rather than guessing in either direction. Both make the estimate
+    the full corpus -- the difference is that only one of them is a measurement.
+
+    Read-only, and it never creates the file: this runs before the schema is
+    prepared.
+    """
+    if not db_path.is_file():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        return {
+            row[0]: (row[1], row[2])
+            for row in conn.execute("SELECT path, size, mtime FROM ingest_state")
+        }
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+@dataclass(frozen=True)
+class ProjectPlan:
+    """One project directory, sized before anything is read."""
+
+    path: Path
+    files: int
+    bytes: int
+    # New or changed since this database last saw them. `pending_known` is
+    # False when `ingest_state` could not be read, in which case `pending_*`
+    # equal `files`/`bytes` -- the whole corpus, because nothing is KNOWN to be
+    # skippable and an estimate that assumed otherwise would be an invented one.
+    pending_files: int
+    pending_bytes: int
+    pending_known: bool
+
+
+@dataclass(frozen=True)
+class BackfillPlan:
+    """What a `--all-projects` run will walk, decided before it starts.
+
+    Four buckets, and every child directory of `root` is in exactly one of
+    them. `empty` is a REAL ANSWER and not an error -- 12 of 19 directories on
+    the machine measured for #97 held no transcript, so a walk that said
+    nothing about them would be silent about 63% of what it looked at.
+    `unreadable` is the one bucket that is not an answer: those directories are
+    unknown, never empty.
+    """
+
+    root: Path
+    projects: tuple[ProjectPlan, ...]
+    empty: tuple[Path, ...]
+    unreadable: tuple[Path, ...]
+    # Any other verdict `classify_projects_dir()` returned, with its name. The
+    # layout does not produce these; carrying them means a directory can never
+    # be silently dropped from all four buckets by a shape nobody anticipated.
+    unexpected: tuple[tuple[Path, str], ...] = ()
+    # Entries at the root that are not directories at all, counted rather than
+    # named (they are files, and naming them adds nothing).
+    non_directories: int = 0
+
+    @property
+    def files(self) -> int:
+        return sum(p.files for p in self.projects)
+
+    @property
+    def bytes(self) -> int:
+        return sum(p.bytes for p in self.projects)
+
+    @property
+    def pending_files(self) -> int:
+        return sum(p.pending_files for p in self.projects)
+
+    @property
+    def pending_bytes(self) -> int:
+        return sum(p.pending_bytes for p in self.projects)
+
+    @property
+    def pending_known(self) -> bool:
+        return all(p.pending_known for p in self.projects)
+
+    @property
+    def estimated_seconds(self) -> float:
+        """Seconds this walk is expected to take, over the PENDING bytes.
+
+        Over pending rather than total, because an unchanged file is skipped
+        after one `stat()`: estimating the whole corpus on a resumed run would
+        quote five minutes for a walk that finishes in one, which is a wrong
+        number even though nothing measured it.
+        """
+        return self.pending_bytes / INGEST_BYTES_PER_SECOND
+
+
+def plan_backfill(
+    root: Path, db_path: Path, tasks_dir_for: Optional[Callable[[Path], Path]] = None
+) -> BackfillPlan:
+    """Size every project under `root` WITHOUT reading a transcript.
+
+    `tasks_dir_for` maps a project directory to its harness task directory; it
+    exists so a test can point the whole walk somewhere hermetic, and defaults
+    to `default_tasks_dir()`, which is what a real run uses.
+
+    Refuses nothing -- classification is this function's whole output, and the
+    caller decides what an empty result means.
+    """
+    state = tracked_state(db_path)
+    projects: list[ProjectPlan] = []
+    empty: list[Path] = []
+    unreadable: list[Path] = []
+    unexpected: list[tuple[Path, str]] = []
+    non_directories = 0
+    try:
+        entries = sorted(root.iterdir())
+    except OSError as exc:
+        raise SystemExit(
+            f"could not read {root}: {exc}\n\n"
+            "That is UNKNOWN, not empty -- a walk reporting zero projects over"
+            " a directory it could not open would state that there is nothing"
+            " on this machine, which has not been measured."
+        ) from exc
+    for entry in entries:
+        if not entry.is_dir():
+            non_directories += 1
+            continue
+        verdict = classify_projects_dir(entry)
+        if verdict.outcome == PROJECTS_DIR_PROJECT:
+            sources, _ = project_sources(
+                entry, tasks_dir_for(entry) if tasks_dir_for else None
+            )
+            projects.append(_size_project(entry, sources, state))
+        elif verdict.outcome == PROJECTS_DIR_EMPTY:
+            empty.append(entry)
+        elif verdict.outcome == PROJECTS_DIR_UNREADABLE:
+            unreadable.append(entry)
+        else:
+            unexpected.append((entry, verdict.outcome))
+    return BackfillPlan(
+        root=root,
+        projects=tuple(projects),
+        empty=tuple(empty),
+        unreadable=tuple(unreadable),
+        unexpected=tuple(unexpected),
+        non_directories=non_directories,
+    )
+
+
+def _size_project(
+    path: Path,
+    sources: Sequence[Source],
+    state: Optional[dict[str, tuple[int, float]]],
+) -> ProjectPlan:
+    """Count and measure one project's sources, splitting off what is pending."""
+    files = 0
+    total = 0
+    pending_files = 0
+    pending_bytes = 0
+    for source in sources:
+        try:
+            stat = source.path.stat()
+        except OSError:
+            # Counted as a file with no size rather than dropped: it is still a
+            # source the walk will try, and dropping it would make the file
+            # count disagree with the list being walked.
+            files += 1
+            pending_files += 1
+            continue
+        files += 1
+        total += stat.st_size
+        tracked = None if state is None else state.get(str(source.path))
+        if not is_unchanged(tracked, stat):
+            pending_files += 1
+            pending_bytes += stat.st_size
+    return ProjectPlan(
+        path=path,
+        files=files,
+        bytes=total,
+        pending_files=pending_files,
+        pending_bytes=pending_bytes,
+        pending_known=state is not None,
+    )
+
+
+# How each `ingest()` summary field combines across the projects of one
+# backfill. Every key of a summary belongs to EXACTLY ONE of these four sets,
+# and `BackfillTotalsPartitionTest` asserts that -- a field added to `ingest()`
+# and forgotten here would otherwise be dropped from the total in silence, or
+# worse, summed when it should not be.
+#
+# SUMMED: events of one run. Add them up; that is the walk's own total.
+BACKFILL_SUMMED_FIELDS = (
+    "files_scanned",
+    "files_ingested",
+    "files_skipped",
+    "files_pruned",
+    "files_archived",
+    "subagent_files_scanned",
+    "subagent_files_ingested",
+    "subagent_transcripts_unavailable",
+    "candidates_scan_truncated",
+    "candidates_unreadable",
+    "records_parsed",
+    "unparsed_records",
+    "calls_without_message_id",
+    "divergent_message_ids",
+    "calls_without_diagnostics",
+    "calls_with_unreadable_diagnostics",
+    "calls_without_cache_write_split",
+    "calls_with_unreadable_cache_write_split",
+    "calls_with_unreconciled_cache_write",
+    "duplicate_dispatches_resolved",
+    "divergent_dispatch_task_ids",
+    "unparsed_details",
+)
+# CORPUS: read off the WHOLE database at the end of each run, so each one
+# already covers every project ingested so far. Summing them would multiply the
+# corpus by the number of projects; the LAST run's value is the complete one.
+BACKFILL_CORPUS_FIELDS = (
+    "sessions_with_subagent_transcripts",
+    "claude_code_versions",
+    "unknown_record_types",
+    "unknown_usage_keys",
+    "missing_usage_keys",
+    "sources_censused",
+    "sources_tracked",
+)
+# RECOMPUTED: true of one run and meaningless added up. While the walk is at
+# project 3 of 19, the other 18 projects' sources are "tracked but unscanned" --
+# a fact about that moment, not about the walk. The walk's own answer is
+# computed once, at the end, against every directory it visited.
+BACKFILL_RECOMPUTED_FIELDS = (
+    "sources_present_unscanned",
+    "sources_unknown_unscanned",
+)
+# PER-PROJECT: answers about ONE directory. Kept beside the project they
+# describe and never folded into a total that would have to invent what the
+# fold means.
+BACKFILL_PER_PROJECT_FIELDS = (
+    "task_index_available",
+    "schema_rebuilt",
+    "prune_plan",
+    "prune_approved",
+    "projects_dir_verdict",
+    "projects_dir_refusal",
+)
+
+
+def backfill(
+    plan: BackfillPlan,
+    db_path: Path,
+    progress: Optional[Callable[[int, ProjectPlan, ScanProgress], None]] = None,
+    tasks_dir_for: Optional[Callable[[Path], Path]] = None,
+) -> dict[str, Any]:
+    """Run `ingest()` over every project in `plan`, into ONE database.
+
+    Returns a report: the per-project summaries, the walk's totals, the
+    directories that held nothing, and whether it was interrupted.
+
+    **Interrupting is safe by construction, not by promise.** Each source is
+    committed in its own transaction inside `ingest()`, and the incremental key
+    is size+mtime, so a `KeyboardInterrupt` leaves every file that landed
+    recorded and a re-run skips exactly those. This function catches the
+    interrupt only to report where it stopped -- it changes nothing about what
+    was already written -- and the caller exits non-zero over it, because a
+    partial walk that returned 0 would claim a corpus it did not read.
+
+    **It never prunes.** `--prune-missing` is refused in combination with
+    `--all-projects` by `main()`, and this function passes neither the request
+    nor an approver, so the destructive path is unreachable from here. A
+    minutes-long walk that deleted rows in nineteen places, each with its own
+    confirmation, is not an operation anyone can supervise.
+    """
+    report: dict[str, Any] = {
+        "root": plan.root,
+        "plan": plan,
+        "projects": [],
+        "empty_directories": list(plan.empty),
+        "unreadable_directories": list(plan.unreadable),
+        "unexpected_directories": list(plan.unexpected),
+        "projects_planned": len(plan.projects),
+        "projects_completed": 0,
+        "interrupted": False,
+        "totals": {},
+    }
+    completed: list[dict[str, Any]] = []
+    try:
+        for position, project in enumerate(plan.projects, 1):
+            summary = ingest(
+                project.path,
+                db_path,
+                tasks_dir=tasks_dir_for(project.path) if tasks_dir_for else None,
+                progress=(
+                    (lambda event, _p=project, _i=position: progress(_i, _p, event))
+                    if progress is not None
+                    else None
+                ),
+            )
+            completed.append(summary)
+            report["projects"].append({"path": project.path, "summary": summary})
+            report["projects_completed"] = position
+    except KeyboardInterrupt:
+        report["interrupted"] = True
+    report["totals"] = backfill_totals(completed)
+    report["totals"].update(_unscanned_outside(db_path, plan, tasks_dir_for))
+    return report
+
+
+def backfill_totals(summaries: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Fold per-project `ingest()` summaries into the walk's own figures.
+
+    Empty input yields zeros for the summed fields and the CORPUS fields left
+    at their empty shape -- a walk that completed no project has measured
+    nothing, and there is no last run to read the corpus off.
+    """
+    totals: dict[str, Any] = {}
+    for name in BACKFILL_SUMMED_FIELDS:
+        if name == "unparsed_details":
+            details: list[str] = []
+            for summary in summaries:
+                details.extend(summary[name])
+            totals[name] = details
+        else:
+            totals[name] = sum(summary[name] for summary in summaries)
+    last = summaries[-1] if summaries else None
+    for name in BACKFILL_CORPUS_FIELDS:
+        # `None`, not 0 and not `{}`, when no project completed: these are
+        # reads of the whole database and nobody performed one. A walk that was
+        # interrupted before its first project finished has not censused a
+        # corpus, and reporting an empty census would say it found nothing
+        # surprising in a corpus it never opened.
+        totals[name] = last[name] if last is not None else None
+    for name in BACKFILL_RECOMPUTED_FIELDS:
+        totals[name] = 0
+    # Named, not summed: `any()` over "did a schema rebuild happen" is the true
+    # statement about the walk, and the count of projects that had a task index
+    # is a count, never a boolean pretending to describe nineteen directories.
+    totals["schema_rebuilt"] = any(s["schema_rebuilt"] for s in summaries)
+    totals["projects_with_task_index"] = sum(
+        1 for s in summaries if s["task_index_available"]
+    )
+    return totals
+
+
+def _unscanned_outside(
+    db_path: Path,
+    plan: BackfillPlan,
+    tasks_dir_for: Optional[Callable[[Path], Path]] = None,
+) -> dict[str, Optional[int]]:
+    """Tracked sources under NO directory this walk visited, and what disk said.
+
+    The walk's own version of the per-run figure, computed once at the end
+    against every project in the plan. On a database that only ever held these
+    projects it is zero on both counts; on one that also holds a project since
+    renamed or a directory outside `root`, it is the honest count of what this
+    walk made no claim about.
+    """
+    state = tracked_state(db_path)
+    if state is None:
+        # The count cannot be computed, so it is not reported as 0. The keys
+        # carry `None` -- unknown -- because a zero here would state that this
+        # walk covered every source in the database, which is exactly the claim
+        # that could not be checked.
+        return dict.fromkeys(BACKFILL_RECOMPUTED_FIELDS, None)
+    roots: list[PurePath] = []
+    for project in plan.projects:
+        roots.append(PurePath(project.path))
+        roots.append(
+            PurePath(
+                tasks_dir_for(project.path)
+                if tasks_dir_for
+                else default_tasks_dir(project.path)
+            )
+        )
+    present = 0
+    unknown = 0
+    for path_str in state:
+        if any(PurePath(path_str).is_relative_to(root) for root in roots):
+            continue
+        gone = source_gone(path_str)
+        if gone is False:
+            present += 1
+        elif gone is None:
+            unknown += 1
+    return {
+        "sources_present_unscanned": present,
+        "sources_unknown_unscanned": unknown,
+    }
 
 
 def transcript_slug(absolute: str) -> str:
@@ -4133,6 +5138,211 @@ def print_inconclusive_note(summary: dict[str, Any]) -> None:
         )
 
 
+def human_bytes(count: int) -> str:
+    """Bytes as the reader's own unit. Decimal, matching `df` and disk labels."""
+    if count < 1_000:
+        return f"{count} B"
+    for unit, scale in (("GB", 1_000_000_000), ("MB", 1_000_000), ("kB", 1_000)):
+        if count >= scale:
+            return f"{count / scale:.2f} {unit}"
+    return f"{count} B"
+
+
+def human_seconds(seconds: float) -> str:
+    """A duration a person can hold in their head: `4m41s`, `12s`, `1h02m`."""
+    total = int(round(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m{total % 60:02d}s"
+    return f"{total // 3600}h{(total % 3600) // 60:02d}m"
+
+
+def format_backfill_plan(plan: BackfillPlan) -> str:
+    """What the walk is about to do, stated BEFORE it starts (#97).
+
+    Four things, in this order, because each answers a question the next one
+    assumes: what was found, how much of it is new, how long that is expected
+    to take and on what authority, and what happens if you stop it.
+    """
+    directories = (
+        len(plan.projects)
+        + len(plan.empty)
+        + len(plan.unreadable)
+        + len(plan.unexpected)
+    )
+    lines = [
+        f"scanning {plan.root}",
+        f"  {directories} project director"
+        f"{'y' if directories == 1 else 'ies'}:"
+        f" {len(plan.projects)} hold transcripts,"
+        f" {len(plan.empty)} hold{'s' if len(plan.empty) == 1 else ''} none,"
+        f" {len(plan.unreadable)} could not be read",
+        f"  {plan.files} transcript file(s), {human_bytes(plan.bytes)} on disk",
+    ]
+    if plan.unexpected:
+        lines.append(
+            f"  {len(plan.unexpected)} director(y/ies) of an unexpected shape,"
+            " left alone rather than guessed at:"
+        )
+        lines.extend(f"    {path}  ({outcome})" for path, outcome in plan.unexpected)
+    if not plan.pending_known:
+        lines.append(
+            "  the database could not be read, so NOTHING is known to be"
+            " skippable -- the estimate below covers the whole corpus"
+        )
+    elif plan.pending_files != plan.files:
+        lines.append(
+            f"  {plan.pending_files} file(s) new or changed"
+            f" ({human_bytes(plan.pending_bytes)});"
+            f" {plan.files - plan.pending_files} already ingested and will be"
+            " skipped"
+        )
+    lines += [
+        f"  estimate ~{human_seconds(plan.estimated_seconds)}"
+        f" ({INGEST_BYTES_PER_SECOND / 1_000_000:.2f} MB/s,"
+        f" {INGEST_RATE_PROVENANCE})",
+        "  interrupting is safe: every file that lands is committed, and a"
+        " re-run skips it",
+    ]
+    return "\n".join(lines)
+
+
+# How often the progress line is redrawn, in seconds. The throttle lives in the
+# PRINTER and not in `ingest()`: the library reports every file, and what a
+# terminal should see is a presentation decision. 2,988 unthrottled lines over
+# a 281-second walk would be a scroll, not progress.
+PROGRESS_INTERVAL_SECONDS = 2.0
+# Fraction of the pending bytes that must have landed before the printer quotes
+# a remaining time. Below it, the observed rate is dominated by whichever file
+# happened to come first, and a confidently wrong "8h left" on a five-minute
+# walk is a worse answer than none.
+PROGRESS_RATE_FLOOR = 0.05
+
+
+class BackfillReporter:
+    """Prints a throttled progress line per project. Callable as the callback.
+
+    The remaining time it quotes is arithmetic over THIS run's own measured
+    bytes and elapsed seconds -- not `INGEST_BYTES_PER_SECOND`, which sized the
+    plan and describes a different machine. Two numbers with two provenances,
+    and the one on screen while the disk is working is the one the disk
+    produced.
+    """
+
+    def __init__(
+        self,
+        plan: BackfillPlan,
+        clock: Callable[[], float] = time.monotonic,
+        interval: float = PROGRESS_INTERVAL_SECONDS,
+    ) -> None:
+        self.plan = plan
+        self.clock = clock
+        self.interval = interval
+        self.started = clock()
+        self.last_drawn = 0.0
+        self.bytes_done = 0
+        self.files_done = 0
+
+    def __call__(
+        self, position: int, project: ProjectPlan, event: ScanProgress
+    ) -> None:
+        self.bytes_done += event.size
+        self.files_done += 1
+        now = self.clock()
+        last_of_project = event.files_done == event.files_total
+        if now - self.last_drawn < self.interval and not last_of_project:
+            return
+        self.last_drawn = now
+        elapsed = now - self.started
+        share = (
+            self.bytes_done / self.plan.bytes if self.plan.bytes else 1.0
+        )
+        line = (
+            f"  [{position}/{len(self.plan.projects)}] {project.path.name}:"
+            f" {event.files_done}/{event.files_total} files,"
+            f" {human_bytes(self.bytes_done)} of"
+            f" {human_bytes(self.plan.bytes)} ({share * 100:.0f}%),"
+            f" {human_seconds(elapsed)} elapsed"
+        )
+        if share >= PROGRESS_RATE_FLOOR and elapsed > 0 and self.bytes_done:
+            remaining = self.plan.bytes - self.bytes_done
+            observed = self.bytes_done / elapsed
+            line += f", ~{human_seconds(remaining / observed)} left at this run's rate"
+        print(line)
+
+
+def format_backfill_report(report: dict[str, Any]) -> str:
+    """What the walk found, per project and in total (#97).
+
+    It NAMES the directories that held nothing. 12 of 19 on the machine
+    measured for #97 held no transcript, and a walk that silently did nothing
+    twelve times would leave the reader unable to tell "there is nothing there"
+    from "it did not look".
+    """
+    totals = report["totals"]
+    lines = [
+        ("backfill INTERRUPTED" if report["interrupted"] else "backfill complete")
+        + f": {report['projects_completed']} of {report['projects_planned']}"
+        f" project(s), {totals['files_scanned']} file(s) scanned,"
+        f" {totals['files_ingested']} ingested,"
+        f" {totals['files_skipped']} skipped (unchanged)"
+    ]
+    for entry in report["projects"]:
+        summary = entry["summary"]
+        lines.append(
+            f"  {entry['path'].name}:"
+            f" {summary['files_scanned']} scanned"
+            f" ({summary['subagent_files_scanned']} subagent),"
+            f" {summary['files_ingested']} ingested,"
+            f" {summary['records_parsed']} records"
+        )
+    empty = report["empty_directories"]
+    if empty:
+        lines.append(
+            f"  {len(empty)} director{'y' if len(empty) == 1 else 'ies'} held no"
+            " transcripts (a real answer, not an error):"
+        )
+        lines.extend(_listing(empty, indent="    "))
+    unreadable = report["unreadable_directories"]
+    if unreadable:
+        lines.append(
+            f"  {len(unreadable)} director"
+            f"{'y' if len(unreadable) == 1 else 'ies'} could NOT be read, so"
+            " whether they hold transcripts is unknown rather than no:"
+        )
+        lines.extend(_listing(unreadable, indent="    "))
+    return "\n".join(lines)
+
+
+def print_unscanned_note(summary: dict[str, Any]) -> None:
+    """Tracked sources this run did not look at, and what the disk said (#97).
+
+    Only printed when there are any, and it is the visible half of the
+    archiving fix: once one database can hold several projects, a run over one
+    of them leaves the others' sources tracked-but-unscanned, and this run has
+    made no claim about them. Saying so is what keeps "not examined" from
+    reading like "still fine" AND from reading like "gone".
+    """
+    present = summary["sources_present_unscanned"]
+    unknown = summary["sources_unknown_unscanned"]
+    if present is None or unknown is None:
+        print(
+            "NOTE: whether any tracked source lies outside this run's scan"
+            " could not be determined -- the file ledger was unreadable. That"
+            " is unknown, not none."
+        )
+        return
+    if not present and not unknown:
+        return
+    print(
+        f"NOTE: {present + unknown} tracked source(s) outside this run's scan --"
+        f" still on disk: {present}, could not be determined: {unknown}."
+        " Neither is archived and neither is pruned: this run has no evidence"
+        " that either has gone."
+    )
+
+
 def run_transcript_mode(transcript: Path, db_path: Path) -> None:
     """Single-file mode: one file in, one line out."""
     summary = ingest_transcript(transcript, db_path)
@@ -4166,6 +5376,82 @@ def run_transcript_mode(transcript: Path, db_path: Path) -> None:
     print_cache_write_split_note(summary)
     print_shape_note(summary)
     print_inconclusive_note(summary)
+
+
+# `--all-projects` with no ROOT means `default_projects_root()`, resolved in
+# `main()` rather than here so `Path.home()` is read at run time. argparse
+# stores this OBJECT as the value, so identity distinguishes it from a user who
+# literally typed this string as a path -- which would be a different object and
+# a real (if absurd) relative path.
+ALL_PROJECTS_DEFAULT_ROOT = Path("<default: ~/.claude/projects>")
+
+# The exit status of an interrupted backfill. 130 is the shell convention for
+# SIGINT (128 + 2), and it is non-zero deliberately: what landed is committed
+# and safe, but the walk did not cover the corpus it set out to, and reporting
+# 0 would say it had.
+BACKFILL_INTERRUPTED_STATUS = 130
+
+
+def run_backfill_mode(root: Path, db_path: Path) -> None:
+    """Every project under `root`, in one run: plan, walk, report (#97).
+
+    The order is the contract. The plan is printed BEFORE a single transcript
+    is opened, because the measured cost of one real project's cold ingest was
+    281 seconds and five silent minutes is indistinguishable from a hang.
+    """
+    plan = plan_backfill(root, db_path)
+    print(format_backfill_plan(plan))
+    if not plan.projects:
+        # Nothing to walk. This is #96's refusal one level up: a root whose
+        # every child held nothing is a real answer about the machine, and it
+        # is still not a run that measured zero.
+        raise SystemExit(
+            f"no project under {root} holds a transcript, so there is nothing"
+            " to ingest.\n\n"
+            f"{len(plan.empty)} director(y/ies) held none and"
+            f" {len(plan.unreadable)} could not be read -- the second group is"
+            " unknown, not empty.\n"
+            "If your transcripts are somewhere else, name it:"
+            " python3 ingest.py --all-projects <root>"
+        )
+    report = backfill(plan, db_path, progress=BackfillReporter(plan))
+    totals = report["totals"]
+    print(format_backfill_report(report))
+    for detail in totals["unparsed_details"]:
+        print(f"  unparsed: {detail}")
+    if totals["schema_rebuilt"]:
+        print(
+            "schema version changed: existing DB discarded and rebuilt from the"
+            " transcripts (the DB is derived data; nothing original was lost)."
+        )
+    if report["projects_completed"]:
+        # Guarded, because the corpus-wide fields are `None` when no project
+        # completed -- nobody read the database, so there is no census to print
+        # and an empty one would claim a clean corpus nobody opened.
+        print(
+            f"files scanned: {totals['files_scanned']}"
+            f" (subagent: {totals['subagent_files_scanned']})"
+            f" | ingested: {totals['files_ingested']}"
+            f" (subagent: {totals['subagent_files_ingested']})"
+            f" | skipped (unchanged): {totals['files_skipped']}"
+            f" | archived (source gone, rows KEPT): {totals['files_archived']}"
+            f" | records parsed: {totals['records_parsed']}"
+            f" | unparsed_records: {totals['unparsed_records']}"
+        )
+        print_dedupe_note(totals)
+        print_cache_diagnostics_note(totals)
+        print_cache_write_split_note(totals)
+        print_shape_note(totals)
+        print_inconclusive_note(totals)
+        print_unscanned_note(totals)
+    if report["interrupted"]:
+        print(
+            f"INTERRUPTED after {report['projects_completed']} of"
+            f" {report['projects_planned']} project(s). Every file that landed"
+            " is committed; re-run the same command and it will skip them and"
+            " carry on."
+        )
+        raise SystemExit(BACKFILL_INTERRUPTED_STATUS)
 
 
 # --- #92: the destructive command shows its work and asks ------------------
@@ -4389,6 +5675,22 @@ def main() -> None:
             "source: it neither archives nor prunes."
         ),
     )
+    mode.add_argument(
+        "--all-projects",
+        nargs="?",
+        type=Path,
+        default=None,
+        const=ALL_PROJECTS_DEFAULT_ROOT,
+        metavar="ROOT",
+        help=(
+            "Ingest EVERY project under ROOT into one database -- the backfill "
+            "(#97). ROOT defaults to ~/.claude/projects, whose CHILDREN are "
+            "the project directories. Prints a size and a time estimate before "
+            "it starts, reports progress in bytes, and names the directories "
+            "that held nothing. Interrupting is safe: what landed stays, and "
+            "re-running skips it. Cannot be combined with --prune-missing."
+        ),
+    )
     parser.add_argument(
         "--db",
         type=Path,
@@ -4450,6 +5752,23 @@ def main() -> None:
         run_transcript_mode(args.transcript.expanduser(), db_path)
         return
 
+    if args.all_projects is not None:
+        if args.prune_missing:
+            parser.error(
+                "--prune-missing cannot be combined with --all-projects: the "
+                "backfill runs for minutes across every project on the "
+                "machine, and a destructive step nobody can supervise is not a "
+                "step this tool takes. Prune one project at a time, with its "
+                "own --projects-dir and its own confirmation."
+            )
+        root = (
+            default_projects_root()
+            if args.all_projects is ALL_PROJECTS_DEFAULT_ROOT
+            else args.all_projects.expanduser()
+        )
+        run_backfill_mode(root, db_path)
+        return
+
     # Built whenever a prune was ASKED for -- including for --dry-run, which is
     # the same census down the same code path with the answer fixed at no.
     # `db_path` here is whatever `--db` or CPB_DB resolved to, so the guard
@@ -4474,6 +5793,14 @@ def main() -> None:
             "schema version changed: existing DB discarded and rebuilt from the"
             " transcripts (the DB is derived data; nothing original was lost)."
         )
+    if summary["projects_dir_refusal"] is not None:
+        # #96, and it comes BEFORE the counts rather than after them. `ingest()`
+        # completed and told the truth about what it saw, but every figure it
+        # has to report is a zero over an empty scan -- printing
+        # "files scanned: 0 ... records parsed: 0" and only then refusing puts
+        # the exact sentence this issue exists to delete on screen first. The
+        # refusal is the whole output, and the status is non-zero.
+        raise SystemExit(summary["projects_dir_refusal"])
     print(
         f"files scanned: {summary['files_scanned']}"
         f" (subagent: {summary['subagent_files_scanned']})"
@@ -4513,6 +5840,7 @@ def main() -> None:
     print_cache_write_split_note(summary)
     print_shape_note(summary)
     print_inconclusive_note(summary)
+    print_unscanned_note(summary)
     # LAST, after every count is on screen, and a refusal is a non-zero status
     # (#92). The ingest itself succeeded and its figures are worth printing;
     # what failed is the deletion the user asked for, and reporting that as 0
