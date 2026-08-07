@@ -270,6 +270,23 @@
   /* An unmeasured knob's tag: neither an urgency nor a clean bill of health. */
   .tag-none { background:#eef2ff; color:var(--neutral); }
   .kw { font-size:12px; color:var(--muted); margin-top:3px; }
+  /* #93: THE COMPACT ROWS. A knob with no basis costs one line rather than a
+     61px row carrying a dial with nothing to point at. It is still on screen,
+     still named, and now also states its own shortfall -- "dimmed, not hidden"
+     was never a claim about the height of the row.
+     `.tag-thin` is a THIRD tag beside `.tag-none`, because "measured over too
+     little" and "not measured" are two states and two states may not share a
+     look. Neither is an urgency colour and neither is the healthy green. */
+  .thin { border-top:1px solid var(--line); padding:9px 0 2px; }
+  .thin-h { font-size:12px; color:var(--muted); margin-bottom:5px; }
+  .thin-row { display:grid; grid-template-columns:86px 1fr 92px; gap:10px;
+              align-items:baseline; padding:3px 0; font-size:12px; }
+  .thin-m { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .thin-w { color:var(--muted); margin-left:8px; }
+  .thin-n { text-align:right; color:var(--muted); white-space:nowrap; }
+  .tag-thin { background:#f1f5f9; color:#475569; }
+  .thin-note { font-size:11.5px; color:var(--muted); margin-top:7px;
+               padding-top:6px; border-top:1px dotted var(--line); }
   /* Every cut point of one dial, one click down. The metric key heads the
      group because it is what ties a gauge to its whole reading at the details
      level; on the row itself it was a debugging aid. */
@@ -737,7 +754,7 @@
       <div class="body">Worst first, in the dated table's own order. A row with
         nothing to turn is dimmed, not hidden.</div>
 
-      <template x-for="k in (summary ? summary.recommendations.knobs : [])" :key="k.metric">
+      <template x-for="k in bandedKnobs" :key="k.metric">
         <div class="knob" :class="{ off: !k.directive }">
           <!-- THE DIAL. Every `d` here is composed by `arcPathsFor`,
                `tickPathsFor` and `needlePath` from POSITIONS the API sent; the
@@ -832,10 +849,83 @@
                 <span x-text="aimWord(k.gauge.worse_when)"></span>
                 <strong x-text="fmtUnit(b.value, k.unit)"></strong></div>
             </template>
-            <template x-if="k.value === null">
-              <div class="none" x-text="summary.recommendations.unmeasured_note"></div>
-            </template>
+            <!-- WHAT THE READING RESTS ON (#93). Every row here is banded, so
+                 this always reads "n of m" with n >= m -- which is the point:
+                 the count is the evidence a green row EARNED its green, and a
+                 page that showed the number only where it fell short would
+                 make the floor look like an error message rather than the
+                 standing condition it is.
+
+                 The `k.value === null` branch that used to sit here is gone
+                 rather than merely unused: a knob with no reading no longer
+                 reaches this template at all, and a branch that cannot fire is
+                 a claim about the payload that has stopped being true. Its
+                 `unmeasured_note` is rendered where those rows now live. -->
+            <div class="none" :title="k.sample.counts">
+              over <span x-text="k.sample.size"></span> of
+              <strong x-text="k.sample.minimum"></strong> needed</div>
           </div>
+        </div>
+      </template>
+
+      <!-- THE KNOBS WITH NO BASIS, ONE LINE EACH (#93).
+           =================================================================
+           A row whose sample cannot carry a verdict has no needle, no
+           severity, no target and no directive -- four of the five things the
+           full row above exists to show. It was nonetheless given a full row
+           with an instrument drawn on it, and on a fresh install ALL FIVE were
+           such rows: five dials with no needles, five repetitions of "Nothing
+           to turn here", and a summary page taller than the same page over
+           four thousand calls. Height bought with nothing.
+
+           DIMMED, NOT HIDDEN -- STILL, AND MORE SO. Every knob is here, named,
+           and each now states how much of its own sample the period holds
+           against how much its bands require. That is strictly more than the
+           dimmed full row said; what it stops spending is the 60px of dial
+           that had nothing to point at.
+
+           THE TWO ABSENCES ARE TOLD APART, which is the whole of this change:
+           a knob with a reading too thin to band sends the reader to "come
+           back after a few more sessions", and one with no reading at all does
+           not. The words are the API's -- `sample.note` and `unmeasured_note`
+           -- and the tag beside each is keyed on which of the two it is. -->
+      <template x-if="unbandedKnobs.length">
+        <div class="thin">
+          <div class="thin-h">Not measurable in this period &mdash;
+            <span x-text="unbandedKnobs.length"></span> of
+            <span x-text="summary.recommendations.knobs.length"></span> knobs.</div>
+          <template x-for="k in unbandedKnobs" :key="k.metric">
+            <div class="thin-row">
+              <span class="tag" :class="k.sample.note ? 'tag-thin' : 'tag-none'"
+                    x-text="k.sample.note ? 'TOO FEW' : 'NO READING'"></span>
+              <span class="thin-m">
+                <span class="mono" x-text="k.metric"></span>
+                <span class="thin-w" x-text="k.means"></span></span>
+              <span class="thin-n" :title="k.sample.counts">
+                <span x-text="k.sample.size"></span> of
+                <strong x-text="k.sample.minimum"></strong></span>
+            </div>
+          </template>
+          <!-- THE ONE GENUINELY USEFUL THING THE PAGE CAN TELL A NEW USER, and
+               it is the table's sentence rather than this file's: a claim about
+               what a reader should do next is advice, and no advice on this
+               page is authored here. Shown only where something IS
+               under-sampled -- a project that will never dispatch a subagent
+               is not waiting for more sessions, and telling it to come back
+               later would be a false promise. -->
+          <template x-if="underSampledKnobs.length">
+            <div class="thin-note"
+                 x-text="summary.recommendations.under_sampled_note"></div>
+          </template>
+          <!-- ...and the OTHER absence, in its own sentence, shown on its own
+               condition. Two footers rather than one for the same reason there
+               are two tags: a page that said "come back later" over a metric
+               that will never apply would be making a promise out of the wrong
+               absence. -->
+          <template x-if="unmeasuredKnobs.length">
+            <div class="thin-note"
+                 x-text="summary.recommendations.unmeasured_note"></div>
+          </template>
         </div>
       </template>
 
@@ -862,6 +952,16 @@
           took. Nothing on this page decides where a line goes.</span>
         <span class="context-line context-judged">Table:
           <span x-text="summary ? summary.recommendations.provenance : ''"></span></span>
+        <!-- #93: THE SAMPLE FLOORS' OWN DATE, and it is a DIFFERENT one from
+             the boundaries' above. Where the ratios' floor sits is a judgment
+             taken on its own day; the shares' is arithmetic over boundaries
+             already dated one line up, and moves when they do. One date
+             covering both would say the two were decided together, which is
+             exactly the borrowed authority `band_provenance` exists to
+             refuse -- so there are two dates, as there are two provenances. -->
+        <span class="context-line">Sample floors, where judged, decided
+          <strong x-text="summary ? summary.recommendations.sample_floor_as_of : ''"></strong>.
+          A reading is not banded at all until its own sample can carry one.</span>
         <template x-for="k in (summary ? summary.recommendations.knobs : [])" :key="k.metric">
           <div class="kcuts">
             <div class="kcuts-h"><span class="mono" x-text="k.metric"></span></div>
@@ -878,6 +978,22 @@
                 <strong x-text="b.kind"></strong>:
                 <span x-text="b.statement"></span></span>
             </template>
+            <!-- HOW MUCH THIS ONE HAS TO BE MEASURED OVER, IN ITS FLOOR'S OWN
+                 VOICE (#93). A floor DERIVED from the bands listed above and a
+                 floor somebody DECIDED are two different kinds of claim, and
+                 they wear the same voice classes here that the cut points do,
+                 for the same reason: a judged number that reached the page
+                 looking derived would be the defect this table is arranged
+                 against, one field over. The rule's own name is printed too,
+                 so the reader can see WHICH kind before reading the sentence
+                 that argues it. -->
+            <span class="advice-line"
+                  :class="provenanceVoice({ kind: k.sample.provenance_kind })">
+              needs <strong x-text="k.sample.minimum"></strong>
+              <span x-text="k.sample.counts"></span> &mdash;
+              <strong x-text="k.sample.rule"></strong> floor,
+              <strong x-text="k.sample.provenance_kind"></strong>:
+              <span x-text="k.sample.provenance_statement"></span></span>
           </div>
         </template>
       </details>
@@ -1607,6 +1723,33 @@
               </div>
               <div class="fig"><div class="n">&mdash;</div>
                 <div class="u">no sample</div></div>
+            </div>
+          </template>
+        </div></template>
+
+        <!-- ...AND THE THIRD STATE, WHICH IS NEITHER OF ITS NEIGHBOURS (#93).
+             These metrics HAVE a reading. What they do not have is a sample
+             their bands can be read against, so they carry no severity and no
+             directive, and the sentence beside each is the API's -- how many
+             members the period holds against how many the floor asks for.
+
+             Rendered here rather than folded into "not measured" above,
+             because the two send a reader to different places: one is "this
+             does not apply to you", the other is "come back after a few more
+             sessions". A page that printed one sentence for both would be the
+             composition defect this change is about, moved one level down. -->
+        <template x-if="Object.keys(summary.recommendations.under_sampled).length"><div>
+          <div class="body"><strong>Not enough data yet.</strong>
+            <span x-text="summary.recommendations.under_sampled_note"></span></div>
+          <template x-for="e in Object.entries(summary.recommendations.under_sampled)" :key="e[0]">
+            <div class="opp">
+              <div class="rank">&mdash;</div>
+              <div class="txt">
+                <div class="h"><span class="mono" x-text="e[0]"></span></div>
+                <div class="d" x-text="e[1]"></div>
+              </div>
+              <div class="fig"><div class="n">&mdash;</div>
+                <div class="u">too few</div></div>
             </div>
           </template>
         </div></template>
@@ -2362,6 +2505,22 @@ const STRIP_DOT_TONE = {
   unknown: "dot-unknown",
 };
 const STRIP_DOT_TONE_UNRECOGNISED = "dot-bad";
+
+// #93: the one sample state this page names, and it names ONE on purpose.
+//
+// The split it drives is binary -- a row whose bands can be read, and a row
+// whose cannot -- so the page needs the name of the state that CAN be read and
+// nothing else. Enumerating all three here would be a second copy of
+// `recommendations.SAMPLE_STATES` in the one file no import guard reaches, and
+// the third state's own words come from the API anyway (`sample.note`,
+// `under_sampled_note`), never from a table here.
+//
+// The comparison is deliberately `=== SAMPLE_MEASURED` rather than
+// `!== 'unmeasured'`: a fourth state added upstream would then render in the
+// COMPACT form, which withholds a verdict, instead of falling through to the
+// full row and being drawn as one. Same direction as every other fallback
+// here -- an unrecognised state may weaken a claim and never make one.
+const SAMPLE_MEASURED = "measured";
 function dotTone(state) {
   return STRIP_DOT_TONE[state] ?? STRIP_DOT_TONE_UNRECOGNISED;
 }
@@ -3119,6 +3278,58 @@ function report() {
     // the disclosure holds.
     get opportunitiesOpen() {
       return this.topOpportunity !== null;
+    },
+
+    // THE KNOB ROWS, SPLIT BY THE API'S OWN SAMPLE STATE (#93).
+    //
+    // THIS IS NOT A FILTER AND NOT A THRESHOLD. `k.sample.state` is decided in
+    // `recommendations.py` against a floor that module derives or dates; the
+    // page compares it to a constant that names a state, never to a number.
+    // The one thing decided here is LAYOUT -- which of two renderings a row
+    // gets -- which is what a page is for.
+    //
+    // WHY TWO RENDERINGS AT ALL. A row with no basis has no needle, no
+    // severity, no target and no directive: four of the five things a full row
+    // exists to show. It was still given a full row with a dial drawn on it,
+    // so a fresh install rendered five 61px rows of instrument and no reading
+    // -- taller than the same page over four thousand calls, and every pixel
+    // of it bought with nothing. Split, the rows with something to say get the
+    // space and the rest get a line each.
+    //
+    // NOTHING IS HIDDEN. Every knob still reaches the screen, still names
+    // itself, and now also says how short its sample is -- which is strictly
+    // more than the dimmed full row said. "Dimmed, not hidden" was never about
+    // the height of the row.
+    get bandedKnobs() {
+      if (!this.summary) return [];
+      return this.summary.recommendations.knobs
+        .filter(k => k.sample.state === SAMPLE_MEASURED);
+    },
+
+    get unbandedKnobs() {
+      if (!this.summary) return [];
+      return this.summary.recommendations.knobs
+        .filter(k => k.sample.state !== SAMPLE_MEASURED);
+    },
+
+    // WHICH OF THE TWO ABSENCES each compact row is, split off the SAME rows
+    // -- so the footer sentences cannot appear over a set that has none of
+    // their kind in it.
+    //
+    // ON `sample.note`, WHICH IS NON-NULL EXACTLY WHEN THE ROW IS
+    // UNDER-SAMPLED. That is the API's tri-state-with-a-reason shape, the same
+    // one `no_sample_reason` and `stale_unknown_reason` use, and reading the
+    // reason's presence is how this page has always told those apart. The
+    // alternative -- reading `recommendations.under_sampled` and
+    // `recommendations.unmeasured` -- would put a second payload path into the
+    // summary level, and the summary reaches every reading through `knobs`
+    // precisely so the two levels cannot drift (#70, #89).
+    get underSampledKnobs() {
+      return this.unbandedKnobs.filter(k => k.sample.note);
+    },
+
+    get unmeasuredKnobs() {
+      return this.unbandedKnobs.filter(k => !k.sample.note);
     },
 
     // --- summary ---------------------------------------------------------

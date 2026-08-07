@@ -105,7 +105,14 @@ from typing import NamedTuple, Optional, Sequence
 # project's still-present sources, and `docs/versioning.md`'s "correction is not
 # redefinition" covers exactly that. It is recorded here because a user whose
 # database was pruned by it is owed the note, not because it moves the number.
-VERSION = "3.0.0"
+#
+# 3.0.0 -> 3.1.0 (#93). A metric now carries a sample floor: below it a
+# reading keeps its value and loses its verdict, so a fresh install stops
+# certifying a corpus it cannot yet judge. New payload fields, nothing
+# removed, renamed or redefined -- minor. The floors themselves are read
+# from the table's own boundaries for shares and judged for ratios, which
+# is argued in recommendations.py rather than here.
+VERSION = "3.1.0"
 
 PROG = "cpb"
 

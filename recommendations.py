@@ -121,6 +121,53 @@ citation names cannot drift away from the boundary it justifies.
     `means` is held to the same prose guard the advice is: it too cannot say
     "reduce your cache reads".
 
+**A READING IS NOT A VERDICT UNTIL THE SAMPLE CAN CARRY ONE (#93).** Every
+guarantee above is about a value that was measured. None of them said how MUCH
+had to be measured, and the omission had a visible cost: a fresh install with
+one session and three replies got five green rows, four green dots and
+`cache_reads_per_write` reading "Do not change this." -- an instruction, in the
+product owner's voice, from three calls. Every figure was individually correct.
+The COMPOSITION asserted a clean bill of health on evidence that could not
+support one.
+
+The defect was not that small samples were overlooked. It was that UNMEASURED
+was wired to the sample being EMPTY rather than to its being SUFFICIENT, so one
+call flipped every dot from unknown to good. The empty corpus was handled
+impeccably; the cliff sat between 0 and 1.
+
+So every metric now carries a `Sample`: what its denominator COUNTS, and how
+many of those the period must hold before a reading may be banded at all. Below
+it the reading is `under-sampled` -- a THIRD state, neither `ok` nor
+unmeasured, because a real 0, a metric nobody measured and one measured over
+too little are three different things and must not render alike.
+
+**The floor is derived where deriving it is honest, and judged where it is
+not.** The two rules are not interchangeable and `Sample.__post_init__` will
+not let them blur:
+
+  * `FLOOR_RULE_BAND_GRANULARITY`, for the SHARES. A share over `n` members
+    moves in steps of `1/n`, so it can express a value strictly inside a band
+    only when `1/n` is finer than that band. The floor is therefore whatever
+    makes `1/n` finer than the metric's own NARROWEST BOUNDED BAND -- 11 for
+    `main_thread_share_over_half_window` (narrowest band `ok` [0, 0.1)) and 51
+    for `cache_write_only_share` (`ok` [0, 0.02)). Nothing is judged: the
+    numbers fall out of boundaries the table already carries and move the
+    moment one is redlined, which is what keeps them from rotting. Over three
+    calls `cache_write_only_share` can only be 0, 1/3, 2/3 or 1, so its `ok`
+    band was reachable ONLY at exactly zero -- the green verdict was the
+    observation that something did not happen three times, reported in the
+    voice of a rate.
+  * `FLOOR_RULE_JUDGED`, for the RATIOS OF AGGREGATES. They have no `1/n`
+    granularity, so the argument above does not apply and is REFUSED rather
+    than stretched: the rule cannot be given to a metric whose unit is not
+    `METRIC_UNIT_SHARE`. `RATIO_SAMPLE_FLOOR_PROVENANCE` carries the whole
+    argument, including what a derivation would have needed and what the share
+    rule returns if applied anyway.
+
+A judged floor SAYS it is judged, through the same `Provenance` the boundaries
+use -- so it structurally cannot carry a source, and a reader can tell the
+derived floor from the decided one without leaving the page.
+
 **What it does not do.** It describes the present only. A recommendation that
 stops firing is indistinguishable from a detector that broke unless the report
 compares two periods, which is #77 and is deliberately not here.
@@ -656,6 +703,196 @@ def depth_in_band(
     return 1.0 - ratio if worse_when == WORSE_WHEN_HIGHER else ratio
 
 
+# --------------------------------------------------------------------------
+# #93: how big a sample a reading needs before it may be banded
+# --------------------------------------------------------------------------
+
+# When the JUDGED sample floor below was decided. A THIRD date, deliberately
+# not `RECOMMENDATIONS_AS_OF` and deliberately not a citation's check date:
+# re-deciding where `0.25` sits does not re-decide how many calls a ratio needs,
+# and one date covering both would say that it had.
+SAMPLE_FLOOR_AS_OF = "2026-08-07"
+
+# The two rules by which a floor comes to have its number. They are different
+# KINDS of claim, exactly as `Provenance`'s three kinds are, and `Sample`
+# refuses to let one wear the other's authority.
+FLOOR_RULE_BAND_GRANULARITY = "band-granularity"
+FLOOR_RULE_JUDGED = "judged"
+FLOOR_RULES = (FLOOR_RULE_BAND_GRANULARITY, FLOOR_RULE_JUDGED)
+
+# How many contributing calls a RATIO OF AGGREGATES needs. Judged, and the
+# statement below is the argument rather than a gloss on it.
+RATIO_SAMPLE_FLOOR = 10
+
+RATIO_SAMPLE_FLOOR_PROVENANCE = judged(
+    "ten contributing calls, and this is a JUDGMENT rather than a derivation. "
+    "The shares' floor falls out of counting: a call contributes exactly 1 to a "
+    "counted numerator, so the reading moves in steps of 1/n and the floor is "
+    "whatever makes 1/n finer than the narrowest band it is compared against. A "
+    "ratio of two token sums has no such step. One call contributes its own "
+    "token count, which is unbounded and, on this project's own measurements, "
+    "heavily skewed -- context per call ran 77,128 at p10 against 958,151 at "
+    "p99 (2026-08-05, `serve.PERCENTILES`), and the one-hour cache writes that "
+    "set the TTL-aware ratio's denominator occurred in 41 of 3,021 files with "
+    "one session entirely one-hour. So 'one more call can no longer swing the "
+    "reading across a boundary' needs a bound on how much of a period's tokens "
+    "one call may carry, which nothing here has established and which those two "
+    "figures contradict. DERIVING IT ANYWAY WOULD BE WORSE THAN JUDGING IT: the "
+    "share rule applied to these three metrics returns 2, 2 and 1, because "
+    "their narrowest bounded bands are a whole unit wide or more -- it would "
+    "certify a two-call sample AND wear arithmetic while doing it, which is the "
+    "borrowed authority this module is arranged against. Ten is an order of "
+    "magnitude of contributing calls, the same voice as the two judged 'the "
+    "prefix is doing its job' edges above, and nobody publishes it. What would "
+    "redline it is a measurement of how much of a period's tokens one call can "
+    "carry.",
+    decided=SAMPLE_FLOOR_AS_OF,
+)
+
+
+def smallest_sample_finer_than(width: float) -> int:
+    """The smallest `n` for which `1/n` is strictly finer than `width`.
+
+    THE LOOP CONDITION IS THE DEFINITION, which is why the number is right
+    however the starting guess lands. `floor(1/width)` is an algebraic
+    rearrangement and a float one -- at a width of exactly 0.1 it is the
+    difference between 10 and 11, i.e. between certifying a sample that cannot
+    express the band and refusing it -- so it is used only to skip iterations,
+    one below where the answer can be, and never to produce the answer.
+
+    A share over `n` members moves in steps of `1/n`. To land STRICTLY INSIDE a
+    band of `width` rather than only on its edges, it needs a step finer than
+    that width; `>=` is the right comparison because a step exactly equal to the
+    width reaches the edges and nothing between them.
+    """
+    if not math.isfinite(width) or width <= 0:
+        raise ValueError(f"a band of width {width!r} has no sample floor")
+    n = max(1, math.floor(1.0 / width) - 1)
+    while 1.0 / n >= width:
+        n += 1
+    return n
+
+
+@dataclass(frozen=True)
+class SampleFloor:
+    """A RESOLVED floor: the number, what it counts, and where it came from.
+
+    `counts` is load-bearing in the same way `Metric.measurement` is. "51" says
+    nothing on its own; "51 cache-writing calls" names the set the floor is
+    counting, which is the metric's own DENOMINATOR and not the period's call
+    count. A floor applied to the wrong denominator is a wrong number that
+    reads right -- `main_vs_subagent_tokens_per_reply` needs its floor in BOTH
+    scopes, and the pooled count would pass it on a corpus that dispatched one
+    subagent.
+    """
+
+    minimum: int
+    counts: str
+    rule: str
+    provenance: Provenance
+
+
+@dataclass(frozen=True)
+class Sample:
+    """WHAT a metric's denominator counts, and by WHICH RULE its floor is set.
+
+    The spec, not the resolved floor: a band-granularity floor has no number of
+    its own to state, because its number is arithmetic over the metric's own
+    ranges and must move when they do. `Metric.sample_floor` resolves it.
+
+    The constructor refuses every blurring of the two rules:
+
+      * a derived floor MUST NOT carry a number or a provenance -- both are
+        computed, and a typed-in number would be free to drift from the bands
+        it claims to come from;
+      * a judged floor MUST carry both, and its provenance must be `judged`,
+        which structurally cannot carry a source.
+
+    Whether the rule is ALLOWED at all is checked one level up, in
+    `Metric.__post_init__`, because it turns on the metric's unit.
+    """
+
+    counts: str
+    rule: str
+    minimum: Optional[int] = None
+    provenance: Optional[Provenance] = None
+
+    def __post_init__(self) -> None:
+        if not self.counts.strip():
+            raise ValueError(
+                "a sample floor that does not name what it counts is a number "
+                "against an unnamed denominator"
+            )
+        if self.rule not in FLOOR_RULES:
+            raise ValueError(f"unknown sample floor rule: {self.rule!r}")
+        if self.rule == FLOOR_RULE_JUDGED:
+            if not isinstance(self.minimum, int) or self.minimum < 1:
+                raise ValueError(
+                    "a judged sample floor must state its own minimum, and a "
+                    "floor below one member would admit a reading over nothing"
+                )
+            if self.provenance is None or self.provenance.kind != PROVENANCE_JUDGED:
+                raise ValueError(
+                    "a judged sample floor must carry a judged provenance: it "
+                    "is somebody's decision and has to say so"
+                )
+        if self.rule == FLOOR_RULE_BAND_GRANULARITY:
+            if self.minimum is not None or self.provenance is not None:
+                raise ValueError(
+                    "a derived sample floor states neither number nor "
+                    "provenance: both are computed from the metric's own "
+                    "bands, and a typed one could drift from them"
+                )
+
+
+def band_granularity_floor(ranges: tuple["Range", ...], counts: str) -> SampleFloor:
+    """The floor a SHARE needs to express a value strictly inside its bands.
+
+    Against the NARROWEST BOUNDED band, because a floor that satisfied only the
+    widest would leave the narrow one reachable at its edges alone -- which is
+    exactly `cache_write_only_share`'s `ok` band being reachable only at
+    literal zero over three calls.
+
+    The unbounded top range has no width to be finer than and is skipped: a
+    reading there needs no interior resolution, and inventing a ceiling to give
+    it one is the refusal `depth_in_band()` already makes.
+
+    The provenance is STRUCTURAL. There is nothing here to re-check and a date
+    would claim a currency it does not have: the number moves by itself when a
+    boundary is redlined. Its INPUT may well be a judgment -- both of these
+    narrowest bands are judged edges -- and the statement says so, so that a
+    reader is not told the floor is beyond argument when the band it came from
+    is not.
+    """
+    widths = [
+        (entry.upper.value - entry.lower.value, entry.lower.value, entry.upper.value)
+        for entry in ranges
+        if entry.upper is not None
+    ]
+    if not widths:
+        raise ValueError(
+            "every range is unbounded, so there is no band width to be finer "
+            "than and no granularity floor to derive"
+        )
+    width, lower, upper = min(widths)
+    minimum = smallest_sample_finer_than(width)
+    return SampleFloor(
+        minimum=minimum,
+        counts=counts,
+        rule=FLOOR_RULE_BAND_GRANULARITY,
+        provenance=structural(
+            f"derived, not decided: this reading is a share over {counts}, so it "
+            f"moves in steps of 1/n and can express a value strictly inside a "
+            f"band only where 1/n is finer than that band. Its narrowest bounded "
+            f"band is [{lower:g}, {upper:g}), width {width:g}, so n must exceed "
+            f"{1.0 / width:g} -- {minimum}. Arithmetic over boundaries this table "
+            "already carries, and it moves the moment one of them is redlined, "
+            "which is what keeps it from rotting. The BAND it is computed from "
+            "may itself be a judgment; this floor is not a second one."
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class Metric:
     """One measured quantity and the ranges over it.
@@ -686,10 +923,17 @@ class Metric:
     share as a percentage and a ratio as a multiple without ever learning a
     metric key. See `METRIC_UNIT_KINDS`.
 
+    `sample` says HOW MUCH has to be measured before a reading may be banded at
+    all (#93), and it is not optional: a metric with no floor is one whose first
+    call earns it a verdict, which is the defect the field exists to close.
+
     `__post_init__` refuses a metric missing any of them. A metric added later
-    cannot ship with no reader copy, with an unrecognised unit or with a
-    direction nothing can read: it would not be constructible, which is
-    stronger than a guard that fires when some other module is imported.
+    cannot ship with no reader copy, with an unrecognised unit, with a direction
+    nothing can read or with no sample floor: it would not be constructible,
+    which is stronger than a guard that fires when some other module is
+    imported. It also resolves the floor EAGERLY, so a metric whose bands admit
+    no derivable floor fails where it is written rather than at the first
+    request that reads one.
     """
 
     key: str
@@ -698,6 +942,7 @@ class Metric:
     unit: str
     worse_when: str
     ranges: tuple[Range, ...]
+    sample: Sample
 
     def __post_init__(self) -> None:
         if not self.key.strip():
@@ -725,6 +970,48 @@ class Metric:
             raise ValueError(f"{self.key}: unknown direction {self.worse_when!r}")
         if not self.ranges:
             raise ValueError(f"{self.key}: a metric with no range assesses nothing")
+        # THE SHARES' DERIVATION MAY NOT BE GIVEN TO A RATIO, and refusing it
+        # here is what makes "do not hand the ratios the number that is to
+        # hand" unrepresentable rather than merely discouraged -- `lever()`'s
+        # treatment of "reduce your cache reads", one field over. The rule
+        # rests on a call contributing exactly 1 to a counted numerator, which
+        # is what `METRIC_UNIT_SHARE` means here and what a ratio of token sums
+        # is not. It is not caught by arithmetic: applied to the three ratios
+        # the rule RETURNS something -- 2, 2 and 1 -- and a number that looks
+        # derived is worse than no number at all.
+        if (
+            self.sample.rule == FLOOR_RULE_BAND_GRANULARITY
+            and self.unit != METRIC_UNIT_SHARE
+        ):
+            raise ValueError(
+                f"{self.key}: the band-granularity floor is only honest for a "
+                f"{METRIC_UNIT_SHARE!r}, whose value moves in steps of 1/n. "
+                f"This metric is a {self.unit!r} -- a ratio of aggregates has "
+                "no such step, so use FLOOR_RULE_JUDGED and say whose judgment "
+                "it is"
+            )
+        # Resolve now, so an underivable floor fails at construction.
+        self.sample_floor
+
+    @property
+    def sample_floor(self) -> SampleFloor:
+        """How many members this metric's sample needs, resolved.
+
+        Derived from the metric's own ranges under `FLOOR_RULE_BAND_GRANULARITY`
+        and read off the spec under `FLOOR_RULE_JUDGED`. `Sample` has already
+        refused every combination that is not one of those two, so there is no
+        third branch and no default.
+        """
+        if self.sample.rule == FLOOR_RULE_BAND_GRANULARITY:
+            return band_granularity_floor(self.ranges, self.sample.counts)
+        assert self.sample.minimum is not None  # `Sample` refuses otherwise
+        assert self.sample.provenance is not None
+        return SampleFloor(
+            minimum=self.sample.minimum,
+            counts=self.sample.counts,
+            rule=self.sample.rule,
+            provenance=self.sample.provenance,
+        )
 
     def range_for(self, value: float) -> Range:
         for entry in self.ranges:
@@ -865,6 +1152,16 @@ METRICS: dict[str, Metric] = {
             "re-reads a long history."
         ),
         unit=METRIC_UNIT_SHARE,
+        # THE DENOMINATOR, NOT THE PERIOD'S CALLS. `banded_calls` for the
+        # main thread -- a call is banded exactly when its context was measured
+        # AND its model has a documented window -- which is the set this share
+        # divides by. The period may hold a thousand calls and eleven of them
+        # be banded, and it is the eleven that decide whether this reading can
+        # sit anywhere but on a band edge.
+        sample=Sample(
+            counts="main-thread calls with a measured context and a documented window",
+            rule=FLOOR_RULE_BAND_GRANULARITY,
+        ),
         worse_when=WORSE_WHEN_HIGHER,
         ranges=(
             Range(
@@ -931,6 +1228,17 @@ METRICS: dict[str, Metric] = {
             "a markup that only reuse pays back, so higher is better."
         ),
         unit=METRIC_UNIT_RATIO,
+        # A RATIO OF TWO TOKEN SUMS, so the floor is judged and says so. The
+        # members counted are the calls that WROTE cache, which are the calls
+        # that put anything in the denominator: a period of a thousand calls
+        # where one wrote cache has one contributing call, and its single write
+        # sets the whole reading.
+        sample=Sample(
+            counts="calls that wrote cache",
+            rule=FLOOR_RULE_JUDGED,
+            minimum=RATIO_SAMPLE_FLOOR,
+            provenance=RATIO_SAMPLE_FLOOR_PROVENANCE,
+        ),
         worse_when=WORSE_WHEN_LOWER,
         ranges=(
             Range(
@@ -1029,6 +1337,19 @@ METRICS: dict[str, Metric] = {
             "for itself as a five-minute one."
         ),
         unit=METRIC_UNIT_RATIO,
+        # THE SAME SET THE MEASUREMENT NAMES, and pointedly not the one beside
+        # it: the calls whose per-TTL split was measured AND that wrote at
+        # either TTL. Borrowing `cache_reads_per_write`'s count here would
+        # certify this reading on the strength of calls excluded from both its
+        # sides -- the #84 defect the third query exists to avoid, arriving
+        # through the floor instead of through the numerator.
+        sample=Sample(
+            counts="calls whose per-TTL cache-write split was measured and that "
+            "wrote at either TTL",
+            rule=FLOOR_RULE_JUDGED,
+            minimum=RATIO_SAMPLE_FLOOR,
+            provenance=RATIO_SAMPLE_FLOOR_PROVENANCE,
+        ),
         worse_when=WORSE_WHEN_LOWER,
         ranges=(
             Range(
@@ -1102,6 +1423,17 @@ METRICS: dict[str, Metric] = {
             "paid the write markup and got nothing for it."
         ),
         unit=METRIC_UNIT_SHARE,
+        # 51, AND IT IS THE POINT OF #93. Over three calls this share can only
+        # be 0, 1/3, 2/3 or 1, so its `ok` band [0, 0.02) is reachable ONLY at
+        # exactly zero -- the green verdict a fresh install earned was the
+        # observation that something did not happen three times, reported in
+        # the voice of a rate. Seventeen times that sample is what the band it
+        # is compared against actually requires, and the number is the band's,
+        # not anybody's.
+        sample=Sample(
+            counts="calls that wrote cache",
+            rule=FLOOR_RULE_BAND_GRANULARITY,
+        ),
         worse_when=WORSE_WHEN_HIGHER,
         ranges=(
             Range(
@@ -1166,6 +1498,18 @@ METRICS: dict[str, Metric] = {
             "subagent starts clean."
         ),
         unit=METRIC_UNIT_RATIO,
+        # THE SMALLER OF THE TWO SCOPES, never the pooled count. This metric
+        # already refuses when either scope has no call, and that precedent is
+        # about the ratio being UNDEFINED rather than UNDER-SAMPLED -- two
+        # different absences. The floor is the second one, and it has to bind on
+        # both sides: a period of a thousand main-thread calls and one subagent
+        # call has a defined ratio whose denominator is one reply.
+        sample=Sample(
+            counts="calls in whichever of the two scopes ran fewer",
+            rule=FLOOR_RULE_JUDGED,
+            minimum=RATIO_SAMPLE_FLOOR,
+            provenance=RATIO_SAMPLE_FLOOR_PROVENANCE,
+        ),
         worse_when=WORSE_WHEN_HIGHER,
         ranges=(
             Range(
@@ -1288,6 +1632,72 @@ UNMEASURED_NOTE = (
     "healthy."
 )
 
+# The THIRD state's note (#93), and it is deliberately not a variant of the one
+# above. "Nobody measured this" and "this was measured over too little to mean
+# anything" are different absences with different remedies, and the remedy is
+# the one genuinely useful thing the report can tell a new user -- so it is
+# said here, in the table's voice, rather than typed into the page.
+UNDER_SAMPLED_NOTE = (
+    "not enough data yet -- there IS a reading, and this period does not yet "
+    "hold enough of what it counts for the table's bands to mean anything over "
+    "it. This is not a verdict and it is not a clean bill of health: come back "
+    "after a few more sessions, or widen the period. Each row states how many "
+    "it has and how many it needs."
+)
+
+# The three states a metric can be in for one period. Enumerated, in the order
+# "usable" to "least established", so that "every state is handled" is a
+# checkable statement rather than a habit -- `CONTEXT_ANSWER_STATES`' rule.
+#
+# THREE, NOT TWO. A real 0, a metric nobody measured and one measured over too
+# small a sample are three different claims. Collapsing the last two is what
+# made a fresh install indistinguishable from a healthy corpus (#93); collapsing
+# the first two is the defect this module was written for (#78).
+SAMPLE_MEASURED = "measured"
+SAMPLE_UNMEASURED = "unmeasured"
+SAMPLE_UNDER_SAMPLED = "under-sampled"
+SAMPLE_STATES = (SAMPLE_MEASURED, SAMPLE_UNDER_SAMPLED, SAMPLE_UNMEASURED)
+
+
+@dataclass(frozen=True)
+class Reading:
+    """One metric's raw input: the value, AND how many members its sample had.
+
+    Both, always, and in one object on purpose. `assess_all()` used to take a
+    bare `Optional[float]`, which made "how much was this measured over?" a
+    question the table had no way to ask -- so the only sample size it could
+    react to was zero, and one call bought a verdict. A caller cannot now
+    supply a value without saying what it was measured over.
+
+    `sample_size` counts the members of the metric's OWN denominator, which is
+    what `Metric.sample.counts` names. It is not the period's call count, and
+    the difference is the whole of `SampleFloor.counts`' docstring.
+
+    A number over an empty sample is refused rather than banded: it cannot
+    happen -- every one of the five values is None exactly when its denominator
+    is empty -- so if it ever arrives, a caller has paired a value with the
+    wrong counter, and that is a wrong number that would read right.
+    """
+
+    value: Optional[float]
+    sample_size: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.sample_size, bool) or not isinstance(self.sample_size, int):
+            raise ValueError(
+                f"sample_size must be a count, got {self.sample_size!r}"
+            )
+        if self.sample_size < 0:
+            raise ValueError(
+                f"sample_size cannot be negative: got {self.sample_size!r}"
+            )
+        if self.value is not None and self.sample_size == 0:
+            raise ValueError(
+                f"a value of {self.value!r} over a sample of 0 is arithmetic "
+                "over an empty set: the value and the count do not describe "
+                "the same rows"
+            )
+
 
 @dataclass(frozen=True)
 class Assessment:
@@ -1312,16 +1722,59 @@ class Assessment:
 
 
 @dataclass(frozen=True)
+class UnderSampled:
+    """A metric that HAS a reading and not enough sample to band it (#93).
+
+    It carries the value, and that is deliberate: the number was measured and
+    is true, so withholding it would be its own small dishonesty. What is
+    withheld is the SEVERITY -- there is no verdict, no lever and no directive,
+    because those are claims the sample cannot support. A caller rendering this
+    must show it as neither `ok` nor unmeasured.
+
+    `shortfall` is derived rather than stored, so it cannot disagree with the
+    two numbers it is the difference of.
+    """
+
+    metric: str
+    measurement: str
+    value: float
+    sample_size: int
+    floor: SampleFloor
+
+    @property
+    def shortfall(self) -> int:
+        return self.floor.minimum - self.sample_size
+
+
+@dataclass(frozen=True)
 class Assessments:
-    """A ranked run over several metrics, plus the ones with no sample.
+    """A ranked run over several metrics, plus the two kinds of absence.
 
     `unmeasured` is not an error list and not an empty result: it is the set of
     metrics whose recommendation is `UNMEASURED_NOTE`, carried so the page can
     say "not measured" where it would otherwise say nothing at all.
+
+    `under_sampled` is the THIRD state and not a flavour of either neighbour.
+    Its members have a reading, so they are not unmeasured; they have no
+    severity, so they cannot join `ranked` -- a ranking is by severity and then
+    by depth into it, and a metric with neither would have to be given one to
+    be placed. Three tuples, three states, and every metric lands in exactly
+    one of them (`assess_all()` partitions).
+
+    `sample_sizes` is every metric's supplied count, measured or not, keyed by
+    metric. It lives on the RUN rather than on `Assessment` because that is what
+    it is a property of: how much a period held is a fact about the period, and
+    `assess()` remains the pure banding lookup it has always been -- a value
+    falls in a range, and how many rows produced the value plays no part in
+    WHICH range. Carried at all because a measured row has to be able to show
+    "51 of 51": a count published only where it was short would read as an error
+    message rather than as the standing condition it is.
     """
 
     ranked: tuple[Assessment, ...]
     unmeasured: tuple[str, ...]
+    under_sampled: tuple[UnderSampled, ...]
+    sample_sizes: Mapping[str, int]
 
 
 def assess(metric_key: str, value: Optional[float]) -> Optional[Assessment]:
@@ -1390,28 +1843,88 @@ def rank(assessments: Iterable[Assessment]) -> tuple[Assessment, ...]:
     )
 
 
-def assess_all(values: Mapping[str, Optional[float]]) -> Assessments:
-    """Assess every metric in `METRICS`, ranked, with the unmeasured named.
+def sample_state(metric_key: str, reading: Reading) -> str:
+    """Which of `SAMPLE_STATES` `reading` is in for `metric_key`.
 
-    `values` must have an entry for EVERY metric -- `None` where there is no
-    sample. Omitting a key is refused rather than treated as unmeasured: a
-    caller that forgot a metric and a caller that measured nothing would
-    otherwise produce the same page, and only one of them is telling the truth.
+    THE ORDER OF THE TWO REFUSALS MATTERS. No value at all is `unmeasured`
+    whatever the count says -- a metric can have members in its denominator and
+    still produce nothing, and reporting that as "not enough data yet" would
+    promise the reader that more sessions will fix something the arithmetic
+    will not. Only a reading that EXISTS can be under-sampled.
+
+    The floor is compared against the metric's own denominator, which is what
+    `Reading.sample_size` is required to carry.
     """
-    missing = sorted(set(METRICS) - set(values))
+    metric = METRICS.get(metric_key)
+    if metric is None:
+        raise KeyError(f"no metric named {metric_key!r}")
+    if not isinstance(reading, Reading):
+        raise TypeError(
+            f"{metric_key}: expected a Reading(value, sample_size), got "
+            f"{type(reading).__name__}. A bare value cannot say what it was "
+            "measured over, which is the whole of #93"
+        )
+    if reading.value is None:
+        return SAMPLE_UNMEASURED
+    if reading.sample_size < metric.sample_floor.minimum:
+        return SAMPLE_UNDER_SAMPLED
+    return SAMPLE_MEASURED
+
+
+def assess_all(readings: Mapping[str, Reading]) -> Assessments:
+    """Assess every metric in `METRICS`, ranked, with both absences named.
+
+    `readings` must have an entry for EVERY metric -- a `Reading` whose value is
+    `None` where there is no sample. Omitting a key is refused rather than
+    treated as unmeasured: a caller that forgot a metric and a caller that
+    measured nothing would otherwise produce the same page, and only one of
+    them is telling the truth.
+
+    THE PARTITION IS TOTAL. Every metric lands in exactly one of the three
+    tuples, and nothing falls through to `ranked` by default -- which is the
+    same guarantee `Metric.range_for()` makes about the value axis, made about
+    the sample axis instead.
+    """
+    missing = sorted(set(METRICS) - set(readings))
     if missing:
         raise KeyError(
-            f"no value supplied for {missing}; pass None to say 'not measured'"
+            f"no reading supplied for {missing}; pass "
+            "Reading(None, <sample size>) to say 'not measured'"
         )
-    unknown = sorted(set(values) - set(METRICS))
+    unknown = sorted(set(readings) - set(METRICS))
     if unknown:
         raise KeyError(f"no metric named {unknown}")
-    measured = []
-    unmeasured = []
+    measured: list[Assessment] = []
+    unmeasured: list[str] = []
+    under_sampled: list[UnderSampled] = []
     for key in sorted(METRICS):
-        result = assess(key, values[key])
-        if result is None:
+        reading = readings[key]
+        state = sample_state(key, reading)
+        if state == SAMPLE_UNMEASURED:
             unmeasured.append(key)
-        else:
-            measured.append(result)
-    return Assessments(ranked=rank(measured), unmeasured=tuple(unmeasured))
+            continue
+        if state == SAMPLE_UNDER_SAMPLED:
+            assert reading.value is not None  # `sample_state` guarantees it
+            under_sampled.append(
+                UnderSampled(
+                    metric=key,
+                    measurement=METRICS[key].measurement,
+                    value=reading.value,
+                    sample_size=reading.sample_size,
+                    floor=METRICS[key].sample_floor,
+                )
+            )
+            continue
+        result = assess(key, reading.value)
+        # Unreachable: `sample_state` has already refused a None value, and
+        # `assess` returns None only for one. Raising beats appending nothing,
+        # which would drop a metric out of all three tuples silently.
+        if result is None:  # pragma: no cover - defends the partition
+            raise RuntimeError(f"{key}: measured state produced no assessment")
+        measured.append(result)
+    return Assessments(
+        ranked=rank(measured),
+        unmeasured=tuple(unmeasured),
+        under_sampled=tuple(under_sampled),
+        sample_sizes={key: readings[key].sample_size for key in sorted(METRICS)},
+    )
