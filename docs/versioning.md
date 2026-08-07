@@ -121,6 +121,22 @@ that ships changed; nothing a user types did. It is still a release, because
 the shipped plugin changed and an install that did not receive it would be
 running a layout the docs no longer describe.
 
+### Where a break is announced
+
+Classifying a break is not telling anyone about it, and for one release this
+file did only the first. **A change to any of the three surfaces above is
+announced in [`releases.md`](releases.md)**, under the version that shipped it,
+in the terms a caller meets it in: what stopped working, and what to do
+instead. `tests/test_release_notes.py` asserts the shipped `cpb.VERSION` has an
+entry there, so a release cannot ship a break with nowhere to read about it —
+the same mechanism, and the same reason, as the version spans this file's
+opening paragraph is pinned by.
+
+That record is not a changelog and the decision below stands: a **correction**
+to a figure still goes on the README record, beside the number. A break is not
+a wrong number, so it gets its own place rather than diluting one that is
+specifically about figures that were wrong.
+
 ### Correction is not redefinition
 
 The sharp edge of clause 3, and the exemption it needs.
@@ -254,11 +270,20 @@ too weak to be worth writing.
 
 ## Pre-release and the record
 
-There is no changelog. Corrections that moved a headline number are kept in
-`README.md` under "The record", in full, because a tool about measurement
-should show its own corrections rather than quietly restate them — and because
-a number's history is more useful to a reader beside the number than in a file
-of one-line entries.
+There is no changelog. Two records exist instead, and each covers what the
+other is the wrong shape for:
+
+- **Corrections** that moved a headline number are kept in `README.md` under
+  "The record", in full, because a tool about measurement should show its own
+  corrections rather than quietly restate them — and because a number's history
+  is more useful to a reader beside the number than in a file of one-line
+  entries.
+- **Breaks** — a change to one of the three governed surfaces — are announced
+  in [`releases.md`](releases.md), per release, in the terms a caller meets
+  them in. A release with nothing to migrate says so there too: that is a
+  useful fact, not an empty entry.
+
+Neither is a list of commits, and neither is a dead end — each links the other.
 
 Pre-release identifiers (`1.2.0-rc.1`) are available if a change ever needs
 soak time, and carry SemVer's ordinary meaning: lower precedence than the
