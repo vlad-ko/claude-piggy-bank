@@ -112,7 +112,15 @@ from typing import NamedTuple, Optional, Sequence
 # removed, renamed or redefined -- minor. The floors themselves are read
 # from the table's own boundaries for shares and judged for ratios, which
 # is argued in recommendations.py rather than here.
-VERSION = "3.1.0"
+#
+# 3.1.0 -> 3.2.0 (#97). /cpb now offers to ingest the history already on
+# disk before it opens the report, because a new install starts empty while
+# months of transcripts sit unread -- and Claude Code deletes them on a
+# schedule, so install is the moment of maximum available history. The scope
+# is asked, never assumed: "every project" reads directory names that are the
+# user's own paths. New skill step and a read-only planner; nothing removed,
+# renamed or redefined -- minor.
+VERSION = "3.2.0"
 
 PROG = "cpb"
 
