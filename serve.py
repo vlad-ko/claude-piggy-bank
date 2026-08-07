@@ -3,6 +3,15 @@
 Usage:
     python3 serve.py [--db db/usage.db] [--port 8377]
 
+`--db` defaults to `db/usage.db` beside this script, which is right in a
+checkout and DOOMED inside an installed plugin -- there it is
+`${CLAUDE_PLUGIN_ROOT}/db/usage.db`, a directory every plugin update replaces.
+So the default goes through `ingest.default_database()` (#94), the same
+function `ingest.py` uses: from within an install it resolves
+`${CLAUDE_PLUGIN_DATA}/usage.db` where Claude Code names that directory and
+refuses where it does not, rather than pointing the reader at a path the
+database can never durably live at. An explicit `--db` is untouched by it.
+
 Localhost-only stdlib http.server (single-threaded: `Api` holds ONE sqlite3
 connection and there is exactly one request in flight at a time, so no
 locking is needed -- the concurrency hazard is removed by construction
@@ -36,6 +45,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import os
 import sqlite3
 import time
 from collections import defaultdict
@@ -56,7 +66,10 @@ from context_window import (
     window_for_model,
 )
 from ingest import (
+    DB_ENV_VAR,
+    DB_FILENAME,
     INGEST_RUNS_TABLE,
+    PLUGIN_DATA_ENV_VAR,
     SHAPE_TABLE,
     SOURCE_MAIN,
     SOURCE_SUBAGENT,
@@ -64,6 +77,7 @@ from ingest import (
     STATUS_UNAVAILABLE,
     SUBAGENTS_DIR,
     TASKS_DIR,
+    announced_default_database,
     census_coverage,
 )
 from recommendations import (
@@ -4156,11 +4170,32 @@ def make_handler(api: Api) -> type[BaseHTTPRequestHandler]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve the usage-report UI")
-    parser.add_argument("--db", type=Path, default=HERE / "db" / "usage.db")
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help=(
+            "Database to serve. Defaults to db/usage.db beside this script -- "
+            "except inside an INSTALLED plugin, where that path belongs to the "
+            "plugin root the next update replaces, so the default becomes "
+            f"${{{PLUGIN_DATA_ENV_VAR}}}/{DB_FILENAME} or a refusal (#94). "
+            f"serve.py deliberately does NOT read the {DB_ENV_VAR} "
+            f'environment variable; pass --db "${DB_ENV_VAR}" if you set it.'
+        ),
+    )
     parser.add_argument("--port", type=int, default=8377)
     args = parser.parse_args()
 
-    db_path = args.db.expanduser()
+    # The default is resolved only when no --db was given -- the same shape as
+    # `ingest.resolve_db_path()`, and for the same reason: resolving it can
+    # refuse, and a run that named its database must never be refused over a
+    # fallback it does not use. #94's defect was ONE half of this pair being
+    # taught the rule, so both halves now read the same function.
+    db_path = (
+        args.db.expanduser()
+        if args.db is not None
+        else announced_default_database(Path(__file__), os.environ)
+    )
     if not db_path.exists():
         raise SystemExit(f"DB not found: {db_path} -- run ingest.py first")
     server = HTTPServer(("127.0.0.1", args.port), make_handler(Api(db_path)))

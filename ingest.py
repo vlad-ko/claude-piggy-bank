@@ -25,6 +25,14 @@ environment variable, then `db/usage.db` beside this script. `CPB_DB` exists
 so a plugin can point every hook invocation at its own data directory without
 threading a flag through each one.
 
+That third step is PLUGIN-AWARE (#94). Beside this script is right in a
+checkout and doomed inside an installed plugin, where it is
+`${CLAUDE_PLUGIN_ROOT}/db/usage.db` and the next update deletes it. So from
+within an install the default resolves `${CLAUDE_PLUGIN_DATA}/usage.db` where
+Claude Code has named that directory, and REFUSES where it has not -- see
+`default_database()`. `--db` and `CPB_DB` are untouched by any of it: a run
+that names its database never consults the default at all.
+
 TWO transcript sources per session (#4966) -- a session's API calls are NOT
 all in one file:
 
@@ -84,7 +92,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence
 
 SOURCE_MAIN = "main"
 SOURCE_SUBAGENT = "subagent"
@@ -132,6 +140,56 @@ TASKS_DIR = "tasks"
 # built-in default. A plugin exports it once instead of passing `--db` on
 # every hook invocation.
 DB_ENV_VAR = "CPB_DB"
+
+# ---------------------------------------------------------------------------
+# Where the built-in default may and may not put the database (#94)
+#
+# `db/usage.db` beside this script is exactly right in a CHECKOUT and is a
+# DOOMED path inside an installed plugin: `${CLAUDE_PLUGIN_ROOT}` is replaced
+# by every plugin update, `${CLAUDE_PLUGIN_DATA}` is not -- measured across a
+# real install-and-update on 2026-08-07 and recorded in `docs/plugin.md`. Past
+# Claude Code's ~30-day transcript reap the database is the only surviving copy
+# of the history, so a default that silently landed in the plugin root would
+# report a successful ingest over a file the next update deletes.
+#
+# So the default is plugin-aware: it RESOLVES `${CLAUDE_PLUGIN_DATA}` where
+# Claude Code has named it for this plugin, and REFUSES where it has not.
+# What it may never do is fall back to the doomed path quietly.
+PLUGIN_ROOT_ENV_VAR = "CLAUDE_PLUGIN_ROOT"
+PLUGIN_DATA_ENV_VAR = "CLAUDE_PLUGIN_DATA"
+# The database's file name inside the plugin's persistent directory. It matches
+# `DB_FILENAME` in `hooks/cpb_ingest_hook.py` and the path `skills/cpb/SKILL.md`
+# passes, because a manual run and a hook run that disagreed about the file name
+# would be #94 again one directory down.
+DB_FILENAME = "usage.db"
+# ...and the directory the checkout default sits in, beside this script.
+CHECKOUT_DB_DIR = "db"
+
+# Adjacent ancestor directory names that mark Claude Code's OWN plugin store. A
+# copy of CPB below one of these was put there by Claude Code and is Claude
+# Code's to replace: the cache path carries the plugin VERSION, so an update
+# builds a new directory and abandons the old one, and a marketplace clone is
+# re-fetched and removed with the marketplace.
+#
+# MEASURED, not assumed (2026-08-07, this host, from Claude Code's own plugin
+# directory): two installed plugins from two different marketplaces sat at
+#
+#     ~/.claude/plugins/cache/vercel-vercel-plugin/vercel-plugin/0.24.0/
+#     ~/.claude/plugins/cache/laravel/laravel-simplifier/1.0.0/
+#
+# with their marketplace clones at ~/.claude/plugins/marketplaces/<marketplace>/
+# and the persistent data directory at
+# ~/.claude/plugins/data/<marketplace>-<plugin>/ -- no version anywhere in it.
+# `docs/plugin.md` records the same cache shape from an independent
+# install-and-update run against Claude Code 2.1.223. No `.git` exists anywhere
+# under `cache/`, so an install is a copy rather than a clone.
+#
+# This layout is INTERNAL to Claude Code and undocumented, so it is used only as
+# a second, independent piece of evidence -- never as the only one. If a release
+# moves it, this detector stops firing (a false negative the environment check
+# below still covers); it cannot start firing on a clone anywhere a person would
+# actually put one.
+PLUGIN_STORE_ANCESTORS = (("plugins", "cache"), ("plugins", "marketplaces"))
 
 # The per-source census of the transcript SHAPE (#15). Named once, like every
 # other stored vocabulary here, because `serve.py` will read it and a second
@@ -5076,8 +5134,180 @@ def default_projects_dir(
     )
 
 
+def _within(path: Path, directory: Path) -> bool:
+    """Is `path` `directory` itself, or somewhere below it?
+
+    Both arguments must already be RESOLVED. This compares names, and an
+    unresolved `..` or symlink would answer about a path that is not the one
+    being used.
+    """
+    return path == directory or directory in path.parents
+
+
+def plugin_store_ancestor(script_dir: Path) -> Optional[Path]:
+    """The Claude Code plugin-store directory this copy of CPB sits under.
+
+    `None` -- the ordinary answer, and the one every checkout gives -- means
+    nothing about this location says Claude Code put it here.
+
+    See `PLUGIN_STORE_ANCESTORS` for what was measured and why this is only
+    ever one of two pieces of evidence.
+    """
+    for candidate in (script_dir, *script_dir.parents):
+        for outer, inner in PLUGIN_STORE_ANCESTORS:
+            if candidate.name == inner and candidate.parent.name == outer:
+                return candidate
+    return None
+
+
+def plugin_root_naming(script_dir: Path, env: Mapping[str, str]) -> Optional[Path]:
+    """`${CLAUDE_PLUGIN_ROOT}` when it names THIS copy of CPB, else `None`.
+
+    The containment check is the whole point. `${CLAUDE_PLUGIN_ROOT}` set is
+    evidence about the PROCESS, not about this script: another plugin's hook
+    can spawn something that runs a CPB checkout, and its root would then be in
+    the environment while `db/usage.db` beside the checkout is still correct
+    and durable. Refusing there would be a false positive of exactly the kind
+    that is worse than no detection at all.
+
+    A value that will not resolve is treated as no evidence rather than as
+    evidence of a plugin install, for the same reason: it says nothing about
+    where this script is. `plugin_store_ancestor()` still gets its say.
+    """
+    raw = (env.get(PLUGIN_ROOT_ENV_VAR) or "").strip()
+    if not raw:
+        return None
+    try:
+        root = Path(os.path.expanduser(raw)).resolve()
+    except (OSError, ValueError):
+        return None
+    return root if _within(script_dir, root) else None
+
+
+class DefaultDatabase(NamedTuple):
+    """The database a run with no `--db` and no `CPB_DB` uses, and what to say.
+
+    `note` is `None` in a checkout, where nothing surprising happened. It is a
+    sentence when the location moved, because a run that quietly wrote
+    somewhere other than its documented default would leave the reader unable
+    to tell which file the summary they just read describes -- the same defect
+    as the doomed path, one step milder.
+    """
+
+    path: Path
+    note: Optional[str]
+
+
+def default_database(script: Path, env: Mapping[str, str]) -> DefaultDatabase:
+    """Resolve the built-in default, refusing where it cannot be trusted (#94).
+
+    Three outcomes, decided by whether this copy of CPB is a checkout or an
+    installed plugin:
+
+    * **a checkout** -- `db/usage.db` beside the script, unchanged, unannounced.
+      This is the documented, supported and durable answer, and it must survive
+      untouched: a false refusal here breaks the plain-clone path for everyone.
+    * **an install Claude Code has named a data directory for** --
+      `${CLAUDE_PLUGIN_DATA}/usage.db`, the same file the hooks write and
+      `/cpb` serves, announced on stdout.
+    * **an install with no knowable durable location** -- `SystemExit`. The
+      one thing ruled out is the silent fallback to `db/usage.db` inside the
+      plugin root, which the next plugin update deletes.
+
+    Being an install is established from TWO independent observations, either
+    of which is enough, because each covers the other's blind spot:
+
+    1. `${CLAUDE_PLUGIN_ROOT}` names the directory this script is in. Exported
+       to hook and skill invocations; absent from a shell a person types in
+       (measured 2026-08-07: a Bash tool call inside a Claude Code session with
+       plugins enabled had neither variable set), which is exactly the
+       improvised path #94 is about -- hence the second.
+    2. The script sits under Claude Code's plugin store, whose layout is
+       recorded and dated at `PLUGIN_STORE_ANCESTORS`.
+
+    The data directory is only paired with the root when the root names THIS
+    script (1). `${CLAUDE_PLUGIN_DATA}` alone says a plugin process is running,
+    not that it is this one, and writing another plugin's data directory would
+    be a guess wearing an answer's clothes.
+    """
+    script_dir = script.resolve().parent
+    beside_script = script_dir / CHECKOUT_DB_DIR / DB_FILENAME
+
+    own_root = plugin_root_naming(script_dir, env)
+    store = plugin_store_ancestor(script_dir)
+    if own_root is None and store is None:
+        return DefaultDatabase(beside_script, None)
+
+    evidence = (
+        f"{PLUGIN_ROOT_ENV_VAR} names the directory this script is in ({own_root})"
+        if own_root is not None
+        else f"this script sits in Claude Code's plugin store, under {store}"
+    )
+    declared_data = (env.get(PLUGIN_DATA_ENV_VAR) or "").strip()
+    if own_root is not None and declared_data:
+        durable = Path(os.path.expanduser(declared_data)) / DB_FILENAME
+        return DefaultDatabase(
+            durable,
+            f"NOTE: plugin install -- {evidence}. No --db and no {DB_ENV_VAR},"
+            f" so writing to the plugin's persistent database {durable}."
+            f" The checkout default ({beside_script}) is inside"
+            f" {PLUGIN_ROOT_ENV_VAR}, which the next plugin update deletes.",
+        )
+
+    if declared_data:
+        why = (
+            f"{PLUGIN_DATA_ENV_VAR} is set ({declared_data}), but"
+            f" {PLUGIN_ROOT_ENV_VAR} does not name this copy of CPB -- so that"
+            " directory may belong to another plugin, and writing it would be a"
+            " guess."
+        )
+    else:
+        why = (
+            f"{PLUGIN_DATA_ENV_VAR} is not set here. Claude Code exports it to"
+            " the plugin's own hooks and skill, not to a shell, so CPB cannot"
+            " expand it for you -- and it will not invent a path whose only job"
+            " is to outlive updates."
+        )
+    raise SystemExit(
+        "REFUSING to write the database inside a plugin install.\n"
+        "\n"
+        f"  this script:          {script}\n"
+        f"  why that is a plugin: {evidence}\n"
+        f"  the default it would otherwise use: {beside_script}\n"
+        "\n"
+        f"That path is inside the plugin root (${{{PLUGIN_ROOT_ENV_VAR}}}),"
+        " which Claude Code REPLACES on every plugin update. Past Claude Code's"
+        " transcript retention"
+        " window the database is the only surviving copy of your history, so"
+        " writing there would look like it worked and be deleted later.\n"
+        "\n"
+        f"The durable database is ${{{PLUGIN_DATA_ENV_VAR}}}/{DB_FILENAME} --"
+        " the file the plugin's hooks write and /cpb serves. Name it:\n"
+        "\n"
+        f'    python3 {script} --db "${{{PLUGIN_DATA_ENV_VAR}}}/{DB_FILENAME}"\n'
+        "\n"
+        f"{why}\n"
+        "\n"
+        f"Any --db path is accepted, and {DB_ENV_VAR}=<path> does the same job."
+        " If this copy really is a checkout that merely lives under that"
+        f" directory, say so outright: --db {beside_script}"
+    )
+
+
+def announced_default_database(
+    script: Path,
+    env: Mapping[str, str],
+    out: Callable[[str], None] = print,
+) -> Path:
+    """`default_database()` with its note printed rather than swallowed."""
+    chosen = default_database(script, env)
+    if chosen.note is not None:
+        out(chosen.note)
+    return chosen.path
+
+
 def resolve_db_path(
-    flag: Optional[Path], env_value: Optional[str], default: Path
+    flag: Optional[Path], env_value: Optional[str], default: Callable[[], Path]
 ) -> Path:
     """Where to write, highest precedence first: `--db`, `CPB_DB`, default.
 
@@ -5085,6 +5315,11 @@ def resolve_db_path(
     plugin that exports the variable wrongly would otherwise write every
     measurement into a different database than the one it reads, and say
     nothing -- and this tool's whole job is to not do that quietly.
+
+    `default` is a CALLABLE, not a path, because computing it can itself refuse
+    (`default_database()`, #94). Evaluating it eagerly would make a run that
+    named its database -- with `--db` or with `CPB_DB`, either of which settles
+    the question outright -- fail over a fallback it never needed.
     """
     if flag is not None:
         return flag.expanduser()
@@ -5096,7 +5331,7 @@ def resolve_db_path(
                 f"write to a database you did not choose."
             )
         return Path(env_value).expanduser()
-    return default
+    return default()
 
 
 def print_dedupe_note(summary: dict[str, Any]) -> None:
@@ -5788,7 +6023,6 @@ class PruneConfirmation:
 
 
 def main() -> None:
-    default_db = Path(__file__).resolve().parent / "db" / "usage.db"
     parser = argparse.ArgumentParser(description="Ingest Claude Code transcripts into SQLite")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -5834,7 +6068,10 @@ def main() -> None:
         default=None,
         help=(
             f"Database path. Falls back to the {DB_ENV_VAR} environment "
-            f"variable, then to db/usage.db beside this script."
+            f"variable, then to db/usage.db beside this script -- except "
+            f"inside an INSTALLED plugin, where that path is deleted by the "
+            f"next update, so the default becomes "
+            f"${{{PLUGIN_DATA_ENV_VAR}}}/{DB_FILENAME} or a refusal (#94)."
         ),
     )
     parser.add_argument(
@@ -5877,7 +6114,14 @@ def main() -> None:
             "--yes and --dry-run contradict each other: one approves the "
             "deletion, the other performs none"
         )
-    db_path = resolve_db_path(args.db, os.environ.get(DB_ENV_VAR), default_db)
+    db_path = resolve_db_path(
+        args.db,
+        os.environ.get(DB_ENV_VAR),
+        # Lazy on purpose: resolving the default can refuse (#94), and a run
+        # that named its own database has no business being refused over a
+        # fallback it never reaches.
+        lambda: announced_default_database(Path(__file__), os.environ),
+    )
 
     if args.transcript is not None:
         if args.prune_missing:

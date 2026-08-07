@@ -9,9 +9,12 @@ reversed-range validation added in this cycle's review pass.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
+import io
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -30,6 +33,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cpb  # noqa: E402
+import ingest as ingest_mod  # noqa: E402
 from ingest import (  # noqa: E402
     CACHE_CREATION_KEY,
     CACHE_WRITE_1H_KEY,
@@ -43,7 +47,11 @@ from ingest import (  # noqa: E402
     ingest_transcript,
     record_ingest_run,
 )
-from test_ingest import build_corpus, build_hook_only_database  # noqa: E402
+from test_ingest import (  # noqa: E402
+    build_corpus,
+    build_hook_only_database,
+    simulate_plugin_install,
+)
 from context_window import (  # noqa: E402
     BAND_25_TO_50,
     BAND_50_TO_90,
@@ -12523,6 +12531,123 @@ class ReportNamesTheBuildTest(unittest.TestCase):
                 self.assertNotIn(
                     "summary.build.version", view_section(self.html, view)
                 )
+
+class _StopServing(Exception):
+    """Raised in place of `serve_forever()`, so `main()` returns to the test."""
+
+
+class ServeDefaultDatabaseIsPluginAwareTest(unittest.TestCase):
+    """serve.py's default obeys the same rule as ingest.py's (#94).
+
+    THE PAIR, not the instance. #94 taught the `--db` rule to the skill's
+    `serve.py` half and not its `ingest.py` half; #105 stamped one ingest mode
+    and not the other; #108 refused one scope and not its mirror. So the fix
+    for the improvised bare-`ingest.py` run is asserted here on `serve.py` too.
+
+    serve.py never writes, so its half of the hole has a different shape and is
+    just as real: its default was `${CLAUDE_PLUGIN_ROOT}/db/usage.db`, so from
+    inside an install it told the reader that the database it could not find
+    belongs at a path the next update deletes -- and had a pre-fix run left one
+    there, it would serve that copy while the hooks kept writing another.
+    """
+
+    def setUp(self) -> None:
+        # Resolved: macOS hands out /var/..., a symlink to /private/var, and
+        # the resolver compares resolved paths.
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-serve-plugin-test-")).resolve()
+        self.install, self.data = simulate_plugin_install(self.tmp)
+        self.checkout = self.tmp / "checkout"
+        (self.checkout / "db").mkdir(parents=True)
+        self.checkout_db = self.checkout / "db" / "usage.db"
+        sqlite3.connect(self.checkout_db).close()
+        self.plugin_db = self.data / "usage.db"
+        sqlite3.connect(self.plugin_db).close()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_main(self, script: Path, *argv: str, env: Optional[dict] = None):
+        """`serve.main()` from `script`, without binding a port. Returns (db, out).
+
+        `serve.__file__` is patched because that is the value the resolution
+        actually turns on, and no argument reaches it.
+        """
+        opened: list[Path] = []
+
+        class RecordingApi:
+            def __init__(self, db_path: Path) -> None:
+                opened.append(db_path)
+
+        class NoServer:
+            def __init__(self, address, handler) -> None:
+                pass
+
+            def serve_forever(self) -> None:
+                raise _StopServing()
+
+        printed = io.StringIO()
+        with mock.patch.object(serve, "__file__", str(script)), \
+                mock.patch.object(serve, "Api", RecordingApi), \
+                mock.patch.object(serve, "HTTPServer", NoServer), \
+                mock.patch.object(sys, "argv", ["serve.py", *argv]), \
+                mock.patch.dict(os.environ, env or {}, clear=True), \
+                contextlib.redirect_stdout(printed):
+            with self.assertRaises(_StopServing):
+                serve.main()
+        return opened[-1], printed.getvalue()
+
+    def test_both_scripts_resolve_the_default_through_one_function(self) -> None:
+        # Structural, so the two cannot drift back apart: serve.py does not own
+        # a second copy of this decision, it imports ingest.py's.
+        self.assertIs(
+            serve.announced_default_database, ingest_mod.announced_default_database
+        )
+
+    def test_a_checkout_still_serves_db_usage_db_beside_the_script(self) -> None:
+        opened, printed = self.run_main(self.checkout / "serve.py")
+        self.assertEqual(opened, self.checkout_db)
+        self.assertIn(str(self.checkout_db), printed)
+
+    def test_a_bare_serve_inside_an_install_refuses(self) -> None:
+        with mock.patch.object(serve, "__file__", str(self.install / "serve.py")), \
+                mock.patch.object(sys, "argv", ["serve.py"]), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit) as raised:
+                serve.main()
+        message = str(raised.exception)
+        self.assertIn(ingest_mod.PLUGIN_DATA_ENV_VAR, message)
+        self.assertIn("--db", message)
+        # NOT the old "DB not found: <plugin root>/db/usage.db" line, which
+        # named a path the database can never durably live at.
+        self.assertNotIn("run ingest.py first", message)
+
+    def test_the_persistent_directory_is_used_when_claude_code_names_it(self) -> None:
+        opened, printed = self.run_main(
+            self.install / "serve.py",
+            env={
+                ingest_mod.PLUGIN_ROOT_ENV_VAR: str(self.install),
+                ingest_mod.PLUGIN_DATA_ENV_VAR: str(self.data),
+            },
+        )
+        self.assertEqual(opened, self.plugin_db)
+        self.assertIn(str(self.plugin_db), printed)
+
+    def test_an_explicit_db_is_untouched_inside_an_install(self) -> None:
+        opened, _ = self.run_main(
+            self.install / "serve.py", "--db", str(self.checkout_db)
+        )
+        self.assertEqual(opened, self.checkout_db)
+
+    def test_a_missing_database_still_refuses_in_a_checkout(self) -> None:
+        # The pre-existing refusal is unchanged where the path is legitimate:
+        # this change replaces a doomed default, not the absent-DB check.
+        self.checkout_db.unlink()
+        with mock.patch.object(serve, "__file__", str(self.checkout / "serve.py")), \
+                mock.patch.object(sys, "argv", ["serve.py"]), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit) as raised:
+                serve.main()
+        self.assertIn("run ingest.py first", str(raised.exception))
 
 
 if __name__ == "__main__":

@@ -44,6 +44,69 @@ SUBAGENT_FIXTURE = (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: The layout Claude Code really puts an installed plugin in, rebuilt in a
+#: temporary directory so #94's state is TESTED rather than imagined.
+#:
+#: MEASURED (2026-08-07, this host, from Claude Code's own plugin directory):
+#: two plugins installed from two different marketplaces sat at
+#: `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/`, their
+#: marketplace clones at `~/.claude/plugins/marketplaces/<marketplace>/`, and
+#: the persistent data directory at
+#: `~/.claude/plugins/data/<marketplace>-<plugin>/` -- with no version anywhere
+#: in that last path, which is the whole point. `docs/plugin.md` records the
+#: same shape from an independent install-and-update run.
+#:
+#: The version here is deliberately NOT the version CPB ships: the fixture must
+#: not pass by matching a constant, and an install is doomed at every version.
+PLUGIN_MARKETPLACE = "cpb-test-marketplace"
+PLUGIN_NAME = "claude-piggy-bank"
+PLUGIN_INSTALLED_VERSION = "0.0.0-fixture"
+
+
+def simulate_plugin_install(
+    root: Path, *modules: str
+) -> "tuple[Path, Path]":
+    """A copy of CPB where Claude Code puts one, plus its data directory.
+
+    Returns `(install_dir, data_dir)`. The modules are COPIED rather than
+    symlinked, because `Path(__file__).resolve()` follows a symlink straight
+    back to the checkout -- a fixture that symlinked would test the checkout
+    path twice and the install path never.
+    """
+    config = root / "claude-config"
+    install = (
+        config / "plugins" / "cache" / PLUGIN_MARKETPLACE / PLUGIN_NAME
+        / PLUGIN_INSTALLED_VERSION
+    )
+    install.mkdir(parents=True)
+    data = (
+        config / "plugins" / "data" / f"{PLUGIN_MARKETPLACE}-{PLUGIN_NAME}"
+    )
+    data.mkdir(parents=True)
+    for module in modules:
+        shutil.copy(REPO_ROOT / module, install / module)
+    return install, data
+
+
+def simulate_marketplace_clone(root: Path, *modules: str) -> Path:
+    """The OTHER copy Claude Code keeps: the marketplace clone (#94).
+
+    CPB's `marketplace.json` uses `"source": "./"`, so the marketplace clone is
+    a whole checkout of this repository -- one Claude Code re-fetches on
+    `/plugin marketplace update` and deletes on `remove`. Measured on this host
+    2026-08-07 at `~/.claude/plugins/marketplaces/<marketplace>/`.
+    """
+    clone = (
+        root / "claude-config" / "plugins" / "marketplaces" / PLUGIN_MARKETPLACE
+    )
+    clone.mkdir(parents=True)
+    for module in modules:
+        shutil.copy(REPO_ROOT / module, clone / module)
+    return clone
+
+
 def approve_this_prune(plan: "ingest_mod.PrunePlan") -> bool:
     """A caller who read the plan and said yes (#92).
 
@@ -3949,7 +4012,10 @@ class SingleFileIngestCliTest(unittest.TestCase):
         self.assertIn("CPB_DB", proc.stdout)
 
     def test_resolve_db_path_precedence(self) -> None:
-        default = Path("/default/usage.db")
+        # The default arrives as a CALLABLE because computing it can refuse
+        # (#94) -- see `PluginAwareDefaultDatabaseTest`.
+        chosen = Path("/default/usage.db")
+        default = lambda: chosen  # noqa: E731
         self.assertEqual(
             ingest_mod.resolve_db_path(Path("/flag.db"), "/env.db", default),
             Path("/flag.db"),
@@ -3957,13 +4023,13 @@ class SingleFileIngestCliTest(unittest.TestCase):
         self.assertEqual(
             ingest_mod.resolve_db_path(None, "/env.db", default), Path("/env.db")
         )
-        self.assertEqual(ingest_mod.resolve_db_path(None, None, default), default)
+        self.assertEqual(ingest_mod.resolve_db_path(None, None, default), chosen)
 
     def test_an_empty_CPB_DB_refuses_rather_than_falling_back(self) -> None:
         # Falling back would write the measurements to a DIFFERENT database
         # than the operator configured, and say nothing about it.
         with self.assertRaises(SystemExit):
-            ingest_mod.resolve_db_path(None, "   ", Path("/default/usage.db"))
+            ingest_mod.resolve_db_path(None, "   ", lambda: Path("/default/usage.db"))
 class DropColumnCapabilityTest(unittest.TestCase):
     """`ALTER TABLE ... DROP COLUMN` is DETECTED, never assumed (#30).
 
@@ -9100,6 +9166,277 @@ class IngestRateProvenanceTest(unittest.TestCase):
             delta=0.01,
         )
 
+
+class PluginAwareDefaultDatabaseTest(unittest.TestCase):
+    """The built-in default may not land in a directory an update deletes (#94).
+
+    `--db` and `CPB_DB` were already fixed for the DOCUMENTED path. This is the
+    improvised one: somebody types `python3 ingest.py` inside an install, and
+    the default -- `db/usage.db` beside the script -- is
+    `${CLAUDE_PLUGIN_ROOT}/db/usage.db`, which the next plugin update deletes.
+
+    Both directions are pinned here, because a wrong detection either way is
+    worse than none: a false positive would refuse the plain checkout, which is
+    the documented and correct home for `db/usage.db`.
+    """
+
+    def setUp(self) -> None:
+        # `.resolve()` because macOS hands out /var/... which is a symlink to
+        # /private/var, and the resolver compares RESOLVED paths -- as it
+        # must, or a symlinked install would escape the check entirely.
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-plugin-default-test-")).resolve()
+        self.checkout = self.tmp / "checkout"
+        self.checkout.mkdir()
+        self.checkout_script = self.checkout / "ingest.py"
+        self.install, self.data = simulate_plugin_install(self.tmp)
+        self.install_script = self.install / "ingest.py"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ---- the checkout, which must be left entirely alone ------------------
+
+    def test_a_checkout_keeps_db_usage_db_beside_the_script(self) -> None:
+        chosen = ingest_mod.default_database(self.checkout_script, {})
+        self.assertEqual(chosen.path, self.checkout / "db" / "usage.db")
+        self.assertIsNone(chosen.note, "a checkout has nothing to announce")
+
+    def test_another_plugins_environment_does_not_refuse_a_checkout(self) -> None:
+        # A hook belonging to some OTHER plugin can spawn a shell that runs a
+        # CPB checkout: its root and data directory are then in the
+        # environment, and say nothing about where THIS script lives. Refusing
+        # here would break the supported path on somebody else's account.
+        chosen = ingest_mod.default_database(
+            self.checkout_script,
+            {
+                ingest_mod.PLUGIN_ROOT_ENV_VAR: str(self.install),
+                ingest_mod.PLUGIN_DATA_ENV_VAR: str(self.data),
+            },
+        )
+        self.assertEqual(chosen.path, self.checkout / "db" / "usage.db")
+        self.assertIsNone(chosen.note)
+
+    def test_an_unusable_plugin_root_is_not_evidence_about_this_script(self) -> None:
+        chosen = ingest_mod.default_database(
+            self.checkout_script, {ingest_mod.PLUGIN_ROOT_ENV_VAR: "\x00not/a/path"}
+        )
+        self.assertEqual(chosen.path, self.checkout / "db" / "usage.db")
+
+    # ---- the install, detected two independent ways -----------------------
+
+    def test_the_plugin_store_path_alone_refuses(self) -> None:
+        # No environment at all -- the case a person typing the command in a
+        # terminal actually hits, and the one an env-only detector misses.
+        with self.assertRaises(SystemExit) as raised:
+            ingest_mod.default_database(self.install_script, {})
+        self.assertIn(ingest_mod.PLUGIN_DATA_ENV_VAR, str(raised.exception))
+
+    def test_a_marketplace_clone_refuses_too(self) -> None:
+        clone = simulate_marketplace_clone(self.tmp)
+        with self.assertRaises(SystemExit):
+            ingest_mod.default_database(clone / "ingest.py", {})
+
+    def test_the_environment_pair_alone_refuses_without_a_data_directory(self) -> None:
+        # Outside the plugin store entirely (a `--plugin-dir` style root), so
+        # only the environment can tell -- and it says root without data, which
+        # is an install with nowhere durable to write. The hook already refuses
+        # this exact state; so must the CLI.
+        elsewhere = self.tmp / "somewhere-else"
+        elsewhere.mkdir()
+        with self.assertRaises(SystemExit):
+            ingest_mod.default_database(
+                elsewhere / "ingest.py",
+                {ingest_mod.PLUGIN_ROOT_ENV_VAR: str(elsewhere)},
+            )
+
+    def test_a_data_directory_with_no_matching_root_refuses(self) -> None:
+        # `${CLAUDE_PLUGIN_DATA}` on its own says a plugin process is running,
+        # not that it is THIS one. Writing another plugin's data directory
+        # would be a guess with an answer's shape.
+        with self.assertRaises(SystemExit) as raised:
+            ingest_mod.default_database(
+                self.install_script,
+                {ingest_mod.PLUGIN_DATA_ENV_VAR: str(self.data)},
+            )
+        self.assertIn(ingest_mod.PLUGIN_ROOT_ENV_VAR, str(raised.exception))
+        self.assertFalse(
+            (self.data / "usage.db").exists(),
+            "a refusal must not have written anything anywhere",
+        )
+
+    def test_the_refusal_names_the_durable_database_and_the_flag(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            ingest_mod.default_database(self.install_script, {})
+        message = str(raised.exception)
+        # The user's next command has to be obvious from the message alone:
+        # where the database lives, and the flag that reaches it.
+        self.assertIn(
+            f"${{{ingest_mod.PLUGIN_DATA_ENV_VAR}}}/{ingest_mod.DB_FILENAME}",
+            message,
+        )
+        self.assertIn("--db", message)
+        # ...and it must name the path it REFUSED, or the reader cannot tell
+        # which database the tool was about to write.
+        self.assertIn(str(self.install / "db" / "usage.db"), message)
+        self.assertIn(ingest_mod.PLUGIN_ROOT_ENV_VAR, message)
+
+    def test_claude_code_naming_the_data_directory_resolves_it(self) -> None:
+        chosen = ingest_mod.default_database(
+            self.install_script,
+            {
+                ingest_mod.PLUGIN_ROOT_ENV_VAR: str(self.install),
+                ingest_mod.PLUGIN_DATA_ENV_VAR: str(self.data),
+            },
+        )
+        self.assertEqual(chosen.path, self.data / "usage.db")
+        self.assertIsNotNone(
+            chosen.note, "moving the database silently is the milder half of #94"
+        )
+        self.assertIn(str(self.data / "usage.db"), chosen.note)
+
+    def test_the_resolved_location_is_the_one_the_hook_writes(self) -> None:
+        # One file name, decided once. A manual run that resolved
+        # `${CLAUDE_PLUGIN_DATA}/cpb.db` while the hooks wrote
+        # `${CLAUDE_PLUGIN_DATA}/usage.db` would be #94 again, one directory
+        # down: two databases, both durable, and a report over the wrong one.
+        # Loaded by PATH because `hooks/` is not on `sys.path`.
+        hook_path = REPO_ROOT / "hooks" / "cpb_ingest_hook.py"
+        spec = importlib.util.spec_from_file_location("cpb_ingest_hook", hook_path)
+        hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hook)
+        self.assertEqual(ingest_mod.DB_FILENAME, hook.DB_FILENAME)
+        self.assertIn(
+            f'--db "${{{ingest_mod.PLUGIN_DATA_ENV_VAR}}}/{ingest_mod.DB_FILENAME}"',
+            (REPO_ROOT / "skills" / "cpb" / "SKILL.md").read_text(encoding="utf-8"),
+            "the skill and the resolved default must name one database",
+        )
+
+    def test_the_note_is_printed_rather_than_swallowed(self) -> None:
+        said: list[str] = []
+        path = ingest_mod.announced_default_database(
+            self.install_script,
+            {
+                ingest_mod.PLUGIN_ROOT_ENV_VAR: str(self.install),
+                ingest_mod.PLUGIN_DATA_ENV_VAR: str(self.data),
+            },
+            out=said.append,
+        )
+        self.assertEqual(path, self.data / "usage.db")
+        self.assertEqual(len(said), 1)
+        self.assertIn(str(self.data / "usage.db"), said[0])
+
+    def test_a_checkout_says_nothing(self) -> None:
+        said: list[str] = []
+        ingest_mod.announced_default_database(
+            self.checkout_script, {}, out=said.append
+        )
+        self.assertEqual(said, [])
+
+    # ---- precedence, which none of this may touch -------------------------
+
+    def test_the_default_is_never_computed_when_a_database_was_named(self) -> None:
+        # Structural, not incidental: `--db` and `CPB_DB` settle the question,
+        # so a refusal they never reach must not be able to reach them.
+        def explode() -> Path:
+            raise AssertionError("the default was resolved despite an explicit db")
+
+        self.assertEqual(
+            ingest_mod.resolve_db_path(Path("/flag.db"), None, explode),
+            Path("/flag.db"),
+        )
+        self.assertEqual(
+            ingest_mod.resolve_db_path(None, "/env.db", explode), Path("/env.db")
+        )
+
+
+class PluginAwareDefaultCliTest(unittest.TestCase):
+    """The same rule as the real CLI, asserted on what lands on disk.
+
+    Spawned as a subprocess with `ingest.py` COPIED into a simulated install,
+    because `Path(__file__).resolve()` is what decides this and it cannot be
+    faked from inside the test process. The assertion is the state change --
+    which file exists afterwards -- not that a message was printed.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-plugin-cli-test-")).resolve()
+        self.projects_dir = self.tmp / "projects"
+        self.projects_dir.mkdir()
+        shutil.copy(FIXTURE, self.projects_dir / "session-fixture.jsonl")
+        self.install, self.data = simulate_plugin_install(self.tmp, "ingest.py")
+        self.checkout = self.tmp / "checkout"
+        self.checkout.mkdir()
+        shutil.copy(REPO_ROOT / "ingest.py", self.checkout / "ingest.py")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_ingest(self, script: Path, *args: str, env: dict | None = None):
+        environ = dict(os.environ)
+        for stray in (
+            ingest_mod.DB_ENV_VAR,
+            ingest_mod.PLUGIN_ROOT_ENV_VAR,
+            ingest_mod.PLUGIN_DATA_ENV_VAR,
+        ):
+            environ.pop(stray, None)
+        environ.update(env or {})
+        return subprocess.run(
+            [sys.executable, str(script), "--projects-dir", str(self.projects_dir),
+             *args],
+            capture_output=True, text=True, env=environ, cwd=str(self.tmp),
+        )
+
+    def call_count(self, db: Path) -> int:
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_a_bare_run_inside_an_install_writes_nothing_and_exits_non_zero(self) -> None:
+        proc = self.run_ingest(self.install / "ingest.py")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertFalse(
+            (self.install / "db").exists(),
+            "the doomed database was created anyway",
+        )
+        self.assertIn(ingest_mod.PLUGIN_DATA_ENV_VAR, proc.stderr)
+
+    def test_a_bare_run_in_a_checkout_still_writes_beside_the_script(self) -> None:
+        # The supported path, unchanged. If this ever goes red the detection
+        # has a false positive, which is the worse of the two failures.
+        proc = self.run_ingest(self.checkout / "ingest.py")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.call_count(self.checkout / "db" / "usage.db"), 5)
+
+    def test_the_db_flag_still_wins_inside_an_install(self) -> None:
+        named = self.tmp / "named.db"
+        proc = self.run_ingest(self.install / "ingest.py", "--db", str(named))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.call_count(named), 5)
+        self.assertFalse((self.install / "db").exists())
+
+    def test_CPB_DB_still_wins_inside_an_install(self) -> None:
+        named = self.tmp / "from-env.db"
+        proc = self.run_ingest(
+            self.install / "ingest.py", env={ingest_mod.DB_ENV_VAR: str(named)}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.call_count(named), 5)
+        self.assertFalse((self.install / "db").exists())
+
+    def test_the_persistent_directory_is_used_when_claude_code_names_it(self) -> None:
+        proc = self.run_ingest(
+            self.install / "ingest.py",
+            env={
+                ingest_mod.PLUGIN_ROOT_ENV_VAR: str(self.install),
+                ingest_mod.PLUGIN_DATA_ENV_VAR: str(self.data),
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.call_count(self.data / "usage.db"), 5)
+        self.assertFalse((self.install / "db").exists())
+        self.assertIn(str(self.data / "usage.db"), proc.stdout)
 
 
 if __name__ == "__main__":

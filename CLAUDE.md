@@ -37,13 +37,23 @@ anyone who has it in a script. `_exit_status()` reproduces CPython's own
 report a run that measured nothing as a run that measured zero. `VERSION` lives
 in `cpb.py`; `.claude-plugin/plugin.json` repeats it as a literal because the
 plugin loader reads that JSON without running Python, and `tests/test_cpb.py`
-pins the two equal. CPB is **<!--cpb:version-->3.3.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
+pins the two equal. CPB is **<!--cpb:version-->4.0.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
 authority; this line lagged a release once already and may again), and what a
 bump *means* is `docs/versioning.md` — see Commits and PRs below.
 
 Both scripts default `--db` to `db/usage.db` (gitignored); `ingest.py` also
 reads `CPB_DB`, `serve.py` deliberately does not (pass `--db "$CPB_DB"`).
-`serve.py` exits rather than starting if the DB is absent.
+`serve.py` exits rather than starting if the DB is absent. **That default is
+plugin-aware and both scripts share one function for it** (`ingest.
+default_database()`, #94): beside the script is correct in a checkout and is
+`${CLAUDE_PLUGIN_ROOT}/db/usage.db` inside an install, which the next update
+deletes — so there it resolves `${CLAUDE_PLUGIN_DATA}/usage.db` where Claude
+Code named that directory and **refuses** where it did not. Being an install is
+established from two independent observations (the root variable *containing
+this script*, or the script sitting in Claude Code's plugin store), each dated
+and measured in `docs/plugin.md`, because a false positive would refuse the
+plain-clone path that `db/usage.db` is right for. `--db` and `CPB_DB` never
+reach it: the default is computed only when neither named a database.
 
 ```bash
 python3 -m unittest discover tests -v                        # full suite
@@ -224,7 +234,10 @@ not. Every database-touching invocation in that file names its database with
 ([#94](https://github.com/vlad-ko/claude-piggy-bank/issues/94)): only the serve
 half was pinned by a test, and the ingest half quietly wrote the user's only
 copy of their history into `${CLAUDE_PLUGIN_ROOT}/db/` while the report kept
-serving an empty file. `${CLAUDE_PLUGIN_DATA}`
+serving an empty file. The **improvised** invocation — somebody typing `python3
+ingest.py` with no flag — was the surviving half of that issue and is now the
+plugin-aware default described above, applied to `serve.py` by the same
+function rather than to `ingest.py` alone. `${CLAUDE_PLUGIN_DATA}`
 holds the database because `${CLAUDE_PLUGIN_ROOT}` is replaced on every update
 and the DB is not regenerable — *measured* on 2026-08-07 across a real install
 and update, not inferred. **`version` in `plugin.json` is the cache key Claude

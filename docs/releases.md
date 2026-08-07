@@ -42,6 +42,58 @@ already on the README record. The test does not require entries for historical
 versions: pinning history would force a rewrite at every release, which is how
 a check becomes something people route around.
 
+## 4.0.0 — 2026-08-07
+
+**This one only reaches you if you run `ingest.py` or `serve.py` yourself, with
+no `--db`, from inside a plugin *install*.** Nothing else changes: the plugin's
+hooks, the `/cpb` skill, every `--db` and every `CPB_DB` behave exactly as they
+did, no payload field moved, and the database is not touched.
+
+**What broke, and what it did.** Inside an installed plugin, `python3
+ingest.py` with no `--db` and no `CPB_DB` resolved its default to
+`${CLAUDE_PLUGIN_ROOT}/db/usage.db`, printed a successful ingest summary and
+exited 0. `${CLAUDE_PLUGIN_ROOT}` is the directory Claude Code **replaces on
+every plugin update** — measured across a real install and update on
+2026-08-07 — and past Claude Code's ~30-day transcript reap that database is
+the only surviving copy of the history. So the run reported measuring your
+history into a file the next update deletes, while the report kept reading the
+one the hooks write.
+
+**What it does now.** From inside an install, the default resolves
+`${CLAUDE_PLUGIN_DATA}/usage.db` — the file the hooks write and `/cpb` serves —
+and says so on stdout. Where that directory cannot be known for *this* plugin,
+it **refuses**, naming the durable path and the flag that reaches it. A silent
+fall-back to the doomed path is gone in both directions.
+
+**Why it is a major release.** An invocation that exited 0 can now exit
+non-zero. `versioning.md` names a changed exit status as breaking by
+definition, and the fact that the old success was a success at losing data does
+not change what a script sees.
+
+**If your script hits the refusal, name the database:**
+
+```bash
+python3 ingest.py --db "${CLAUDE_PLUGIN_DATA}/usage.db"
+# or, equivalently
+CPB_DB="${CLAUDE_PLUGIN_DATA}/usage.db" python3 ingest.py
+```
+
+**`serve.py` changed with it, deliberately.** It never wrote anything, so its
+half of the hole was quieter: its default named the same doomed path, so inside
+an install it reported the database missing *from a path it can never durably
+live at*, and would have served a database already stranded there. It now
+resolves or refuses through the same function `ingest.py` uses. It still does
+not read `CPB_DB`.
+
+**Nothing changes in a checkout.** `python3 cpb.py ingest` and `python3
+ingest.py` in a clone still write `db/usage.db` beside the script — documented,
+correct, durable, and pinned by a test in both directions, because a refusal
+that fired there would be the worse of the two failures.
+
+**If you already have a database under a plugin root**, it is still readable:
+copy it to `${CLAUDE_PLUGIN_DATA}/usage.db` before your next plugin update, or
+point `--db` at it deliberately. CPB will not move a file it did not create.
+
 ## 3.3.0 — 2026-08-07
 
 **No migration.** Every command, flag, exit status and payload field behaves as
