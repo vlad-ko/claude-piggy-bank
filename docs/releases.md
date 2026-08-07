@@ -42,6 +42,38 @@ already on the README record. The test does not require entries for historical
 versions: pinning history would force a rewrite at every release, which is how
 a check becomes something people route around.
 
+## 3.2.0 — 2026-08-07
+
+**No migration.** Nothing you already run changes; `/cpb` gains a step before
+the report opens.
+
+**What changed for a user:** if the database is empty or thin, `/cpb` now says
+so and offers to ingest the transcripts already on your disk, stating the size
+and an estimate **before** it starts. You choose the scope — **this project
+only**, **every project on this machine**, or **not now** — and nothing is
+scanned until you have.
+
+**Why.** A new install started empty and stayed that way for days while months
+of transcripts sat unread beside it. That emptiness was self-inflicted: on one
+machine measured 2026-08-07 there were 2.10 GB and up to 61 days of history
+already on disk at install. It is also the only time-critical thing here —
+Claude Code deletes transcripts after `cleanupPeriodDays`, so **install is the
+moment of maximum available history**, and every day without a backfill loses
+tail that cannot be recovered.
+
+**The scope is asked, never assumed.** "Every project" reads the directory
+names of every project you have, which are your own paths. That is a choice to
+be offered, not a default to be taken, and "not now" is a first-class answer
+with a documented way back.
+
+**What it does not promise.** A backfill clears a sample floor; it does not
+guarantee a verdict. Since 3.1.0 a metric needs enough calls before CPB will
+judge it, so a small project may still read "not enough data yet" after a full
+backfill — the offer says so rather than overselling.
+
+Merged as [PR #107](https://github.com/vlad-ko/claude-piggy-bank/pull/107),
+closing [#97](https://github.com/vlad-ko/claude-piggy-bank/issues/97).
+
 ## 3.1.0 — 2026-08-07
 
 **No migration. Nothing you run changes, and no figure you already had moves.**
