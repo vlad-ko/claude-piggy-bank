@@ -80,7 +80,7 @@ from typing import NamedTuple, Optional, Sequence
 # carve-out is about FIGURES that were wrong, not about behaviour a script
 # depends on. Someone's nightly prune stops working, and they are entitled to
 # learn that from the version number rather than from a silent pipeline.
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 PROG = "cpb"
 

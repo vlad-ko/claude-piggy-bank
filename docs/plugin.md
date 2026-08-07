@@ -4,7 +4,9 @@ CPB ships as a Claude Code plugin so that ingest happens **when the transcript
 is written**, rather than whenever someone remembers to run `ingest.py`. The
 plugin is the repository: `.claude-plugin/plugin.json` sits at the repository
 root and the hooks invoke the same `ingest.py` and `serve.py` a manual user
-runs. There is no second code path and no packaging step.
+runs. There is no second code path and no packaging step. Since
+[#73](https://github.com/vlad-ko/claude-piggy-bank/issues/73) the repository is
+also its own **marketplace**, so the same tree is catalog, plugin and checkout.
 
 Nor is one needed. A packaging step would exist to install dependencies, and
 CPB has none — the `stdlib-only` CI job resolves every import in every shipped
@@ -28,21 +30,49 @@ behaviour are *measured here* and marked as such. The two are never merged.
 | path | what it is |
 |---|---|
 | `.claude-plugin/plugin.json` | the manifest: name, version, license, repository |
+| `.claude-plugin/marketplace.json` | the catalog — see [The marketplace layer](#the-marketplace-layer) |
 | `hooks/hooks.json` | the three ingest triggers |
 | `hooks/cpb_ingest_hook.py` | the handler the triggers run |
-| `commands/cpb.md` | the `/cpb` command that opens the report |
+| `skills/cpb/SKILL.md` | the `/cpb` skill that opens the report |
 
-Only `plugin.json` belongs inside `.claude-plugin/`; `hooks/` and `commands/`
-must be at the plugin root or they are silently never loaded. (Documented:
-[Plugins reference § Plugin structure
+The two manifests belong inside `.claude-plugin/` and nothing else does;
+`hooks/` and `skills/` must be at the plugin root or they are silently never
+loaded. (Documented: [Plugins reference § Plugin structure
 overview](https://code.claude.com/docs/en/plugins-reference#plugin-directory-structure),
-checked 2026-08-05. `tests/test_plugin_manifest.py` asserts it, because "silently
+checked 2026-08-07. `tests/test_plugin_manifest.py` asserts it, because "silently
 never loaded" is not a failure anyone notices.)
+
+### Why `skills/`, not `commands/`
+
+`/cpb` was `commands/cpb.md` until [#73](https://github.com/vlad-ko/claude-piggy-bank/issues/73).
+The [File locations
+reference](https://code.claude.com/docs/en/plugins-reference#file-locations-reference)
+(checked 2026-08-07) lists `commands/` as "Skills as flat Markdown files. **Use
+`skills/` for new plugins**", so the file moved to `skills/cpb/SKILL.md`. The
+prompt is unchanged; the only edit was adding `name: cpb` to the frontmatter,
+because in a *plugin* skill that field sets the last segment of the command
+([Skills § How a skill gets its command
+name](https://code.claude.com/docs/en/skills#how-a-skill-gets-its-command-name),
+checked 2026-08-07) and writing it down beats depending on the directory
+staying called `cpb`. The command is `/claude-piggy-bank:cpb`, and `/cpb`
+resolves to it while no other plugin ships that name. *Measured here*
+(2026-08-07, Claude Code 2.1.223): after a marketplace install,
+`claude plugin details claude-piggy-bank@claude-piggy-bank` reported
+`Skills (1)  cpb`.
+
+**A migrated plugin reports `0 skills` on `/reload-plugins`.** The reload
+summary counts only `commands/`, so a plugin that correctly uses `skills/`
+shows nothing there. That is the summary being wrong, not the migration.
+(*Product-owner report*, 2026-08-05, via
+[#73](https://github.com/vlad-ko/claude-piggy-bank/issues/73) — **not verified
+here**; `/reload-plugins` is interactive and this document's other measurements
+were taken headlessly. The skill's presence was confirmed through
+`claude plugin details` instead, above.)
 
 ## What the plugin may ask the model to do
 
-Three of those four files are code and configuration. The fourth,
-`commands/cpb.md`, is a **prompt** — that is what a command file is — so it is
+Four of those five files are code and configuration. The fifth,
+`skills/cpb/SKILL.md`, is a **prompt** — that is what a skill file is — so it is
 the one place in the plugin where a model is asked to do anything at all, and
 the project's third constraint had to say precisely how far that reaches.
 
@@ -55,7 +85,7 @@ produce measurement, it produces guidance.
 |---|---|---|
 | `ingest.py`, `serve.py`, `index.html` | **none, ever** | every figure is SQL, arithmetic or JSON parsing; the report runs free and offline |
 | `hooks/cpb_ingest_hook.py` | **none, ever** | it spawns one `ingest.py --transcript` and exits; no hook handler is of type `prompt` or `agent`, and `tests/test_plugin_manifest.py` asserts that |
-| `commands/cpb.md` | **yes, bounded** | it runs in a session the user is already paying for, and summarises figures the report has already computed |
+| `skills/cpb/SKILL.md` | **yes, bounded** | it runs in a session the user is already paying for, and summarises figures the report has already computed |
 
 The reason the line sits exactly there: a model asked for a number it was not
 given will produce a fluent, plausible one. That is the project's *absence is
@@ -66,9 +96,9 @@ a source; a figure a model arrived at has none.
 Two things this is **not**:
 
 - **Not a restriction Claude Code imposes.** The plugin reference places no
-  limit on what a command may ask the model to do; commands are prompts by
+  limit on what a skill may ask the model to do; skills are prompts by
   design. (External: <https://code.claude.com/docs/en/plugins-reference> — the
-  revision `tests/test_plugin_manifest.py` records as checked 2026-08-05. It is
+  revision `tests/test_plugin_manifest.py` records as checked 2026-08-07. It is
   *silent* on the question rather than permissive about it, which is weaker
   evidence than a positive statement, and it was not re-fetched when this
   section was written.) The constraint is CPB's own.
@@ -223,6 +253,124 @@ Uninstalling the plugin from its last scope deletes the data directory by
 default. Pass `--keep-data` to keep the database, or back it up first — see the
 uninstall note in the README.
 
+### The update path, measured rather than reasoned
+
+The paragraph above is the *documented* claim. Because losing a user's only
+copy of their history is not a failure worth finding out about later, it was
+also **measured here** end to end (2026-08-07, Claude Code 2.1.223): a
+throwaway marketplace was served over smart HTTP into an isolated
+`CLAUDE_CONFIG_DIR`, the plugin installed from it, a session run so the hooks
+wrote a real database, the version bumped and republished, and
+`claude plugin update` run.
+
+| | before the update | after |
+|---|---|---|
+| `${CLAUDE_PLUGIN_ROOT}` | `…/plugins/cache/claude-piggy-bank/claude-piggy-bank/1.6.0` | `…/1.7.0` — a directory that did not exist before |
+| `${CLAUDE_PLUGIN_DATA}` | `…/plugins/data/claude-piggy-bank-claude-piggy-bank` | unchanged — no version anywhere in the path |
+| `usage.db` | SHA-256 `78f98623…` | `78f98623…`, byte-identical |
+
+The plugin root carries the version and is therefore replaced on every update;
+the data directory is keyed on the plugin *identity* and is not. After the
+update a further session's `SessionEnd` hook ran from
+`…/1.7.0/hooks/cpb_ingest_hook.py` and appended its session to the *same*
+database, which then held both the pre-update session and the post-update one.
+That is the property the whole location decision rests on, and it is now an
+observation rather than an inference.
+
+## The marketplace layer
+
+`/plugin marketplace add vlad-ko/claude-piggy-bank` then `/plugin install`
+requires a **catalog**, which is a separate file from the manifest:
+`.claude-plugin/marketplace.json`. CPB is a single-plugin repository, so it is
+its own marketplace — the repository is both catalog and plugin, and the entry
+points back at the directory the catalog lives in:
+
+```json
+{
+  "name": "claude-piggy-bank",
+  "description": "…",
+  "owner": { "name": "Vlad Ko", "url": "https://github.com/vlad-ko" },
+  "plugins": [
+    { "name": "claude-piggy-bank", "source": "./" }
+  ]
+}
+```
+
+Every choice in those few lines is a documented property rather than taste
+([Plugin marketplaces](https://code.claude.com/docs/en/plugin-marketplaces),
+checked 2026-08-07):
+
+- **`"source": "./"`** — a relative path resolves against the marketplace
+  *root*, the directory containing `.claude-plugin/`, not `.claude-plugin/`
+  itself. It must start with `./` and may not contain `..`. A `github` source
+  would fetch a second copy of a repository Claude Code has already cloned.
+- **No `version` in the entry.** Version resolution takes `plugin.json` first
+  and "always uses the `plugin.json` value without warning", so a version here
+  could only ever be a second copy free to disagree. *Measured here*
+  (2026-08-07): an entry declaring `9.9.9` against a manifest declaring `1.6.0`
+  validated with a warning naming the mismatch, and installed `1.6.0`.
+- **No `description` in the entry** for the same reason. *Measured here*:
+  with the entry silent, `claude plugin details` showed the description from
+  `plugin.json`.
+- **The marketplace and the plugin share the name `claude-piggy-bank`**, so
+  the install string is `claude-piggy-bank@claude-piggy-bank`. Doubled, and
+  deliberate: the marketplace name is what a user types after `@`, and the
+  repository name is the only string they can predict without reading
+  anything. It is not one of the [reserved
+  names](https://code.claude.com/docs/en/plugin-marketplaces#marketplace-schema);
+  `tests/test_plugin_manifest.py` carries that list so a future rename cannot
+  land on one.
+
+**The one thing `claude plugin validate` does not check is the one most likely
+to be wrong.** *Measured here* (2026-08-07): with `source` pointed at
+`./plugins/claude-piggy-bank`, a directory that does not exist, the validator
+printed `✔ Validation passed`. The install fails later, on a user's machine.
+`tests/test_plugin_manifest.py` resolves the source itself and demands a
+`plugin.json` at the end of it, because nothing else does.
+
+Adding the catalog also changed what `claude plugin validate .` validates — see
+[Validation](#validation) below.
+
+## The version field is the cache key
+
+`version` in `plugin.json` is no longer only a label. Claude Code resolves a
+plugin's version from the first of: `version` in `plugin.json`, `version` in
+the marketplace entry, the git commit SHA, then `unknown` ([Plugins reference §
+Version
+management](https://code.claude.com/docs/en/plugins-reference#version-management),
+checked 2026-08-07). CPB sets the first, so **that string decides whether an
+update exists**, and the plugin cache is literally a directory named after it.
+
+The consequence is sharp enough to be worth stating as a failure mode:
+**a merged change with an unbumped version reaches nobody, and looks shipped.**
+*Measured here* (2026-08-07), the two halves side by side:
+
+| published | `claude plugin update` said | what the install received |
+|---|---|---|
+| `SKILL.md` changed, `version` 1.6.0 → 1.7.0 | `updated from 1.6.0 to 1.7.0` | the new file, from a new cache directory |
+| `SKILL.md` changed, `version` left at 1.7.0 | `already at the latest version (1.7.0)` | nothing — the marketplace clone had the change, the installed copy did not |
+
+Because `marketplace.json` lists the plugin with `"source": "./"`, the
+marketplace *is* this repository and the ref users resolve is the default
+branch: **every merge to `main` is a release**, with no tag in between. So the
+bump is enforced where it can still block, on the pull request, by
+`.github/scripts/check_plugin_version_bump.py`. If a change touches a path that
+reaches an installed user — the manifest, `hooks/`, `skills/`, `vendor/`,
+`index.html`, any top-level module — the version must move forward or the
+`plugin version` job fails. A changed path the script cannot classify is a
+**refusal**, not a pass, so a new plugin component directory forces a decision
+rather than inheriting a silent gap.
+
+The version numbers in the table above are the throwaway install's, chosen to
+make the two runs distinguishable; they are not a statement about what CPB
+ships next. `cpb.VERSION` is the only place to read that.
+
+Five places state the version and must move together: `cpb.VERSION` (the
+authority), `.claude-plugin/plugin.json`, `README.md`, `CLAUDE.md` and
+`docs/versioning.md`. `tests/test_cpb.py` pins all five, and the CI check reads
+`cpb.VERSION` itself and refuses if the manifest disagrees with it — so the
+check cannot end up policing a copy that has drifted from the constant.
+
 ## The failure policy
 
 Two project rules point in opposite directions: CPB must never interrupt
@@ -294,11 +442,57 @@ diverging copy of that logic.
 
 ## Validation
 
-`claude plugin validate .` passes. It reports one warning, which is expected and
-will not be fixed:
+**Which manifest `claude plugin validate .` picks is decided by which files
+exist**, and adding the catalog changed the answer. *Measured here* (2026-08-07,
+Claude Code 2.1.223):
 
-> `root: CLAUDE.md at the plugin root is not loaded as project context.`
+| command | what it validates | verdict | with `--strict` |
+|---|---|---|---|
+| `claude plugin validate .` | `.claude-plugin/marketplace.json`, plus a per-entry pass over the local-path plugin's `plugin.json` | `✔ Validation passed` | passes |
+| `claude plugin validate .claude-plugin/plugin.json` | the plugin | `✔ Validation passed with warnings` (one, below) | **fails** |
 
-CPB's `CLAUDE.md` is the working ruleset for people editing this repository, not
-plugin context. It is not meant to load into a plugin user's session, so
-`--strict` is not used in CI for this check.
+The per-entry pass has real teeth on the manifest — renaming the plugin to
+`Claude Piggy Bank` produced `plugins[0] plugin.json → name: Plugin name cannot
+contain spaces` — but it stops there: a deliberately broken
+`skills/cpb/SKILL.md` frontmatter, and a `source` pointing at a directory that
+does not exist, both validated clean. Those two gaps are covered by
+`tests/test_plugin_manifest.py` instead.
+
+### The `CLAUDE.md` warning: accepted, with the reason
+
+> `⚠ root: CLAUDE.md at the plugin root is not loaded as project context. To
+> ship context with your plugin, use a skill (skills/<name>/SKILL.md) instead.`
+
+The warning is accurate — the reference states plainly that "A `CLAUDE.md` file
+at the plugin root is not loaded as project context" ([Plugin directory
+structure](https://code.claude.com/docs/en/plugins-reference#plugin-directory-structure),
+checked 2026-08-07) — and here it is **irrelevant**. CPB's `CLAUDE.md` is the
+working ruleset for people editing this repository. It is not context to ship
+*with* the plugin, and moving it would break the thing it is actually for:
+Claude Code loads a repository's root `CLAUDE.md` for anyone working *on* CPB.
+Migrating `/cpb` to `skills/` did not change this, and could not: the warning is
+about `CLAUDE.md` existing, not about the absence of a skill.
+
+So the decision is to **accept it**, and three facts make that cheap rather
+than a shrug:
+
+1. `claude plugin validate .` — the command the README and this document tell
+   people to run — no longer surfaces it at all, because it now validates the
+   marketplace. It passes with `--strict` too.
+2. The warning is reachable only by naming the plugin manifest explicitly, and
+   only there does `--strict` fail. **CI does not run `--strict` on that path**,
+   and this paragraph is why.
+3. The community review pipeline runs `claude plugin validate ./your-plugin`
+   and "Warnings don't fail validation; add `--strict` to treat them as errors"
+   ([Plugins § Submit your plugin to the community
+   marketplace](https://code.claude.com/docs/en/plugins#submit-your-plugin-to-the-community-marketplace),
+   checked 2026-08-07). So the warning does not block a submission either. That
+   contradicts the assumption in
+   [#73](https://github.com/vlad-ko/claude-piggy-bank/issues/73) that the
+   pipeline's `--strict` behaviour made this urgent; the documentation is the
+   authority and it says otherwise.
+
+If a future release does start failing submissions on it, the fix is to move
+`CLAUDE.md` out of the plugin root — which costs contributors their
+automatically-loaded ruleset — and that trade should be made then, on evidence,
+not pre-emptively now.
