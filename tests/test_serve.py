@@ -104,6 +104,7 @@ from serve import (  # noqa: E402
     CONTEXT_ANSWER_NO_SAMPLE,
     CONTEXT_ANSWER_STATEMENTS,
     CONTEXT_ANSWER_STATES,
+    CONTEXT_DOT_METRIC,
     CONTEXT_ANSWER_UNKNOWN,
     CONTEXT_ANSWER_YES,
     CONTEXT_SAMPLE,
@@ -150,8 +151,7 @@ from serve import (  # noqa: E402
     STALE_UNKNOWN_NO_RUN_TABLE,
     STALE_UNKNOWN_RUN_IN_FUTURE,
     STATUS_ARCHIVED,
-    STRIP_CACHE_UNDER_SAMPLED,
-    STRIP_CACHE_UNMEASURED,
+    STRIP_NOT_MEASURED,
     STRIP_BAD,
     STRIP_DOTS,
     STRIP_DOT_BROKEN,
@@ -162,9 +162,9 @@ from serve import (  # noqa: E402
     STRIP_FROM_HEALTH,
     STRIP_FROM_SEVERITY,
     STRIP_GOOD,
-    STRIP_KNOBS_NO_BASIS,
     STRIP_ORDER,
     STRIP_QUESTIONS,
+    STRIP_UNDER_SAMPLED,
     STRIP_WATCH,
     STRIP_UNKNOWN,
     UTIL_NO_SAMPLE_NO_CALLS,
@@ -7144,7 +7144,9 @@ FIRST_RUN_WRITE = 100
 FIRST_RUN_READS_PER_WRITE = 24.0
 
 
-def build_first_run_corpus(root: Path, replies: int = FIRST_RUN_REPLIES) -> Path:
+def build_first_run_corpus(
+    root: Path, replies: int = FIRST_RUN_REPLIES, read: int = FIRST_RUN_READ
+) -> Path:
     """One session, `replies` assistant replies, NO subagents.
 
     The zero-subagent half matters as much as the small count: it is what makes
@@ -7173,7 +7175,7 @@ def build_first_run_corpus(root: Path, replies: int = FIRST_RUN_REPLIES) -> Path
                 "usage": {
                     "input_tokens": 100,
                     "cache_creation_input_tokens": FIRST_RUN_WRITE,
-                    "cache_read_input_tokens": FIRST_RUN_READ,
+                    "cache_read_input_tokens": read,
                     "output_tokens": 50,
                 },
                 "content": [{"type": "text", "text": f"reply {n}"}],
@@ -7335,7 +7337,7 @@ class FirstRunRendersNoVerdictTest(unittest.TestCase):
         # "0 of 5" is arithmetic over an empty set that reads exactly like five
         # checks passing. That sentence is what a fresh install saw.
         self.assertNotIn("of 5", dot["answer"])
-        self.assertEqual(dot["answer"], STRIP_KNOBS_NO_BASIS)
+        self.assertEqual(dot["answer"], STRIP_UNDER_SAMPLED)
 
     def test_the_cache_dot_is_not_green_and_names_the_right_absence(self):
         dot = self.dot(STRIP_DOT_CACHE)
@@ -7343,18 +7345,37 @@ class FirstRunRendersNoVerdictTest(unittest.TestCase):
         # Under-sampled, not unmeasured: two of the three cache metrics have
         # readings here. A dot that said "Not measured" would send the reader
         # to the wrong remedy.
-        self.assertEqual(dot["answer"], STRIP_CACHE_UNDER_SAMPLED)
-        self.assertNotEqual(dot["answer"], STRIP_CACHE_UNMEASURED)
+        self.assertEqual(dot["answer"], STRIP_UNDER_SAMPLED)
+        self.assertNotEqual(dot["answer"], STRIP_NOT_MEASURED)
+
+    def test_the_context_dot_is_not_green_either(self):
+        # #93, second pass, and the defect this class first shipped WITH. The
+        # page rendered a green "Wasting context? -- No" directly above a row
+        # reading `TOO FEW - main_thread_share_over_half_window - 5 of 11`, and
+        # a reader cannot hold both. "Am I wasting context?" is a judgment; it
+        # is the judgment that metric makes, and it is owed that metric's floor.
+        dot = self.dot(STRIP_DOT_CONTEXT)
+        self.assertEqual(dot["state"], STRIP_UNKNOWN)
+        self.assertEqual(dot["answer"], STRIP_UNDER_SAMPLED)
+        # The card underneath still answers its own, narrower question -- the
+        # observation is complete over these three calls and is not withdrawn.
+        # Only the judgment built on top of it is.
+        self.assertEqual(
+            self.summary()["context"]["utilisation"]["answer"]["verdict"],
+            CONTEXT_ANSWER_NO,
+        )
 
     def test_no_dot_backed_by_the_table_is_good(self):
-        # GREEN MEANS MEASURED AND HEALTHY. The two dots that summarise the
-        # recommendation table have no basis here and may not wear the colour
-        # of one that has. The other two -- "anything broken?" and "wasting
-        # context?" -- answer questions whose basis IS these three calls, and
-        # are deliberately not asserted: nothing was unparsed and no call came
-        # near half its window, and both of those are complete answers over the
-        # period rather than rates estimated from a sample.
-        for key in (STRIP_DOT_KNOBS, STRIP_DOT_CACHE):
+        # GREEN MEANS MEASURED AND HEALTHY. Every dot whose question is
+        # answered by a metric in the table has no basis here and may not wear
+        # the colour of one that has.
+        #
+        # "Anything broken?" is deliberately excluded and deliberately still
+        # green-capable: nothing was unparsed, nothing skipped and no model
+        # unknown, which is a COMPLETE statement over whatever was ingested
+        # rather than a rate estimated from a sample. It answers to no floor
+        # because there is no floor a count of parse failures could need.
+        for key in (STRIP_DOT_CONTEXT, STRIP_DOT_KNOBS, STRIP_DOT_CACHE):
             with self.subTest(dot=key):
                 self.assertNotEqual(self.dot(key)["state"], STRIP_GOOD)
 
@@ -7391,6 +7412,192 @@ class FirstRunRendersNoVerdictTest(unittest.TestCase):
             a for a in block["ranked"] if a["metric"] == METRIC_CACHE_READS_PER_WRITE
         )
         self.assertEqual(reads["value"], FIRST_RUN_READS_PER_WRITE)
+
+
+class AProvenYesSurvivesTheFloorTest(unittest.TestCase):
+    """#93, second pass: the floor weakens a clean answer, never a bad one.
+
+    The direction is `CONTEXT_ANSWER_STATES`' own, written down long before
+    this change: "an unknown may weaken a `no` and never a `yes` -- a proven
+    saturation is not softened by the calls that could not be measured beside
+    it." A call observed at or above half its window HAPPENED; the remedy is
+    real, and a thin sample is no reason to hide it. Holding the dot to a floor
+    in both directions would have answered one over-claim with the opposite
+    error, and it is the error this repository never makes.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-93-yes-"))
+        db_path = cls.tmp / "usage.db"
+        # Three replies, each carrying 70% of a 1,000,000-token window: too few
+        # to band the share, and every one of them proven over half.
+        ingest(
+            build_first_run_corpus(cls.tmp, read=700_000),
+            db_path,
+            tasks_dir=cls.tmp / "no-task-index",
+        )
+        cls.api = Api(db_path)
+        cls.payload = cls.api.summary(*day_bounds(None, None))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_the_fixture_is_the_case_it_claims_to_be(self):
+        backing = next(
+            k
+            for k in self.payload["recommendations"]["knobs"]
+            if k["metric"] == CONTEXT_DOT_METRIC
+        )
+        self.assertEqual(backing["sample"]["state"], SAMPLE_UNDER_SAMPLED)
+        self.assertEqual(
+            self.payload["context"]["utilisation"]["answer"]["verdict"],
+            CONTEXT_ANSWER_YES,
+        )
+
+    def test_the_dot_stays_bad_over_an_under_sampled_metric(self):
+        dot = next(
+            d for d in self.payload["status"]["dots"] if d["key"] == STRIP_DOT_CONTEXT
+        )
+        self.assertEqual(dot["state"], STRIP_BAD)
+        self.assertNotEqual(dot["answer"], STRIP_UNDER_SAMPLED)
+
+    def test_the_proven_answer_keeps_its_named_scope(self):
+        # The scope is the ranking's own winner and is the actionable half of a
+        # proven yes. A floor that swallowed it would leave the reader a red
+        # dot with nothing to act on.
+        dot = next(
+            d for d in self.payload["status"]["dots"] if d["key"] == STRIP_DOT_CONTEXT
+        )
+        self.assertIn(str(self.payload["context"]["utilisation"]["worst_scope"]),
+                      dot["answer"])
+
+    def test_the_floor_helper_never_improves_a_state(self):
+        # Directly, over every state the strip has, so the one-way property is
+        # pinned independently of whatever a corpus happens to reach.
+        under = {"sample": {"state": SAMPLE_UNDER_SAMPLED}}
+        banded = {"sample": {"state": SAMPLE_MEASURED}}
+        for state in STRIP_ORDER:
+            with self.subTest(state=state):
+                floored, _ = Api._floored(state, "answer", under)
+                # `STRIP_ORDER` is WORST FIRST, so a lower index is a worse
+                # state and "never improves" is the floored index being at most
+                # the original's. Spelled through the published order rather
+                # than as a comparison of the four names, so a reordering there
+                # cannot silently invert this.
+                self.assertLessEqual(
+                    STRIP_ORDER.index(floored), STRIP_ORDER.index(state)
+                )
+                self.assertEqual(
+                    Api._floored(state, "answer", banded), (state, "answer")
+                )
+        # ...and specifically: good is weakened, bad is not.
+        self.assertEqual(
+            Api._floored(STRIP_GOOD, "No", under), (STRIP_UNKNOWN, STRIP_UNDER_SAMPLED)
+        )
+        self.assertEqual(Api._floored(STRIP_BAD, "Yes", under), (STRIP_BAD, "Yes"))
+        # An already-unknown dot keeps its own, more specific words: "no
+        # sample" and "unknown" say different things and neither is improved by
+        # being told to come back later.
+        self.assertEqual(
+            Api._floored(STRIP_UNKNOWN, "No sample", under),
+            (STRIP_UNKNOWN, "No sample"),
+        )
+
+
+def build_subagent_only_corpus(root: Path) -> Path:
+    """A window whose only calls are a subagent's.
+
+    The main-thread share is then UNMEASURED -- no such call ran -- while the
+    context card still answers cleanly, because every call in the period was
+    measured, banded and inside its window.
+    """
+    project = root / "projects" / "-fixture-subagent-only"
+    subagents = project / "sub-only" / "subagents"
+    subagents.mkdir(parents=True)
+    (project / "sub-only.jsonl").write_text(
+        json.dumps({"type": "mode", "mode": "normal", "sessionId": "sub-only"}) + "\n"
+    )
+    lines = []
+    for n in range(3):
+        lines.append(json.dumps({
+            "type": "assistant", "sessionId": "sub-only", "agentId": "agent-solo",
+            "isSidechain": True,
+            "timestamp": f"2026-08-06T10:0{n}:00.000Z",
+            "message": {
+                "id": f"msg-sub-only-{n}", "model": REC_OPUS_1M,
+                "usage": {
+                    "input_tokens": 100, "cache_creation_input_tokens": 100,
+                    "cache_read_input_tokens": 1_000, "output_tokens": 50,
+                },
+                "content": [{"type": "text", "text": f"sub {n}"}],
+            },
+        }))
+    (subagents / "agent-solo.jsonl").write_text("\n".join(lines) + "\n")
+    return project
+
+
+class AnAbsentQuestionIsNotAnUnansweredOneTest(unittest.TestCase):
+    """#93, second pass: the floor binds on UNDER-SAMPLED, never on UNMEASURED.
+
+    A window holding only subagent calls has no main-thread share at all. The
+    metric is unmeasured because no such call ran -- not because too few did --
+    and the context card answers cleanly over what did run: every call
+    measured, banded and inside its window.
+
+    Telling that reader "come back after a few more sessions" would be a
+    promise with no arithmetic behind it, and it is the mirror of the defect
+    this change fixes rather than more of the same medicine. The distinction
+    exists precisely because this repository keeps the two absences apart
+    everywhere else.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-93-absent-"))
+        db_path = cls.tmp / "usage.db"
+        ingest(
+            build_subagent_only_corpus(cls.tmp),
+            db_path,
+            tasks_dir=cls.tmp / "no-task-index",
+        )
+        cls.api = Api(db_path)
+        cls.payload = cls.api.summary(*day_bounds(None, None))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.api.conn.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_the_fixture_is_the_case_it_claims_to_be(self):
+        backing = next(
+            k
+            for k in self.payload["recommendations"]["knobs"]
+            if k["metric"] == CONTEXT_DOT_METRIC
+        )
+        self.assertEqual(backing["sample"]["state"], SAMPLE_UNMEASURED)
+        self.assertEqual(
+            self.payload["context"]["utilisation"]["answer"]["verdict"],
+            CONTEXT_ANSWER_NO,
+        )
+
+    def test_the_dot_keeps_its_clean_answer(self):
+        # Nothing here is waiting for data, so nothing here is told to wait.
+        dot = next(
+            d for d in self.payload["status"]["dots"] if d["key"] == STRIP_DOT_CONTEXT
+        )
+        self.assertEqual(dot["state"], STRIP_GOOD)
+        self.assertNotEqual(dot["answer"], STRIP_UNDER_SAMPLED)
+
+    def test_the_floor_helper_ignores_an_unmeasured_backing_reading(self):
+        # Directly, so the decision is pinned independently of what any corpus
+        # happens to reach.
+        unmeasured = {"sample": {"state": SAMPLE_UNMEASURED}}
+        self.assertEqual(
+            Api._floored(STRIP_GOOD, "No", unmeasured), (STRIP_GOOD, "No")
+        )
 
 
 class SampleFloorIsPerPeriodTest(unittest.TestCase):
@@ -7840,10 +8047,12 @@ class ThreeLevelPayloadTest(unittest.TestCase):
                     self.assertIn(dot["state"], STRIP_ORDER)
                     self.assertTrue(dot["answer"].strip())
 
-    def test_the_broken_and_context_dots_are_their_cards_own_verdicts(self) -> None:
+    def test_the_broken_dot_is_its_cards_own_verdict(self) -> None:
         # A dot that disagreed with the card it summarises is the three-level
-        # page's own defect in its most literal form. Both are READ off the
-        # blocks the payload already carries.
+        # page's own defect in its most literal form. "Anything broken?" is a
+        # complete statement over whatever was ingested -- nothing unparsed,
+        # nothing skipped -- rather than a rate estimated from a sample, so it
+        # answers to no floor and is its card's verdict unconditionally.
         for day in self.ALL_DAYS:
             with self.subTest(day=day):
                 payload = self.summary(day)
@@ -7852,10 +8061,60 @@ class ThreeLevelPayloadTest(unittest.TestCase):
                     dots[STRIP_DOT_BROKEN]["state"],
                     STRIP_FROM_HEALTH[payload["health"]["verdict"]][0],
                 )
-                verdict = payload["context"]["utilisation"]["answer"]["verdict"]
-                self.assertEqual(
-                    dots[STRIP_DOT_CONTEXT]["state"], STRIP_FROM_CONTEXT[verdict][0]
+
+    def test_the_context_dot_is_its_cards_verdict_held_to_its_metrics_floor(self):
+        # #93, second pass. The dot asks "Wasting context?", which is a
+        # JUDGMENT; the card underneath answers "did any call reach half its
+        # window", which is an observation complete over any sample. The two
+        # are not the same claim, and on a five-call corpus the page rendered a
+        # green "No" directly above a row reading `TOO FEW -
+        # main_thread_share_over_half_window - 5 of 11`. A reader cannot hold
+        # both.
+        #
+        # So the dot is the card's verdict EXCEPT where the metric that answers
+        # its question has no basis, and the exception runs one way only.
+        for day in self.ALL_DAYS:
+            with self.subTest(day=day):
+                payload = self.summary(day)
+                dot = next(
+                    d
+                    for d in payload["status"]["dots"]
+                    if d["key"] == STRIP_DOT_CONTEXT
                 )
+                verdict = payload["context"]["utilisation"]["answer"]["verdict"]
+                card = STRIP_FROM_CONTEXT[verdict][0]
+                backing = next(
+                    k
+                    for k in payload["recommendations"]["knobs"]
+                    if k["metric"] == CONTEXT_DOT_METRIC
+                )
+                if backing["sample"]["state"] != SAMPLE_UNDER_SAMPLED:
+                    self.assertEqual(dot["state"], card)
+                    continue
+                # Under-sampled: the floor contributes an unknown and
+                # `STRIP_ORDER` decides, so the dot is never BETTER than the
+                # card and never better than unknown.
+                self.assertEqual(
+                    dot["state"], min((card, STRIP_UNKNOWN), key=STRIP_ORDER.index)
+                )
+                self.assertNotEqual(dot["state"], STRIP_GOOD)
+
+    def test_the_corpus_reaches_a_context_dot_held_to_the_floor(self) -> None:
+        # Without this the test above could pass vacuously over a corpus where
+        # the backing metric is always banded.
+        floored = [
+            day
+            for day in self.ALL_DAYS
+            if next(
+                k
+                for k in self.summary(day)["recommendations"]["knobs"]
+                if k["metric"] == CONTEXT_DOT_METRIC
+            )["sample"]["state"]
+            == SAMPLE_UNDER_SAMPLED
+        ]
+        self.assertTrue(
+            floored, "no window in this corpus under-samples the context metric"
+        )
 
     def test_the_context_dot_names_the_scope_only_on_a_proven_yes(self) -> None:
         # A named scope is the ranking's own winner and only exists where the
@@ -7899,7 +8158,18 @@ class ThreeLevelPayloadTest(unittest.TestCase):
                 turnable = len([k for k in knobs if k["directive"]])
                 without_basis = [k for k in knobs if k["severity"] is None]
                 if len(without_basis) == len(knobs):
-                    self.assertEqual(dot["answer"], STRIP_KNOBS_NO_BASIS)
+                    # WHICH absence, not merely that there is one. An empty
+                    # window is waiting for nothing and must not be told to
+                    # come back later; a fresh install is, and must.
+                    under = [
+                        k
+                        for k in knobs
+                        if k["sample"]["state"] == SAMPLE_UNDER_SAMPLED
+                    ]
+                    self.assertEqual(
+                        dot["answer"],
+                        STRIP_UNDER_SAMPLED if under else STRIP_NOT_MEASURED,
+                    )
                     continue
                 self.assertTrue(
                     dot["answer"].startswith(f"{turnable} of {len(knobs)}"),
@@ -7917,7 +8187,7 @@ class ThreeLevelPayloadTest(unittest.TestCase):
         payload = self.summary(REC_NO_CACHE_DAY)
         dot = next(d for d in payload["status"]["dots"] if d["key"] == STRIP_DOT_CACHE)
         self.assertEqual(dot["state"], STRIP_UNKNOWN)
-        self.assertEqual(dot["answer"], STRIP_CACHE_UNMEASURED)
+        self.assertEqual(dot["answer"], STRIP_NOT_MEASURED)
         self.assertNotEqual(dot["state"], STRIP_GOOD)
         # And the day where they ARE measured is not unknown, so the assertion
         # above is not passing on a dot that is always grey.

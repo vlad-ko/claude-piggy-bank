@@ -261,6 +261,41 @@ def _refuse_ungrouped_cache_metrics(
 
 _refuse_ungrouped_cache_metrics(CACHE_METRICS, RECOMMENDED_METRICS)
 
+# WHICH METRIC THE CONTEXT DOT ANSWERS TO (#93, second pass).
+#
+# The dot asks "Wasting context?" and that is a JUDGMENT, not an observation.
+# The observation underneath it -- did any call in this period reach half its
+# model's documented window -- is complete over whatever ran, however little
+# ran, and `_context()` answers it honestly on any sample. Turning that into
+# "No, you are not wasting context" is a different claim, and it is the same
+# claim `main_thread_share_over_half_window` makes; so it is owed the same
+# floor.
+#
+# THIS WAS SHIPPED WRONG AND CAUGHT IN REVIEW. The first pass exempted this dot
+# on the grounds that its verdict is a complete statement over the period. That
+# is true of the question the CARD asks and false of the question the DOT asks,
+# and the two sat on one screen contradicting each other: a green "Wasting
+# context? -- No" directly above a row reading `TOO FEW -
+# main_thread_share_over_half_window - 5 of 11`. A reader cannot hold both.
+#
+# Named here rather than reached for inside `_status()`, and checked against
+# the wired set at import, for `CACHE_METRICS`' reason: a dot that answers to a
+# metric nothing computes would report a verdict it never looked at.
+CONTEXT_DOT_METRIC = METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW
+
+
+def _refuse_unbacked_context_dot(metric: str, wired: frozenset[str]) -> None:
+    """Refuse to import if the context dot answers to nothing this file computes."""
+    if metric not in wired:
+        raise RuntimeError(
+            f"serve.CONTEXT_DOT_METRIC is {metric!r}, which "
+            "serve.RECOMMENDED_METRICS does not name: a dot cannot inherit the "
+            "floor of a reading nothing measures."
+        )
+
+
+_refuse_unbacked_context_dot(CONTEXT_DOT_METRIC, RECOMMENDED_METRICS)
+
 # WHAT KIND OF NUMBER EACH READING IS -- `30.3%` rather than `0.3034`, `3.20x`
 # rather than `3.195` -- IS NOT DECLARED HERE ANY MORE. It shipped as a
 # `METRIC_UNITS` mapping in this file, under an import-time totality guard,
@@ -662,21 +697,23 @@ STRIP_FROM_SEVERITY: dict[str, tuple[str, str]] = {
     SEVERITY_WATCH: (STRIP_WATCH, "Watch"),
     SEVERITY_ACT: (STRIP_BAD, "Not repaying"),
 }
-# What the cache dot says when not one of its metrics has a sample. Named
-# rather than defaulted, because "no cache reading in this window" is a
-# statement and an empty dot is not.
-STRIP_CACHE_UNMEASURED = "Not measured"
-# ... and what it says when they have readings that are too thin to band (#93).
-# A THIRD PHRASE, not a reuse of the one above: "nobody measured this" and
-# "this was measured over too little" send a reader to two different remedies,
-# and only one of them is "come back later".
-STRIP_CACHE_UNDER_SAMPLED = "Not enough data yet"
-# The knobs dot, where NO knob has a basis. "0 of 5" is arithmetic over an
-# empty set wearing the look of five checks passed -- the exact composition
-# defect #93 is about, in four characters. Where SOME have a basis the dot
-# still counts, and names the rest rather than quietly narrowing its own
-# denominator.
-STRIP_KNOBS_NO_BASIS = "Not enough data yet"
+# WHAT A DOT SAYS WHEN IT HAS NO VERDICT, and there are TWO such sentences
+# because there are two absences. Spelled once each and shared by every dot
+# that can reach them: three dots arrive here by three different routes, and a
+# reader meets one phrase per state rather than one phrase per dot.
+#
+# "Nobody measured this" and "this was measured over too little" send a reader
+# to two different remedies, and only one of them is "come back later". A
+# project that never dispatches a subagent is not waiting for more sessions.
+STRIP_NOT_MEASURED = "Not measured"
+STRIP_UNDER_SAMPLED = "Not enough data yet"
+# The suffix the knobs dot adds where SOME of its knobs have a basis. Where
+# some do, the count still ranges over all of them -- narrowing the denominator
+# to the measured ones would be a second, smaller truth told in place of the
+# first -- and this names the rest. Where NONE does, "0 of 5" is arithmetic
+# over an empty set wearing the look of five checks passed, which is the
+# composition defect #93 is about in four characters, and the dot says which
+# absence it is instead.
 STRIP_KNOBS_SHORT_SUFFIX = "{short} not yet measurable"
 
 # The four questions, in the order they are read. Chosen so the strip runs from
@@ -3067,6 +3104,23 @@ class Api:
         if context_verdict == CONTEXT_ANSWER_YES and utilisation["worst_scope"]:
             context_answer = f"{context_answer} — {utilisation['worst_scope']}"
         knobs = recommendations["knobs"]
+        # THE CONTEXT DOT INHERITS ITS BACKING METRIC'S FLOOR (#93). "Wasting
+        # context?" is answered by `main_thread_share_over_half_window`, and a
+        # dot may not state a verdict its own metric has just refused to state.
+        #
+        # THROUGH `STRIP_ORDER`, so no new precedence rule is invented here:
+        # the floor contributes an UNKNOWN and the worst of the two wins. That
+        # gives the direction this repository takes everywhere -- an unknown
+        # WEAKENS a clean answer and NEVER softens a bad one, which
+        # `CONTEXT_ANSWER_STATES` already spells out for the card. A proven
+        # `yes` is a call observed at or above half its window; it happened,
+        # the remedy is real, and a thin sample is no reason to hide it. A `no`
+        # over five banded calls is the over-claim.
+        context_state, context_answer = cls._floored(
+            context_state,
+            context_answer,
+            next(k for k in knobs if k["metric"] == CONTEXT_DOT_METRIC),
+        )
         turnable = [k for k in knobs if k["directive"]]
         # EVERY KNOB, INCLUDING THE ONES WITH NO SEVERITY (#93). This used to
         # filter the severity-less rows out and take the worst of what was
@@ -3086,7 +3140,7 @@ class Api:
             # is what stops a page of two rows reading as a page of two
             # problems.
             STRIP_DOT_KNOBS: (knob_state, cls._knobs_answer(knobs, turnable)),
-            STRIP_DOT_CACHE: (cache_state, cls._cache_answer(cache, cache_state)),
+            STRIP_DOT_CACHE: (cache_state, cls._severity_answer(cache, cache_state)),
         }
         return {
             "dots": [
@@ -3138,6 +3192,56 @@ class Api:
         return min(states, key=STRIP_ORDER.index)
 
     @staticmethod
+    def _no_basis_answer(rows: list[dict[str, Any]]) -> str:
+        """WHICH absence a dot with no verdict is reporting (#93).
+
+        Under-sampled beats unmeasured where both are present, and the
+        direction is the useful one rather than the cautious one: if ANY of
+        these readings is only waiting for more data, "come back after a few
+        more sessions" is true and actionable for this dot. If none is, nothing
+        here is waiting for anything, and saying so would be a promise the
+        arithmetic will not keep.
+
+        SHARED BY EVERY DOT THAT CAN HAVE NO VERDICT, so the two absences
+        cannot be told apart on one dot and collapsed on another -- which is
+        precisely what shipped in this change's first pass, where the knobs dot
+        said "Not enough data yet" over an empty corpus that was waiting for
+        nothing.
+        """
+        if any(row["sample"]["state"] == SAMPLE_UNDER_SAMPLED for row in rows):
+            return STRIP_UNDER_SAMPLED
+        return STRIP_NOT_MEASURED
+
+    @classmethod
+    def _floored(
+        cls, state: str, answer: str, backing: dict[str, Any]
+    ) -> tuple[str, str]:
+        """One dot's state and words, held to its backing reading's floor.
+
+        The floor contributes an UNKNOWN and `STRIP_ORDER` decides, so this
+        adds no precedence rule of its own: a clean verdict is weakened, a bad
+        one is not softened, and a dot already unknown keeps whatever more
+        specific words it had (`no sample` and `unknown` say different things,
+        and neither is improved by this sentence).
+
+        UNDER-SAMPLED ONLY, NEVER UNMEASURED, and the difference is reachable
+        rather than theoretical. A window holding only subagent calls has no
+        main-thread share at all -- the metric is unmeasured because no such
+        call ran, not because too few did -- while the context card still
+        answers cleanly, every call in the period having been measured, banded
+        and inside its window. There is nothing missing there and nothing to
+        wait for, so "come back after a few more sessions" would be a promise
+        with no arithmetic behind it. An absent question is not an unanswered
+        one.
+        """
+        if backing["sample"]["state"] != SAMPLE_UNDER_SAMPLED:
+            return state, answer
+        weakened = min((state, STRIP_UNKNOWN), key=STRIP_ORDER.index)
+        if weakened == state:
+            return state, answer
+        return weakened, STRIP_UNDER_SAMPLED
+
+    @staticmethod
     def _knobs_answer(
         knobs: list[dict[str, Any]], turnable: list[dict[str, Any]]
     ) -> str:
@@ -3156,7 +3260,10 @@ class Api:
         """
         without_basis = [k for k in knobs if k["severity"] is None]
         if knobs and len(without_basis) == len(knobs):
-            return STRIP_KNOBS_NO_BASIS
+            # WHICH absence, not merely that there is one. An empty corpus and
+            # a fresh install both leave every knob without a verdict, and only
+            # one of them is waiting for more sessions.
+            return Api._no_basis_answer(knobs)
         answer = f"{len(turnable)} of {len(knobs)}"
         if without_basis:
             suffix = STRIP_KNOBS_SHORT_SUFFIX.format(short=len(without_basis))
@@ -3164,24 +3271,22 @@ class Api:
         return answer
 
     @staticmethod
-    def _cache_answer(cache: list[dict[str, Any]], state: str) -> str:
-        """The cache dot's words, distinguishing the two absences (#93).
+    def _severity_answer(rows: list[dict[str, Any]], state: str) -> str:
+        """A dot's words where its readings carry severities (#93).
 
-        A severity's own phrase where there is one. Where there is not, WHICH
-        absence it is: a cache metric with a reading too thin to band sends the
+        The worst severity's own phrase where there is one. Where there is not,
+        WHICH absence it is: a metric with a reading too thin to band sends the
         reader to "come back later", and one with no reading at all does not.
-        Both were `STRIP_CACHE_UNMEASURED` before, which made a first run and a
-        project that never cached look identical.
+        Both were one string before, which made a first run and a project that
+        never cached look identical.
         """
         if state != STRIP_UNKNOWN:
             worst = max(
-                (k["severity"] for k in cache if k["severity"] is not None),
+                (row["severity"] for row in rows if row["severity"] is not None),
                 key=lambda s: SEVERITY_RANK[s],
             )
             return STRIP_FROM_SEVERITY[worst][1]
-        if any(k["sample"]["state"] == SAMPLE_UNDER_SAMPLED for k in cache):
-            return STRIP_CACHE_UNDER_SAMPLED
-        return STRIP_CACHE_UNMEASURED
+        return Api._no_basis_answer(rows)
 
     # ----------------------------------------------------------------------
     # #89: the model mix -- an observation, and deliberately not advice
