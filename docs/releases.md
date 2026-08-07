@@ -42,6 +42,46 @@ already on the README record. The test does not require entries for historical
 versions: pinning history would force a rewrite at every release, which is how
 a check becomes something people route around.
 
+## 3.1.0 — 2026-08-07
+
+**No migration. Nothing you run changes, and no figure you already had moves.**
+
+**What changed for a user:** a reading now has to be big enough to judge before
+CPB judges it. Every metric carries a *sample floor*; below it the report shows
+the reading and withholds the verdict, marked `TOO FEW` with how far short the
+period is — `5 of 11`, `5 of 51`. The status dots follow: a question whose
+backing metric is under-sampled reads **"Not enough data yet"** rather than
+green.
+
+**Why.** A fresh install used to render four green dots and four knobs saying
+"Nothing to turn here" over three replies — and one of them said *"Do not
+change this"*, an instruction in the product owner's voice drawn from three
+calls. Each figure was individually correct; the composition asserted a clean
+bill of health on evidence that could not support one. Over three calls,
+`cache_write_only_share` can only be 0, 1/3, 2/3 or 1, so its healthy band was
+reachable **only at exactly zero**: the green was the observation that
+something had not happened three times, reported in the voice of a rate.
+
+**Where the floors come from.** For a share, from the table's own boundaries: a
+share over *n* calls moves in steps of `1/n`, so it needs `1/n` finer than the
+narrowest band it is judged against. That gives 11 and 51, and the numbers move
+if a boundary is redlined rather than being written down anywhere. For a ratio
+of sums there is no such step, so the floor is **judged, dated, and says so** —
+applying the share rule to the ratios would have returned 2, 2 and 1, certifying
+a one-call sample while wearing arithmetic.
+
+**Three states, not two.** A measured zero, a metric with no sample, and a
+reading too small to judge now render differently everywhere. A window holding
+only subagent calls has *no* main-thread share — unmeasured because none ran,
+not because too few did — and reads "Not measured" rather than being told to
+come back later, which would be a promise with no arithmetic behind it.
+
+A proven problem is never softened by a floor: a three-call corpus running at
+70% of its window still says so.
+
+Merged as [PR #106](https://github.com/vlad-ko/claude-piggy-bank/pull/106),
+closing [#93](https://github.com/vlad-ko/claude-piggy-bank/issues/93).
+
 ## 2.1.0 — 2026-08-07
 
 **No break. Nothing to migrate from 2.0.0.** Every command, flag, exit status,
