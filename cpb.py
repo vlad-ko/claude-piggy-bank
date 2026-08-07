@@ -142,7 +142,30 @@ from typing import NamedTuple, Optional, Sequence
 #
 # SCHEMA_VERSION 12 -> 13 adds one nullable column and upgrades in place, so
 # the schema clause of docs/versioning.md is satisfied rather than waived.
-VERSION = "3.3.0"
+#
+# 3.3.0 -> 4.0.0 (#94, the surviving criterion). `python3 ingest.py` with no
+# --db and no CPB_DB, run from inside an INSTALLED plugin, used to write
+# ${CLAUDE_PLUGIN_ROOT}/db/usage.db -- the directory every plugin update
+# replaces -- print a successful summary and exit 0. It now resolves
+# ${CLAUDE_PLUGIN_DATA}/usage.db where Claude Code has named that directory,
+# and REFUSES where it has not. `serve.py`'s default gets the same treatment
+# from the same function, because it had the same hole reading rather than
+# writing: it pointed the reader at the doomed path and would serve a database
+# already stranded there.
+#
+# MAJOR, on the same clause that forced 3.0.0: a CHANGED EXIT STATUS on an
+# existing invocation, which docs/versioning.md names as breaking by
+# definition. A silent success became a loud refusal, so someone's script
+# exits non-zero and is entitled to learn that from the version number. The
+# temptation to call it a correction -- the run only ever "succeeded" at
+# writing a file the next update deletes -- is exactly the reasoning that
+# clause refuses, and correction-is-not-redefinition is scoped to FIGURES, not
+# to behaviour a caller depends on.
+#
+# The plain checkout is untouched: `db/usage.db` beside the script is still the
+# documented, correct and durable answer there, and a false refusal in that
+# direction would be the worse defect of the two.
+VERSION = "4.0.0"
 
 PROG = "cpb"
 

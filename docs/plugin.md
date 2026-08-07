@@ -253,6 +253,81 @@ Uninstalling the plugin from its last scope deletes the data directory by
 default. Pass `--keep-data` to keep the database, or back it up first — see the
 uninstall note in the README.
 
+### The improvised run: a bare `ingest.py` inside an install
+
+The rule above is the *hook's*. It leaves a hole one size smaller, and
+[#94](https://github.com/vlad-ko/claude-piggy-bank/issues/94)'s last open
+criterion is that hole: somebody types `python3 ingest.py` themselves, with no
+`--db` and no `CPB_DB`, from inside an installed plugin. The default —
+`db/usage.db` beside the script — is then `${CLAUDE_PLUGIN_ROOT}/db/usage.db`,
+and everything the section above says about that directory applies.
+
+So `ingest.default_database()` decides the built-in default the same way the
+handler decides `CPB_DB`, and `serve.py` calls the *same function* rather than
+carrying a second copy of the decision. Three outcomes:
+
+| where the script is | what happens |
+|---|---|
+| a checkout | `db/usage.db` beside it — unchanged, unannounced, correct and durable |
+| an install where Claude Code named `${CLAUDE_PLUGIN_DATA}` | `${CLAUDE_PLUGIN_DATA}/usage.db`, announced on stdout |
+| an install with no knowable durable location | **refuses**, naming that path and `--db` |
+
+`--db` and `CPB_DB` are untouched: the default is computed only when neither
+named a database, so a run that says where to write is never refused over a
+fallback it does not reach.
+
+**Deciding "this is an install" is the part that had to be measured**, because
+a wrong answer in *either* direction is worse than none — a false negative is
+the bug, and a false positive refuses the plain-clone path that
+`db/usage.db` is exactly right for. Two independent observations, either
+sufficient, each covering the other's blind spot:
+
+1. **`${CLAUDE_PLUGIN_ROOT}` names the directory the script is in.** Set alone
+   it is evidence about the *process*, not about this script — another
+   plugin's hook can spawn a shell that runs a CPB checkout — so containment is
+   required, not the variable's presence. *Measured here* (2026-08-07): a Bash
+   tool call inside a Claude Code session with plugins enabled had **neither**
+   `CLAUDE_PLUGIN_ROOT` nor `CLAUDE_PLUGIN_DATA` in its environment. Claude
+   Code exports them to a plugin's own hook and skill invocations (measured
+   2026-08-05, above), not to shells in general — which is precisely why this
+   check cannot be the only one. *(Scope: one Bash tool call, in a subagent, on
+   this host. It is evidence that the variable is not universally present, not
+   a claim about every invocation shape.)*
+2. **The script sits in Claude Code's own plugin store.** *Measured here*
+   (2026-08-07, this host's `~/.claude/plugins/`), across two plugins installed
+   from two different marketplaces:
+
+   ```
+   ~/.claude/plugins/cache/vercel-vercel-plugin/vercel-plugin/0.24.0/
+   ~/.claude/plugins/cache/laravel/laravel-simplifier/1.0.0/
+   ~/.claude/plugins/marketplaces/<marketplace>/
+   ~/.claude/plugins/data/<marketplace>-<plugin>/
+   ```
+
+   The cache path carries the **version**, so an update builds a new directory;
+   the data path carries none. That is the same shape the install-and-update
+   run above recorded independently. `ingest.PLUGIN_STORE_ANCESTORS` matches on
+   the adjacent pair `plugins/cache` or `plugins/marketplaces` in the resolved
+   path — the marketplace clone is included because CPB's `"source": "./"`
+   makes it a full checkout of this repository that Claude Code re-fetches and
+   deletes with the marketplace. There is **no `.git` anywhere under `cache/`**,
+   so an install is a copy rather than a clone.
+
+   This layout is **internal to Claude Code and undocumented**, so it is only
+   ever the second piece of evidence. If a release moves it, this detector
+   stops firing — a false negative check (1) still covers — and it cannot start
+   firing on a clone anywhere a person would actually put one.
+
+**The data directory is paired with the root, never taken alone.**
+`${CLAUDE_PLUGIN_DATA}` on its own says a plugin process is running, not that
+it is *this* plugin; writing another plugin's data directory would be a guess
+with an answer's shape. So the resolve outcome needs (1); evidence (2) on its
+own refuses.
+
+This is the version that also breaks CPB's own CLI compatibility promise on
+purpose — a run that exited 0 can now exit non-zero — which is why it is a
+major release. See [`releases.md`](releases.md).
+
 ### The update path, measured rather than reasoned
 
 The paragraph above is the *documented* claim. Because losing a user's only

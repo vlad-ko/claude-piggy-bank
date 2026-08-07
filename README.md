@@ -45,7 +45,7 @@ that ships the numbers themselves — ingest, the server, the page — has no mo
 in it at all. This is a rule CPB imposes on itself, not one Claude Code imposes
 on plugins.
 
-CPB is **<!--cpb:version-->3.3.0<!--/cpb:version-->** and follows [Semantic
+CPB is **<!--cpb:version-->4.0.0<!--/cpb:version-->** and follows [Semantic
 Versioning](https://semver.org/spec/v2.0.0.html). What that promises you is
 written down rather than left to be guessed at: the command line, the HTTP API,
 and **what each figure measures** are the interface, so a number that changes
@@ -354,6 +354,17 @@ on success — a hook that cannot see a failure is worse than no hook.
 directory without threading a flag through each one. It applies to both ingest
 modes. Setting it to an empty value is refused rather than falling back, so a
 misconfigured wrapper cannot quietly write to a database nobody reads.
+
+**Step 3 is plugin-aware, and `serve` obeys it too**
+([#94](https://github.com/vlad-ko/claude-piggy-bank/issues/94)). Beside the
+script is right in a checkout and doomed inside an installed *plugin*, where it
+is `${CLAUDE_PLUGIN_ROOT}/db/usage.db` — the directory the next plugin update
+replaces. So from inside an install the default resolves
+`${CLAUDE_PLUGIN_DATA}/usage.db`, the file the hooks write and `/cpb` serves,
+and says so; where that directory cannot be known it **refuses** and names the
+path and the flag. A silent fall-back to a path an update deletes is the one
+option ruled out. Steps 1 and 2 are unaffected — a run that names its database
+never consults the default — and a plain clone is unaffected entirely.
 
 `serve` does **not** read `CPB_DB`; point it at the same file explicitly:
 
