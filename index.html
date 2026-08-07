@@ -458,6 +458,15 @@
        is perfectly healthy -- merging them would report that as staleness, and
        would hide a week-old database whose last-seen call happens to be recent.
 
+       THREE since #105, and the third splits the first rather than joining it:
+       `last_full_scan_at` says whether the run that produced the age above
+       looked at the whole corpus or at one file. Both readings are true at
+       once on a plugin install -- the database is current AND nothing has ever
+       swept it -- and one field could only ever express the first by denying
+       the second, which is precisely what it did: single-file mode declined to
+       stamp, so every hook-maintained install reported that no ingest had ever
+       completed. Same rule as the pair above, one axis over.
+
        A null `last_run_at` is not an age of zero and not a stale-forever
        verdict. Nor is it one thing: this branch used to state ONE cause ("this
        database predates CPB recording ingest times") for an absence with
@@ -503,6 +512,38 @@
       <template x-if="summary.ingest.last_run_at !== null"><span>Last ingest:
         <strong x-text="fmtAge(asOfNow - summary.ingest.last_run_at)"></strong>
         (<span x-text="fmtTs(summary.ingest.last_run_at)"></span>)</span></template>
+      <!-- #105: WHICH SET that age is over, annotating the line rather than
+           taking a surface of its own (CLAUDE.md constraint 4). `ingest.py
+           --transcript` is a completed run over ONE file, and it is the only
+           mode the plugin's hooks ever use; before #105 it stamped nothing, so
+           a working install read "NEVER COMPLETED" forever above. It stamps
+           now, which makes the age above true and leaves this second clause to
+           say what it is NOT: evidence that anything ever swept the corpus.
+
+           Three absences, named by the API and never guessed here, exactly as
+           `stale_unknown_reason` is. Only the third is a statement about what
+           has happened; the other two are statements about what the database
+           was able to write down, and a hook-maintained install must not read
+           as an old schema or vice versa. None of the three is a fault, so none
+           of them reaches the banner. -->
+      <template x-if="summary.ingest.last_run_at !== null"><span>
+        <template x-if="summary.ingest.last_full_scan_at !== null"><span>
+          &middot; last full-corpus scan:
+          <strong x-text="fmtAge(asOfNow - summary.ingest.last_full_scan_at)"></strong>
+          (<span x-text="fmtTs(summary.ingest.last_full_scan_at)"></span>)</span></template>
+        <template x-if="summary.ingest.full_scan_unknown_reason === 'no-full-scan-recorded'"><span>
+          &middot; <strong>no full-corpus scan on record</strong> &mdash; this
+          database has been maintained one file at a time, which is what the
+          plugin's hooks do. It is current for the sessions it was handed and
+          has never been swept for transcripts nobody handed it. Run
+          <code>ingest.py</code> over a projects directory to scan the corpus
+        </span></template>
+        <template x-if="summary.ingest.full_scan_unknown_reason === 'no-scope-column'"><span>
+          &middot; whether a full-corpus scan has ever run is <strong>not
+          recorded</strong> by this database &mdash; it was written before CPB
+          recorded what a run ranged over. Unrecorded, not none
+        </span></template>
+      </span></template>
       &middot;
       <template x-if="summary.ingest.newest_call_ts === null"><span>newest measured
         call: <strong>none</strong> &mdash; no API calls ingested</span></template>

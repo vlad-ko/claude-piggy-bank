@@ -101,6 +101,25 @@ INGEST_RUNS_TABLE = "ingest_runs"
 # a magic number. A history of runs is a different feature; what the report
 # needs is "when did this database last look at the transcripts".
 INGEST_RUN_ROW_ID = 1
+
+# WHAT a completed run looked at (#105). A run stamp is an aggregate over the
+# sources it examined, so -- by this project's own rule -- it has to name the
+# set it ranges over. Two modes exist and only one of them used to stamp:
+#
+#   * CORPUS: `ingest()` scanned a whole projects directory. It is the only
+#     mode that reconciles -- archiving, pruning, the wholesale subagent ledger
+#     rebuild -- because it is the only one with evidence about sources it was
+#     not handed.
+#   * FILE: `ingest_transcript()` was handed exactly one path and read it. Just
+#     as completed, over a set of one.
+#
+# Both are runs that finished; neither is the other. `finished_at` records the
+# most recent of EITHER and `corpus_finished_at` the most recent CORPUS one, so
+# "how old is this database" and "has anything ever scanned the whole corpus"
+# stay separate questions with separate answers.
+RUN_SCOPE_CORPUS = "corpus"
+RUN_SCOPE_FILE = "file"
+RUN_SCOPES = frozenset({RUN_SCOPE_CORPUS, RUN_SCOPE_FILE})
 # The on-disk layout, named once. `discover_sources()` globs it and
 # `source_for_transcript()` classifies a single path against it; the two must
 # describe the SAME layout or single-file mode and directory mode would derive
@@ -362,11 +381,11 @@ DERIVED_TABLES = (
 # older shape is rebuilt from scratch rather than migrated in place -- see
 # `_prepare_schema`, and `IN_PLACE_UPGRADE_FROM` below for the narrow case
 # where rebuilding would cost rows to arrive at the identical database.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Versions whose difference from the current shape can be applied WITHOUT
 # losing a measurement, so they upgrade in place instead of being dropped and
-# rebuilt. Six such hops exist, and a v6 database makes all six at once:
+# rebuilt. Seven such hops exist, and a v6 database makes all seven at once:
 #
 #   v6 -> v7  ADDS `ingest_runs`, supplied by `CREATE TABLE IF NOT EXISTS`.
 #   v7 -> v8  DROPS `api_calls.cost_usd` (#30), applied by `ALTER TABLE ...
@@ -386,6 +405,11 @@ SCHEMA_VERSION = 12
 #             cache-write split (#84), by the same statement and clearing the
 #             same bar -- and only because the flat `cache_write` STAYS. This
 #             hop adds a measurement, it does not redefine one.
+#   v12 -> v13 ADDS one nullable `ingest_runs.corpus_finished_at` (#105), by
+#             the same `ALTER TABLE ... ADD COLUMN`. `finished_at` keeps its
+#             column, its value and the definition it always published ("when a
+#             run last COMPLETED"); the new column carries the NARROWER fact
+#             that used to ride along inside it unannounced.
 #
 # RE-DECIDED at this bump, not extended by habit -- the comment below has said
 # since v8 that this does not accumulate, so each member was re-checked against
@@ -394,15 +418,20 @@ SCHEMA_VERSION = 12
 #   * 6: needs `ingest_runs` created (empty is true of it), `cost_usd` dropped
 #     in place, `source_shape` created (empty is true of it -- see
 #     IN_PLACE_CREATABLE_TABLES), duplicate dispatch rows resolved, the three
-#     diagnostics columns added, the two TTL columns added.
+#     diagnostics columns added, the two TTL columns added, `corpus_finished_at`
+#     added.
 #   * 7: `cost_usd` dropped in place, `source_shape` created, duplicates
-#     resolved, diagnostics columns added, TTL columns added.
+#     resolved, diagnostics columns added, TTL columns added,
+#     `corpus_finished_at` added.
 #   * 8: `source_shape` created, duplicates resolved, diagnostics columns
-#     added, TTL columns added.
-#   * 9: duplicates resolved, diagnostics columns added, TTL columns added.
-#   * 10: diagnostics columns added, TTL columns added.
-#   * 11: the two TTL columns added, and NOTHING else -- the v11 shape is the
-#     current one minus `cache_write_5m` and `cache_write_1h`.
+#     added, TTL columns added, `corpus_finished_at` added.
+#   * 9: duplicates resolved, diagnostics columns added, TTL columns added,
+#     `corpus_finished_at` added.
+#   * 10: diagnostics columns added, TTL columns added, `corpus_finished_at`
+#     added.
+#   * 11: the two TTL columns added and `corpus_finished_at` added.
+#   * 12: `corpus_finished_at` added, and NOTHING else -- the v12 shape is the
+#     current one minus that single nullable column.
 #
 # THE BAR MOVED AT THE v10 BUMP, and saying so is the point of re-deciding
 # rather than extending. It was "the delta preserves every ROW"; v9 -> v10
@@ -436,7 +465,21 @@ SCHEMA_VERSION = 12
 # hop adds two columns beside it and touches nothing else, so the delta loses
 # no row and no measurement, and the only value it writes to an existing row is
 # NULL -- which is the true one (see IN_PLACE_ADDABLE_COLUMNS).
-IN_PLACE_UPGRADE_FROM = frozenset({6, 7, 8, 9, 10, 11})
+#
+# v12 is admitted at THIS bump under that same bar, and the interesting half is
+# again the back-fill NOT done. Every row this hop meets was written by
+# `ingest()` -- directory mode was `record_ingest_run()`'s only caller before
+# #105 -- so `corpus_finished_at = finished_at` would be a TRUE statement about
+# it, which is exactly why it is tempting and exactly why it is refused. The
+# column records what a RUN reported about itself, and no run before v13
+# reported anything; writing the deduction into it would make a value the
+# migration inferred indistinguishable from a value a run stamped, over the
+# whole corpus at once. NULL is the honest reading -- "no run has yet stamped
+# itself a full-corpus scan over this database" -- and it is repaired by the
+# ordinary means, the next directory run, exactly as an uncensused source is
+# (#15). The measurement that column would have carried is not lost: the
+# timestamp is still in `finished_at`, where it always was.
+IN_PLACE_UPGRADE_FROM = frozenset({6, 7, 8, 9, 10, 11, 12})
 
 # The two permissions an in-place upgrade needs, named and bounded, because
 # `CREATE TABLE IF NOT EXISTS` silently grants the first to EVERY table and
@@ -502,6 +545,20 @@ IN_PLACE_CREATABLE_TABLES = frozenset({INGEST_RUNS_TABLE, SHAPE_TABLE})
 # an unmeasured split keeps the honest refusal, while a back-filled one would
 # resolve the band with a value nobody measured. Those rows are re-read when
 # their source file next changes.
+#
+# `ingest_runs.corpus_finished_at` (#105) clears it for the fourth time, and
+# this one is the sharpest test of the bar so far, because the back-fill here
+# would be TRUE rather than false. NULL means "no run has stamped itself a
+# full-corpus scan over this database", which is what a pre-v13 database's
+# state is: no run of any version ever recorded its scope. The single row the
+# hop meets was in fact written by directory mode -- that was the only caller --
+# so `corpus_finished_at = finished_at` would not be a lie. It is still refused,
+# and the reason is what the column is FOR: it distinguishes a scan that
+# reported itself from a scan nobody has evidence of, and a migration that
+# writes into it makes an inference indistinguishable from an observation. That
+# is the same defect as back-filling `cache_write_5m`, arriving through a door
+# marked "but this one is correct". A NOT NULL column still cannot be added
+# this way at all.
 IN_PLACE_ADDABLE_COLUMNS: dict[tuple[str, str], str] = {
     ("ingest_state", "archived_at"): "REAL",
     ("api_calls", "cache_miss_outcome"): "TEXT",
@@ -509,6 +566,7 @@ IN_PLACE_ADDABLE_COLUMNS: dict[tuple[str, str], str] = {
     ("api_calls", "cache_missed_input_tokens"): "INTEGER",
     ("api_calls", "cache_write_5m"): "INTEGER",
     ("api_calls", "cache_write_1h"): "INTEGER",
+    (INGEST_RUNS_TABLE, "corpus_finished_at"): "REAL",
 }
 
 # What one `agent_dispatches` row knows about a dispatch BEYOND its identity
@@ -744,6 +802,18 @@ CREATE TABLE IF NOT EXISTS ingest_state (
 -- absence: it could not have recorded a run. The two are told apart in
 -- `serve.staleness_verdict`, because only the second is explained by age.
 --
+-- TWO COLUMNS, TWO SETS, because one stamp was answering two questions and got
+-- the second one wrong for every plugin install (#105). `finished_at` is the
+-- last run of EITHER scope -- the fact the freshness surfaces need, and the one
+-- this table always claimed to hold. `corpus_finished_at` is the last
+-- FULL-CORPUS scan, NULL where none has been stamped. Single-file mode is the
+-- only mode the plugin's hooks ever use, so before #105 a hook-maintained
+-- database stamped nothing, and the report told a working install its ingest
+-- may have failed -- permanently, and with advice that could never clear it.
+-- Stamping single-file runs into `finished_at` fixes that; keeping
+-- `corpus_finished_at` separate is what stops it from also asserting that the
+-- corpus was rescanned, which a run over one file is no evidence of.
+--
 -- Deliberately not a column on `ingest_state`: that table is per SOURCE FILE
 -- and its `mtime` is the FILE's mtime, a different fact that reads like this
 -- one. A run is a fact about the ingester, so it gets its own row, and an
@@ -762,7 +832,8 @@ CREATE TABLE IF NOT EXISTS ingest_state (
 --     run times -- the benign reading the page used to assert for all of them.
 CREATE TABLE IF NOT EXISTS ingest_runs (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    finished_at REAL NOT NULL
+    finished_at REAL NOT NULL,
+    corpus_finished_at REAL
 );
 -- What the transcripts this source was parsed from actually LOOKED LIKE (#15).
 -- Anthropic documents the entry format as internal and changing between Claude
@@ -2924,19 +2995,50 @@ def rebuild_sessions(conn: sqlite3.Connection) -> None:
     )
 
 
-def record_ingest_run(conn: sqlite3.Connection, finished_at: float) -> None:
-    """Stamp WHEN an ingest run completed (epoch seconds), replacing the last.
+def record_ingest_run(
+    conn: sqlite3.Connection, finished_at: float, *, scope: str
+) -> None:
+    """Stamp WHEN an ingest run completed (epoch seconds) and WHAT it looked at.
 
-    Called once per successful `ingest()`, INCLUDING a run that ingested
+    Called once per successful run of EITHER mode, INCLUDING a run that ingested
     nothing: "we looked and everything was unchanged" is a completed run, and
     conflating it with "nobody has looked" is the whole defect in #20. The
     caller owns the transaction.
+
+    **Both modes stamp, and that is #105.** Single-file mode is the only mode
+    the plugin's hooks ever use, and it did not stamp, so every plugin install
+    reported "no ingest.py run has ever COMPLETED over this database" on a
+    working install -- the tool's loudest absence-handling firing a false alarm
+    on its own primary path. A run over one file completed; what it did not do
+    is scan the corpus, and `scope` is where that distinction now lives instead
+    of in the silence.
+
+    `scope` is KEYWORD-ONLY AND REQUIRED, deliberately. A default would let the
+    next caller inherit a scope nobody chose for it, which is the shape of the
+    defect this argument exists to close: the wrong answer here is not a
+    crash, it is a plausible timestamp attributed to a set that was never read.
+
+    Written as three plain statements rather than one UPSERT so it needs no
+    SQLite newer than the rest of the file does, and so a FILE-scoped run
+    cannot erase a corpus scan's stamp: it never names `corpus_finished_at`,
+    which is a different claim from writing NULL over it.
     """
+    if scope not in RUN_SCOPES:
+        raise ValueError(f"unknown ingest run scope: {scope!r}")
     conn.execute(
-        f"INSERT OR REPLACE INTO {INGEST_RUNS_TABLE} (id, finished_at)"
+        f"INSERT OR IGNORE INTO {INGEST_RUNS_TABLE} (id, finished_at)"
         " VALUES (?, ?)",
         (INGEST_RUN_ROW_ID, finished_at),
     )
+    conn.execute(
+        f"UPDATE {INGEST_RUNS_TABLE} SET finished_at = ? WHERE id = ?",
+        (finished_at, INGEST_RUN_ROW_ID),
+    )
+    if scope == RUN_SCOPE_CORPUS:
+        conn.execute(
+            f"UPDATE {INGEST_RUNS_TABLE} SET corpus_finished_at = ? WHERE id = ?",
+            (finished_at, INGEST_RUN_ROW_ID),
+        )
 
 
 def shape_census(conn: sqlite3.Connection, fact: str) -> dict[Optional[str], int]:
@@ -3859,8 +3961,16 @@ def ingest(
         # database has seen the transcripts as of now", which is false if we
         # never got here. Read fresh rather than reusing the `now` computed
         # for archiving above, so it dates the run's END.
+        #
+        # CORPUS scope, and this is the mode that earns it: it globbed the whole
+        # projects directory, archived what was gone and rebuilt the subagent
+        # ledger from every source it found (#105).
         with conn:
-            record_ingest_run(conn, datetime.now(timezone.utc).timestamp())
+            record_ingest_run(
+                conn,
+                datetime.now(timezone.utc).timestamp(),
+                scope=RUN_SCOPE_CORPUS,
+            )
         return summary
     finally:
         conn.close()
@@ -3904,6 +4014,15 @@ def ingest_transcript(
     roll-up from the whole of `ingest_state`, which this mode leaves intact
     apart from the one file. A session spans N sources, so nothing narrower
     would be correct.
+
+    **The run stamp is also written here, and is not one of the withheld three
+    (#105).** The list above is of conclusions about sources this mode did not
+    examine; "an ingest run completed at this time" is a fact about the RUN,
+    which it did examine, and it is recorded with `RUN_SCOPE_FILE` so it claims
+    a set of one rather than the corpus. Withholding it was not caution -- it
+    left every plugin install, whose hooks use this mode and no other, reporting
+    that no ingest had ever completed over a database its hooks were keeping
+    current.
 
     The summary carries no `files_archived` / `files_pruned` keys at all.
     Reporting them as 0 would state that a check was run and found nothing,
@@ -4034,6 +4153,24 @@ def ingest_transcript(
         # dependent on which mode last ran.
         with conn:
             rebuild_sessions(conn)
+        # LAST, and only on the success path, exactly as directory mode stamps
+        # (#105). This mode looked at one file and finished; that is a completed
+        # run over a set of one, and `RUN_SCOPE_FILE` is what says the set was
+        # one rather than the corpus. Withholding the stamp entirely -- what
+        # this mode did until #105 -- did not say "one file", it said "no run
+        # has ever completed here", which for a plugin install was never true
+        # and was the loudest thing the report could say.
+        #
+        # The skip path stamps too, for #20's reason unchanged: "we looked and
+        # this file was unchanged" is a completed run, and a stamp written only
+        # when bytes moved would leave a hook-maintained database ageing past
+        # the staleness threshold while being perfectly current.
+        with conn:
+            record_ingest_run(
+                conn,
+                datetime.now(timezone.utc).timestamp(),
+                scope=RUN_SCOPE_FILE,
+            )
         return summary
     finally:
         conn.close()

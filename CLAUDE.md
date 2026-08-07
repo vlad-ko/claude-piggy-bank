@@ -37,7 +37,7 @@ anyone who has it in a script. `_exit_status()` reproduces CPython's own
 report a run that measured nothing as a run that measured zero. `VERSION` lives
 in `cpb.py`; `.claude-plugin/plugin.json` repeats it as a literal because the
 plugin loader reads that JSON without running Python, and `tests/test_cpb.py`
-pins the two equal. CPB is **<!--cpb:version-->3.2.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
+pins the two equal. CPB is **<!--cpb:version-->3.3.0<!--/cpb:version-->** under SemVer (`cpb.VERSION` is the
 authority; this line lagged a release once already and may again), and what a
 bump *means* is `docs/versioning.md` — see Commits and PRs below.
 
@@ -164,6 +164,32 @@ raised before stamping — so the payload carries `stale_unknown_reason` and the
 page never asserts which. `ingest.stale` is tri-state, so "never recorded" and
 a negative age both read as an unknown age rather than as a verdict.
 
+**What `ingest_runs` means, decided at #105.** `finished_at` is *when an ingest
+run last completed, of either mode* — not "when the corpus was last rescanned",
+which is what it silently meant while directory mode was its only writer.
+`ingest.py --transcript` is `ingest.py` completing, over one file, and it is the
+**only** mode the plugin's hooks ever use; withholding the stamp did not say
+"one file", it said "no run has ever completed here", so every plugin install
+read the loudest thing the report can say — *your ingest may have failed* — on a
+working install, with advice that could never clear it. Widening the field to
+what it always published is a **correction** under `docs/versioning.md`, not a
+redefinition. The narrower fact moved into its own column, `corpus_finished_at`,
+surfaced as `last_full_scan_at` with a three-valued `full_scan_unknown_reason`
+beside it (no run table / no recorded scope / no full scan yet) — the same shape
+as `stale_unknown_reason` and for the same reason: three absences with three
+remedies must not collapse into one. A hook-maintained database is current
+**and** has never been swept; those are two facts, and one field could only
+express the first by denying both. The three freshness surfaces — the staleness
+verdict, the report banner and the data-age line — still read `last_run_at` and
+nothing else, so widening it moved all three at once. **A run that raises still
+stamps nothing**, and must: both modes stamp last and only on success, so a
+failed ingest stays indistinguishable from no ingest, because it is. Note what
+the v12→v13 migration declines to do: every stamp a pre-v13 build wrote *was* a
+corpus run, so back-filling `corpus_finished_at = finished_at` would be true —
+and it is refused anyway, because the column exists to separate a scan that
+reported itself from one nobody has evidence of, and a migration writing into it
+makes an inference indistinguishable from an observation.
+
 **No dollar figures anywhere (#30).** Tokens are measured; dollars were derived
 from a hand-maintained list-rate table that went stale twice and diverged from
 real spend by >2.5x, so the estimate was removed — schema column, module and
@@ -240,7 +266,7 @@ response that never happened — and the ambiguity is counted (a *different* set
 from the 108 above, and re-measure before quoting any of these). Records with no
 `message.id` each stay their own call; `NULL` is not a shared key.
 
-**Schema** (`SCHEMA_VERSION = 12`, `PRAGMA user_version`): `sessions`, `turns`,
+**Schema** (`SCHEMA_VERSION = 13`, `PRAGMA user_version`): `sessions`, `turns`,
 `api_calls`, `agent_dispatches`, `subagent_runs`, `task_index_sessions`,
 `ingest_state`, `ingest_runs`, `source_shape`. Ingest is incremental per file,
 keyed on size+mtime in `ingest_state`; re-ingesting a changed file deletes its
@@ -361,16 +387,19 @@ Consequences encoded in the code, which must be preserved:
   that rebuild: on any corpus past the retention window the guard would refuse a
   change that risks nothing, and an untrue refusal is the same class of defect
   as an untrue number. `IN_PLACE_UPGRADE_FROM` (currently
-  `{6, 7, 8, 9, 10, 11}`) lists the versions whose delta to the **current**
-  shape can be applied without losing one. Six hops exist, and a v6 database
-  makes all six at once: v6→v7 adds `ingest_runs`; v7→v8 drops
+  `{6, 7, 8, 9, 10, 11, 12}`) lists the versions whose delta to the **current**
+  shape can be applied without losing one. Seven hops exist, and a v6 database
+  makes all seven at once: v6→v7 adds `ingest_runs`; v7→v8 drops
   `api_calls.cost_usd` (#30) via `ALTER TABLE ... DROP COLUMN`, gated on a
   **runtime** check of `sqlite3.sqlite_version` ≥ 3.35; v8→v9 adds
   `source_shape` (#15); v9→v10 adds the UNIQUE `idx_agent_dispatches_task_id`,
   which `_dedupe_dispatch_task_ids()` has to precede because the index cannot be
   built over a table already holding duplicates (#36); v10→v11 adds the three
-  nullable cache-miss diagnostic columns to `api_calls` (#5); and v11→v12 adds
-  the two nullable per-TTL cache-write columns to the same table (#84). It is
+  nullable cache-miss diagnostic columns to `api_calls` (#5); v11→v12 adds
+  the two nullable per-TTL cache-write columns to the same table (#84); and
+  v12→v13 adds the nullable `ingest_runs.corpus_finished_at` (#105), where the
+  interesting half is the back-fill **not** taken — see the `ingest_runs`
+  paragraph above. It is
   re-decided at every bump against the current shape, never extended by habit,
   and the sub-3.35 fallback goes through the rebuild path **including** the
   guard — never around it.
@@ -410,6 +439,23 @@ Consequences encoded in the code, which must be preserved:
   different value so a swapped column mapping cannot pass).
 - Verify a test has teeth by mutation — change one implementation line, confirm
   red, change it back. A test that survives a deliberate mutation is not a test.
+- **Assert the rule over the whole pair, and over the seam.** Three defects in
+  two weeks were one shape: a rule written while looking at one mode, with
+  nobody asking what its sibling does. #94 passed `--db` on every `serve`
+  invocation in the skill and not on its `ingest` twin, writing the user's only
+  copy of their history where the next plugin update deletes it. #105 stamped
+  `ingest_runs` from directory mode and not from single-file mode — the only
+  mode the plugin's hooks use. #108 refused a wrong scope in one direction and
+  reported a confident zero in the other. Each was covered by a test ranging
+  over the member somebody had in mind. So the unit of assertion is the axis,
+  not the instance: `EveryIngestModeStampsARunTest` derives its haystack from
+  the module (every public function taking a `db_path` is a mode that must
+  stamp or is declared not to be one), and
+  `BothScopesRefuseTheOthersShapeTest` runs each scope against the other's
+  shape. And #105 could ship green because both paths were tested and the
+  **seam** between them was not — `HookToReportSeamTest` fires the real hook and
+  asks the report what it then says, which is the only place that defect was
+  visible.
 - Fixtures are synthetic and hand-built. **Never commit captured session
   content** — real transcripts contain prompts, file paths and source code.
 - CI runs the suite on 3.10–3.13 with `fail-fast: false`; branch protection

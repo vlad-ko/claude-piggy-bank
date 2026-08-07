@@ -273,6 +273,49 @@ class PlannerBehaviourTest(unittest.TestCase):
         self.assertEqual(self.verdict_of(text), cpb_backfill_plan.VERDICT_WRONG_SCOPE)
         self.assertIn("CHILDREN", text)
 
+    def test_one_project_is_not_an_empty_machine(self):
+        # #108, the inverse of the test above and the half that shipped
+        # uncovered. `plan_backfill()` ranges over `root`'s CHILDREN, so a root
+        # that IS a project produced `0 transcript file(s), 0 B on disk` and the
+        # note "that is a real answer about the machine, not a failure" --
+        # measured on `main` at 3.2.0 on 2026-08-07 against a directory holding
+        # one transcript. `ingest.py --projects-dir` on that same path scans and
+        # ingests it.
+        text = self.run_planner(
+            "--db", str(self.db), "--all-projects", str(self.project)
+        )
+        self.assertEqual(self.verdict_of(text), cpb_backfill_plan.VERDICT_WRONG_SCOPE)
+        self.assertIn("IS one project", text)
+        # The sentence that made it worse than a bare zero must be gone from
+        # THIS answer: it asserts the emptiness was established, and nothing
+        # under this path was examined.
+        self.assertNotIn("not a failure", text)
+
+    def test_a_genuinely_empty_root_keeps_its_confident_zero(self):
+        # The other direction of #108, and the one a careless fix breaks. A
+        # root whose children were every one of them examined and found empty
+        # HAS established its zero, and must keep saying so plainly --
+        # curing a false confident answer by making every answer hedge trades
+        # one unreadable verdict for another.
+        bare = self.tmp / "bare-root"
+        (bare / "-synthetic-nothing").mkdir(parents=True)
+        text = self.run_planner("--db", str(self.db), "--all-projects", str(bare))
+        self.assertEqual(
+            self.verdict_of(text), cpb_backfill_plan.VERDICT_NO_TRANSCRIPTS
+        )
+        self.assertIn("not a failure", text)
+
+    def test_the_shared_note_names_neither_direction(self):
+        # One note serves two shapes since #108, so a note that named one of
+        # them would state the wrong one half the time. Which shape it is comes
+        # from the measured lines above the verdict; all the note may claim is
+        # what both have in common -- that nothing was measured.
+        note = cpb_backfill_plan.VERDICT_NOTES[cpb_backfill_plan.VERDICT_WRONG_SCOPE]
+        self.assertNotIn("CHILDREN", note)
+        self.assertNotIn("IS one project", note)
+        self.assertIn("Nothing was measured", note)
+
+
     # -- the estimate ----------------------------------------------------
 
     def test_the_estimate_is_the_walks_own_arithmetic(self):
@@ -358,6 +401,99 @@ class PlannerBehaviourTest(unittest.TestCase):
             if name.startswith("VERDICT_") and isinstance(value, str)
         }
         self.assertEqual(verdicts, set(cpb_backfill_plan.VERDICT_NOTES))
+
+
+class BothScopesRefuseTheOthersShapeTest(unittest.TestCase):
+    """The rule is asserted over the PAIR, not over one member of it (#108).
+
+    Three defects of one shape, in three files, inside two weeks:
+
+      #94   every `serve` invocation in the skill passed `--db`;
+            its `ingest` twin did not, and wrote the user's only copy of
+            their history where the next plugin update deletes it.
+      #105  full-scan mode stamped `ingest_runs`; single-file mode -- the
+            only mode the plugin's hooks use -- did not, so every install
+            reported that no ingest had ever completed.
+      #108  a parent named in project mode was caught; a project named in
+            parent mode reported a confident zero about the machine.
+
+    None of the three is a hard bug. Each is a rule written while looking at
+    one mode, with nobody asking what its sibling does -- and each was covered
+    by a test that ranged over the member somebody was looking at.
+
+    So this class ranges over the pair. `SCOPES` names both members, and every
+    test below asserts the property for each, so a fix applied to one of them
+    cannot go green. It is not a general cure -- nothing here can invent a
+    third mode -- but it moves the unit of assertion from "the case I fixed" to
+    "the axis it sits on", which is where all three of these were lost.
+    """
+
+    #: (flag, "shape this scope reads", "shape it must refuse")
+    SCOPES = (
+        ("--projects-dir", "project", "parent"),
+        ("--all-projects", "parent", "project"),
+    )
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-scope-pair-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.db = self.tmp / "usage.db"
+        # ONE parent and ONE project, so each scope has both the shape it reads
+        # and the shape it must refuse available to it -- and they are
+        # deliberately different directories, so a planner that answered from
+        # the path it was handed rather than from the path's SHAPE cannot pass.
+        self.parent = self.tmp / "parent"
+        self.parent.mkdir()
+        self.project = build_project(self.parent / "-synthetic-alpha", sessions=1)
+        self.shapes = {"parent": self.parent, "project": self.project}
+
+    def plan(self, flag: str, path: Path) -> tuple[list[str], str]:
+        if flag == "--projects-dir":
+            return cpb_backfill_plan.plan_one_project(path, self.db)
+        return cpb_backfill_plan.plan_every_project(path, self.db)
+
+    def test_each_scope_measures_the_shape_it_reads(self):
+        # The control. Without it, refusing everything would pass the test
+        # below and this class would assert nothing about measurement at all.
+        for flag, reads, _refuses in self.SCOPES:
+            with self.subTest(flag=flag):
+                _lines, verdict = self.plan(flag, self.shapes[reads])
+                self.assertEqual(verdict, cpb_backfill_plan.VERDICT_PENDING)
+
+    def test_each_scope_names_the_others_shape_as_the_wrong_scope(self):
+        for flag, _reads, refuses in self.SCOPES:
+            with self.subTest(flag=flag):
+                _lines, verdict = self.plan(flag, self.shapes[refuses])
+                self.assertEqual(
+                    verdict,
+                    cpb_backfill_plan.VERDICT_WRONG_SCOPE,
+                    f"{flag} reports a real answer about a {refuses} directory",
+                )
+
+    def test_neither_scope_calls_the_others_shape_empty(self):
+        # The specific wrong answer, named. NO_TRANSCRIPTS is a claim about a
+        # corpus that was looked at; over the wrong shape nothing was.
+        for flag, _reads, refuses in self.SCOPES:
+            with self.subTest(flag=flag):
+                _lines, verdict = self.plan(flag, self.shapes[refuses])
+                self.assertNotEqual(
+                    verdict, cpb_backfill_plan.VERDICT_NO_TRANSCRIPTS
+                )
+
+    def test_neither_scope_states_an_established_emptiness_it_did_not_establish(
+        self,
+    ):
+        # The sentence, not just the verdict. "That is a real answer about the
+        # machine, not a failure" is the half of #108 that made it worse than a
+        # bare zero, and a verdict-only assertion would let it survive a rename.
+        confident = cpb_backfill_plan.VERDICT_NOTES[
+            cpb_backfill_plan.VERDICT_NO_TRANSCRIPTS
+        ]
+        for flag, _reads, refuses in self.SCOPES:
+            with self.subTest(flag=flag):
+                lines, verdict = self.plan(flag, self.shapes[refuses])
+                text = "\n".join(lines) + f"\n{cpb_backfill_plan.VERDICT_NOTES[verdict]}"
+                self.assertNotIn(confident, text)
 
 
 class PlannerIsRunnableAsShippedTest(unittest.TestCase):

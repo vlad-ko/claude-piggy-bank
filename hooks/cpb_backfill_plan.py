@@ -79,6 +79,21 @@ VERDICT_UNKNOWN = "UNKNOWN"
 #: on this machine" to someone who named the wrong scope -- which is #96's own
 #: defect (`--projects-dir ~/.claude/projects` scanned zero files and reported
 #: success) repeated one level up, in the offer built to cure it.
+#:
+#: IT COVERS BOTH DIRECTIONS SINCE #108, and it shipped covering one. A parent
+#: named in project mode was caught; a PROJECT named in parent mode was not, and
+#: measured on `main` at 3.2.0, 2026-08-07, a directory holding one transcript
+#: reported `0 transcript file(s), 0 B on disk` and the note "that is a real
+#: answer about the machine, not a failure". The closing sentence is what made
+#: it worse than a bare zero: it told the reader the emptiness had been
+#: ESTABLISHED, when nothing at that path had been examined.
+#:
+#: The pattern, which is why it is worth naming rather than patching: a rule
+#: written for one member of a mode pair, with nobody asking what the sibling
+#: does. #94 passed `--db` on every `serve` invocation and not on its `ingest`
+#: twin; #105 stamped `ingest_runs` from full-scan mode and not from
+#: single-file mode; #108 is the third. `BothScopesRefuseTheOthersShapeTest`
+#: ranges over the pair rather than over one member of it.
 VERDICT_WRONG_SCOPE = "WRONG_SCOPE"
 
 VERDICT_NOTES = {
@@ -99,10 +114,16 @@ VERDICT_NOTES = {
         " rather than nothing; the size below covers the whole corpus because"
         " nothing could be shown to be skippable"
     ),
+    # Direction-NEUTRAL since #108, deliberately. Two shapes reach this verdict
+    # -- a parent named as a project and a project named as a parent -- and the
+    # note is shared, so naming one of them here would state the wrong one half
+    # the time. Which shape it is comes from the lines above, where it is
+    # measured; what is common to both, and all this note may claim, is that
+    # NOTHING was measured.
     VERDICT_WRONG_SCOPE: (
-        "the directory named is not one project -- its CHILDREN are the"
-        " project directories. Nothing was measured, and this says nothing"
-        " about how much history is on this machine"
+        "the directory named is not the shape this scope reads, and the lines"
+        " above say which shape it is. Nothing was measured, so this says"
+        " nothing about how much history is on this machine"
     ),
 }
 
@@ -265,8 +286,38 @@ def plan_every_project(root: Path, db_path: Path) -> tuple[list[str], str]:
     held NOTHING, which was 12 of 19 on the measured machine. A walk silent
     about 63% of what it looked at leaves the reader unable to tell "there is
     nothing there" from "it did not look".
+
+    **`root` is classified before it is walked (#108).** `plan_backfill()`
+    ranges over `root`'s CHILDREN, so a `root` that is itself a project -- its
+    transcripts at its own top level -- produced zero projects, zero files and
+    the confident note "this scope holds no transcripts at all. That is a real
+    answer about the machine, not a failure". It was not: the emptiness was
+    assumed, not established, and the confident sentence is what made it worse
+    than a bare zero. `plan_one_project()` has refused the mirror-image mistake
+    since #97 shipped; this is the same refusal for the other member of the
+    pair.
+
+    A genuinely empty root still gets its confident zero. The classification
+    below fires on PROJECT and on nothing else, so a root whose children were
+    all examined and all held nothing is unchanged -- fixing a false zero by
+    making every zero hedge would trade one unreadable answer for another.
     """
     line, _ = describe_database(db_path)
+    classify = ingest.classify_projects_dir(root)
+    if classify.outcome == ingest.PROJECTS_DIR_PROJECT:
+        return (
+            [
+                line,
+                f"scanning {root} (every project on this machine)",
+                "  that directory IS one project: its transcripts sit at its"
+                " own top level, and this scope reads the project directories"
+                " UNDER a root. Nothing beneath it was measured, and nothing"
+                " here says how much history is on this machine.",
+                "  it is the other choice, not this one -- pass it as"
+                f" --projects-dir {root} to size the project it is.",
+            ],
+            VERDICT_WRONG_SCOPE,
+        )
     plan = ingest.plan_backfill(root, db_path)
     return (
         [line, ingest.format_backfill_plan(plan)],

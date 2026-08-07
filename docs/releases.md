@@ -42,6 +42,61 @@ already on the README record. The test does not require entries for historical
 versions: pinning history would force a rewrite at every release, which is how
 a check becomes something people route around.
 
+## 3.3.0 — 2026-08-07
+
+**No migration.** Every command, flag, exit status and payload field behaves as
+it did; the database upgrades in place on the next run (`SCHEMA_VERSION` 12 →
+13, one nullable column added, no row touched).
+
+**If you installed CPB as a plugin, this is the release that stops the report
+telling you your ingest may have failed.** Measured on 3.1.0: a hook fired,
+ingested 5 API calls and exited 0, and the report then said
+
+> **INCONCLUSIVE:** no `ingest.py` run has ever COMPLETED over this database …
+> a run that raises never stamps, so a failing ingest looks exactly like this.
+> Re-run `ingest.py` and check it exits cleanly.
+
+permanently, on a working install. The cause: `ingest_runs` was stamped by
+`--projects-dir` and not by `--transcript`, and `--transcript` is the only mode
+the plugin's hooks ever use. The advice could never clear the message, because
+the mode you would re-run in was the mode that did not stamp.
+
+**What changed.** A single-file run now records that a run completed, because it
+did — over one file rather than the corpus. That is the fact the freshness
+verdict, the report banner and the data-age line all needed, and they still read
+it from one field between them (`ingest.last_run_at`).
+
+**A run that genuinely fails still reads as unknown.** Both modes stamp last and
+only on success, so an ingest that raises leaves exactly what no ingest leaves.
+The INCONCLUSIVE message is unchanged and still fires — it stopped firing on
+working installs, not on broken ones.
+
+**New in `/api/summary`, both under `ingest`:** `last_full_scan_at` (when a run
+last looked at the *whole corpus*, rather than at one file) and
+`full_scan_unknown_reason`, which names why that is null — no run table, no
+recorded scope, or no full scan yet. A hook-maintained database now reads, on
+the data-age line, as current *and* as never swept, which are two true facts
+that one field could only ever express by denying both. On a database written
+before this release the scope of past runs is **unrecorded** rather than
+assumed: every stamp such a build wrote did come from a corpus run, and writing
+that deduction in would make an inference indistinguishable from an observation.
+The next `ingest.py --projects-dir` records it.
+
+**Also in this release:** `hooks/cpb_backfill_plan.py` — the read-only planner
+behind `/cpb`'s backfill offer — reported a directory holding one transcript as
+`0 transcript file(s), 0 B on disk` when it was named with `--all-projects`,
+adding "that is a real answer about the machine, not a failure". It was not: the
+scope reads the project directories *under* a root, and nothing at that path had
+been examined. It now says `WRONG_SCOPE` and names which shape the directory is.
+A genuinely empty root keeps its confident zero.
+
+Both are **corrections** under [`versioning.md`](versioning.md) — each figure now
+measures what it always claimed to — so the minor bump is carried by the two new
+payload fields.
+
+Closing [#105](https://github.com/vlad-ko/claude-piggy-bank/issues/105) and
+[#108](https://github.com/vlad-ko/claude-piggy-bank/issues/108).
+
 ## 3.2.0 — 2026-08-07
 
 **No migration.** Nothing you already run changes; `/cpb` gains a step before

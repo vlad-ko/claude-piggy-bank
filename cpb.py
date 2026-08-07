@@ -120,7 +120,29 @@ from typing import NamedTuple, Optional, Sequence
 # is asked, never assumed: "every project" reads directory names that are the
 # user's own paths. New skill step and a read-only planner; nothing removed,
 # renamed or redefined -- minor.
-VERSION = "3.2.0"
+#
+# 3.2.0 -> 3.3.0 (#105, #108). Two CORRECTIONS and two new payload fields, and
+# the corrections are what decide the bump is not major:
+#
+#   * `ingest.py --transcript` now stamps `ingest_runs`. It always claimed to
+#     be `ingest.py` completing and always was; withholding the stamp meant
+#     every plugin install -- whose hooks use that mode and no other -- read
+#     "no ingest.py run has ever COMPLETED over this database ... a failing
+#     ingest looks exactly like this". `last_run_at` therefore measures what it
+#     always published, which `docs/versioning.md` names a correction rather
+#     than a redefinition.
+#   * the backfill planner reports a project directory named in `--all-projects`
+#     as WRONG_SCOPE instead of `0 transcript file(s)` and "that is a real
+#     answer about the machine, not a failure" (#108). A verdict about a set
+#     nothing examined; the same correction clause, one file over.
+#
+#   * `/api/summary`'s `ingest` block gains `last_full_scan_at` and
+#     `full_scan_unknown_reason`, which carry the narrower fact `last_run_at`
+#     used to imply. New fields, nothing removed -- minor, and it governs.
+#
+# SCHEMA_VERSION 12 -> 13 adds one nullable column and upgrades in place, so
+# the schema clause of docs/versioning.md is satisfied rather than waived.
+VERSION = "3.3.0"
 
 PROG = "cpb"
 
