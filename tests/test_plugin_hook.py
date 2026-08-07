@@ -41,6 +41,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HANDLER = REPO_ROOT / "hooks" / "cpb_ingest_hook.py"
 
+# `serve.py` is imported here for exactly one class -- `HookToReportSeamTest`,
+# which asks the report what it says about a database the hook built. The seam
+# between the two paths is the thing #105 lived in, and it can only be asserted
+# by a test that can see both ends of it.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import serve  # noqa: E402  (must follow the sys.path insertion above)
+
 
 def load_handler():
     """Load the hook handler from its path in the plugin tree."""
@@ -613,6 +622,179 @@ class FailureLogTest(HookTestCase):
         code, stderr, _ = self.run_hook(self.stop_payload())
 
         self.assertEqual(code, 0, stderr)
+
+
+class HookToReportSeamTest(unittest.TestCase):
+    """What the REPORT says about a database the hook built (#105).
+
+    THE SEAM, and why #105 could ship green. Every class above asserts that the
+    hook spawns the right `ingest.py` for the right file into the right
+    database; `tests/test_serve.py` asserts what `/api/summary` says about a
+    database. Both paths were covered. The join between them -- run the hook,
+    then ask the report -- was covered by nothing, so the hook could succeed
+    into a database the report then described as one no ingest had ever
+    completed over, and no test on either side could see it.
+
+    THIS CLASS IS THE ONLY ONE HERE THAT SPAWNS A PROCESS, and it is deliberate
+    rather than an oversight of the module docstring's rule. An injected runner
+    would assert the seam between the hook and a stand-in, which is the shape of
+    coverage that let #105 through in the first place: the defect was in what
+    `ingest.py --transcript` really wrote, and only the real child writes it.
+    One spawn, one small transcript, no network, no real corpus.
+
+    Same shape as #94, where every `serve` invocation in the skill was pinned
+    and its `ingest` twin was not, and as #108, where a wrong scope was refused
+    in one direction. Three defects, one shape: a rule applied to one member of
+    a pair.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.data_dir = self.tmp / "plugin-data"
+        # A structurally real transcript at the main-thread depth, hand-built:
+        # `source_for_transcript()` classifies a single path by that layout, and
+        # the usage values differ per class so a swapped column mapping could
+        # not pass here either.
+        projects = self.tmp / "projects" / "-synthetic-seam"
+        projects.mkdir(parents=True)
+        self.transcript = projects / "00000000-0000-4000-8000-000000000000.jsonl"
+        self.transcript.write_text(
+            json.dumps({
+                "type": "assistant",
+                "uuid": "u0",
+                "sessionId": "00000000-0000-4000-8000-000000000000",
+                "timestamp": "2026-08-07T00:00:00.000Z",
+                "version": "2.1.223",
+                "message": {
+                    "id": "msg_seam",
+                    "model": "claude-test-model",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "synthetic"}],
+                    "usage": {
+                        "input_tokens": 13,
+                        "output_tokens": 17,
+                        "cache_creation_input_tokens": 19,
+                        "cache_read_input_tokens": 23,
+                    },
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+        self.db = self.data_dir / hook.DB_FILENAME
+
+    def fire_hook(self) -> int:
+        """One real `Stop`, spawning the real `ingest.py`. Returns the exit code."""
+        stderr = io.StringIO()
+        code = hook.main(
+            stdin=io.StringIO(json.dumps({
+                "session_id": "00000000-0000-4000-8000-000000000000",
+                "transcript_path": str(self.transcript),
+                "cwd": str(self.tmp),
+                "hook_event_name": "Stop",
+            })),
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "CLAUDE_PLUGIN_ROOT": str(REPO_ROOT),
+                "CLAUDE_PLUGIN_DATA": str(self.data_dir),
+            },
+            stderr=stderr,
+        )
+        self.assertEqual(code, hook.EXIT_OK, stderr.getvalue())
+        return code
+
+    def summary(self) -> dict:
+        api = serve.Api(self.db)
+        try:
+            return api.summary(*serve.day_bounds(None, None))
+        finally:
+            api.conn.close()
+
+    def test_the_hook_ingests_and_the_report_calls_the_database_current(self):
+        # THE regression, end to end. Before #105 every assertion up to
+        # `calls` passed and the three after it failed -- a hook that ingested
+        # 5 calls and exited 0, over a database the report then called one no
+        # ingest had ever completed over.
+        self.fire_hook()
+        payload = self.summary()
+        self.assertGreater(payload["calls"], 0, "the hook ingested nothing")
+        ingest_block = payload["ingest"]
+        self.assertIsNotNone(
+            ingest_block["last_run_at"],
+            "the hook succeeded and the report says no run ever completed",
+        )
+        self.assertIs(ingest_block["stale"], False)
+        self.assertIsNone(ingest_block["stale_unknown_reason"])
+
+    def test_the_report_does_not_claim_the_corpus_was_scanned(self):
+        # The other half. The hook read one file; nothing swept the corpus, and
+        # the report must not say otherwise while calling the database current.
+        self.fire_hook()
+        ingest_block = self.summary()["ingest"]
+        self.assertIsNone(ingest_block["last_full_scan_at"])
+        self.assertEqual(
+            ingest_block["full_scan_unknown_reason"],
+            serve.FULL_SCAN_UNKNOWN_NONE_RECORDED,
+        )
+
+    def test_the_health_band_agrees_with_the_report_it_sits_above(self):
+        self.fire_hook()
+        payload = self.summary()
+        check = next(
+            c
+            for c in payload["health"]["checks"]
+            if c["check"] == serve.CHECK_INGEST_AGE
+        )
+        self.assertEqual(check["state"], serve.HEALTH_OK)
+
+    def test_a_hook_whose_ingest_fails_leaves_the_age_unknown(self):
+        # THE TRUE ALARM, pinned at the same seam as the false one, because the
+        # cheap way to silence a false INCONCLUSIVE is to stop raising the real
+        # one. A hook whose spawned ingest dies after the schema is stamped and
+        # before the run is leaves a database that HOLDS the run table and no
+        # row -- which is exactly what a database nothing has ever run over
+        # holds, and the report must say "unknown age", not "fresh".
+        #
+        # Produced by a real failing child rather than by deleting the stamp:
+        # the transcript is made unreadable, so `parse_file()` raises and
+        # `ingest.py` exits non-zero having already created the database.
+        os.chmod(self.transcript, 0o000)
+        self.addCleanup(os.chmod, self.transcript, 0o600)
+        try:
+            with self.transcript.open("rb"):
+                pass
+        except OSError:
+            pass
+        else:  # running as root: the mode is advisory and the child succeeds
+            self.skipTest("this process can read a mode-000 file")
+
+        stderr = io.StringIO()
+        code = hook.main(
+            stdin=io.StringIO(json.dumps({
+                "transcript_path": str(self.transcript),
+                "hook_event_name": "Stop",
+            })),
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "CLAUDE_PLUGIN_ROOT": str(REPO_ROOT),
+                "CLAUDE_PLUGIN_DATA": str(self.data_dir),
+            },
+            stderr=stderr,
+        )
+        self.assertEqual(code, hook.EXIT_NONBLOCKING_ERROR, stderr.getvalue())
+        self.assertTrue(self.db.is_file(), "the child never reached the database")
+        ingest_block = self.summary()["ingest"]
+        self.assertIsNone(ingest_block["last_run_at"])
+        self.assertIsNone(
+            ingest_block["stale"], "a failed ingest is not a fresh one"
+        )
+        self.assertEqual(
+            ingest_block["stale_unknown_reason"],
+            serve.STALE_UNKNOWN_NO_RUN_RECORDED,
+        )
 
 
 if __name__ == "__main__":

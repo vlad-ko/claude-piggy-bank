@@ -35,13 +35,15 @@ from ingest import (  # noqa: E402
     CACHE_WRITE_1H_KEY,
     CACHE_WRITE_5M_KEY,
     INGEST_RUNS_TABLE,
+    RUN_SCOPE_CORPUS,
+    RUN_SCOPE_FILE,
     SOURCE_MAIN,
     SOURCE_SUBAGENT,
     ingest,
     ingest_transcript,
     record_ingest_run,
 )
-from test_ingest import build_corpus  # noqa: E402
+from test_ingest import build_corpus, build_hook_only_database  # noqa: E402
 from context_window import (  # noqa: E402
     BAND_25_TO_50,
     BAND_50_TO_90,
@@ -108,6 +110,9 @@ from serve import (  # noqa: E402
     CONTEXT_ANSWER_UNKNOWN,
     CONTEXT_ANSWER_YES,
     CONTEXT_SAMPLE,
+    FULL_SCAN_UNKNOWN_NONE_RECORDED,
+    FULL_SCAN_UNKNOWN_NO_RUN_TABLE,
+    FULL_SCAN_UNKNOWN_NO_SCOPE_COLUMN,
     GROWTH_MATERIAL_CHANGE,
     GROWTH_MIN_CALLS,
     GROWTH_MIN_CALLS_PER_QUARTER,
@@ -1464,11 +1469,19 @@ class DataStalenessTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def _set_run_stamp(self, finished_at: float) -> None:
-        """Stamp the run through the ingester's own writer, never a raw INSERT."""
+    def _set_run_stamp(
+        self, finished_at: float, scope: str = RUN_SCOPE_CORPUS
+    ) -> None:
+        """Stamp the run through the ingester's own writer, never a raw INSERT.
+
+        `scope` defaults to CORPUS because this fixture ingests with `ingest()`,
+        so a corpus stamp is what the run it is standing in for produced. Tests
+        about the single-file mode pass `RUN_SCOPE_FILE` explicitly -- the
+        writer itself has no default (#105), for the reason its docstring gives.
+        """
         conn = sqlite3.connect(self.db_path)
         try:
-            record_ingest_run(conn, finished_at)
+            record_ingest_run(conn, finished_at, scope=scope)
             conn.commit()
         finally:
             conn.close()
@@ -1641,6 +1654,192 @@ class DataStalenessTest(unittest.TestCase):
         # The run itself DID happen, and is a separate fact from what it found.
         self.assertIsNotNone(block["last_run_at"])
         self.assertFalse(block["stale"])
+
+    def test_a_full_scan_and_a_single_file_run_are_separate_fields(self) -> None:
+        # #105. The pair `last_run_at` / `newest_call_ts` above is one axis;
+        # this is the other, and it splits `last_run_at` rather than joining it.
+        # Stamped DELIBERATELY APART so a payload that reported one field twice
+        # cannot pass.
+        scanned_at = time.time() - 600.0
+        self._set_run_stamp(scanned_at, RUN_SCOPE_CORPUS)
+        self._set_run_stamp(scanned_at + 300.0, RUN_SCOPE_FILE)
+        block = self._ingest_block()
+        self.assertAlmostEqual(block["last_full_scan_at"], scanned_at, places=3)
+        self.assertAlmostEqual(block["last_run_at"], scanned_at + 300.0, places=3)
+        self.assertIsNone(block["full_scan_unknown_reason"])
+
+    def test_a_database_that_cannot_record_scope_says_unrecorded_not_none(
+        self,
+    ) -> None:
+        # `serve.py` never migrates, so a pre-v13 database read by this build
+        # has `ingest_runs` and no `corpus_finished_at`. Whether a full scan
+        # ever ran is UNRECORDED. It is pointedly not answered "yes" either,
+        # though every stamp such a build wrote did come from a corpus run --
+        # `ingest.py` refuses that same deduction at the migration, and the
+        # reader is owed the same refusal.
+        self._write(
+            f"ALTER TABLE {INGEST_RUNS_TABLE} DROP COLUMN corpus_finished_at"
+        )
+        block = self._ingest_block()
+        self.assertIsNone(block["last_full_scan_at"])
+        self.assertEqual(
+            block["full_scan_unknown_reason"], FULL_SCAN_UNKNOWN_NO_SCOPE_COLUMN
+        )
+        # ...and it has NOT cost the freshness verdict, which reads the other
+        # column and is unaffected.
+        self.assertIs(block["stale"], False)
+
+    def test_a_database_with_no_run_table_cannot_answer_either_question(
+        self,
+    ) -> None:
+        self._write(f"DROP TABLE {INGEST_RUNS_TABLE}")
+        block = self._ingest_block()
+        self.assertIsNone(block["last_full_scan_at"])
+        self.assertEqual(
+            block["full_scan_unknown_reason"], FULL_SCAN_UNKNOWN_NO_RUN_TABLE
+        )
+        self.assertEqual(block["stale_unknown_reason"], STALE_UNKNOWN_NO_RUN_TABLE)
+
+    def test_a_measured_full_scan_carries_no_unknown_reason(self) -> None:
+        # Same rule as `stale_unknown_reason`: the reason field qualifies an
+        # ABSENT answer, and beside a real one it is a second, contradictory
+        # answer to the same question.
+        self._set_run_stamp(time.time(), RUN_SCOPE_CORPUS)
+        block = self._ingest_block()
+        self.assertIsNotNone(block["last_full_scan_at"])
+        self.assertIsNone(block["full_scan_unknown_reason"])
+
+
+class HookOnlyDatabaseFreshnessTest(unittest.TestCase):
+    """What the report says about a database only the plugin's hooks built.
+
+    THE STATE EVERY PLUGIN USER IS IN, and no fixture built it before #105.
+    `hooks/hooks.json` fires on `Stop`, `SubagentStop` and `SessionEnd`; each
+    runs `hooks/cpb_ingest_hook.py`, which spawns `ingest.py --transcript` for
+    exactly one file. `ingest()` is never called on such a machine, so single-
+    file mode's silence about run stamps was the whole of what those installs
+    reported: measured on `main` at 3.1.0, 2026-08-07, a hook run that ingested
+    5 calls and exited 0 left `ingest_runs` empty, and the page then said
+
+        INCONCLUSIVE: no ingest.py run has ever COMPLETED over this database
+        ... a run that raises never stamps, so a failing ingest looks exactly
+        like this. Re-run ingest.py and check it exits cleanly.
+
+    permanently, on a working install, with advice that could never clear it --
+    the mode they would re-run in was the mode that did not stamp.
+
+    The two halves are asserted together on purpose. A hook-only database must
+    read as CURRENT, and it must not thereby claim that anything ever scanned
+    the corpus: the second is what a run over one file has no evidence for, and
+    a fix that asserted it would be a different wrong number in the same field.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="usage-report-hook-only-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.db_path, self.transcripts = build_hook_only_database(self.tmp)
+
+    def block(self) -> dict:
+        api = Api(self.db_path)
+        try:
+            return api.summary(*day_bounds(None, None))["ingest"]
+        finally:
+            api.conn.close()
+
+    def payload(self) -> dict:
+        api = Api(self.db_path)
+        try:
+            return api.summary(*day_bounds(None, None))
+        finally:
+            api.conn.close()
+
+    def test_the_fixture_really_is_hook_only(self) -> None:
+        # Guarding the fixture, not the code. If this ever ingests through
+        # `ingest()`, every assertion below stops describing a plugin install
+        # and starts passing for the wrong reason.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            corpus = conn.execute(
+                f"SELECT corpus_finished_at FROM {INGEST_RUNS_TABLE}"
+            ).fetchone()
+            calls = conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertIsNone(corpus[0], "a directory run touched this fixture")
+        self.assertGreater(calls, 0, "the fixture ingested nothing to report on")
+        self.assertEqual(len(self.transcripts), 2)
+
+    def test_a_working_install_is_not_told_its_ingest_may_have_failed(self) -> None:
+        # THE defect, at the surface the user reads.
+        block = self.block()
+        self.assertIsNotNone(
+            block["last_run_at"],
+            "a hook-maintained database reports that no ingest ever completed",
+        )
+        self.assertIs(block["stale"], False)
+        self.assertIsNone(
+            block["stale_unknown_reason"],
+            "the INCONCLUSIVE banner fires on a working plugin install",
+        )
+
+    def test_it_does_not_claim_a_corpus_scan_nobody_ran(self) -> None:
+        block = self.block()
+        self.assertIsNone(block["last_full_scan_at"])
+        self.assertEqual(
+            block["full_scan_unknown_reason"], FULL_SCAN_UNKNOWN_NONE_RECORDED
+        )
+
+    def test_the_health_band_agrees_with_the_staleness_verdict(self) -> None:
+        # One of the three surfaces. It may not LOWER the verdict and it may not
+        # raise one either: `ingest-age` maps the tri-state it was handed.
+        payload = self.payload()
+        check = next(
+            c for c in payload["health"]["checks"] if c["check"] == CHECK_INGEST_AGE
+        )
+        self.assertEqual(check["state"], HEALTH_OK)
+
+    def test_the_three_surfaces_read_one_source(self) -> None:
+        # The requirement that outlives this fix: the staleness verdict, the
+        # banner and the data-age line share `ingest.last_run_at` and must keep
+        # sharing it. Asserted by RE-DERIVING the verdict from the payload's own
+        # published fields -- if the block ever computed `stale` from something
+        # the page cannot see, the page's rendering and the verdict would be
+        # free to disagree, which is the defect `RANKED_BY` exists to stop one
+        # layer up.
+        block = self.block()
+        stale, reason = staleness_verdict(
+            block["last_run_at"], block["as_of"], True
+        )
+        self.assertIs(block["stale"], stale)
+        self.assertEqual(block["stale_unknown_reason"], reason)
+
+    def test_a_hook_run_that_raises_still_reads_as_unknown(self) -> None:
+        # The true alarm the false one must not be fixed by deleting. A hook
+        # whose spawned ingest died leaves no stamp, and a database in that
+        # state is indistinguishable from one nothing has ever run over --
+        # because it is.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(f"DELETE FROM {INGEST_RUNS_TABLE}")
+            conn.commit()
+        finally:
+            conn.close()
+        block = self.block()
+        self.assertIsNone(block["last_run_at"])
+        self.assertIsNone(block["stale"])
+        self.assertEqual(
+            block["stale_unknown_reason"], STALE_UNKNOWN_NO_RUN_RECORDED
+        )
+
+    def test_a_second_hook_run_advances_the_age(self) -> None:
+        # The property that makes the fix hold over time rather than once: the
+        # `Stop` hook fires every turn, most of them changing nothing, so a
+        # stamp written only when bytes moved would age past the threshold on a
+        # database being kept current.
+        first = self.block()["last_run_at"]
+        time.sleep(0.01)
+        ingest_transcript(self.transcripts[-1], self.db_path)
+        self.assertGreater(self.block()["last_run_at"], first)
 
 
 class StalenessThresholdTest(unittest.TestCase):
@@ -1977,6 +2176,30 @@ class DataAgeCauseTest(unittest.TestCase):
         body = self.summary()
         self.assertIn("this.summary.ingest.stale === true", body)
         self.assertEqual(body.count("this.banner.stale ="), 1)
+
+    def test_the_data_age_line_names_the_set_the_age_ranges_over(self) -> None:
+        # #105. The age above is now true for a hook-maintained database, and
+        # this clause is what stops it from also reading as "the corpus was
+        # rescanned". Both absences the API can report are branched on by name,
+        # never inferred from the timestamp being null.
+        body = self.data_age()
+        self.assertIn("ingest.last_full_scan_at", body)
+        self.assertIn("ingest.full_scan_unknown_reason", body)
+        for reason in (
+            FULL_SCAN_UNKNOWN_NONE_RECORDED,
+            FULL_SCAN_UNKNOWN_NO_SCOPE_COLUMN,
+        ):
+            with self.subTest(reason=reason):
+                self.assertRegex(body, r"""['"]%s['"]""" % re.escape(reason))
+
+    def test_no_full_corpus_scan_is_not_raised_as_a_failure(self) -> None:
+        # It is the plugin's NORMAL state, not a fault: a hook-maintained
+        # database is current for the sessions it was handed. Putting it in the
+        # banner would restore, one field over, exactly the permanent false
+        # alarm #105 removed -- and this one could not be cleared either,
+        # because the hooks will never run a corpus scan.
+        body = self.summary()
+        self.assertNotIn("full_scan_unknown_reason", body)
 
 
 # ---------------------------------------------------------------------------

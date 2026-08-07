@@ -1005,6 +1005,32 @@ STALE_UNKNOWN_NO_RUN_RECORDED = "no-run-recorded"
 # The stamp is AHEAD of the server's clock, so there is no age to compare.
 STALE_UNKNOWN_RUN_IN_FUTURE = "run-in-future"
 
+# Why `last_full_scan_at` is null, when it is (#105) -- the same three-value
+# shape as the reasons above, and for the same reason: the page may state which
+# absence it has, never guess one.
+#
+# `finished_at` answers "how old is this database" and `corpus_finished_at`
+# answers "has anything ever scanned the whole corpus". They used to be one
+# column answering both, which is why single-file mode -- the plugin's only mode
+# -- could not stamp without asserting a corpus scan, and so stamped nothing.
+#
+# No `ingest_runs` table: this database predates run stamping entirely, so it
+# cannot have recorded a scan of any scope. The SAME value the staleness reason
+# uses, deliberately -- one absence, one name.
+FULL_SCAN_UNKNOWN_NO_RUN_TABLE = STALE_UNKNOWN_NO_RUN_TABLE
+# The table is here without the column: written by a build that stamped runs
+# and did not record what they ranged over. Whether a full scan ever completed
+# is UNRECORDED, not answered `no` -- and pointedly not answered `yes` either,
+# though every stamp such a build wrote did come from a corpus run. `ingest.py`
+# refuses that same deduction at the migration (IN_PLACE_ADDABLE_COLUMNS); the
+# reader is owed the same refusal.
+FULL_SCAN_UNKNOWN_NO_SCOPE_COLUMN = "no-scope-column"
+# The column is here and NULL: this database records run scope and no
+# full-corpus scan has ever stamped itself over it. THE PLUGIN'S NORMAL STATE,
+# and a true statement rather than a fault -- a hook-maintained database holds
+# the sessions its hooks were handed and has never been swept for anything else.
+FULL_SCAN_UNKNOWN_NONE_RECORDED = "no-full-scan-recorded"
+
 MIN_LIMIT = 1
 MAX_LIMIT = 500
 DEFAULT_LIMIT = 20
@@ -1188,8 +1214,65 @@ class Api:
             is not None
         )
 
+    def _has_run_scope_column(self) -> bool:
+        """Does this database record WHAT a completed run looked at? (#105)
+
+        A third question in the same family as `_has_ingest_runs_table()`, asked
+        the same way and for the same reason: `serve.py` never migrates, so a
+        database written by a pre-v13 build has `ingest_runs` and no
+        `corpus_finished_at`, and "this build cannot ask" must not read as "the
+        answer is no". `PRAGMA table_info` rather than a `SELECT` that catches
+        `OperationalError`, which would swallow a corrupt or locked database as
+        a merely old schema.
+        """
+        return "corpus_finished_at" in {
+            row[1]
+            for row in self.conn.execute(
+                f"PRAGMA table_info({INGEST_RUNS_TABLE})"
+            ).fetchall()
+        }
+
+    def _last_full_scan(self) -> tuple[Optional[float], Optional[str]]:
+        """`(when a FULL-CORPUS scan last completed, why not)` (#105).
+
+        The narrower of the two run facts, split out of `finished_at` when
+        single-file runs started stamping. Both are needed and neither
+        substitutes: `_last_ingest_run()` says how old this database's reading
+        of the transcripts is, and this says whether anything has ever looked
+        at the transcripts it was not handed.
+
+        The reason is non-null exactly when the timestamp is null, and names
+        which of THREE absences it is, because they carry different remedies:
+        a schema too old to record runs at all, one that recorded runs without
+        their scope, and one that records scope and has seen no corpus scan.
+        Only the third is a statement about what has happened; the first two are
+        statements about what could have been written down. Collapsing them
+        would let a pre-v13 database read as a plugin install, which is the
+        `no-run-table`/`no-run-recorded` conflation of #34 one column over.
+        """
+        if not self._has_ingest_runs_table():
+            return None, FULL_SCAN_UNKNOWN_NO_RUN_TABLE
+        if not self._has_run_scope_column():
+            return None, FULL_SCAN_UNKNOWN_NO_SCOPE_COLUMN
+        row = self.conn.execute(
+            f"SELECT corpus_finished_at FROM {INGEST_RUNS_TABLE}"
+            " WHERE corpus_finished_at IS NOT NULL"
+            " ORDER BY corpus_finished_at DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None, FULL_SCAN_UNKNOWN_NONE_RECORDED
+        return row["corpus_finished_at"], None
+
     def _last_ingest_run(self) -> Optional[float]:
         """When `ingest.py` last COMPLETED, or None if that was never recorded.
+
+        **Of EITHER mode (#105).** That is what this has always claimed and
+        since #105 it is also what it does: `ingest.py --transcript` is
+        `ingest.py` completing, over one file rather than the corpus, and it
+        used not to stamp -- so a plugin install, whose hooks use that mode and
+        no other, reported "no run has ever completed" however much it ingested.
+        What a single-file run is no evidence of is a corpus scan, and that
+        narrower fact is `_last_full_scan()`, beside this rather than inside it.
 
         Two different absences reach this None, and both are an honest "no
         sample" rather than a value:
@@ -1208,6 +1291,12 @@ class Api:
         naming WHICH absence it has in `stale_unknown_reason`, because the
         second one is a broken ingest and the page used to render it as the
         first, a benign old database.
+
+        **A run that RAISES still reaches the second one, and must.** #105
+        widened which runs stamp; it did not weaken when a stamp is written.
+        Both modes stamp last and only on the success path, so a run that died
+        before finishing leaves exactly what no run leaves, because that is what
+        the database knows about it.
         """
         if not self._has_ingest_runs_table():
             return None
@@ -1232,6 +1321,16 @@ class Api:
         idle machine is healthy and shows an old `newest_call_ts`; a database
         nobody has re-ingested for a week can show a recent `newest_call_ts`
         for the last thing it ever saw. Only the pair is readable.
+
+        A THIRD since #105, and it splits the first rather than joining it:
+        `last_full_scan_at` is when a run last looked at the whole corpus
+        instead of at one file. `last_run_at` is what every freshness surface
+        reads -- the verdict, the banner and the data-age line, one source
+        between them, unchanged -- and `last_full_scan_at` qualifies the SET
+        that reading ranges over. A hook-maintained database is current and has
+        never been swept; those are two facts and they now have two fields
+        rather than one field that could only express the first by denying
+        both.
 
         `as_of` is the server's own clock at the moment this response was
         built, so an age is measured against the machine that owns the data
@@ -1259,10 +1358,18 @@ class Api:
         stale, stale_unknown_reason = staleness_verdict(
             last_run_at, as_of, self._has_ingest_runs_table()
         )
+        # NOT fed into `staleness_verdict` (#105). The staleness verdict is
+        # about the age of this database's reading, and a corpus scan that never
+        # happened is not an age -- folding it in would let "nobody has swept
+        # the whole corpus" render as "your data may be stale", which is the
+        # false alarm this issue exists to remove, restored one field over.
+        last_full_scan_at, full_scan_unknown_reason = self._last_full_scan()
         return {
             "files": row["files"],
             "unparsed_records": row["unparsed"],
             "last_run_at": last_run_at,
+            "last_full_scan_at": last_full_scan_at,
+            "full_scan_unknown_reason": full_scan_unknown_reason,
             "newest_call_ts": newest_call_ts,
             "as_of": as_of,
             "stale_after_seconds": STALE_AFTER_SECONDS,

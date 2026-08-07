@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -611,6 +612,41 @@ def build_corpus(root: Path) -> tuple[Path, Path]:
     t2.mkdir(parents=True)
     (t2 / "atest2.output").symlink_to(a2)
     return projects, tasks
+
+
+def build_hook_only_database(root: Path) -> tuple[Path, list[Path]]:
+    """A database built the way EVERY PLUGIN INSTALL builds one (#105).
+
+    The state no fixture built until #105, and the state most CPB users are
+    actually in. `hooks/hooks.json` fires on `Stop`, `SubagentStop` and
+    `SessionEnd`; each one runs `hooks/cpb_ingest_hook.py`, which spawns
+    `ingest.py --transcript` for exactly one file. **`ingest()` is never called
+    on such a machine at all**, so every property derived from a directory scan
+    -- the archiving sweep, the wholesale subagent ledger, and until #105 the
+    run stamp -- is absent by construction rather than by accident.
+
+    Two transcripts, ingested one at a time in the order their sessions would
+    have ended, so the fixture cannot pass by treating "one file" as a special
+    case of "the corpus". They are laid out at the real on-disk depths
+    (`build_corpus`'s first two shapes) because `source_for_transcript()`
+    classifies a single path by that layout.
+
+    Returns `(db_path, transcripts_in_ingest_order)`.
+    """
+    projects = root / "projects"
+    (projects / "session-fixture" / "subagents").mkdir(parents=True)
+    main = projects / "session-fixture.jsonl"
+    shutil.copy(FIXTURE, main)
+    agent = projects / "session-fixture" / "subagents" / "agent-atest1.jsonl"
+    shutil.copy(SUBAGENT_FIXTURE, agent)
+
+    db = root / "usage.db"
+    order = [agent, main]  # SubagentStop fires before the Stop that follows it
+    for transcript in order:
+        ingest_mod.ingest_transcript(
+            transcript, db, tasks_dir=root / "no-task-index"
+        )
+    return db, order
 
 
 class TaskIndexAttributionTest(unittest.TestCase):
@@ -2855,6 +2891,390 @@ class IngestRunTimestampTest(unittest.TestCase):
         self.assertGreater(second, first)
 
 
+class SingleFileRunStampTest(unittest.TestCase):
+    """A run over ONE FILE is a completed run, and now says so (#105).
+
+    Measured on `main` at 3.1.0, 2026-08-07, on clean databases:
+
+        ingest.py --transcript <file>   ->  0 rows in `ingest_runs`
+        ingest.py --projects-dir <dir>  ->  1 row
+
+    `--transcript` is the only mode the plugin ever uses, so a plugin install
+    stamped a run NEVER, however much it ingested -- and the report told every
+    one of those users that no ingest had ever completed and that theirs *may
+    have failed*, on a working install, with advice that could not clear it.
+
+    Two halves are pinned here and both are load-bearing:
+
+      * the single-file run stamps `finished_at`, so the age is measurable;
+      * it does NOT stamp `corpus_finished_at`, and does not clear one either.
+        The narrower claim -- "something scanned the whole corpus" -- is the
+        one a run over one file has no evidence for, and the fix would be a
+        different defect if it asserted that instead of the first.
+
+    The fixtures pin the two timestamps DELIBERATELY APART (a corpus run, a
+    sleep, then a file run) so an implementation that wrote both from one mode
+    cannot pass, in either direction.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-filestamp-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+        self.tasks = self.tmp / "no-task-index"
+
+    def _stamp(self) -> tuple:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                "SELECT finished_at, corpus_finished_at"
+                f" FROM {ingest_mod.INGEST_RUNS_TABLE}"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def test_a_single_file_run_records_that_a_run_completed(self) -> None:
+        # THE defect. Before #105 this table was empty here.
+        before = time.time()
+        ingest_mod.ingest_transcript(self.transcript, self.db, tasks_dir=self.tasks)
+        after = time.time()
+        ((finished_at, _corpus),) = self._stamp()
+        self.assertGreaterEqual(finished_at, before)
+        self.assertLessEqual(finished_at, after)
+
+    def test_a_single_file_run_does_not_claim_a_corpus_scan(self) -> None:
+        ingest_mod.ingest_transcript(self.transcript, self.db, tasks_dir=self.tasks)
+        ((_finished_at, corpus),) = self._stamp()
+        self.assertIsNone(
+            corpus,
+            "one file is no evidence that anything scanned the corpus",
+        )
+
+    def test_a_single_file_run_does_not_erase_an_earlier_corpus_scan(self) -> None:
+        # The stamp is ONE row, so the file-scoped write has to leave a column
+        # it did not measure alone rather than overwrite it with NULL. On a
+        # plugin install this fires on every turn, so a writer that cleared it
+        # would erase the corpus scan the user ran seconds after running it.
+        ingest(self.projects, self.db)
+        ((_first, scanned_at),) = self._stamp()
+        self.assertIsNotNone(scanned_at)
+        time.sleep(0.01)
+        ingest_mod.ingest_transcript(self.transcript, self.db, tasks_dir=self.tasks)
+        ((finished_at, corpus),) = self._stamp()
+        self.assertEqual(corpus, scanned_at, "the corpus scan was overwritten")
+        self.assertGreater(
+            finished_at, scanned_at, "the file run did not advance the age"
+        )
+
+    def test_a_directory_run_stamps_both_facts_at_once(self) -> None:
+        ingest(self.projects, self.db)
+        ((finished_at, corpus),) = self._stamp()
+        self.assertEqual(finished_at, corpus)
+
+    def test_a_skipped_single_file_run_still_counts_as_a_run(self) -> None:
+        # #20's rule, applied to the mode that now stamps. "We looked and this
+        # file was unchanged" is a completed run; a stamp written only when
+        # bytes moved would leave a hook-maintained database ageing past the
+        # threshold while being perfectly current -- the `Stop` hook fires on
+        # every turn and most of those turns change nothing.
+        ingest_mod.ingest_transcript(self.transcript, self.db, tasks_dir=self.tasks)
+        ((first, _),) = self._stamp()
+        time.sleep(0.01)
+        summary = ingest_mod.ingest_transcript(
+            self.transcript, self.db, tasks_dir=self.tasks
+        )
+        self.assertEqual(summary["files_skipped"], 1)
+        self.assertEqual(summary["files_ingested"], 0)
+        ((second, _),) = self._stamp()
+        self.assertGreater(second, first)
+
+    def test_a_run_that_raises_before_finishing_stamps_nothing(self) -> None:
+        # The true alarm the false one must not be fixed by deleting. A run
+        # that dies leaves exactly what no run leaves, because that is what the
+        # database knows about it -- and `serve.py` reports it as an unknown
+        # age rather than as a fresh one.
+        boom = RuntimeError("ingest died before it finished")
+        with mock.patch.object(
+            ingest_mod, "rebuild_sessions", side_effect=boom
+        ):
+            with self.assertRaises(RuntimeError):
+                ingest_mod.ingest_transcript(
+                    self.transcript, self.db, tasks_dir=self.tasks
+                )
+        self.assertEqual(
+            self._stamp(), [], "a raising run must not look like a completed one"
+        )
+
+    def test_the_writer_has_no_default_scope(self) -> None:
+        # The argument is keyword-only and required on purpose: a default would
+        # let the next caller inherit a scope nobody chose for it, which is the
+        # shape of this whole defect. The failure mode it guards is not a crash
+        # -- it is a plausible timestamp attributed to a set that was never read.
+        conn = sqlite3.connect(self.db)
+        self.addCleanup(conn.close)
+        conn.executescript(ingest_mod.SCHEMA)
+        with self.assertRaises(TypeError):
+            ingest_mod.record_ingest_run(conn, time.time())
+        with self.assertRaises(ValueError):
+            ingest_mod.record_ingest_run(conn, time.time(), scope="everything")
+
+
+class EveryIngestModeStampsARunTest(unittest.TestCase):
+    """The rule is asserted over EVERY mode, not over the one being looked at.
+
+    #105 is the third instance of one shape inside two weeks: a rule written
+    while looking at one mode, with nobody asking what its sibling does. #94
+    passed `--db` on every `serve` invocation in the skill and not on its
+    `ingest` twin. #105 stamped `ingest_runs` from directory mode and not from
+    single-file mode -- the only mode the plugin's hooks use. #108 refused a
+    wrong scope in one direction and not the other. Each was covered by a test
+    that ranged over the member somebody had in mind.
+
+    So the unit of assertion here is the SET. `MODES` names every entry point
+    that reads transcripts into a database, and each one has to leave a stamp;
+    `test_the_set_of_modes_is_the_modules_own` derives the same set from the
+    module so a fourth mode cannot be added and quietly left out of this list --
+    it has to be classified deliberately, the way `IN_PLACE_UPGRADE_FROM` is
+    re-decided rather than extended.
+
+    `backfill()` earns its place by composition rather than by a stamp of its
+    own: it calls `ingest()` per project, so it stamps CORPUS once per project
+    and the last one wins. That is the correct answer and it is worth asserting
+    rather than assuming, because "it goes through the other one" is exactly
+    the reasoning that would have been offered for single-file mode.
+    """
+
+    #: Every entry point that ingests transcripts into a database. Re-decided
+    #: when one is added, never extended by habit.
+    MODES = ("ingest", "ingest_transcript", "backfill")
+
+    #: The rest of the `db_path` surface, and why each is not a mode. Listed
+    #: rather than implied, because "it does not write" is a claim about a
+    #: function and the way to keep it true is to make somebody restate it.
+    NOT_MODES = {
+        "already_tracks": "reads ingest_state to answer one question",
+        "plan_backfill": "sizes what a walk would read; ingests nothing (#97)",
+        "plan_prune": "censuses what a prune would delete; deletes nothing (#92)",
+        "run_backfill_mode": "the CLI wrapper around backfill(); no writer",
+        "run_transcript_mode": "the CLI wrapper around ingest_transcript()",
+        "tracked_state": "opens the database read-only",
+    }
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-modes-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = self.tmp / "root"
+        self.projects = self.root / "-synthetic-project"
+        self.projects.mkdir(parents=True)
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.tasks = self.tmp / "no-task-index"
+
+    def _stamp(self, db: Path):
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute(
+                "SELECT finished_at, corpus_finished_at"
+                f" FROM {ingest_mod.INGEST_RUNS_TABLE}"
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def _run(self, mode: str, db: Path) -> None:
+        if mode == "ingest":
+            ingest(self.projects, db, tasks_dir=self.tasks)
+        elif mode == "ingest_transcript":
+            ingest_mod.ingest_transcript(self.transcript, db, tasks_dir=self.tasks)
+        elif mode == "backfill":
+            plan = ingest_mod.plan_backfill(
+                self.root, db, tasks_dir_for=lambda _p: self.tasks
+            )
+            ingest_mod.backfill(
+                plan, db, tasks_dir_for=lambda _p: self.tasks
+            )
+        else:  # pragma: no cover -- the pin below makes this unreachable
+            raise AssertionError(f"no runner for mode {mode!r}")
+
+    def test_every_db_path_function_is_classified(self) -> None:
+        # DERIVED from the module, so a fourth entry point cannot be added and
+        # quietly left out of `MODES`. The haystack is every public function
+        # taking a `db_path`; each is either a mode that must stamp or is named
+        # in `NOT_MODES` with the reason it is not one. This is the check that
+        # would have caught #105 as a class rather than as an instance.
+        surface = {
+            name
+            for name, obj in vars(ingest_mod).items()
+            if not name.startswith("_")
+            and inspect.isfunction(obj)
+            and obj.__module__ == ingest_mod.__name__
+            and "db_path" in inspect.signature(obj).parameters
+        }
+        self.assertEqual(
+            surface,
+            set(self.MODES) | set(self.NOT_MODES),
+            "a function taking a db_path is neither pinned as an ingest mode"
+            " nor declared not to be one -- classify it deliberately",
+        )
+
+    def test_every_mode_records_that_a_run_completed(self) -> None:
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                db = self.tmp / f"{mode}.db"
+                self._run(mode, db)
+                stamp = self._stamp(db)
+                self.assertIsNotNone(
+                    stamp,
+                    f"{mode}() completed and the database says no run ever did",
+                )
+                self.assertIsNotNone(stamp[0])
+
+    def test_only_the_modes_that_scanned_a_corpus_claim_one(self) -> None:
+        # The other half, and the reason a blanket "everything stamps" would be
+        # the wrong fix: `ingest_transcript()` looked at one file.
+        expected = {
+            "ingest": True,
+            "backfill": True,
+            "ingest_transcript": False,
+        }
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                db = self.tmp / f"corpus-{mode}.db"
+                self._run(mode, db)
+                stamp = self._stamp(db)
+                self.assertEqual(
+                    stamp[1] is not None,
+                    expected[mode],
+                    f"{mode}() disagrees with the set it actually read",
+                )
+
+
+class RunScopeUpgradeTest(unittest.TestCase):
+    """v12 -> v13 adds the run-scope column and back-fills NOTHING (#105).
+
+    The hop is one nullable column on `ingest_runs`, so it is in
+    `IN_PLACE_UPGRADE_FROM` -- no rebuild, and therefore no collision with the
+    reaped-source guard on the databases that are the only copy of their
+    history.
+
+    What is worth a test rather than a comment is the back-fill NOT taken.
+    Every row this hop meets was written by directory mode, because `ingest()`
+    was `record_ingest_run()`'s only caller before #105, so
+    `corpus_finished_at = finished_at` would be a TRUE statement about it. It
+    is refused all the same: the column exists to separate a scan that reported
+    itself from a scan nobody has evidence of, and a value the migration
+    deduced would be indistinguishable from a value a run stamped. The reader
+    is told `no-scope-column` -- unrecorded -- and the next directory run fills
+    it in, which is the same resolution an uncensused source gets (#15).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-scope-upgrade-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+
+    def _make_v12(self) -> float:
+        """A real v12 database: ingest at v13, then undo exactly the delta."""
+        ingest(self.projects, self.db)
+        conn = sqlite3.connect(self.db)
+        try:
+            (stamped,) = conn.execute(
+                f"SELECT finished_at FROM {ingest_mod.INGEST_RUNS_TABLE}"
+            ).fetchone()
+            conn.execute(
+                f"ALTER TABLE {ingest_mod.INGEST_RUNS_TABLE}"
+                " DROP COLUMN corpus_finished_at"
+            )
+            conn.execute("PRAGMA user_version = 12")
+            conn.commit()
+        finally:
+            conn.close()
+        return stamped
+
+    def _rows(self, table: str) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _state(self) -> tuple:
+        conn = sqlite3.connect(self.db)
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            row = conn.execute(
+                "SELECT finished_at, corpus_finished_at"
+                f" FROM {ingest_mod.INGEST_RUNS_TABLE}"
+            ).fetchone()
+            return version, row
+        finally:
+            conn.close()
+
+    @unittest.skipUnless(
+        ingest_mod._sqlite_supports_drop_column(),
+        "building the v12 fixture needs ALTER TABLE ... DROP COLUMN",
+    )
+    def test_the_hop_adds_the_column_without_rebuilding(self) -> None:
+        stamped = self._make_v12()
+        calls_before = self._rows("api_calls")
+        self.assertGreater(calls_before, 0)
+        summary = ingest_mod.ingest_transcript(self.transcript, self.db)
+        self.assertFalse(
+            summary["schema_rebuilt"],
+            "a one-column addition must not go through the rebuild path, which"
+            " the reaped-source guard refuses on the corpora it protects",
+        )
+        version, row = self._state()
+        self.assertEqual(version, ingest_mod.SCHEMA_VERSION)
+        self.assertEqual(self._rows("api_calls"), calls_before)
+        # `finished_at` MOVED, because the single-file run above completed --
+        # and it moved from the v12 stamp, not from nothing.
+        self.assertGreater(row[0], stamped)
+
+    @unittest.skipUnless(
+        ingest_mod._sqlite_supports_drop_column(),
+        "building the v12 fixture needs ALTER TABLE ... DROP COLUMN",
+    )
+    def test_the_hop_does_not_back_fill_a_corpus_scan_it_did_not_observe(
+        self,
+    ) -> None:
+        stamped = self._make_v12()
+        # A SINGLE-FILE run performs the upgrade, which is how a plugin install
+        # would meet it: nothing here scanned a corpus, so nothing may say one
+        # was scanned.
+        ingest_mod.ingest_transcript(self.transcript, self.db)
+        _version, row = self._state()
+        self.assertIsNone(
+            row[1],
+            "the migration deduced a corpus scan instead of observing one",
+        )
+        self.assertNotEqual(
+            row[1],
+            stamped,
+            "`corpus_finished_at = finished_at` is true of this row and is"
+            " still not an observation this database made",
+        )
+
+    @unittest.skipUnless(
+        ingest_mod._sqlite_supports_drop_column(),
+        "building the v12 fixture needs ALTER TABLE ... DROP COLUMN",
+    )
+    def test_the_next_directory_run_fills_the_column_in(self) -> None:
+        # The ordinary repair, and the reason NULL costs nothing permanent.
+        self._make_v12()
+        ingest(self.projects, self.db)
+        _version, row = self._state()
+        self.assertIsNotNone(row[1])
+        self.assertEqual(row[0], row[1])
+
+
 class AdditiveSchemaUpgradeTest(unittest.TestCase):
     """Adding a table must not cost the rows a re-ingest cannot reproduce (#20).
 
@@ -3795,15 +4215,16 @@ class SchemaVersionSetsAreDecidedTest(unittest.TestCase):
     difference between its shape and the CURRENT one can be applied without
     losing a measurement. This test cannot judge that for a future version --
     what it pins is that the set was re-read at the bump, by tying it to the
-    six hops (#20's added table, #30's dropped column, #15's added census
+    seven hops (#20's added table, #30's dropped column, #15's added census
     table, #36's uniqueness, #5's added diagnostics columns, #84's added
-    per-TTL cache-write columns) that were actually reasoned about.
+    per-TTL cache-write columns, #105's added run-scope column) that were
+    actually reasoned about.
     """
 
-    def test_schema_version_is_12(self) -> None:
-        self.assertEqual(ingest_mod.SCHEMA_VERSION, 12)
+    def test_schema_version_is_13(self) -> None:
+        self.assertEqual(ingest_mod.SCHEMA_VERSION, 13)
 
-    def test_only_the_six_reasoned_hops_upgrade_in_place(self) -> None:
+    def test_only_the_seven_reasoned_hops_upgrade_in_place(self) -> None:
         # v9 was re-checked against the CURRENT shape at the v10 bump, not
         # inherited: v9 -> v10 adds the UNIQUE index over `task_id`, which
         # needs the duplicates already stored resolved first. That deletes
@@ -3816,15 +4237,22 @@ class SchemaVersionSetsAreDecidedTest(unittest.TestCase):
         # read `message.diagnostics` -- it means unmeasured, which is what those
         # rows are.
         #
-        # v11 is decided at THIS bump, and its delta is two more nullable
-        # `api_calls` columns (#84). What earns it a place is as much what the
+        # v11 was decided at the v12 bump, and its delta is two more nullable
+        # `api_calls` columns (#84). What earned it a place is as much what the
         # hop leaves alone: `cache_write` keeps its meaning and its value, so
         # no figure reading it changes, and the only value written to an
         # existing row is NULL -- "this row predates CPB reading
-        # `usage.cache_creation`", which is true of every one of them. The
-        # reasoning is written out above the constant.
+        # `usage.cache_creation`", which is true of every one of them.
+        #
+        # v12 is decided at THIS bump (#105): one nullable column on
+        # `ingest_runs`, and the row it meets keeps its `finished_at` untouched.
+        # The bar's sharp edge here is the back-fill NOT taken -- every existing
+        # stamp WAS a corpus run, so writing it into `corpus_finished_at` would
+        # be true and would still be wrong, because the column's whole job is to
+        # separate a scan that reported itself from one nobody has evidence of.
+        # The reasoning is written out above the constant.
         self.assertEqual(
-            ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7, 8, 9, 10, 11})
+            ingest_mod.IN_PLACE_UPGRADE_FROM, frozenset({6, 7, 8, 9, 10, 11, 12})
         )
 
     def test_the_current_version_is_not_in_the_upgrade_set(self) -> None:
@@ -4478,6 +4906,16 @@ class InPlaceRepairSetsAreDecidedTest(unittest.TestCase):
         # at that TTL, and copying `cache_write` into `cache_write_5m` would
         # assert a 1.25x write for the 26.86% of cache-write tokens measured as
         # 1-hour 2x writes (`PerTtlCacheWriteUpgradeTest`).
+        #
+        # `ingest_runs.corpus_finished_at` (#105): NULL means "no run has
+        # stamped itself a full-corpus scan over this database", which is a
+        # pre-v13 database's true state -- no build before v13 recorded a run's
+        # scope at all. This is the entry where the bar is hardest, because the
+        # back-fill would be TRUE: directory mode was the only caller of
+        # `record_ingest_run()`, so every row the hop meets came from a corpus
+        # scan. Refused anyway, and `RunScopeUpgradeTest` pins the refusal --
+        # a value the migration deduced must not be indistinguishable from one
+        # a run reported.
         self.assertEqual(
             dict(ingest_mod.IN_PLACE_ADDABLE_COLUMNS),
             {
@@ -4487,6 +4925,7 @@ class InPlaceRepairSetsAreDecidedTest(unittest.TestCase):
                 ("api_calls", "cache_missed_input_tokens"): "INTEGER",
                 ("api_calls", "cache_write_5m"): "INTEGER",
                 ("api_calls", "cache_write_1h"): "INTEGER",
+                (ingest_mod.INGEST_RUNS_TABLE, "corpus_finished_at"): "REAL",
             },
         )
 
