@@ -8,6 +8,7 @@ swapped column mapping (e.g. cache_read <-> cache_write) cannot pass.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -40,6 +41,18 @@ FIXTURE = FIXTURES / "session-fixture.jsonl"
 SUBAGENT_FIXTURE = (
     Path(__file__).resolve().parent / "fixtures" / "subagent-transcript.jsonl"
 )
+
+
+def approve_this_prune(plan: "ingest_mod.PrunePlan") -> bool:
+    """A caller who read the plan and said yes (#92).
+
+    Spelled at every call site that wants a prune, never defaulted, because
+    that is exactly the property `ingest()` now has: consent is an argument
+    somebody passed, and `prune_missing=True` on its own deletes nothing. A
+    test that reached the deletion by omitting an argument would be testing
+    the behaviour this change exists to remove.
+    """
+    return True
 
 
 class IngestTest(unittest.TestCase):
@@ -243,7 +256,12 @@ class IngestTest(unittest.TestCase):
         # What changed is that you have to ask.
         path = self.projects_dir / "session-fixture.jsonl"
         path.unlink()
-        summary2 = ingest(self.projects_dir, self.db_path, prune_missing=True)
+        summary2 = ingest(
+            self.projects_dir,
+            self.db_path,
+            prune_missing=True,
+            approve_prune=approve_this_prune,
+        )
         self.assertEqual(summary2["files_pruned"], 1)
         self.assertEqual(self.q1("SELECT COUNT(*) n FROM sessions")["n"], 0)
         self.assertEqual(self.q1("SELECT COUNT(*) n FROM api_calls")["n"], 0)
@@ -449,7 +467,12 @@ class SubagentTranscriptIngestTest(unittest.TestCase):
         # a session_id, so the delete must never widen to the session. Only the
         # trigger moved behind the explicit flag (see the sibling test above).
         self.subagent_path.unlink()
-        summary2 = ingest(self.projects_dir, self.db_path, prune_missing=True)
+        summary2 = ingest(
+            self.projects_dir,
+            self.db_path,
+            prune_missing=True,
+            approve_prune=approve_this_prune,
+        )
         self.assertEqual(summary2["files_pruned"], 1)
         self.assertEqual(
             self.q1("SELECT COUNT(*) n FROM api_calls")["n"], self.MAIN["n"]
@@ -1213,9 +1236,15 @@ class ReapedTranscriptRetentionTest(unittest.TestCase):
         self.assertIsNone(archived)
 
     def test_explicit_prune_is_the_only_way_to_delete(self) -> None:
+        # #92 added a second lock rather than replacing this one: asking for
+        # the prune (`prune_missing`) and consenting to the censused plan
+        # (`approve_prune`) are now two acts, and both are needed here.
         before = self.calls()
         self.transcript.unlink()
-        ingest(self.projects, self.db, prune_missing=True)
+        ingest(
+            self.projects, self.db,
+            prune_missing=True, approve_prune=approve_this_prune,
+        )
         self.assertLess(
             self.calls(), before,
             "the destructive behaviour must still be REACHABLE -- it is opt-in, "
@@ -1230,6 +1259,718 @@ class ReapedTranscriptRetentionTest(unittest.TestCase):
             summary["files_pruned"], 0,
             "retaining is not pruning; the two counts must stay distinguishable",
         )
+
+
+class PruneShowsItsWorkTest(unittest.TestCase):
+    """The census a prune is approved from ranges over the rows it deletes (#92).
+
+    `--prune-missing` is the one operation in CPB that destroys measurements
+    nothing can regenerate: past Claude Code's `cleanupPeriodDays` the rows are
+    the only surviving copy of that history, which is why the default is
+    archive-not-delete and why `_prepare_schema()` refuses a rebuild that would
+    drop them. Opt-in protects against the default; it does not protect against
+    a typo, so the flag now states what it will delete and asks.
+
+    The failure mode this class exists for is NOT "the confirmation was
+    skipped" -- that is the easy half, pinned by `PruneConfirmationTest`. It is
+    the one this repository keeps rediscovering: a summary computed by one
+    query and a deletion performed by another, free to range over different
+    sets, agreeing only by the author's care. `RANKED_BY`'s heading and its
+    `ORDER BY` disagreed for a whole release for exactly that reason.
+
+    So `plan_prune()` counts a path list and `execute_prune()` deletes that
+    same `PrunePlan`'s OWN path list, through the same `PRUNE_TABLES` iteration
+    with the same key columns. These tests pin the tie rather than the two
+    halves separately: a count that ranged wider than the delete would report a
+    loss that did not happen, and one that ranged narrower would understate a
+    loss that did -- and the second is how somebody types the word over a
+    summary that hid half of what went.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-prune-plan-test-"))
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        # THREE sources, and the fixture must not make the defect
+        # undetectable: two go, one stays. A one-source corpus cannot tell a
+        # plan scoped to the reaped set from one scoped to the whole database,
+        # which is the confusion with teeth here.
+        self.doomed = [self.projects / "gone-a.jsonl", self.projects / "gone-b.jsonl"]
+        self.kept = self.projects / "still-here.jsonl"
+        for path in (*self.doomed, self.kept):
+            shutil.copy(FIXTURE, path)
+        self.db = self.tmp / "usage.db"
+        ingest(self.projects, self.db)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.db)
+
+    def rows_for(self, path: Path) -> dict[str, int]:
+        conn = self.connect()
+        try:
+            return ingest_mod.census_source_rows(conn, str(path))
+        finally:
+            conn.close()
+
+    def total_rows(self) -> dict[str, int]:
+        conn = self.connect()
+        try:
+            return {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table, _ in ingest_mod.PRUNE_TABLES
+            }
+        finally:
+            conn.close()
+
+    def reap(self) -> None:
+        for path in self.doomed:
+            path.unlink()
+
+    def test_a_prune_nobody_approved_deletes_nothing_and_archives_instead(self) -> None:
+        # THE default that matters. `prune_missing=True` says a prune was
+        # ASKED for; it is not consent to one, and a caller who forgets the
+        # approver must land in the safe state rather than the destructive one.
+        self.reap()
+        before = self.total_rows()
+        summary = ingest(self.projects, self.db, prune_missing=True)
+        self.assertEqual(self.total_rows(), before, "nothing may have been deleted")
+        self.assertEqual(summary["files_pruned"], 0)
+        self.assertEqual(
+            summary["files_archived"], 2,
+            "a refused prune must still ARCHIVE -- `archived_at` is what tells "
+            "the report its totals are no longer reproducible",
+        )
+        self.assertIs(summary["prune_approved"], False)
+
+    def test_a_run_that_never_asked_censuses_nothing(self) -> None:
+        # Tri-state, and the third state is the one absence-is-never-a-value
+        # requires: a run with no `--prune-missing` says NOTHING about what a
+        # prune would cost, which is different from having found nothing to
+        # prune. `None`, never an empty plan.
+        self.reap()
+        summary = ingest(self.projects, self.db)
+        self.assertIsNone(summary["prune_plan"])
+        self.assertIsNone(summary["prune_approved"])
+
+    def test_the_plan_is_censused_before_a_single_row_is_deleted(self) -> None:
+        # Ordering is the whole guarantee. A summary computed after the delete
+        # would be a report of an empty set, and the approver would be shown
+        # nothing to withhold consent from.
+        self.reap()
+        before = self.total_rows()
+        seen: list = []
+
+        def approve(plan: ingest_mod.PrunePlan) -> bool:
+            seen.append(plan)
+            self.assertEqual(
+                self.total_rows(), before,
+                "the approver was called AFTER rows were already deleted",
+            )
+            return True
+
+        ingest(self.projects, self.db, prune_missing=True, approve_prune=approve)
+        self.assertEqual(len(seen), 1)
+        self.assertLess(self.total_rows()["api_calls"], before["api_calls"])
+
+    def test_the_summary_counts_exactly_the_rows_the_delete_removes(self) -> None:
+        # THE tie, asserted as arithmetic rather than as a shape. Per table,
+        # because a plan that got the total right by counting one table wide
+        # and another narrow would pass a check on the sum.
+        self.reap()
+        before = self.total_rows()
+        captured: list = []
+
+        def approve(plan: ingest_mod.PrunePlan) -> bool:
+            captured.append(plan)
+            return True
+
+        ingest(self.projects, self.db, prune_missing=True, approve_prune=approve)
+        after = self.total_rows()
+        plan = captured[0]
+        for table, _ in ingest_mod.PRUNE_TABLES:
+            with self.subTest(table=table):
+                self.assertEqual(
+                    before[table] - after[table],
+                    plan.rows_by_table[table],
+                    f"{table}: the plan promised a different number of rows "
+                    f"than the deletion took",
+                )
+        self.assertEqual(sum(plan.rows_by_table.values()), plan.rows)
+
+    def test_the_census_names_every_table_the_delete_touches(self) -> None:
+        # The other half of the tie, and the one a new table would break: a
+        # table added to `delete_source_rows()` and not to the census would be
+        # rows destroyed that no summary ever mentioned. They read the same
+        # tuple, so this asserts the tuple IS what the delete uses.
+        deleted_from = set()
+        conn = self.connect()
+        try:
+            conn.set_trace_callback(
+                lambda sql: deleted_from.add(sql.split()[2])
+                if sql.strip().upper().startswith("DELETE FROM")
+                else None
+            )
+            ingest_mod.delete_source_rows(conn, str(self.kept))
+            conn.rollback()
+        finally:
+            conn.set_trace_callback(None)
+            conn.close()
+        self.assertEqual(
+            deleted_from,
+            {table for table, _ in ingest_mod.PRUNE_TABLES},
+            "the delete touches a table the census does not count, or vice versa",
+        )
+
+    def test_the_plan_ranges_over_the_reaped_set_and_not_the_database(self) -> None:
+        # The set the plan names is the set that goes. The surviving source is
+        # the control: a plan scoped to the whole database would list it, and a
+        # delete scoped that way would take it.
+        self.reap()
+        kept_before = self.rows_for(self.kept)
+        captured: list = []
+        ingest(
+            self.projects, self.db,
+            prune_missing=True,
+            approve_prune=lambda plan: (captured.append(plan), True)[1],
+        )
+        self.assertEqual(
+            sorted(captured[0].paths), sorted(str(p) for p in self.doomed)
+        )
+        self.assertEqual(captured[0].sources, 2)
+        self.assertEqual(
+            self.rows_for(self.kept), kept_before,
+            "a source still on disk must not be touched by a prune",
+        )
+
+    def test_execute_prune_deletes_the_plans_own_paths_and_no_others(self) -> None:
+        # `execute_prune()` takes a plan, not a path list, so the only way to
+        # reach the deletion is through a set somebody was shown. Handed a plan
+        # naming ONE source, it must take that one.
+        conn = self.connect()
+        try:
+            plan = ingest_mod.plan_prune(conn, self.db, [str(self.doomed[0])])
+            other_before = self.rows_for(self.doomed[1])
+            self.assertEqual(ingest_mod.execute_prune(conn, plan), 1)
+        finally:
+            conn.close()
+        self.assertEqual(
+            self.rows_for(self.doomed[0]),
+            {table: 0 for table, _ in ingest_mod.PRUNE_TABLES},
+        )
+        self.assertEqual(self.rows_for(self.doomed[1]), other_before)
+
+    def test_the_plan_names_the_date_range_of_the_calls_involved(self) -> None:
+        # A count says how much history goes; only a range says WHICH history.
+        # Pinned against the reaped sources' own MIN/MAX rather than the
+        # database's, so a range computed over every call would fail even
+        # though both are "a real date range".
+        self.reap()
+        conn = self.connect()
+        try:
+            plan = ingest_mod.plan_prune(conn, self.db, [str(p) for p in self.doomed])
+            lo, hi, n = conn.execute(
+                "SELECT MIN(ts), MAX(ts), COUNT(ts) FROM api_calls"
+                " WHERE source_path IN (?, ?)",
+                tuple(str(p) for p in self.doomed),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual((plan.first_call_ts, plan.last_call_ts), (lo, hi))
+        self.assertEqual(plan.dated_calls, n)
+        rendered = ingest_mod.format_prune_plan(plan)
+        self.assertIn("date range of the calls involved", rendered)
+        self.assertIn(ingest_mod._fmt_prune_ts(lo), rendered)
+        self.assertIn(ingest_mod._fmt_prune_ts(hi), rendered)
+
+    def test_an_undated_call_is_counted_apart_from_the_range(self) -> None:
+        # `api_calls.ts` is nullable, so the range ranges over a strictly
+        # smaller set than the rows being deleted -- and must say so. A range
+        # drawn from 2 of 10 calls presented as covering all 10 is an aggregate
+        # that does not name the set it ranges over.
+        self.reap()
+        conn = self.connect()
+        try:
+            conn.execute(
+                "UPDATE api_calls SET ts = NULL WHERE source_path = ?",
+                (str(self.doomed[0]),),
+            )
+            conn.commit()
+            plan = ingest_mod.plan_prune(conn, self.db, [str(p) for p in self.doomed])
+        finally:
+            conn.close()
+        calls = plan.rows_by_table["api_calls"]
+        self.assertLess(plan.dated_calls, calls)
+        self.assertIsNotNone(plan.first_call_ts)
+        rendered = ingest_mod.format_prune_plan(plan)
+        self.assertIn(f"{plan.dated_calls} of {calls} call(s)", rendered)
+        self.assertIn(f"{calls - plan.dated_calls} carry none", rendered)
+
+    def test_a_set_with_no_dated_call_reads_as_unknown_not_as_empty(self) -> None:
+        # Absence is never rendered as a value, in the field most tempting to
+        # default: a missing range must not print as "1970-01-01" or as a
+        # blank, both of which read as an answer.
+        self.reap()
+        conn = self.connect()
+        try:
+            conn.execute("UPDATE api_calls SET ts = NULL")
+            conn.commit()
+            plan = ingest_mod.plan_prune(conn, self.db, [str(p) for p in self.doomed])
+        finally:
+            conn.close()
+        self.assertIsNone(plan.first_call_ts)
+        self.assertIsNone(plan.last_call_ts)
+        self.assertEqual(plan.dated_calls, 0)
+        self.assertGreater(plan.rows_by_table["api_calls"], 0)
+        rendered = ingest_mod.format_prune_plan(plan)
+        self.assertIn("UNKNOWN", rendered)
+        self.assertIn("Unknown, not empty.", rendered)
+        self.assertNotIn("1970", rendered)
+
+    def test_a_set_with_no_calls_at_all_is_a_different_sentence(self) -> None:
+        # "No call rows are in this set" and "no call row carries a date" are
+        # two facts, and collapsing them would tell a reader deleting only
+        # turn rows that their dates were unreadable.
+        conn = self.connect()
+        try:
+            plan = ingest_mod.plan_prune(conn, self.db, [])
+        finally:
+            conn.close()
+        self.assertEqual(plan.rows_by_table["api_calls"], 0)
+        rendered = ingest_mod.format_prune_plan(plan)
+        self.assertIn("no api_calls row is in this set", rendered)
+        self.assertNotIn("UNKNOWN", rendered)
+
+    def test_the_plan_states_the_database_it_would_delete_from(self) -> None:
+        # The guard travels with whatever `--db` or CPB_DB resolved to, so the
+        # summary has to name it: a plan that showed counts without saying
+        # which database they came from is one a reader cannot check against
+        # the file they meant.
+        conn = self.connect()
+        try:
+            plan = ingest_mod.plan_prune(conn, self.db, [str(self.kept)])
+        finally:
+            conn.close()
+        self.assertIn(str(self.db), ingest_mod.format_prune_plan(plan))
+        self.assertIn(str(self.kept), ingest_mod.format_prune_plan(plan))
+
+
+class FakeTerminal:
+    """A stdin somebody is sitting at, and the answer they type.
+
+    Not `io.StringIO`: its `isatty()` is False, which is the very condition the
+    refusal path turns on, so a test built on one could never reach the prompt.
+    """
+
+    def __init__(self, answer: str, *, interactive: bool = True) -> None:
+        self.answer = answer
+        self.interactive = interactive
+        self.reads = 0
+
+    def isatty(self) -> bool:
+        return self.interactive
+
+    def readline(self) -> str:
+        self.reads += 1
+        return self.answer
+
+
+class UnaskableStream:
+    """A stream that raises when asked whether it is a terminal."""
+
+    def isatty(self) -> bool:
+        raise ValueError("I/O operation on closed file")
+
+    def readline(self) -> str:  # pragma: no cover -- must never be reached
+        raise AssertionError("a stream that cannot be asked must not be read")
+
+
+class PruneConfirmationTest(unittest.TestCase):
+    """Consent to the deletion is obtained, never assumed (#92).
+
+    `PruneConfirmation` is the only place the answer is decided and the only
+    place the plan is printed, which is what makes `--dry-run` and a real run
+    show byte-identical summaries: one call to `format_prune_plan()` over one
+    `PrunePlan`. Every path sets `outcome`, because "nothing was deleted" is
+    several different facts and the exit status turns on which.
+    """
+
+    def plan(self, sources: int = 2) -> ingest_mod.PrunePlan:
+        return ingest_mod.PrunePlan(
+            db_path="/tmp/usage.db",
+            paths=tuple(f"/tmp/gone-{i}.jsonl" for i in range(sources)),
+            # Deliberately unequal per table, so a formatter that printed one
+            # count in every slot cannot pass.
+            rows_by_table={"api_calls": 41, "turns": 7, "agent_dispatches": 3,
+                           "ingest_state": 2, "source_shape": 5},
+            dated_calls=41,
+            first_call_ts=1_780_000_000.0,
+            last_call_ts=1_785_000_000.0,
+        )
+
+    def ask(self, **kwargs) -> tuple[bool, ingest_mod.PruneConfirmation, str]:
+        out: list[str] = []
+        confirmation = ingest_mod.PruneConfirmation(out=out.append, **kwargs)
+        answer = confirmation(self.plan())
+        return answer, confirmation, "\n".join(out)
+
+    def test_the_plan_is_printed_before_the_question_is_asked(self) -> None:
+        terminal = FakeTerminal("delete\n")
+        approved, confirmation, printed = self.ask(
+            assume_yes=False, dry_run=False, stdin=terminal
+        )
+        self.assertTrue(approved)
+        self.assertIs(confirmation.outcome, ingest_mod.PRUNE_CONFIRMED)
+        self.assertLess(
+            printed.index("PRUNE PLAN"),
+            printed.index(ingest_mod.PRUNE_CONFIRM_WORD + " to delete"),
+            "the question was asked before the plan was shown",
+        )
+
+    def test_the_summary_states_the_sources_the_rows_and_the_range(self) -> None:
+        # All three of the issue's requirements in one assertion set: a count
+        # with no date range does not tell someone what they are about to lose.
+        _, _, printed = self.ask(assume_yes=True, dry_run=False)
+        self.assertIn("sources no longer on disk: 2", printed)
+        self.assertIn("rows to delete: 58", printed)
+        for table, count in (("api_calls", 41), ("turns", 7),
+                             ("agent_dispatches", 3), ("ingest_state", 2),
+                             ("source_shape", 5)):
+            with self.subTest(table=table):
+                self.assertIn(f"{table}: {count}", printed)
+        self.assertIn("date range of the calls involved", printed)
+        self.assertIn("/tmp/gone-0.jsonl", printed)
+        self.assertIn("/tmp/usage.db", printed)
+
+    def test_the_summary_says_the_rows_may_be_the_only_copy(self) -> None:
+        # The durability argument is the reason this prompt exists, so it is
+        # part of the prompt rather than part of the commit message.
+        _, _, printed = self.ask(assume_yes=True, dry_run=False)
+        self.assertIn("cleanupPeriodDays", printed)
+        self.assertIn("ONLY", printed)
+
+    def test_typing_the_word_is_what_approves(self) -> None:
+        terminal = FakeTerminal(f"{ingest_mod.PRUNE_CONFIRM_WORD}\n")
+        approved, confirmation, _ = self.ask(
+            assume_yes=False, dry_run=False, stdin=terminal
+        )
+        self.assertTrue(approved)
+        self.assertEqual(terminal.reads, 1)
+        self.assertIs(confirmation.outcome, ingest_mod.PRUNE_CONFIRMED)
+
+    def test_anything_but_the_word_declines(self) -> None:
+        # Including "y" and "yes": a single reflexive keystroke is not consent
+        # to deleting the only copy of a month of history.
+        for answer in ("y\n", "yes\n", "\n", "DELETE\n", " del \n", "no\n"):
+            with self.subTest(answer=answer):
+                approved, confirmation, printed = self.ask(
+                    assume_yes=False, dry_run=False,
+                    stdin=FakeTerminal(answer),
+                )
+                self.assertFalse(approved)
+                self.assertIs(confirmation.outcome, ingest_mod.PRUNE_DECLINED)
+                self.assertIn("NOTHING", printed)
+
+    def test_surrounding_whitespace_does_not_defeat_the_word(self) -> None:
+        approved, _, _ = self.ask(
+            assume_yes=False, dry_run=False,
+            stdin=FakeTerminal(f"  {ingest_mod.PRUNE_CONFIRM_WORD}  \n"),
+        )
+        self.assertTrue(approved)
+
+    def test_a_non_interactive_stdin_refuses_rather_than_proceeding(self) -> None:
+        # A hook or a pipe cannot be asked, and "cannot be asked" is not "said
+        # yes". The plan is still printed, so the operator's log says exactly
+        # what the refusal was about.
+        approved, confirmation, printed = self.ask(
+            assume_yes=False, dry_run=False,
+            stdin=FakeTerminal("delete\n", interactive=False),
+        )
+        self.assertFalse(approved)
+        self.assertIs(confirmation.outcome, ingest_mod.PRUNE_NOT_INTERACTIVE)
+        self.assertIn("PRUNE PLAN", printed)
+        self.assertIn("REFUSED", printed)
+        self.assertIn(confirmation.outcome, ingest_mod.PRUNE_REFUSALS)
+
+    def test_a_non_interactive_stdin_is_never_even_read(self) -> None:
+        # Teeth on the test above. Reading the pipe and comparing the word
+        # would let `echo delete | ingest.py --prune-missing` delete -- which
+        # is the scripted path `--yes` exists to make explicit.
+        terminal = FakeTerminal("delete\n", interactive=False)
+        self.ask(assume_yes=False, dry_run=False, stdin=terminal)
+        self.assertEqual(terminal.reads, 0)
+
+    def test_end_of_input_is_not_an_answer(self) -> None:
+        # A terminal that closes mid-prompt (Ctrl-D) reads as EOF, and a
+        # readline() of "" treated as agreement would be the non-interactive
+        # hole with one extra step.
+        approved, confirmation, printed = self.ask(
+            assume_yes=False, dry_run=False, stdin=FakeTerminal(""),
+        )
+        self.assertFalse(approved)
+        self.assertIs(confirmation.outcome, ingest_mod.PRUNE_NO_ANSWER)
+        self.assertIn(confirmation.outcome, ingest_mod.PRUNE_REFUSALS)
+        self.assertIn("NOTHING was deleted", printed)
+
+    def test_a_stream_that_cannot_be_asked_is_not_a_yes(self) -> None:
+        approved, confirmation, _ = self.ask(
+            assume_yes=False, dry_run=False, stdin=UnaskableStream(),
+        )
+        self.assertFalse(approved)
+        self.assertIs(confirmation.outcome, ingest_mod.PRUNE_NOT_INTERACTIVE)
+
+    def test_yes_approves_without_asking(self) -> None:
+        terminal = FakeTerminal("no\n")
+        approved, confirmation, printed = self.ask(
+            assume_yes=True, dry_run=False, stdin=terminal
+        )
+        self.assertTrue(approved)
+        self.assertIs(confirmation.outcome, ingest_mod.PRUNE_ASSUMED_YES)
+        self.assertEqual(terminal.reads, 0)
+        self.assertIn("PRUNE PLAN", printed)
+
+    def test_dry_run_approves_nothing_and_is_not_a_refusal(self) -> None:
+        approved, confirmation, printed = self.ask(
+            assume_yes=False, dry_run=True, stdin=FakeTerminal("delete\n")
+        )
+        self.assertFalse(approved)
+        self.assertIs(confirmation.outcome, ingest_mod.PRUNE_DRY_RUN)
+        self.assertNotIn(
+            confirmation.outcome, ingest_mod.PRUNE_REFUSALS,
+            "a dry run did exactly what it was asked; it is not a refusal",
+        )
+        self.assertIn("NOTHING was deleted", printed)
+
+    def test_the_dry_run_and_the_real_run_print_the_SAME_summary(self) -> None:
+        # The issue's requirement, and it is structural rather than kept in
+        # step: both paths render one `format_prune_plan()` over one plan, so
+        # this compares the whole block byte for byte. A second formatter for
+        # the preview -- the obvious way to write this feature -- would be a
+        # second description of the set, free to differ from the one somebody
+        # actually approves.
+        plan = self.plan()
+        outputs = {}
+        for name, kwargs in (
+            ("dry", {"assume_yes": False, "dry_run": True}),
+            ("real", {"assume_yes": True, "dry_run": False}),
+        ):
+            captured: list[str] = []
+            ingest_mod.PruneConfirmation(out=captured.append, **kwargs)(plan)
+            outputs[name] = captured[0]
+        self.assertEqual(outputs["dry"], outputs["real"])
+        self.assertIn("PRUNE PLAN", outputs["dry"])
+
+    def test_an_empty_plan_is_not_a_deletion_to_approve(self) -> None:
+        confirmation = ingest_mod.PruneConfirmation(
+            assume_yes=True, dry_run=False, out=lambda _line: None
+        )
+        empty = ingest_mod.PrunePlan(
+            db_path="/tmp/usage.db", paths=(),
+            rows_by_table={table: 0 for table, _ in ingest_mod.PRUNE_TABLES},
+            dated_calls=0, first_call_ts=None, last_call_ts=None,
+        )
+        self.assertFalse(confirmation(empty))
+        self.assertIs(confirmation.outcome, ingest_mod.PRUNE_NOTHING_MISSING)
+
+    def test_stdin_is_resolved_when_asked_and_not_at_construction(self) -> None:
+        # A confirmation built before `sys.stdin` was redirected must ask the
+        # stream that is current when the question is put, or a harness that
+        # rebinds stdin would be asking a stream nobody types into.
+        confirmation = ingest_mod.PruneConfirmation(
+            assume_yes=False, dry_run=False, out=lambda _line: None
+        )
+        with mock.patch.object(ingest_mod.sys, "stdin", FakeTerminal("delete\n")):
+            self.assertTrue(confirmation(self.plan()))
+
+
+class PruneCliTest(unittest.TestCase):
+    """The guard as a user meets it: flags, output and exit status (#92).
+
+    Subprocess rather than in-process, because the exit status is part of the
+    governed CLI surface (`docs/versioning.md` clause 1) and `main()` returning
+    None where it should refuse is invisible to an in-process call. Every run
+    below sets stdin explicitly -- inheriting the test runner's would make the
+    interactive branch depend on whether somebody ran the suite from a
+    terminal.
+    """
+
+    INGEST = str(Path(__file__).resolve().parent.parent / "ingest.py")
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cpb-prune-cli-test-"))
+        self.projects = self.tmp / "projects"
+        self.projects.mkdir()
+        self.transcript = self.projects / "session-fixture.jsonl"
+        shutil.copy(FIXTURE, self.transcript)
+        self.db = self.tmp / "usage.db"
+        self.run_ingest("--projects-dir", str(self.projects), "--db", str(self.db))
+        self.before = self.calls()
+        self.assertGreater(self.before, 0, "the fixture must produce rows")
+        self.transcript.unlink()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_ingest(self, *args: str, env: dict | None = None, stdin: str = ""):
+        environ = dict(os.environ)
+        environ.pop("CPB_DB", None)
+        environ["PYTHONDONTWRITEBYTECODE"] = "1"
+        environ.update(env or {})
+        return subprocess.run(
+            [sys.executable, "-B", self.INGEST, *args],
+            capture_output=True, text=True, env=environ, input=stdin,
+            cwd=str(self.tmp),
+        )
+
+    def calls(self) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        finally:
+            conn.close()
+
+    def archived(self) -> int:
+        conn = sqlite3.connect(self.db)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM ingest_state WHERE archived_at IS NOT NULL"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def prune(self, *extra: str, env: dict | None = None):
+        return self.run_ingest(
+            "--projects-dir", str(self.projects), "--db", str(self.db),
+            "--prune-missing", *extra, env=env,
+        )
+
+    def test_a_pipe_without_yes_refuses_and_keeps_every_row(self) -> None:
+        # `input=""` gives the child a PIPE, which is what a hook, a cron job
+        # and `ingest.py ... | tee` all hand it. The state change asserted is
+        # the rows, not the message.
+        proc = self.prune()
+        self.assertEqual(self.calls(), self.before, proc.stdout)
+        self.assertEqual(self.archived(), 1)
+        self.assertIn("PRUNE PLAN", proc.stdout)
+        self.assertIn("REFUSED", proc.stdout)
+
+    def test_a_refusal_does_not_exit_zero(self) -> None:
+        # The user asked to delete and nothing was deleted. Reporting 0 would
+        # say "pruned nothing" in the same voice as "there was nothing to
+        # prune" -- `cpb._exit_status()` exists to keep those apart.
+        self.assertNotEqual(self.prune().returncode, 0)
+
+    def test_yes_deletes_and_still_shows_its_work(self) -> None:
+        proc = self.prune("--yes")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.calls(), 0)
+        self.assertIn("PRUNE PLAN", proc.stdout)
+        self.assertIn("pruned (deleted): 1", proc.stdout)
+
+    def test_dry_run_prints_the_summary_and_deletes_nothing(self) -> None:
+        proc = self.prune("--dry-run")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.calls(), self.before)
+        self.assertEqual(self.archived(), 1)
+        self.assertIn("PRUNE PLAN", proc.stdout)
+        self.assertIn("pruned (deleted): 0", proc.stdout)
+
+    def test_the_dry_run_summary_is_the_summary_the_deletion_shows(self) -> None:
+        # End to end, over a real database rather than a hand-built plan: the
+        # block a user reads before deciding is the block that describes what
+        # actually goes.
+        preview = self.prune("--dry-run").stdout
+        real = self.prune("--yes").stdout
+        block = preview[preview.index("PRUNE PLAN"):preview.index("--dry-run:")]
+        self.assertIn(block.strip(), real)
+
+    def test_the_guard_applies_to_a_database_named_by_CPB_DB(self) -> None:
+        # The guard travels with the database, not with the default path: an
+        # env-resolved DB is the plugin's normal case (`${CLAUDE_PLUGIN_DATA}`)
+        # and is exactly where the only surviving copy lives.
+        proc = self.run_ingest(
+            "--projects-dir", str(self.projects), "--prune-missing",
+            env={"CPB_DB": str(self.db)},
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("REFUSED", proc.stdout)
+        self.assertEqual(self.calls(), self.before)
+
+    def test_yes_without_prune_missing_is_a_usage_error(self) -> None:
+        # A flag that silently does nothing is the CLI's form of absence
+        # rendered as a value: the user stated an intent about a deletion and
+        # there is no deletion for it to be about.
+        for flag in ("--yes", "--dry-run"):
+            with self.subTest(flag=flag):
+                proc = self.run_ingest(
+                    "--projects-dir", str(self.projects), "--db", str(self.db),
+                    flag,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("without --prune-missing", proc.stderr)
+
+    def test_yes_and_dry_run_together_are_a_usage_error(self) -> None:
+        # One approves the deletion and the other performs none. Picking a
+        # winner would make a typo silently destructive in one direction.
+        proc = self.prune("--yes", "--dry-run")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(self.calls(), self.before)
+
+    def test_the_flags_are_documented_where_the_prune_is(self) -> None:
+        proc = self.run_ingest("--help")
+        self.assertEqual(proc.returncode, 0)
+        for flag in ("--prune-missing", "--yes", "--dry-run"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, proc.stdout)
+        self.assertIn(ingest_mod.PRUNE_CONFIRM_WORD, proc.stdout)
+
+
+class HookNeverPrunesTest(unittest.TestCase):
+    """The one caller that must never reach the destructive path (#92).
+
+    `hooks/cpb_ingest_hook.py` fires on `SubagentStop`, `Stop` and `SessionEnd`
+    -- unattended, with no terminal, many times a session. It is the single
+    worst place for a prune to be reachable, and it is also the one place a
+    future edit would add a flag without a human watching the output.
+
+    Pinned three ways, because each catches a different edit: the flag appears
+    nowhere in the file, `build_argv()` does not emit it, and `ingest.py`
+    rejects the combination the hook's own mode would produce anyway.
+    """
+
+    HOOK = Path(__file__).resolve().parent.parent / "hooks" / "cpb_ingest_hook.py"
+
+    def test_the_flag_appears_nowhere_in_the_hook(self) -> None:
+        self.assertNotIn("--prune-missing", self.HOOK.read_text(encoding="utf-8"))
+
+    def test_the_argv_the_hook_builds_carries_no_prune_flag(self) -> None:
+        # Loaded by PATH, matching `tests/test_plugin_hook.py`: `hooks/` is not
+        # on `sys.path` and an `import cpb_ingest_hook` statement would be an
+        # unresolvable name to the `stdlib-only` CI job, which ASTs every
+        # shipped module and knows only the repo root and `tests/` as local.
+        spec = importlib.util.spec_from_file_location("cpb_ingest_hook", self.HOOK)
+        hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hook)
+        argv = hook.build_argv(Path("/tmp/session.jsonl"))
+        self.assertIn("--transcript", argv)
+        for flag in ("--prune-missing", "--yes"):
+            with self.subTest(flag=flag):
+                self.assertNotIn(flag, argv)
+
+    def test_single_file_mode_rejects_the_prune_flag_outright(self) -> None:
+        # Belt and braces, and it is the mode the hook always runs in: even a
+        # hook that grew the flag could not delete, because a run that examined
+        # ONE file has no basis to conclude any other source is gone.
+        proc = subprocess.run(
+            [sys.executable, "-B", str(self.HOOK.parent.parent / "ingest.py"),
+             "--transcript", "/tmp/nope.jsonl", "--prune-missing"],
+            capture_output=True, text=True, input="",
+            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("cannot be combined with --transcript", proc.stderr)
 
 
 class SchemaRebuildSafetyTest(unittest.TestCase):
@@ -4320,7 +5061,10 @@ class TranscriptVersionCensusTest(unittest.TestCase):
 
     def test_pruning_a_source_removes_its_census(self) -> None:
         self.three.unlink()
-        ingest(self.projects, self.db, prune_missing=True)
+        ingest(
+            self.projects, self.db,
+            prune_missing=True, approve_prune=approve_this_prune,
+        )
         self.assertEqual(census_rows(self.db, ingest_mod.SHAPE_VERSION, self.three), {})
         self.assertEqual(
             census_rows(self.db, ingest_mod.SHAPE_VERSION),

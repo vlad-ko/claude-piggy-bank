@@ -327,7 +327,34 @@
 <div class="wrap" x-data="report()" x-on:visibilitychange.document="tickAge()"
      x-on:hashchange.window="applyUrl()">
   <h1>Claude Code Usage Report</h1>
-  <div class="sub">Token usage from local session transcripts. Dates are America/New_York.</div>
+  <!-- #92 / #21's last open criterion: WHICH BUILD PRODUCED THESE NUMBERS.
+       `grep -c VERSION serve.py index.html` returned 0 and 0, so a bug report
+       filed against a figure on this page could not name the build that
+       computed it, and neither could anyone triaging it.
+
+       It ANNOTATES the line that already says what these figures are, rather
+       than taking a surface of its own (CLAUDE.md constraint 4), and it sits
+       in the chrome for the banner's reason: it qualifies every figure in
+       every view, so there is one rendering and no way to navigate past it.
+
+       THREE STATES, and the third is the point. "not loaded yet" stays TRUE if
+       the first fetch fails, because `summary` is only ever assigned by a
+       successful one. A null version is UNKNOWN and says so in as many words:
+       `serve.py` runs without `cpb.py` beside it, and a report that filled
+       that absence with a plausible-looking number would send a bug against
+       the wrong build -- absence rendered as a value, in the one field whose
+       whole job is to make a report checkable. -->
+  <div class="sub">Token usage from local session transcripts. Dates are America/New_York.
+    <template x-if="!summary"><span>Build: not loaded yet.</span></template>
+    <template x-if="summary && summary.build.version === null"><span>Build:
+      <strong>UNKNOWN</strong> &mdash; this server could not read
+      <code>cpb.VERSION</code>, so the build that produced these figures is
+      unknown, not unversioned. Say so if you file a bug about a number
+      here.</span></template>
+    <template x-if="summary && summary.build.version !== null"><span>Build:
+      <strong x-text="'cpb ' + summary.build.version"></strong> &mdash; name it
+      in any bug report about a figure on this page.</span></template>
+  </div>
 
   <!-- #70: TWO VIEWS, ONE PAYLOAD.
        ============================
