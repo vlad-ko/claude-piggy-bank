@@ -1,6 +1,6 @@
 {
   "name": "claude-piggy-bank",
-  "description": "Claude Piggy Bank: a local, standard-library-only report on where a project's Claude Code context and token spend actually went.",
+  "description": "Claude Piggy Bank: a local, standard-library-only report on where a project's Claude Code context and token spend actually went. The first /cpb offers to measure the transcripts already on your machine, for this project or for every project, whichever you choose.",
   "owner": {
     "name": "Vlad Ko",
     "url": "https://github.com/vlad-ko"
