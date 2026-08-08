@@ -46,7 +46,7 @@ a check becomes something people route around.
 
 **This one only reaches you if you run `ingest.py` or `serve.py` yourself, with
 no `--db`, from inside a plugin *install*.** Nothing else changes: the plugin's
-hooks, the `/cpb` skill, every `--db` and every `CPB_DB` behave exactly as they
+hooks, the `/claude-piggy-bank:cpb` skill, every `--db` and every `CPB_DB` behave exactly as they
 did, no payload field moved, and the database is not touched.
 
 **What broke, and what it did.** Inside an installed plugin, `python3
@@ -60,7 +60,8 @@ history into a file the next update deletes, while the report kept reading the
 one the hooks write.
 
 **What it does now.** From inside an install, the default resolves
-`${CLAUDE_PLUGIN_DATA}/usage.db` — the file the hooks write and `/cpb` serves —
+`${CLAUDE_PLUGIN_DATA}/usage.db` — the file the hooks write and
+`/claude-piggy-bank:cpb` serves —
 and says so on stdout. Where that directory cannot be known for *this* plugin,
 it **refuses**, naming the durable path and the flag that reaches it. A silent
 fall-back to the doomed path is gone in both directions.
@@ -135,7 +136,7 @@ that deduction in would make an inference indistinguishable from an observation.
 The next `ingest.py --projects-dir` records it.
 
 **Also in this release:** `hooks/cpb_backfill_plan.py` — the read-only planner
-behind `/cpb`'s backfill offer — reported a directory holding one transcript as
+behind the skill's backfill offer — reported a directory holding one transcript as
 `0 transcript file(s), 0 B on disk` when it was named with `--all-projects`,
 adding "that is a real answer about the machine, not a failure". It was not: the
 scope reads the project directories *under* a root, and nothing at that path had
@@ -151,10 +152,11 @@ Closing [#105](https://github.com/vlad-ko/claude-piggy-bank/issues/105) and
 
 ## 3.2.0 — 2026-08-07
 
-**No migration.** Nothing you already run changes; `/cpb` gains a step before
+**No migration.** Nothing you already run changes; `/claude-piggy-bank:cpb`
+gains a step before
 the report opens.
 
-**What changed for a user:** if the database is empty or thin, `/cpb` now says
+**What changed for a user:** if the database is empty or thin, the skill now says
 so and offers to ingest the transcripts already on your disk, stating the size
 and an estimate **before** it starts. You choose the scope — **this project
 only**, **every project on this machine**, or **not now** — and nothing is
@@ -245,7 +247,7 @@ The name is doubled because `<plugin>@<marketplace>` names two things that are
 here the same repository. The plain checkout is unchanged and still supported;
 see [Install](../README.md#install).
 
-**`/cpb` moved file, not name.** The skill was `commands/cpb.md` and is now
+**The skill moved file, not name.** It was `commands/cpb.md` and is now
 `skills/cpb/SKILL.md`
 ([#73](https://github.com/vlad-ko/claude-piggy-bank/issues/73)), the layout the
 plugin reference asks new plugins to use. What you type is

@@ -29,7 +29,8 @@ That last point is deliberate, and so is the scope of it. This is a tool for
 understanding what your sessions consume; it would be a poor one if
 *measuring* consumed anything. Measuring is free.
 
-**One place a model is involved, and the line is drawn precisely.** `/cpb`, the
+**One place a model is involved, and the line is drawn precisely.**
+`/claude-piggy-bank:cpb`, the
 in-session skill, reads the finished report and summarises it — so it spends
 tokens, in a session you are already paying for. Claude Code shows that as a
 per-plugin *context cost* in the `/plugin` panel, so you can see it before you
@@ -39,7 +40,7 @@ here.) The boundary is: **a model may read a finished measurement and explain
 it; it may never produce, compute, estimate or fill in a figure.** A model
 asked for a number it does not have will give you a fluent one, which is the
 same failure as [rendering absence as a
-value](#absence-is-never-rendered-as-a-value) with better prose. `/cpb`
+value](#absence-is-never-rendered-as-a-value) with better prose. The skill
 summarises the report and always links you to it; see [Use](#use). Everything
 that ships the numbers themselves — ingest, the server, the page — has no model
 in it at all. This is a rule CPB imposes on itself, not one Claude Code imposes
@@ -79,7 +80,7 @@ nothing is compiled, and there are no dependencies either way.
 | install | `/plugin install` from CPB's own marketplace, or a clone into your skills directory | `git clone` |
 | ingest | automatic — three hooks ingest each transcript as it is written | manual — you run `cpb.py ingest` when you want it |
 | database | `${CLAUDE_PLUGIN_DATA}/usage.db`, one per install, survives updates | `db/usage.db` beside the checkout |
-| report | `/cpb` from inside a session | `python3 cpb.py serve` |
+| report | `/claude-piggy-bank:cpb` from inside a session | `python3 cpb.py serve` |
 
 **Prefer the plugin if you intend to keep using CPB.** Subagent transcripts are
 reaped, and its `SubagentStop` hook is the difference between capturing that
@@ -103,6 +104,12 @@ or, without starting a session:
 claude plugin marketplace add vlad-ko/claude-piggy-bank
 claude plugin install claude-piggy-bank@claude-piggy-bank
 ```
+
+**Both lines are needed.** `marketplace add` registers the catalog and installs
+nothing — it only lets you browse what is in it. The second line is the one that
+puts CPB on your machine, and skipping it leaves you with a marketplace and no
+plugin, which looks like a successful install until the first time you reach for
+the report.
 
 The name is doubled because the marketplace and the plugin are the same
 repository — `<plugin>@<marketplace>` is the form Claude Code installs by. If
@@ -129,6 +136,17 @@ git clone https://github.com/vlad-ko/claude-piggy-bank.git \
 
 Restart Claude Code and it loads as `claude-piggy-bank@skills-dir`. Update it
 with `git pull`; there is nothing to uninstall.
+
+**The command is the same either way.** A skills-directory folder holding a
+`.claude-plugin/plugin.json` is a *plugin*, not a loose skill, so the skill it
+bundles is namespaced by the plugin exactly as it is after a marketplace
+install: `/claude-piggy-bank:cpb`. Clone into a folder of that name, as above,
+and the two paths agree. (Documented: [Plugins reference § Skills-directory
+plugins](https://code.claude.com/docs/en/plugins-reference#skills-directory-plugins)
+and [Skills § How a skill gets its command
+name](https://code.claude.com/docs/en/skills#how-a-skill-gets-its-command-name),
+both checked 2026-08-07. Not separately measured on a skills-directory install
+here — the measurement below is of the marketplace path.)
 
 To load it for one session without installing it anywhere:
 
@@ -190,7 +208,8 @@ data directory did not move at all, and `usage.db` came through the update
 byte-identical. The session recorded before the update was still in it
 afterwards, next to the one recorded after.
 
-`/cpb` opens that database for you. If you run either script by hand instead,
+`/claude-piggy-bank:cpb` opens that database for you. If you run either script
+by hand instead,
 pass it explicitly — `serve.py` reads only `--db`, not `CPB_DB`, and while
 `ingest.py` does read `CPB_DB`, nothing sets it in a session you started
 yourself. Without the flag each falls back to its own default beside the code,
@@ -251,18 +270,30 @@ claude plugin disable claude-piggy-bank@skills-dir
 From inside Claude Code, once the plugin is enabled:
 
 ```
-/cpb
+/claude-piggy-bank:cpb
 ```
 
-It is a plugin skill, so its full name is `/claude-piggy-bank:cpb`; `/cpb`
-reaches it while nothing else you have installed ships that name.
+**The prefix is not optional here, and that is the whole name.** A plugin's
+skills are namespaced by the plugin, so the command is
+`<plugin-name>:<skill-name>` — the plugin is `claude-piggy-bank` and the skill
+is `cpb`. Claude Code will also answer the bare skill name, without the prefix,
+*while nothing else you have installed has claimed it* — but that is a condition
+of your machine, not a promise CPB can make, so every invocation in this README
+is written the long way. (Documented: [Skills § How a skill gets its command
+name](https://code.claude.com/docs/en/skills#how-a-skill-gets-its-command-name),
+checked 2026-08-07. Measured here 2026-08-07 on Claude Code 2.1.223: after a
+marketplace install, `claude plugin details claude-piggy-bank@claude-piggy-bank`
+reports `Skills (1)  cpb` under the plugin `claude-piggy-bank`.)
+
+If it is not there at all, check that you ran **both** install lines above —
+`/plugin marketplace add` on its own installs nothing.
 
 That starts the report server, summarises what it found, and **always gives you
 the URL**. The summary is a way in, not a substitute for the page: two runs of a
 model produce two different summaries, and a measurement has to be reproducible
 where a conversation does not. The page is the artifact you can cite, screenshot
-or come back to — so `/cpb` will never be the only path to a number, and it will
-never state a figure the report does not already show.
+or come back to — so the skill will never be the only path to a number, and it
+will never state a figure the report does not already show.
 
 Everything below works the same from a plain checkout, with or without the
 plugin. `cpb.py ingest` and `cpb.py serve` involve no model at all.
@@ -360,7 +391,8 @@ misconfigured wrapper cannot quietly write to a database nobody reads.
 script is right in a checkout and doomed inside an installed *plugin*, where it
 is `${CLAUDE_PLUGIN_ROOT}/db/usage.db` — the directory the next plugin update
 replaces. So from inside an install the default resolves
-`${CLAUDE_PLUGIN_DATA}/usage.db`, the file the hooks write and `/cpb` serves,
+`${CLAUDE_PLUGIN_DATA}/usage.db`, the file the hooks write and
+`/claude-piggy-bank:cpb` serves,
 and says so; where that directory cannot be known it **refuses** and names the
 path and the flag. A silent fall-back to a path an update deletes is the one
 option ruled out. Steps 1 and 2 are unaffected — a run that names its database

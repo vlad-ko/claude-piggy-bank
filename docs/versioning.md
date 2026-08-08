@@ -107,17 +107,23 @@ redefinition is worse than a removed field, because a removed field raises
 where a redefined one just reads differently. This is the compatibility form of
 the rule that an aggregate must name the set it ranges over.
 
-The plugin's behaviour is covered under (1): which hooks fire, the name `/cpb`
+The plugin's behaviour is covered under (1): which hooks fire, the name
+`/claude-piggy-bank:cpb`
 resolves under, and the fact that the database resolves to
 `${CLAUDE_PLUGIN_DATA}` (a directory that survives plugin updates) rather than
 somewhere a reinstall would take with it. Moving it would strand a database
 that, past Claude Code's transcript retention, is the only copy of a user's
 history.
 
-Moving `/cpb` from `commands/cpb.md` to `skills/cpb/SKILL.md` (#73) is **not**
+Moving the skill from `commands/cpb.md` to `skills/cpb/SKILL.md` (#73) is **not**
 a change to that surface: a plugin namespaces both layouts the same way, so the
 command was `/claude-piggy-bank:cpb` before the move and is after it. The file
-that ships changed; nothing a user types did. It is still a release, because
+that ships changed; nothing a user types did. (What the *documentation* said a
+user types was wrong throughout — see
+[#111](https://github.com/vlad-ko/claude-piggy-bank/issues/111). Correcting
+prose that misdescribed a surface is not a change to the surface, so it is a
+correction and not a break; `tests/test_documented_commands.py` now pins the two
+together.) It is still a release, because
 the shipped plugin changed and an install that did not receive it would be
 running a layout the docs no longer describe.
 

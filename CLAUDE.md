@@ -106,9 +106,9 @@ even if the code is good.
      the report spends no tokens and makes no network call, whatever else
      changes.
    - **Guidance, in session, may use the model already present** — new, and
-     bounded to `commands/cpb.md`. `/cpb` runs inside a session the user is
-     already paying for, and *it does not produce measurement, it produces
-     guidance*.
+     bounded to `skills/cpb/SKILL.md`. `/claude-piggy-bank:cpb` runs inside a
+     session the user is already paying for, and *it does not produce
+     measurement, it produces guidance*.
 
    The boundary, stated positively rather than as an exception, because an
    exception invites the next reader to look for more of them: **a model may
@@ -116,12 +116,13 @@ even if the code is good.
    estimate or fill in a figure.** A model asked for a number it was not given
    will supply a fluent, plausible one — that is *absence rendered as a value*
    (below) arriving by a route no `Optional[int]` can catch, and it is why the
-   line sits exactly here rather than anywhere looser. So `/cpb` may summarise
-   what the report already computed; it may not compute.
+   line sits exactly here rather than anywhere looser. So the skill may
+   summarise what the report already computed; it may not compute.
 
    **This is CPB's own constraint, not an Anthropic requirement.** Claude Code
-   command files *are* prompts — `commands/cpb.md` is one, and `docs/plugin.md`
-   lists it as the `/cpb` command — and the plugin reference imposes no limit
+   skill files *are* prompts — `skills/cpb/SKILL.md` is one, and `docs/plugin.md`
+   lists it as the `/claude-piggy-bank:cpb` skill — and the plugin reference
+   imposes no limit
    on what a command may ask the model to do (external:
    `code.claude.com/docs/en/plugins-reference`, the revision
    `tests/test_plugin_manifest.py` cites as checked 2026-08-05; that reference
@@ -130,7 +131,8 @@ even if the code is good.
    figures, and takes it for guidance.
 
    **The cost claim is scoped, not dropped.** "Running CPB costs nothing" was
-   true of the whole tool and no longer is. The report stays free; `/cpb`
+   true of the whole tool and no longer is. The report stays free;
+   `/claude-piggy-bank:cpb`
    spends tokens in a session already being paid for, which Claude Code
    surfaces as a per-plugin *context cost* in the `/plugin` panel
    (product-owner report, 2026-08-05; not verified against the Claude Code
@@ -222,9 +224,18 @@ and `.claude-plugin/marketplace.json` the catalog, whose single entry points
 back at the repository with `"source": "./"`; `hooks/hooks.json` declares three
 triggers (`SubagentStop`, `Stop`, `SessionEnd`) that each run
 `hooks/cpb_ingest_hook.py`, which spawns `ingest.py --transcript` for **exactly
-one file**; `skills/cpb/SKILL.md` is the `/cpb` skill (it was `commands/cpb.md`
+one file**; `skills/cpb/SKILL.md` is the skill (it was `commands/cpb.md`
 until #73 — `commands/` is the legacy flat-file layout and the reference says
-to use `skills/` for new plugins). Its decided behaviour
+to use `skills/` for new plugins). **A plugin's skills are namespaced by the
+plugin, so what a user types is `/claude-piggy-bank:cpb`, never the bare
+segment** — the bare form resolves only while nothing else on that machine has
+claimed it, which is a fact about the reader rather than about CPB. The front
+door said the bare form until
+[#111](https://github.com/vlad-ko/claude-piggy-bank/issues/111);
+`tests/test_documented_commands.py` now composes the command from the manifest's
+`name` and the `skills/` directory and pins every documented invocation in
+`README.md`, `docs/` and this file against it, so renaming either end turns the
+prose red rather than orphaning it. Its decided behaviour
 ([#79](https://github.com/vlad-ko/claude-piggy-bank/issues/79)): **summarise,
 then always link to the report — never become the only path to a number.** The
 page is the reproducible artifact; two model runs produce two different
