@@ -165,7 +165,13 @@ from typing import NamedTuple, Optional, Sequence
 # The plain checkout is untouched: `db/usage.db` beside the script is still the
 # documented, correct and durable answer there, and a false refusal in that
 # direction would be the worse defect of the two.
-VERSION = "4.0.0"
+#
+# 4.0.0 -> 4.0.1 (#111). Three shipped strings named the bare `/cpb`.
+# That form resolves unless another command claims the name -- a condition
+# about the reader's machine CPB cannot know -- so they now name the form
+# that always resolves. A correction to prose; nothing a caller depends on
+# changes, so patch.
+VERSION = "4.0.1"
 
 PROG = "cpb"
 

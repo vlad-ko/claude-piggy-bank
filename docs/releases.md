@@ -42,6 +42,29 @@ already on the README record. The test does not require entries for historical
 versions: pinning history would force a rewrite at every release, which is how
 a check becomes something people route around.
 
+## 4.0.1 — 2026-08-07
+
+**No migration.** A correction to three strings that ship with the plugin.
+
+**What changed for a user:** the skill, the marketplace listing and the
+contributor guide named the skill without its plugin namespace. They now name
+`/claude-piggy-bank:cpb`, which is the form that always resolves.
+
+**Why, precisely.** The unqualified form is not broken — Claude Code's skills
+documentation says an unqualified skill name "also invokes the skill unless
+another command already uses that name" (checked 2026-08-07). So it works, on a
+condition about the reader's machine that CPB cannot see. Naming a command
+whose success depends on something we cannot check is a claim wider than its
+evidence, which is the thing this project refuses everywhere else. The
+namespaced form has no such condition.
+
+The prose in `README.md` and `docs/` was corrected in the previous release;
+these three were held back because they are shipped paths and correcting them
+required a version to move.
+
+Merged as [PR #113](https://github.com/vlad-ko/claude-piggy-bank/pull/113),
+closing the last of [#111](https://github.com/vlad-ko/claude-piggy-bank/issues/111).
+
 ## 4.0.0 — 2026-08-07
 
 **This one only reaches you if you run `ingest.py` or `serve.py` yourself, with

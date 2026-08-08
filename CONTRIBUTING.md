@@ -91,7 +91,7 @@ a figure.** A model asked for a number it was not given will supply a fluent,
 plausible one — *absence rendered as a value*, arriving by a route no
 `Optional[int]` can catch.
 
-Note the cost claim is scoped: the report is free, `/cpb` spends tokens in a
+Note the cost claim is scoped: the report is free, `/claude-piggy-bank:cpb` spends tokens in a
 session you are already paying for. Two claims, two scopes; do not restore the
 sentence that made them one.
 
