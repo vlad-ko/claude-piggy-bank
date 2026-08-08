@@ -106,7 +106,7 @@ do not summarise it while it works.
 Nothing is ingested. Go to step 3 and open the report.
 
 "Not now" is a complete answer, not a deferral you should chase. Tell the user
-how to come back to it, in these terms: run `/cpb` again and the offer reappears
+how to come back to it, in these terms: run `/claude-piggy-bank:cpb` again and the offer reappears
 while there are still unmeasured transcripts on disk, or run the ingest command
 above directly at any time. Do not ask a second time in this session.
 
