@@ -33,7 +33,7 @@ behaviour are *measured here* and marked as such. The two are never merged.
 | `.claude-plugin/marketplace.json` | the catalog — see [The marketplace layer](#the-marketplace-layer) |
 | `hooks/hooks.json` | the three ingest triggers |
 | `hooks/cpb_ingest_hook.py` | the handler the triggers run |
-| `skills/cpb/SKILL.md` | the `/cpb` skill that opens the report |
+| `skills/cpb/SKILL.md` | the `/claude-piggy-bank:cpb` skill that opens the report |
 
 The two manifests belong inside `.claude-plugin/` and nothing else does;
 `hooks/` and `skills/` must be at the plugin root or they are silently never
@@ -44,7 +44,7 @@ never loaded" is not a failure anyone notices.)
 
 ### Why `skills/`, not `commands/`
 
-`/cpb` was `commands/cpb.md` until [#73](https://github.com/vlad-ko/claude-piggy-bank/issues/73).
+The skill was `commands/cpb.md` until [#73](https://github.com/vlad-ko/claude-piggy-bank/issues/73).
 The [File locations
 reference](https://code.claude.com/docs/en/plugins-reference#file-locations-reference)
 (checked 2026-08-07) lists `commands/` as "Skills as flat Markdown files. **Use
@@ -54,11 +54,54 @@ because in a *plugin* skill that field sets the last segment of the command
 ([Skills § How a skill gets its command
 name](https://code.claude.com/docs/en/skills#how-a-skill-gets-its-command-name),
 checked 2026-08-07) and writing it down beats depending on the directory
-staying called `cpb`. The command is `/claude-piggy-bank:cpb`, and `/cpb`
-resolves to it while no other plugin ships that name. *Measured here*
-(2026-08-07, Claude Code 2.1.223): after a marketplace install,
-`claude plugin details claude-piggy-bank@claude-piggy-bank` reported
-`Skills (1)  cpb`.
+staying called `cpb`. *Measured here* (2026-08-07, Claude Code 2.1.223): after a
+marketplace install, `claude plugin details claude-piggy-bank@claude-piggy-bank`
+reported `Skills (1)  cpb`.
+
+### The command is namespaced, and the docs must say so
+
+The command is **`/claude-piggy-bank:cpb`** — the plugin's `name` from
+`.claude-plugin/plugin.json`, then the skill's own segment. That is the
+documented rule for a plugin skill and not a property of this plugin: [Skills §
+How a skill gets its command
+name](https://code.claude.com/docs/en/skills#how-a-skill-gets-its-command-name)
+(checked 2026-08-07) gives `my-plugin/skills/review/SKILL.md` → `/my-plugin:review`,
+and the same page's precedence section says plugin skills "use a
+`plugin-name:skill-name` namespace, so they cannot conflict with other levels".
+
+The same reference adds that the bare segment "also invokes the skill unless
+another command already uses that name". **That condition is a fact about the
+reader's machine, not about CPB**, so it cannot be written as an instruction:
+CPB does not know what else the reader has installed, and a front door that
+works for whoever wrote it and fails for whoever has one more plugin is the
+familiar defect — a claim whose scope is narrower than the sentence carrying it.
+So every invocation in `README.md` and in `docs/` is the namespaced form, and
+[#111](https://github.com/vlad-ko/claude-piggy-bank/issues/111) exists because
+they were not.
+
+`tests/test_documented_commands.py` pins that. It composes the command from the
+**artifacts** — the manifest's `name` and the directory under `skills/`, both
+read at test time — and asserts every command-shaped mention in those documents
+equals it, so renaming either the plugin or the skill turns the prose red instead
+of orphaning it. A path such as `skills/cpb/SKILL.md` or `hooks/cpb_ingest_hook.py`
+is a file reference and is deliberately not an invocation; the test separates the
+two rather than matching the bare word.
+
+**A skills-directory install is namespaced identically.** A folder under
+`~/.claude/skills/` that holds a `.claude-plugin/plugin.json` is loaded as a
+*plugin* named `<name>@skills-dir` and "can bundle its own skills, agents, hooks,
+and more" ([Plugins reference §
+Skills-directory plugins](https://code.claude.com/docs/en/plugins-reference#skills-directory-plugins),
+checked 2026-08-07) — so its bundled skill takes the plugin row of the
+command-name table, not the loose-skill row, and reads `/claude-piggy-bank:cpb`
+there too. **Not measured here**: this document's other measurements were taken
+against a marketplace install, and no skills-directory install was made to
+confirm it. Note also what the reference does *not* settle — it writes the
+plugin id as `<name>@skills-dir` from the example path `<skills-dir>/foo/`,
+without saying whether `foo` is the folder name or the manifest's `name` when
+the two differ. The README's clone command names the folder
+`claude-piggy-bank`, which is the manifest's `name`, so both readings give the
+same command and this project never depends on the answer.
 
 **A migrated plugin reports `0 skills` on `/reload-plugins`.** The reload
 summary counts only `commands/`, so a plugin that correctly uses `skills/`
@@ -78,7 +121,8 @@ the project's third constraint had to say precisely how far that reaches.
 
 **The line:** a model may read a **finished** measurement and explain it; it may
 never produce, compute, estimate or fill in a figure. Stated positively, not as
-an exception, so there is nothing to reason outward from. `/cpb` does not
+an exception, so there is nothing to reason outward from.
+`/claude-piggy-bank:cpb` does not
 produce measurement, it produces guidance.
 
 | surface | model | why |
@@ -102,15 +146,16 @@ Two things this is **not**:
   *silent* on the question rather than permissive about it, which is weaker
   evidence than a positive statement, and it was not re-fetched when this
   section was written.) The constraint is CPB's own.
-- **Not a claim that `/cpb` is free.** Ingest and the report are free and
-  offline, absolutely and unchanged. `/cpb` spends tokens in a session already
+- **Not a claim that `/claude-piggy-bank:cpb` is free.** Ingest and the report
+  are free and
+  offline, absolutely and unchanged. The skill spends tokens in a session already
   being paid for; Claude Code surfaces that as a per-plugin *context cost* in
   the `/plugin` panel. (Product-owner report, 2026-08-05, **unverified** — not
   checked against the Claude Code documentation here.) Those are two claims
   with two scopes and the older single sentence, "running CPB costs nothing",
   collapsed them.
 
-**And `/cpb` never becomes the only path to a number**
+**And `/claude-piggy-bank:cpb` never becomes the only path to a number**
 ([#79](https://github.com/vlad-ko/claude-piggy-bank/issues/79)): it summarises,
 then always links to the report. Two runs of a model produce two different
 summaries, and a measurement has to be reproducible where a conversation does
@@ -354,7 +399,11 @@ observation rather than an inference.
 
 ## The marketplace layer
 
-`/plugin marketplace add vlad-ko/claude-piggy-bank` then `/plugin install`
+`/plugin marketplace add vlad-ko/claude-piggy-bank` then
+`/plugin install claude-piggy-bank@claude-piggy-bank` — **two steps, because the
+first installs nothing**; it registers the catalog so the second has somewhere
+to resolve from, and a reader who stops after it has a marketplace and no
+plugin. That pair
 requires a **catalog**, which is a separate file from the manifest:
 `.claude-plugin/marketplace.json`. CPB is a single-plugin repository, so it is
 its own marketplace — the repository is both catalog and plugin, and the entry
@@ -545,7 +594,7 @@ checked 2026-08-07) — and here it is **irrelevant**. CPB's `CLAUDE.md` is the
 working ruleset for people editing this repository. It is not context to ship
 *with* the plugin, and moving it would break the thing it is actually for:
 Claude Code loads a repository's root `CLAUDE.md` for anyone working *on* CPB.
-Migrating `/cpb` to `skills/` did not change this, and could not: the warning is
+Migrating the skill to `skills/` did not change this, and could not: the warning is
 about `CLAUDE.md` existing, not about the absence of a skill.
 
 So the decision is to **accept it**, and three facts make that cheap rather
