@@ -598,7 +598,10 @@ class SkillOfferTest(unittest.TestCase):
         # route back, "not now" would mean "never" for anyone who did not
         # remember a flag.
         section = self.text.split("If they choose 3")[1]
-        self.assertIn("/cpb", section)
+        # The way back must name the form that ALWAYS resolves. The unqualified
+        # name works only while nothing else claims it (#111), and this test
+        # pinned the unqualified one until 4.0.1 -- enforcing the defect.
+        self.assertIn("/claude-piggy-bank:cpb", section)
         self.assertIn("Do not ask a second time in this session.", section)
 
     def test_the_estimate_is_read_from_the_planner_not_written_down(self):

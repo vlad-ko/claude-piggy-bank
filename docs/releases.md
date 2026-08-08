@@ -47,12 +47,12 @@ a check becomes something people route around.
 **No migration.** A correction to three strings that ship with the plugin.
 
 **What changed for a user:** the skill, the marketplace listing and the
-contributor guide named the bare `/cpb`. They now name
+contributor guide named the skill without its plugin namespace. They now name
 `/claude-piggy-bank:cpb`, which is the form that always resolves.
 
-**Why, precisely.** The bare form is not broken — Claude Code's skills
-documentation says *"the bare `/fancy` also invokes the skill unless another
-command already uses that name"* (checked 2026-08-07). So `/cpb` works, on a
+**Why, precisely.** The unqualified form is not broken — Claude Code's skills
+documentation says an unqualified skill name "also invokes the skill unless
+another command already uses that name" (checked 2026-08-07). So it works, on a
 condition about the reader's machine that CPB cannot see. Naming a command
 whose success depends on something we cannot check is a claim wider than its
 evidence, which is the thing this project refuses everywhere else. The
