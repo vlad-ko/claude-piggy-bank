@@ -173,8 +173,11 @@ asserted separately. Two facts with different confidence, two tests.
 
 ## Versioning
 
-CPB is **1.0.0** and follows Semantic Versioning. Which part to bump is a rule
-with cases and it has one home: [`docs/versioning.md`](docs/versioning.md).
+CPB follows Semantic Versioning and is past 1.0.0, so the compatibility promise
+is live. `cpb.VERSION` is the authority for which release you are on — read it
+with `python3 cpb.py --version` rather than from prose, which has lagged the
+constant before. Which part to bump is a rule with cases and it has one home:
+[`docs/versioning.md`](docs/versioning.md).
 Read it before a change that touches a flag, an exit status, a route, a payload
 field, or what a figure measures.
 
@@ -194,8 +197,9 @@ rather than in review:
   problem go away.
 
 A correction is not a breaking change — a figure that starts reporting what it
-always claimed to report is a fix, and belongs on the record in `README.md`
-rather than in a major bump. The distinction is drawn in full in that document.
+always claimed to report is a fix, and belongs on the record in
+[`docs/corrections.md`](docs/corrections.md) rather than in a major bump. The
+distinction is drawn in full in [`docs/versioning.md`](docs/versioning.md).
 If your change *is* breaking under the rule, say so in the PR body; that is the
 cheapest moment for anyone to notice.
 

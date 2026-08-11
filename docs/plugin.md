@@ -99,9 +99,9 @@ against a marketplace install, and no skills-directory install was made to
 confirm it. Note also what the reference does *not* settle — it writes the
 plugin id as `<name>@skills-dir` from the example path `<skills-dir>/foo/`,
 without saying whether `foo` is the folder name or the manifest's `name` when
-the two differ. The README's clone command names the folder
-`claude-piggy-bank`, which is the manifest's `name`, so both readings give the
-same command and this project never depends on the answer.
+the two differ. The clone command in [`install.md`](install.md#as-a-plugin-from-a-clone-you-read-first)
+names the folder `claude-piggy-bank`, which is the manifest's `name`, so both
+readings give the same command and this project never depends on the answer.
 
 **A migrated plugin reports `0 skills` on `/reload-plugins`.** The reload
 summary counts only `commands/`, so a plugin that correctly uses `skills/`
@@ -295,8 +295,8 @@ guessing:
    there.
 
 Uninstalling the plugin from its last scope deletes the data directory by
-default. Pass `--keep-data` to keep the database, or back it up first — see the
-uninstall note in the README.
+default. Pass `--keep-data` to keep the database, or back it up first — see
+[`install.md`](install.md#uninstall).
 
 ### The improvised run: a bare `ingest.py` inside an install
 
@@ -489,9 +489,11 @@ The version numbers in the table above are the throwaway install's, chosen to
 make the two runs distinguishable; they are not a statement about what CPB
 ships next. `cpb.VERSION` is the only place to read that.
 
-Five places state the version and must move together: `cpb.VERSION` (the
-authority), `.claude-plugin/plugin.json`, `README.md`, `CLAUDE.md` and
-`docs/versioning.md`. `tests/test_cpb.py` pins all five, and the CI check reads
+Four places state the version and must move together: `cpb.VERSION` (the
+authority), `.claude-plugin/plugin.json`, `CLAUDE.md` and `docs/versioning.md`.
+`README.md` deliberately states none — see
+[`versioning.md`](versioning.md#the-manifest-version-gates-whether-users-receive-anything).
+`tests/test_cpb.py` pins all four, and the CI check reads
 `cpb.VERSION` itself and refuses if the manifest disagrees with it — so the
 check cannot end up policing a copy that has drifted from the constant.
 
@@ -600,8 +602,8 @@ about `CLAUDE.md` existing, not about the absence of a skill.
 So the decision is to **accept it**, and three facts make that cheap rather
 than a shrug:
 
-1. `claude plugin validate .` — the command the README and this document tell
-   people to run — no longer surfaces it at all, because it now validates the
+1. `claude plugin validate .` — the command this document tells people to run —
+   no longer surfaces it at all, because it now validates the
    marketplace. It passes with `--strict` too.
 2. The warning is reachable only by naming the plugin manifest explicitly, and
    only there does `--strict` fail. **CI does not run `--strict` on that path**,

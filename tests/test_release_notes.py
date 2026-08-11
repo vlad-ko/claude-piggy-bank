@@ -7,9 +7,13 @@ and this module is what stops it from being announced for the release *before*
 the one a user installs.
 
 The mechanism is deliberately the one that already worked. The version spans in
-`README.md`, `CLAUDE.md` and `docs/versioning.md` are pinned to `cpb.VERSION` by
+`CLAUDE.md` and `docs/versioning.md` are pinned to `cpb.VERSION` by
 `DocsStateTheShippedVersionTest`, and that fixed a drift which had happened
-twice. The same shape applies here: the repository is the source of truth, and
+twice. (`README.md` was a third and now states no version at all -- the better
+fix, where a document can afford it: a file that carries no version literal
+cannot carry a stale one. This record cannot take that route, because
+announcing the shipped release *is* its content.) The same shape applies here:
+the repository is the source of truth, and
 the record is test-pinned to the constant rather than to a release ritual
 somebody has to remember. A record CI cannot see will drift, which is why
 GitHub Releases alone was not enough -- nothing stops one being published there
