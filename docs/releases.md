@@ -15,9 +15,8 @@ version number could correctly say "this release broke you" with nowhere for
 anyone to read what broke.
 
 **Corrections are not kept here**, deliberately. A figure that was wrong and is
-now right goes on [the record in
-`README.md`](../README.md#the-record-the-defect-that-made-the-headline-numbers-wrong),
-in full, with what the number was and how the difference was measured — a
+now right goes on [the record of corrections](corrections.md), in full, with
+what the number was and how the difference was measured — a
 tool about measurement should show its own corrections beside the number rather
 than as a one-line entry in a list. A **break** is a different thing from a
 wrong number: it is behaviour a caller's script depended on that no longer
@@ -29,8 +28,8 @@ rather than dead-ending.
 (`python3 cpb.py --version`), and `/api/summary` reports the same string as
 `build.version`. **`tests/test_release_notes.py` asserts that the version this
 build ships has an entry below**, so the record cannot quietly fall a release
-behind. That is the same mechanism that pins the version spans in `README.md`,
-`CLAUDE.md` and `versioning.md`, applied for the same reason: a manual release
+behind. That is the same mechanism that pins the version spans in `CLAUDE.md`
+and `versioning.md`, applied for the same reason: a manual release
 step on this project has already rotted twice, and a record CI cannot see will
 drift.
 
@@ -38,7 +37,8 @@ drift.
 0.1.0 through 1.6.0 all landed on 2026-08-05 (from `git log` over `cpb.py`,
 read 2026-08-07) and are not reconstructed here — 1.x is where the SemVer rule
 was adopted and first applied, and the corrections made along the way are
-already on the README record. The test does not require entries for historical
+already on the [record of corrections](corrections.md). The test does not
+require entries for historical
 versions: pinning history would force a rewrite at every release, which is how
 a check becomes something people route around.
 

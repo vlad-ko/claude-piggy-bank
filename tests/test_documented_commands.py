@@ -63,6 +63,25 @@ segment, and not followed by anything that would make it a longer path or word.
 `CommandTokenDiscriminatorTest` pins that separation directly, on synthetic
 strings, so the corpus passing is not the only evidence that the rule works.
 
+Why this survived the README's rewrite
+--------------------------------------
+
+Cutting `README.md` to essentials removed every other content assertion over it
+-- the version literal left the file entirely, and the pointer to
+`docs/versioning.md` was replaced by the docs index's own orphan rule. This one
+stayed, and the cost is worth naming rather than hiding: **the README can never
+stop naming the composed command.** That is a real coupling between a test and
+the front door's prose.
+
+It was kept because the alternative is worse in the direction this project
+cares about. A README whose stated job is "how to install" has to print what
+the reader types, that string contains the plugin name, and the plugin name is
+exactly what drifted in #111. Moving the check to `docs/install.md` would leave
+the *most-read* copy unchecked -- the same "rule applied to one member of a
+pair" defect listed above. So the README carries **exactly one** occurrence and
+this file makes one narrow assertion about it: reverting that occurrence to the
+bare `/cpb` goes red. Nothing here requires any other sentence to exist.
+
 Which documents are covered
 ---------------------------
 

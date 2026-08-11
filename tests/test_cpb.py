@@ -323,14 +323,22 @@ class VersioningRuleTest(unittest.TestCase):
         # an orphan. A compatibility promise nobody can find is not a promise.
         self.assertIn("versioning.md", DOCS_INDEX.read_text(encoding="utf-8"))
 
-    def test_the_front_door_and_the_contributor_contract_both_point_at_it(self):
-        # One home and a pointer: a user asking "what does 1.0.0 promise me?"
-        # starts at the README, a contributor asking "which part do I bump?"
-        # starts at CONTRIBUTING, and both must arrive at the same text rather
-        # than at two copies free to drift.
-        for path in (README, CONTRIBUTING):
-            with self.subTest(path.name):
-                self.assertIn("docs/versioning.md", path.read_text(encoding="utf-8"))
+    def test_the_contributor_contract_points_at_it(self):
+        # One home and a pointer: a contributor asking "which part do I bump?"
+        # starts at CONTRIBUTING and must arrive at the rule rather than at a
+        # second copy free to drift.
+        #
+        # The README was pinned here too and deliberately is not any more. Its
+        # job is to get a reader installed, and it now links `docs/README.md`
+        # -- the index -- rather than each document under it. Reachability is
+        # what actually has to hold, and it is asserted directly, one line up:
+        # `test_the_rule_is_indexed_rather_than_orphaned` reads the index's own
+        # rule that an unlisted document is an orphan. Requiring a second,
+        # particular sentence in the front door pinned the prose instead of the
+        # property.
+        self.assertIn(
+            "docs/versioning.md", CONTRIBUTING.read_text(encoding="utf-8")
+        )
 
     def test_the_schema_argument_cites_code_that_exists(self):
         # The tie between the claim and the mechanism. The rule's hardest
@@ -691,8 +699,19 @@ VERSION_MARK_CLOSE = "<!--/cpb:version-->"
 # Every file that states the current version. Listed, not globbed: a doc that
 # stops stating it should fail loudly here rather than quietly drop out of the
 # check.
+#
+# `README.md` was here and was REMOVED deliberately, which is a different act
+# from a doc quietly falling out. The front door twice stated a version the
+# constant had moved past, and this pin was a check standing in for a fact the
+# document had no need to carry: a reader wanting to know which build produced
+# a number runs `python3 cpb.py --version`, or reads the build off the report,
+# neither of which can go stale, and the README now says so instead of stating
+# a literal. A document
+# that states no version cannot state a wrong one, so the defect is gone rather
+# than guarded. The two files below still state it, still for a reason --
+# `CLAUDE.md` is the working ruleset and `docs/versioning.md` is the rule about
+# the number itself -- and both stay pinned.
 FILES_STATING_THE_VERSION = (
-    REPO_ROOT / "README.md",
     REPO_ROOT / "CLAUDE.md",
     DOCS / "versioning.md",
 )

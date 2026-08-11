@@ -58,16 +58,24 @@ not a pass: a new plugin component directory has to be classified deliberately
 rather than slip through a set nobody re-read. Prose changes, `tests/`, `docs/`
 and the catalog itself are not shipped behaviour and need no release.
 
-Five places state the version and move together:
+Four places state the version and move together:
 
 | where | pinned by |
 |---|---|
 | `cpb.VERSION` | the authority; everything else is compared to it |
 | `.claude-plugin/plugin.json` | `tests/test_cpb.py`, asserted equal to `cpb.VERSION` |
-| `README.md`, `CLAUDE.md`, this file | `DocsStateTheShippedVersionTest`, via the `cpb:version` HTML-comment marks |
+| `CLAUDE.md`, this file | `DocsStateTheShippedVersionTest`, via the `cpb:version` HTML-comment marks |
 
 The marketplace entry deliberately declares **no** version: `plugin.json` wins
-silently over it, so a sixth copy could only ever be a copy free to disagree.
+silently over it, so a fifth copy could only ever be a copy free to disagree.
+
+`README.md` used to be a fifth and is deliberately no longer one. It stated the
+shipped version twice while the constant had moved on, and the pin that fixed
+that was a check standing in for a fact the document had no need to carry: the
+front door's job is to get a reader installed, and *which build produced a
+number* is answered by `python3 cpb.py --version`, by the build named on the
+report, and by `build.version` in `/api/summary` — none of which can go stale.
+A document that states no version cannot state a wrong one.
 
 This file exists because the number is meaningless without it. A version says
 "this release did not break you" only if something states what *break* covers,
@@ -139,9 +147,9 @@ the same mechanism, and the same reason, as the version spans this file's
 opening paragraph is pinned by.
 
 That record is not a changelog and the decision below stands: a **correction**
-to a figure still goes on the README record, beside the number. A break is not
-a wrong number, so it gets its own place rather than diluting one that is
-specifically about figures that were wrong.
+to a figure still goes on the [record of corrections](corrections.md), beside
+the number. A break is not a wrong number, so it gets its own place rather than
+diluting one that is specifically about figures that were wrong.
 
 ### Correction is not redefinition
 
@@ -152,15 +160,16 @@ The sharp edge of clause 3, and the exemption it needs.
   not. It is a fix, and it takes a patch or minor bump on its own merits.
 
 The dedupe fix is the worked example: it moved main-thread call counts by 2.36x
-and subagent counts by 1.91x (the figures in the README's record). Enormous
+and subagent counts by 1.91x (the figures are in
+[`corrections.md`](corrections.md)). Enormous
 movement, no redefinition — `api_calls` always claimed to count API calls, and
 had been counting transcript records. Calling that breaking would put the tool
 in the position of promising to keep reporting a number it knows is wrong.
 
 What a correction owes instead is disclosure: a correction that moves a
-headline figure goes on the record in `README.md`, with what the number was,
-what it is, and how that was measured. The version number is not the place a
-user learns their old figures were wrong.
+headline figure goes on the record in [`corrections.md`](corrections.md), with
+what the number was, what it is, and how that was measured. The version number
+is not the place a user learns their old figures were wrong.
 
 ## What the version does not govern
 
@@ -279,9 +288,10 @@ too weak to be worth writing.
 There is no changelog. Two records exist instead, and each covers what the
 other is the wrong shape for:
 
-- **Corrections** that moved a headline number are kept in `README.md` under
-  "The record", in full, because a tool about measurement should show its own
-  corrections rather than quietly restate them — and because a number's history
+- **Corrections** that moved a headline number are kept in
+  [`corrections.md`](corrections.md), in full, because a tool about measurement
+  should show its own corrections rather than quietly restate them — and
+  because a number's history
   is more useful to a reader beside the number than in a file of one-line
   entries.
 - **Breaks** — a change to one of the three governed surfaces — are announced
