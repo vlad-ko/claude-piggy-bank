@@ -34,6 +34,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -624,6 +625,134 @@ class FailureLogTest(HookTestCase):
         self.assertEqual(code, 0, stderr)
 
 
+class HookSuccessRecordTest(HookTestCase):
+    """A hook that never launches leaves nothing behind (#116).
+
+    That is the whole defect: on a machine where `hooks.json`'s `python3` does
+    not resolve, all three triggers fail before this module runs, and the
+    report cannot tell that install from one created a minute ago. Nothing here
+    can fix the launch -- see `docs/plugin.md` -- but a SUCCESS can leave a
+    positive record, and then the absence of one is a fact the report can read.
+
+    The failure log is the sibling rule and it is deliberately not this one:
+    failures are APPENDED, because each is a separate event worth keeping;
+    successes OVERWRITE, because `Stop` fires every turn and an append per turn
+    would grow without bound in a directory that survives plugin updates.
+    """
+
+    @property
+    def record(self) -> Path:
+        return self.data_dir / hook.HOOK_STATE_FILENAME
+
+    def read(self) -> dict:
+        return json.loads(self.record.read_text(encoding="utf-8"))
+
+    def test_a_successful_run_records_when_it_happened(self):
+        before = time.time()
+
+        code, _, _ = self.run_hook(self.stop_payload())
+
+        self.assertEqual(code, 0)
+        self.assertTrue(self.record.is_file(), "a success left no record of itself")
+        self.assertGreaterEqual(self.read()["last_success_at"], before)
+
+    def test_the_record_names_the_interpreter_the_launcher_resolved(self):
+        # The half of #116's pair that could not be observed before. The
+        # launcher runs a bare `python3` off PATH and this module resolves its
+        # own child with `sys.executable`; recording the second is what lets
+        # the report state which interpreter the first actually found.
+        self.run_hook(self.stop_payload())
+
+        self.assertEqual(self.read()["interpreter"], sys.executable)
+
+    def test_a_failed_ingest_records_no_success(self):
+        # The state the whole feature is about must not be reachable by a hook
+        # that ran and failed. That failure has its own channel -- stderr and
+        # the log -- and writing a success beside it would report the ingest
+        # that did not happen.
+        runner = RecordingRunner(returncode=4, stderr="disk on fire")
+
+        code, _, _ = self.run_hook(self.stop_payload(), runner=runner)
+
+        self.assertEqual(code, 1)
+        self.assertFalse(self.record.exists())
+        self.assertTrue((self.data_dir / hook.LOG_FILENAME).is_file())
+
+    def test_a_refusal_records_no_success(self):
+        payload = self.stop_payload()
+        del payload["transcript_path"]
+
+        self.run_hook(payload)
+
+        self.assertFalse(self.record.exists())
+
+    #: One JSON object of two small fields. Well above what that costs and far
+    #: below what appending one line per turn would reach.
+    RECORD_SIZE_CEILING = 256
+
+    def test_the_record_is_overwritten_rather_than_grown(self):
+        # The objection to logging successes, answered rather than ignored: one
+        # record however many turns run, and the newest one wins. Asserted on
+        # the SHAPE rather than on an exact size, which floats by a byte with
+        # the timestamp's repr -- and on the parse, because an appended file
+        # stops being a JSON object at the second turn.
+        self.run_hook(self.stop_payload())
+        first = self.read()["last_success_at"]
+        time.sleep(0.01)
+
+        for _ in range(3):
+            self.run_hook(self.stop_payload())
+
+        self.assertGreater(self.read()["last_success_at"], first)
+        self.assertLess(self.record.stat().st_size, self.RECORD_SIZE_CEILING)
+        self.assertEqual(
+            sorted(p.name for p in self.data_dir.iterdir()),
+            [hook.HOOK_STATE_FILENAME],
+            "a scratch file was left behind beside the record",
+        )
+
+    def test_it_is_written_beside_the_database_the_run_ingested_into(self):
+        # The rule the report depends on: `serve.py` is handed a database and
+        # nothing else, so it looks for this file beside that database. A
+        # record written anywhere else is a record with no reader.
+        elsewhere = self.tmp / "chosen" / "mine.db"
+        env = {
+            "CLAUDE_PLUGIN_ROOT": str(REPO_ROOT),
+            "CLAUDE_PLUGIN_DATA": str(self.data_dir),
+            "CPB_DB": str(elsewhere),
+        }
+
+        code, _, _ = self.run_hook(self.stop_payload(), env=env)
+
+        self.assertEqual(code, 0)
+        self.assertFalse(self.record.exists(), "written beside the log, not the DB")
+        self.assertTrue((elsewhere.parent / hook.HOOK_STATE_FILENAME).is_file())
+
+    def test_a_checkout_run_records_nothing_and_reports_nothing(self):
+        # No plugin data directory and no `CPB_DB`: a plain checkout, where the
+        # report says "not a plugin install" from its own location and never
+        # consults this file. Writing one would be a record with no reader; a
+        # failure to write one would be a complaint about nothing.
+        code, stderr, _ = self.run_hook(self.stop_payload(), env={})
+
+        self.assertEqual(code, 0, stderr)
+        self.assertFalse(self.record.exists())
+        self.assertEqual(stderr, "")
+
+    def test_an_unwritable_data_directory_does_not_turn_a_success_into_a_failure(self):
+        # Same policy as the log's: the ingest succeeded, and reporting a
+        # failure against the one thing that did not fail would spend this
+        # hook's single loud channel on the wrong event. The cost is that the
+        # report says no success is recorded, which is true of the record.
+        self.data_dir.mkdir(parents=True)
+        self.record.mkdir()
+
+        code, stderr, _ = self.run_hook(self.stop_payload())
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stderr, "")
+
+
 class HookToReportSeamTest(unittest.TestCase):
     """What the REPORT says about a database the hook built (#105).
 
@@ -705,12 +834,48 @@ class HookToReportSeamTest(unittest.TestCase):
         self.assertEqual(code, hook.EXIT_OK, stderr.getvalue())
         return code
 
-    def summary(self) -> dict:
-        api = serve.Api(self.db)
+    def summary(self, **install) -> dict:
+        api = serve.Api(self.db, **install)
         try:
             return api.summary(*serve.day_bounds(None, None))
         finally:
             api.conn.close()
+
+    def test_the_report_reads_the_success_the_hook_just_recorded(self):
+        # THE #116 SEAM, and the reason it is asserted here rather than on
+        # either side alone. The hook writes `cpb-hook-state.json` beside the
+        # database and `serve.py` looks for it beside the database it was
+        # handed; two constants, two modules, and nothing in either file forces
+        # them to agree. A rename on one side would leave both suites green and
+        # every install reporting hooks that never ran.
+        self.fire_hook()
+        hooks = self.summary(
+            script=REPO_ROOT / "serve.py",
+            env={"CLAUDE_PLUGIN_ROOT": str(REPO_ROOT)},
+        )["hooks"]
+        self.assertEqual(hooks["state"], serve.HOOKS_RECORDED)
+        self.assertIsNotNone(hooks["last_success_at"])
+        self.assertEqual(
+            hooks["interpreter"],
+            sys.executable,
+            "the report names an interpreter the hook did not run under",
+        )
+
+    def test_a_hook_whose_ingest_failed_records_no_success_at_the_seam(self):
+        # The true alarm beside the false one, at the same seam: a real failing
+        # child, and the report must not read the install as one whose hooks
+        # work. It cannot yet say they never have -- no install date is
+        # readable from a checkout -- and says WHICH absence that is.
+        self.fail_hook()
+        hooks = self.summary(
+            script=REPO_ROOT / "serve.py",
+            env={"CLAUDE_PLUGIN_ROOT": str(REPO_ROOT)},
+        )["hooks"]
+        self.assertIsNone(hooks["last_success_at"])
+        self.assertIsNone(hooks["state"])
+        self.assertEqual(
+            hooks["unknown_reason"], serve.HOOKS_UNKNOWN_NO_INSTALL_RECORD
+        )
 
     def test_the_hook_ingests_and_the_report_calls_the_database_current(self):
         # THE regression, end to end. Before #105 every assertion up to
@@ -749,17 +914,15 @@ class HookToReportSeamTest(unittest.TestCase):
         )
         self.assertEqual(check["state"], serve.HEALTH_OK)
 
-    def test_a_hook_whose_ingest_fails_leaves_the_age_unknown(self):
-        # THE TRUE ALARM, pinned at the same seam as the false one, because the
-        # cheap way to silence a false INCONCLUSIVE is to stop raising the real
-        # one. A hook whose spawned ingest dies after the schema is stamped and
-        # before the run is leaves a database that HOLDS the run table and no
-        # row -- which is exactly what a database nothing has ever run over
-        # holds, and the report must say "unknown age", not "fresh".
-        #
-        # Produced by a real failing child rather than by deleting the stamp:
-        # the transcript is made unreadable, so `parse_file()` raises and
-        # `ingest.py` exits non-zero having already created the database.
+    def fail_hook(self) -> None:
+        """One real `Stop` whose spawned `ingest.py` FAILS, for the true alarm.
+
+        Produced by a real failing child rather than by deleting a stamp
+        afterwards: the transcript is made unreadable, so `parse_file()` raises
+        and `ingest.py` exits non-zero having already created the database.
+        That is the state a half-finished hook leaves, and it is the state the
+        report must not read as a healthy one.
+        """
         os.chmod(self.transcript, 0o000)
         self.addCleanup(os.chmod, self.transcript, 0o600)
         try:
@@ -786,6 +949,15 @@ class HookToReportSeamTest(unittest.TestCase):
         )
         self.assertEqual(code, hook.EXIT_NONBLOCKING_ERROR, stderr.getvalue())
         self.assertTrue(self.db.is_file(), "the child never reached the database")
+
+    def test_a_hook_whose_ingest_fails_leaves_the_age_unknown(self):
+        # THE TRUE ALARM, pinned at the same seam as the false one, because the
+        # cheap way to silence a false INCONCLUSIVE is to stop raising the real
+        # one. A hook whose spawned ingest dies after the schema is stamped and
+        # before the run is leaves a database that HOLDS the run table and no
+        # row -- which is exactly what a database nothing has ever run over
+        # holds, and the report must say "unknown age", not "fresh".
+        self.fail_hook()
         ingest_block = self.summary()["ingest"]
         self.assertIsNone(ingest_block["last_run_at"])
         self.assertIsNone(

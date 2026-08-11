@@ -59,6 +59,29 @@ def load_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def script_invocations(text: str, script: str) -> list[str]:
+    """Every line that runs a bundled script, WHATEVER launches it (#116).
+
+    This used to be `script in line and "python3" in line`, and the second half
+    was the defect. `hooks.json` launches the hook by the bare name `python3`
+    resolved on `PATH` -- which is not the name Python has on Windows -- and
+    the one test in a position to notice filtered on that literal, so the
+    assumption under test was load-bearing inside the test. A skill rewritten
+    to say `py -3` or `python` would have dropped out of every `--db` and
+    `--prune-missing` check below while the suite stayed green: the rules would
+    not have failed, they would have stopped ranging over anything.
+
+    The filter is now the STRUCTURAL fact instead. Every documented invocation
+    reaches its script through `${CLAUDE_PLUGIN_ROOT}`, because hooks and
+    skills run in the user's project directory rather than in the plugin, and
+    that is asserted in its own right by
+    `test_it_reaches_serve_py_through_the_plugin_root`. An interpreter rename
+    cannot move it.
+    """
+    needle = f"{PLUGIN_ROOT_PLACEHOLDER}/{script}"
+    return [line for line in text.splitlines() if needle in line]
+
+
 class ManifestTest(unittest.TestCase):
     def setUp(self) -> None:
         self.assertTrue(MANIFEST.is_file(), f"{MANIFEST} is missing")
@@ -242,11 +265,7 @@ class SkillTest(unittest.TestCase):
         self.assertTrue((REPO_ROOT / "serve.py").is_file())
 
     def invocations(self, script: str) -> list[str]:
-        return [
-            line
-            for line in self.text.splitlines()
-            if script in line and "python3" in line
-        ]
+        return script_invocations(self.text, script)
 
     def test_every_database_touching_invocation_names_its_database(self):
         # BOTH scripts, not just `serve.py` (#94). The serve half was pinned
@@ -265,7 +284,10 @@ class SkillTest(unittest.TestCase):
         # the rule now ranges over both. Checked per invocation rather than
         # once for the file, so a line that drops the flag cannot hide behind
         # another line that still has it.
-        for script in ("serve.py", "ingest.py"):
+        # THE WHOLE SET since #116, not the two members somebody had in mind.
+        # `cpb_backfill_plan.py` opens the database too -- read-only, and the
+        # wrong database read-only still reports on a file nobody is serving.
+        for script in ("serve.py", "ingest.py", "hooks/cpb_backfill_plan.py"):
             lines = self.invocations(script)
             self.assertTrue(lines, f"the skill must actually invoke {script}")
             for line in lines:
@@ -317,6 +339,202 @@ class SkillTest(unittest.TestCase):
             }
 
         self.assertEqual(databases("serve.py"), databases("ingest.py"))
+
+
+class SkillRefreshesBeforeItServesTest(unittest.TestCase):
+    """The report must not need a manual ingest (#116 part C).
+
+    The hooks fire on `Stop`, `SubagentStop` and `SessionEnd`, so the turn the
+    user is IN when they ask for the report has never been ingested -- and on
+    an install whose hooks do not run, nothing has. Until #116 the skill ran
+    `ingest.py` only as a REMEDY, when `serve.py` refused to start for want of
+    a database; the ordinary path opened a report over whatever the hooks had
+    managed.
+
+    These are assertions about a prompt, so they pin the two things a rewrite
+    could lose without anyone noticing: that a refresh exists BEFORE the serve,
+    and that a failed one is documented as non-blocking. A stale report that
+    says it is stale is better than no report; a rewrite that made the refresh
+    a precondition would have turned a slow disk into a missing report.
+    """
+
+    def setUp(self) -> None:
+        self.text = SKILL.read_text(encoding="utf-8")
+
+    def steps(self) -> dict[str, tuple[int, str]]:
+        """`{heading title: (step number, body)}` for every numbered step.
+
+        Located by TITLE rather than by number, because a step's number is the
+        one thing about it that a later edit is expected to change. Pinning
+        `## 3.` would go green the moment somebody renumbered, and -- measured
+        by mutation -- also went green when the refresh step was renamed out of
+        existence with its body left in place.
+        """
+        found = {}
+        parts = re.split(r"(?m)^## (\d+)\. (.+)$", self.text)
+        for number, title, body in zip(parts[1::3], parts[2::3], parts[3::3]):
+            found[title.strip().lower()] = (int(number), body)
+        return found
+
+    def step(self, title: str) -> tuple[int, str]:
+        steps = self.steps()
+        self.assertIn(title, steps, f"the skill has no '{title}' step: {list(steps)}")
+        return steps[title]
+
+    def test_an_ingest_is_run_before_the_report_is_served(self):
+        # The defect stated positively, and asserted on the UNCONDITIONAL step
+        # rather than on the first `ingest.py` in the file. The backfill offer
+        # also invokes ingest, so a "first invocation precedes the serve" test
+        # would have stayed green with the refresh deleted -- the offer only
+        # runs when there is unmeasured history and the user says yes, which is
+        # once in an install's life.
+        refresh, _ = self.step("refresh the measurements")
+        serve_step, _ = self.step("open the report")
+        self.assertLess(
+            refresh, serve_step, "the report is served before anything refreshes it"
+        )
+
+    def test_the_refresh_step_names_its_database(self):
+        # #94, applied to the invocation this change adds rather than trusted
+        # to the rule that already covers the file: an ingest with no `--db`
+        # writes the user's only copy of their history into the directory the
+        # next plugin update deletes, while the report keeps serving the other
+        # file. Asserted on THIS step so it cannot pass on a sibling's flag.
+        _, body = self.step("refresh the measurements")
+        lines = script_invocations(body, "ingest.py")
+        self.assertTrue(lines, "the refresh step does not run an ingest")
+        for line in lines:
+            with self.subTest(line=line.strip()):
+                self.assertIn('--db "${CLAUDE_PLUGIN_DATA}/usage.db"', line)
+
+    def test_a_failed_refresh_does_not_withhold_the_report(self):
+        # The rule that keeps a refresh from becoming a precondition. Every
+        # figure the database already holds is still measured, and the page
+        # states its own age -- so the answer to a failed refresh is to say so
+        # and open the report, never to withhold it.
+        serve_step, _ = self.step("open the report")
+        _, body = self.step("refresh the measurements")
+        body = body.lower()
+        self.assertIn("exits non-zero", body)
+        self.assertIn(f"go to step {serve_step} anyway", body)
+        self.assertIn("do not describe the report as current", body)
+
+    def test_the_refresh_is_skipped_when_the_backfill_already_ingested(self):
+        # The cold-start case the owner called out: the backfill offer already
+        # covers a first run, and running the same command twice would spend
+        # the user's time re-reading a file it has just read.
+        offer, _ = self.step("offer the backfill — ask, never assume")
+        _, body = self.step("refresh the measurements")
+        self.assertIn(
+            f"skip this step if an ingest already ran in step {offer}", body.lower()
+        )
+
+    def test_the_cost_of_a_warm_refresh_is_measured_but_not_in_the_prompt(self):
+        # BOTH halves, because they pull against each other. A change that
+        # slows every report open owes a measurement -- and the one place it
+        # must not appear is the prompt: a duration in a model's instructions
+        # is a figure about somebody else's disk that the model will relay as
+        # if it were the reader's, which is what `test_the_skill_states_no_size
+        # _of_its_own` in `test_walkthrough.py` exists to stop. So the number
+        # lives where a person reads it, dated and with its corpus named.
+        self.assertRegex(
+            (REPO_ROOT / "docs" / "install.md").read_text(encoding="utf-8"),
+            r"(?s)0\.22 s.{0,60}measured 2026-08-11",
+            "the refresh's cost is claimed without a dated measurement",
+        )
+        _, body = self.step("refresh the measurements")
+        self.assertNotRegex(body, r"\d+(\.\d+)?\s*(s|ms|seconds)\b")
+        self.assertIn("Do not tell the user how long it will take", self.text)
+
+
+class InterpreterLaunchDecisionTest(unittest.TestCase):
+    """WHICH interpreter the hooks are launched with, decided rather than left.
+
+    Established from https://code.claude.com/docs/en/hooks (checked
+    2026-08-11), which is quoted in `docs/plugin.md`:
+
+    * **Exec form** (`args` present) "resolves `command` as an executable on
+      `PATH` and spawns it directly. There is no shell." A bare `python3` is
+      therefore a `PATH` lookup for a name Windows does not have.
+    * **Shell form** (`args` absent) runs "`sh -c` on macOS and Linux, Git Bash
+      on Windows, or PowerShell when Git Bash isn't installed" -- so a
+      `command -v python3 || command -v python` fallback is not portable
+      either: it is not a PowerShell expression.
+    * The documented example for a bundled script is exec form with an
+      interpreter in `command`.
+
+    There is no portable literal, so the launch is UNCHANGED and the state it
+    fails in is detected instead (`serve.HOOKS_NEVER_SUCCEEDED`). What this
+    class pins is that the decision stays deliberate: exec form, one
+    interpreter name, recorded in `docs/plugin.md`, and a report that can say
+    the hooks never ran.
+    """
+
+    def setUp(self) -> None:
+        self.hooks = load_json(HOOKS)["hooks"]
+        self.plugin_doc = (REPO_ROOT / "docs" / "plugin.md").read_text(encoding="utf-8")
+
+    def handlers(self):
+        for event, groups in self.hooks.items():
+            for group in groups:
+                for handler in group["hooks"]:
+                    yield event, handler
+
+    def test_every_trigger_is_launched_by_the_same_interpreter_name(self):
+        # One rule for all three. Two triggers launched differently would make
+        # "the hooks do not run here" a per-event fact, and the report has one
+        # verdict for the install.
+        names = {handler["command"] for _, handler in self.handlers()}
+        self.assertEqual(len(names), 1, f"three triggers, {len(names)} launchers: {names}")
+
+    def test_the_launcher_is_a_bare_executable_name_in_exec_form(self):
+        # Exec form takes an executable and an argument vector; a `command`
+        # carrying whitespace alongside `args` cannot spawn at all, and the
+        # hooks reference says Claude Code warns about exactly that.
+        for event, handler in self.handlers():
+            with self.subTest(event):
+                self.assertIsInstance(handler.get("args"), list)
+                self.assertNotIn(" ", handler["command"])
+
+    def test_the_choice_of_interpreter_is_recorded_where_it_was_decided(self):
+        # The acceptance criterion #116 opens with: the interpreter is a
+        # DECISION, in the register of the `${CLAUDE_PLUGIN_DATA}` one, not a
+        # literal nobody re-examined. Pinned by naming the launcher this
+        # repository actually ships, so changing it without touching the
+        # reasoning turns red.
+        launcher = next(handler["command"] for _, handler in self.handlers())
+        self.assertIn(f"`{launcher}`", self.plugin_doc)
+        self.assertIn("exec form", self.plugin_doc.lower())
+        self.assertIn("Windows", self.plugin_doc)
+
+    def test_the_report_can_say_the_hooks_never_ran(self):
+        # The other half of the decision, and the reason leaving the launcher
+        # alone is defensible: the failure it cannot prevent is one the report
+        # NAMES. A change that deleted that state would leave the launch
+        # undiagnosed again, so the two are pinned together.
+        import serve
+
+        self.assertIn(
+            serve.HOOKS_NEVER_SUCCEEDED,
+            (REPO_ROOT / "index.html").read_text(encoding="utf-8"),
+        )
+
+    def test_the_hook_and_the_report_agree_on_the_success_records_name(self):
+        # Two literals in two modules, tied here because the hook must not
+        # import `serve.py` -- it spawns one bounded child and opens nothing --
+        # and a rename on either side would leave every install reporting
+        # hooks that never ran. The same arrangement `cpb.VERSION` has with
+        # `.claude-plugin/plugin.json`.
+        import importlib.util
+
+        import serve
+
+        spec = importlib.util.spec_from_file_location(
+            "cpb_ingest_hook", REPO_ROOT / "hooks" / "cpb_ingest_hook.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.HOOK_STATE_FILENAME, serve.HOOK_STATE_FILENAME)
 
 
 # Reserved marketplace names, from the "Reserved names" note in

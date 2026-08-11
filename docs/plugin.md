@@ -255,6 +255,131 @@ independently bounds the `ingest.py` child it spawns at
 `INGEST_TIMEOUT_SECONDS = 20`, so a hung ingest is killed by CPB before Claude
 Code has to intervene.
 
+### Which interpreter launches the hooks — and why it is not portable
+
+The decision, in the register of the `${CLAUDE_PLUGIN_DATA}` one below:
+`hooks.json` launches all three triggers in **exec form**, with
+`"command": "python3"` and the handler's path in `args`. That is what CPB
+ships, it is the documented pattern, and **on a machine where `python3` is not
+on `PATH` under that name it fails on every trigger, permanently and silently.**
+Nothing in the hook system can prevent that. What CPB does instead is *detect*
+it — see "When the hooks never run" below.
+
+What the [hooks reference](https://code.claude.com/docs/en/hooks#exec-form-and-shell-form)
+says (checked 2026-08-11), because the choice turns entirely on it:
+
+- **Exec form** runs when `args` is present: "Claude Code resolves `command` as
+  an executable on `PATH` and spawns it directly … There is no shell." So
+  `python3` is a bare `PATH` lookup.
+- **Shell form** runs when `args` is absent: "The `command` string is passed to
+  a shell: `sh -c` on macOS and Linux, **Git Bash on Windows, or PowerShell when
+  Git Bash isn't installed**."
+- The reference's own example of running a bundled script is exec form with the
+  interpreter in `command` — `"command": "node", "args": [".../eslint.js"]` —
+  and it notes that on Windows exec form "requires `command` to resolve to a
+  real executable such as a `.exe`", which `node.exe` is.
+
+Python has no equivalent of `node.exe`. On Windows the interpreter is
+`python.exe`, the launcher is `py.exe`, and Microsoft's Store ships a
+**`python3.exe` stub that opens the Store rather than running anything** — so
+the one name that is right everywhere else is the one name that is wrong there,
+in the way most likely to look like nothing happened.
+
+Three candidates were considered and none is takeable:
+
+1. **Shell form with a fallback**, e.g. `command -v python3 || command -v
+   python`. Not portable: on a Windows machine without Git Bash the string is
+   handed to *PowerShell*, where it is not an expression. The `shell` field
+   accepts only `"bash"` or `"powershell"` and is "ignored when `args` is set",
+   so it selects between two shells rather than guaranteeing either exists.
+2. **A second handler per trigger** naming `python`. Both would run: on Linux
+   the second is frequently Python 2, so a Windows-only silent failure would
+   become a `hook error` notice on every turn for everyone else. `hooks.json`
+   has no platform condition to narrow it with.
+3. **A `userConfig` option** holding the interpreter, substituted as
+   `${user_config.python}` — [documented for exec form
+   specifically](https://code.claude.com/docs/en/plugins-reference#user-configuration)
+   (checked 2026-08-11), with a `default` field. This is the only candidate
+   that could work, and it is **not shipped on evidence we do not have**: an
+   older Claude Code that does not know the key would pass the placeholder
+   through as the executable name and break the hooks on *every* platform,
+   which is a far worse failure than the one it fixes. Taking it needs a
+   measured floor for when `userConfig` landed, a check of whether a `default`
+   suppresses the enable-time prompt, and a Windows machine to verify the fix
+   on. None of the three was available when this was written.
+
+**Not verified on Windows.** No Windows machine was available; the failure is
+established from the documented `PATH` resolution above and from the Store
+stub's documented behaviour, not from an observed run. The neighbouring
+unverified Windows assumption is `ingest.transcript_slug()`, flagged the same
+way in `CLAUDE.md`.
+
+The half that *is* settled is the pair the hook itself owns.
+`hooks/cpb_ingest_hook.py` resolves its own child with `sys.executable`, so the
+`ingest.py` it spawns always runs under the interpreter that is already
+running — the launcher and the child cannot disagree. What the launcher
+resolved was previously unobservable; it is now **recorded and reported**, so
+the asymmetry is declared rather than assumed away. See below.
+
+### When the hooks never run
+
+A plugin whose hooks never fire looks exactly like a plugin installed a minute
+ago: both hold a database nothing has updated. The report was honest about that
+— it said the database's age was unknown and declined to call anything fresh
+(#93, #105) — and honest is not diagnosed.
+
+So a **successful** hook run overwrites `cpb-hook-state.json` beside the
+database:
+
+```json
+{"last_success_at": 1786465130.18, "interpreter": "/opt/homebrew/bin/python3.13"}
+```
+
+Overwritten rather than appended, because `Stop` fires every turn: one small
+record however long the plugin is installed, which is the same reason the
+failure log does *not* record successes. It sits beside the database rather
+than beside the log because `serve.py` is handed a database and nothing else.
+
+`/api/summary` reports what that file says under `hooks`, and the report reads
+five states off it:
+
+| state | what it means |
+|---|---|
+| `recorded` | a hook run succeeded, at this time, under this interpreter |
+| `too-soon-to-tell` | no success recorded, and nothing has finished since this build arrived. **The normal state of a new install** |
+| `never-succeeded` | no success recorded, and enough exchanges have completed since this build arrived that a working hook would have written one |
+| `not-a-plugin-install` | a checkout ships no hooks; there is nothing to diagnose |
+| `null` | the record is unreadable, or Claude Code's plugin registry does not say when this build arrived. Named in `unknown_reason`, never guessed |
+
+**A new install must never read as a broken one**, which is the whole
+difficulty: "nothing has ended yet" is the normal state for minutes after an
+install, and for as long as somebody leaves a session idle. Elapsed time alone
+cannot tell the two apart. The report therefore waits for **completed
+exchanges** — an API call later than the install, followed by a *user turn*
+later than that call — because a user prompting again after Claude replied is
+the ordinary shape of a turn that ended, and a turn ending is what `Stop` fires
+on. Neither half suffices alone: the skill refreshes before it serves, so
+opening the report ingests the turn it is being opened *from*, and calls newer
+than the install date exist on every render forever.
+
+It is evidence rather than proof — the hooks reference says `Stop` "does not
+run if the stoppage occurred due to a user interrupt", and an API error fires
+`StopFailure` instead — so the verdict waits for three, on the reasoning that
+three consecutive interrupted exchanges is not a session anybody is reading a
+spend report about.
+
+The install date is Claude Code's own, read from
+`<config>/plugins/installed_plugins.json`, matched by the entry whose
+`installPath` contains this script. **`lastUpdated`, not `installedAt`**: an
+install whose hooks have worked for weeks acquires its first success record
+only after the update that started writing them, and dating the silence from
+the original install would tell that reader, once and wrongly, that their hooks
+have never run. That file is undocumented internal state (its shape measured
+2026-08-11 on Claude Code 2.1.222), so every way of failing to read it ends at
+`unknown_reason: no-install-record` — the loud verdict is the only thing the
+date can unlock, so a format change costs the diagnosis and can never
+manufacture one.
+
 ### Why no hook is `async`
 
 `async: true` would keep the session from waiting on ingest, but async hooks are

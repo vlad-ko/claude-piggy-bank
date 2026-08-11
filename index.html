@@ -544,6 +544,67 @@
           recorded what a run ranged over. Unrecorded, not none
         </span></template>
       </span></template>
+      <!-- #116: is the ingest above happening BY ITSELF? Annotates this line
+           rather than taking a surface of its own (CLAUDE.md constraint 4),
+           and sits next to the age it explains: the plugin's hooks are the
+           only reason that age moves without somebody typing a command.
+
+           FIVE readings, and the two quiet ones are the point. A plugin
+           installed a minute ago has recorded no hook success and is perfectly
+           healthy -- `Stop` has not fired yet -- so "too-soon-to-tell" is a
+           state of its own and not the loud one with softer words; telling a
+           new install its hooks are broken is exactly the false alarm #105
+           removed. A checkout ships no hooks at all, which is neither "no" nor
+           "cannot tell". The two null states name which absence they have and
+           this page never guesses one, the same arrangement
+           `stale_unknown_reason` has one line up.
+
+           Only `never-succeeded` also reaches the banner, because it is the
+           only one of the five that says something is wrong. -->
+      <template x-if="summary.hooks.state === 'recorded'"><span>
+        &middot; automatic ingest (plugin hooks): last succeeded
+        <strong x-text="fmtAge(asOfNow - summary.hooks.last_success_at)"></strong>
+        (<span x-text="fmtTs(summary.hooks.last_success_at)"></span>)<template
+          x-if="summary.hooks.interpreter"><span>, under <code
+          x-text="summary.hooks.interpreter"></code></span></template><template
+          x-if="!summary.hooks.interpreter"><span>, under an interpreter it did
+          not record</span></template></span></template>
+      <template x-if="summary.hooks.state === 'too-soon-to-tell'"><span>
+        &middot; automatic ingest (plugin hooks): <strong>no run recorded
+        yet</strong> &mdash; this build was installed
+        <span x-text="fmtAge(asOfNow - summary.hooks.build_installed_at)"></span>
+        ago and
+        <span x-text="summary.hooks.exchanges_since_install.toLocaleString()"></span>
+        of <span x-text="summary.hooks.exchanges_before_silence"></span>
+        exchange(s) have completed since. The hooks record a run when a turn
+        ends; nothing has ended yet. <strong>This is not a fault</strong>
+      </span></template>
+      <template x-if="summary.hooks.state === 'never-succeeded'"><span>
+        &middot; automatic ingest (plugin hooks): <strong>NO RUN HAS EVER
+        SUCCEEDED</strong> here &mdash;
+        <span x-text="summary.hooks.exchanges_since_install.toLocaleString()"></span>
+        exchange(s) have completed since this build was installed
+        (<span x-text="fmtTs(summary.hooks.build_installed_at)"></span>) and not
+        one of them recorded an ingest. See the banner above
+      </span></template>
+      <template x-if="summary.hooks.state === 'not-a-plugin-install'"><span>
+        &middot; automatic ingest: <strong>not applicable</strong> &mdash; this
+        is a checkout, not a plugin install, so nothing ingests on its own here.
+        Run <code>ingest.py</code> yourself
+      </span></template>
+      <template x-if="summary.hooks.state === null"><span>
+        &middot; automatic ingest (plugin hooks): <strong>cannot tell</strong>
+        <template x-if="summary.hooks.unknown_reason === 'unreadable-record'"><span>
+          &mdash; the file the hooks write on success is here and will not
+          parse, so it is neither a success nor the absence of one. It is
+          <code>cpb-hook-state.json</code>, beside the database
+        </span></template>
+        <template x-if="summary.hooks.unknown_reason === 'no-install-record'"><span>
+          &mdash; this copy is an installed plugin and Claude Code's plugin
+          registry does not say when this build arrived, so there is nothing to
+          weigh the silence against. Unknown, not none
+        </span></template>
+      </span></template>
       &middot;
       <template x-if="summary.ingest.newest_call_ts === null"><span>newest measured
         call: <strong>none</strong> &mdash; no API calls ingested</span></template>
@@ -3652,6 +3713,28 @@ function report() {
       // warning the reader could navigate away from would be a warning this
       // page had quietly weakened.
       if (this.summary.ingest.unparsed_records > 0) msgs.push(`INCONCLUSIVE: ${this.summary.ingest.unparsed_records} unparsed record(s) across ingested files — totals may undercount.`);
+      // #116: the plugin is installed, its hooks have never recorded a run,
+      // and enough turns have ended since this build arrived that a working
+      // hook would have. That is a broken automatic ingest, and it is the ONE
+      // hook state loud enough for the banner — the other four are readings on
+      // the data-age line, including "installed a minute ago, nothing has
+      // ended yet", which must never arrive here.
+      //
+      // It names a next action, because "your hooks have not run" with no
+      // remedy is the same dead end as an unknown age with no cause. The first
+      // check is the interpreter: `hooks.json` launches them as a bare
+      // `python3` resolved on PATH, which is the documented form and is the
+      // one that does not exist on a Windows machine (docs/plugin.md).
+      if (this.summary.hooks.state === "never-succeeded") msgs.push(
+        `AUTOMATIC INGEST IS NOT RUNNING: Claude Piggy Bank's hooks have never recorded a `
+        + `successful run on this install, across ${this.summary.hooks.exchanges_since_install.toLocaleString()} `
+        + `completed exchange(s) since this build arrived on `
+        + `${fmtTs(this.summary.hooks.build_installed_at)}. Figures below are only as `
+        + `current as the last ingest anyone ran by hand. Check that the hooks are `
+        + `registered with /hooks, then that the interpreter they launch exists — they `
+        + `run "python3" as found on PATH, which is not the name Python has on every `
+        + `machine. "claude --debug" logs each hook's exit code and stderr to `
+        + `~/.claude/debug/<session-id>.txt.`);
       // Totals here are COMPLETE — the archived calls are counted. What they
       // are not is reproducible: those transcripts are gone, so this database
       // is the only copy and re-ingesting will not bring them back. Back it up.

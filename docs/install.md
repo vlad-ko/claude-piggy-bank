@@ -136,6 +136,46 @@ never blocks a turn, never stops a subagent, and never reports success for work
 it did not do. The reasoning, and the plugin design generally, is in
 [`plugin.md`](plugin.md).
 
+You do not have to wait for a hook to see current numbers:
+`/claude-piggy-bank:cpb` refreshes before it opens the report, so the turn you
+are in is measured too. A refresh re-reads only files whose size or mtime
+changed — 0.22 s over this project's own 75 transcripts, measured 2026-08-11 on
+macOS — and if it fails the report still opens, over the data already in the
+database, saying how old that data is.
+
+### If the hooks do not run at all
+
+Claude Code launches each hook by resolving the name `python3` on your `PATH`,
+with no shell involved — the documented form for a bundled script, and the only
+one available. **On a machine where Python is not called `python3` there,
+nothing ingests, and no error is shown.** Windows is where this bites: the
+interpreter is `python.exe`, the launcher is `py.exe`, and the Microsoft Store
+ships a `python3.exe` that opens the Store rather than running anything. (This
+is established from Claude Code's [hooks
+reference](https://code.claude.com/docs/en/hooks#exec-form-and-shell-form),
+checked 2026-08-11, and the Store stub's documented behaviour — **not from an
+observed Windows run**; CPB has no Windows machine to verify it on. If you hit
+it, or do not, please say so on
+[#116](https://github.com/vlad-ko/claude-piggy-bank/issues/116).)
+
+The report will tell you. A successful hook run leaves a record beside the
+database, so once enough turns have completed since the install with no record
+written, the page says **"AUTOMATIC INGEST IS NOT RUNNING"** and stops there
+rather than leaving you with an old number and no explanation. To check by
+hand:
+
+- `/hooks` lists every configured hook — CPB's three appear under *Plugin
+  Hooks* if the plugin is enabled at all;
+- `python3 --version` in the same shell Claude Code runs in says whether that
+  name resolves;
+- `claude --debug` writes each hook's exit code and stderr to
+  `~/.claude/debug/<session-id>.txt`.
+
+There is no supported way to point the hooks at a differently-named interpreter
+today; `/claude-piggy-bank:cpb` still refreshes and serves, so the report stays
+current whenever you open it. Why no portable launcher exists, and what would
+be needed to ship one, is in [`plugin.md`](plugin.md#which-interpreter-launches-the-hooks--and-why-it-is-not-portable).
+
 ## Where the plugin keeps your database
 
 `${CLAUDE_PLUGIN_DATA}/usage.db` — a directory that survives plugin updates,

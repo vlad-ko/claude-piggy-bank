@@ -24,7 +24,7 @@ import threading
 import time
 import unittest
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime, timezone
 from http.server import HTTPServer
 from pathlib import Path
 from typing import Optional
@@ -144,6 +144,14 @@ from serve import (  # noqa: E402
     HEALTH_ORDER,
     HEALTH_STATEMENTS,
     HEALTH_UNCHECKED,
+    HOOKS_NEVER_SUCCEEDED,
+    HOOKS_NOT_A_PLUGIN,
+    HOOKS_RECORDED,
+    HOOKS_TOO_SOON,
+    HOOKS_UNKNOWN_NO_INSTALL_RECORD,
+    HOOKS_UNKNOWN_UNREADABLE_RECORD,
+    HOOK_SILENCE_EXCHANGES,
+    HOOK_STATE_FILENAME,
     MEASURED_CONTEXT_MIN,
     MODEL_MIX_SAMPLE,
     OVER_HALF_WINDOW_BANDS,
@@ -1848,6 +1856,464 @@ class HookOnlyDatabaseFreshnessTest(unittest.TestCase):
         time.sleep(0.01)
         ingest_transcript(self.transcripts[-1], self.db_path)
         self.assertGreater(self.block()["last_run_at"], first)
+
+
+class AutomaticIngestHealthTest(unittest.TestCase):
+    """Have the plugin's hooks ever run? -- the state #116 could not name.
+
+    A plugin whose hooks never fire is indistinguishable, on the page, from a
+    plugin installed a minute ago: both hold a database nothing has updated and
+    both report an unknown age. #93 and #105 made that honest; honest is not
+    the same as diagnosed, and only one of the two readers has anything to do
+    about it.
+
+    THE FALSE ALARM IS THE EXPENSIVE FAILURE HERE, not the missed one, so the
+    fixtures below are weighted towards states that must stay QUIET: a fresh
+    install that has just backfilled old history, an install whose only
+    activity since is the very invocation that opened the report, and an
+    upgrade of an install whose hooks have worked for weeks. Each of those
+    would be told its hooks are broken by an implementation that treated the
+    absence of a success record as a verdict, and each is a working install.
+
+    Every timestamp is explicit and the corpus is hand-built, because the whole
+    subject is the ORDER of three things -- when this build arrived, when
+    Claude replied, when the user prompted again -- and a fixture that let any
+    two of them coincide would pass whatever the comparison did.
+    """
+
+    #: Well clear of any real clock so an off-by-a-day in the fixture cannot be
+    #: mistaken for the anchor working.
+    BASE = 1786000000.0
+    SESSION = "00000000-0000-4000-8000-0000000000ab"
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="usage-report-hook-health-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.install, self.data_dir = simulate_plugin_install(self.tmp)
+        self.script = self.install / "serve.py"
+        self.script.write_text("", encoding="utf-8")
+        self.db_path = self.data_dir / "usage.db"
+        self.registry = self.install.parents[3] / serve.PLUGIN_REGISTRY_FILENAME
+
+    # -- fixture builders -------------------------------------------------
+
+    @staticmethod
+    def _iso(ts: float) -> str:
+        return (
+            datetime.fromtimestamp(ts, tz=timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        )
+
+    def write_corpus(self, exchanges: int, *, start: float) -> None:
+        """`exchanges` prompt/reply pairs, one second apart, ingested.
+
+        A pair is a user record then an assistant record, which is what the
+        report counts an exchange from: `turns` holds the user side and
+        `api_calls` the reply side. Written through `ingest_transcript` -- the
+        hook's own mode -- so the rows arrive the way a plugin install's rows
+        arrive.
+        """
+        projects = self.tmp / "projects"
+        projects.mkdir(exist_ok=True)
+        lines = []
+        for n in range(exchanges):
+            lines.append(json.dumps({
+                "type": "user",
+                "sessionId": self.SESSION,
+                "timestamp": self._iso(start + n * 2),
+                "message": {"role": "user", "content": f"prompt {n}"},
+            }))
+            lines.append(json.dumps({
+                "type": "assistant",
+                "sessionId": self.SESSION,
+                "timestamp": self._iso(start + n * 2 + 1),
+                "message": {
+                    "id": f"msg-{n}",
+                    "model": "claude-sonnet-5-20260115",
+                    "content": [{"type": "text", "text": f"reply {n}"}],
+                    "usage": {
+                        "input_tokens": 11,
+                        "cache_creation_input_tokens": 13,
+                        "cache_read_input_tokens": 17,
+                        "output_tokens": 19,
+                    },
+                },
+            }))
+        transcript = projects / f"{self.SESSION}.jsonl"
+        transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        ingest_transcript(
+            transcript, self.db_path, tasks_dir=self.tmp / "no-task-index"
+        )
+
+    def write_registry(self, *, last_updated=None, installed_at=None, path=None):
+        """Claude Code's own record of this install, in its measured shape."""
+        entry = {"scope": "user", "installPath": str(self.install if path is None else path)}
+        if installed_at is not None:
+            entry["installedAt"] = self._iso(installed_at)
+        if last_updated is not None:
+            entry["lastUpdated"] = self._iso(last_updated)
+        self.registry.write_text(
+            json.dumps({"version": 2, "plugins": {"cpb@market": [entry]}}),
+            encoding="utf-8",
+        )
+
+    def write_success(self, when: float, interpreter="/opt/py/bin/python3.13") -> None:
+        (self.db_path.parent / HOOK_STATE_FILENAME).write_text(
+            json.dumps({"last_success_at": when, "interpreter": interpreter}),
+            encoding="utf-8",
+        )
+
+    def block(self, script=None, env=None) -> dict:
+        api = Api(
+            self.db_path,
+            script=self.script if script is None else script,
+            env={} if env is None else env,
+        )
+        try:
+            return api.summary(*day_bounds(None, None))["hooks"]
+        finally:
+            api.conn.close()
+
+    # -- the states that must stay quiet ----------------------------------
+
+    def test_a_fresh_install_that_backfilled_old_history_is_not_told_it_is_broken(self):
+        # THE false alarm this whole design is arranged around. The user
+        # installed the plugin and accepted the backfill offer, so the database
+        # is full of exchanges -- every one of them from BEFORE the plugin
+        # existed. Counting exchanges without an anchor would read a month of
+        # history as a month of dead hooks on a plugin ten seconds old.
+        self.write_corpus(50, start=self.BASE)
+        self.write_registry(last_updated=self.BASE + 100_000)
+
+        block = self.block()
+
+        self.assertEqual(block["state"], HOOKS_TOO_SOON)
+        self.assertEqual(block["exchanges_since_install"], 0)
+
+    def test_the_invocation_that_opened_the_report_is_not_evidence_against_it(self):
+        # The second false alarm, and the subtler one: the skill refreshes
+        # before it serves (#116 part C), so opening the report ingests the
+        # turn it is being opened FROM. Those calls are newer than the anchor
+        # on every render forever. Counting replies alone would make a fresh
+        # install accuse itself the moment it was first used.
+        #
+        # The fixture is exactly that shape: the last prompt is followed by a
+        # reply and by nothing else, because nothing else has happened yet.
+        self.write_corpus(1, start=self.BASE + 100_000)
+        self.write_registry(last_updated=self.BASE + 99_999)
+
+        block = self.block()
+
+        self.assertEqual(block["state"], HOOKS_TOO_SOON)
+        self.assertEqual(
+            block["exchanges_since_install"],
+            0,
+            "a reply with no prompt after it is a turn that has not ended",
+        )
+
+    def test_an_upgrade_of_a_working_install_is_dated_from_the_upgrade(self):
+        # The third false alarm, and the reason `lastUpdated` is the field
+        # rather than `installedAt`. Hooks that have worked for weeks acquire
+        # their FIRST success record only after the update that started writing
+        # them, so an anchor at the original install date would tell that
+        # reader -- once, loudly, and wrongly -- that they never ran.
+        self.write_corpus(20, start=self.BASE)
+        self.write_registry(
+            installed_at=self.BASE - 1000, last_updated=self.BASE + 100_000
+        )
+
+        block = self.block()
+
+        self.assertEqual(block["state"], HOOKS_TOO_SOON)
+        self.assertEqual(block["build_installed_at"], self.BASE + 100_000)
+
+    def test_a_checkout_is_not_an_install_with_broken_hooks(self):
+        # A checkout ships no hooks, so "have they run" is not a question about
+        # it. Neither "no" nor "cannot tell" -- and this is the state every
+        # other test in this file runs in, which is why it must be explicit.
+        self.write_corpus(20, start=self.BASE)
+        self.write_registry(last_updated=self.BASE)
+
+        block = self.block(script=Path(__file__).resolve().parent.parent / "serve.py")
+
+        self.assertEqual(block["state"], HOOKS_NOT_A_PLUGIN)
+        self.assertIsNone(block["unknown_reason"])
+        self.assertIsNone(block["build_installed_at"])
+        self.assertIsNone(block["exchanges_since_install"])
+
+    # -- the loud state ---------------------------------------------------
+
+    def test_an_install_whose_hooks_never_ran_says_so(self):
+        # The state #116 is about. Every exchange since this build arrived
+        # completed with no hook recording anything, which on a working install
+        # cannot happen: `Stop` fires at the end of each one.
+        self.write_corpus(HOOK_SILENCE_EXCHANGES + 5, start=self.BASE + 10)
+        self.write_registry(last_updated=self.BASE)
+
+        block = self.block()
+
+        self.assertEqual(block["state"], HOOKS_NEVER_SUCCEEDED)
+        self.assertIsNone(block["unknown_reason"])
+        self.assertIsNone(block["last_success_at"])
+        self.assertGreaterEqual(
+            block["exchanges_since_install"], HOOK_SILENCE_EXCHANGES
+        )
+
+    def test_the_verdict_waits_for_the_declared_number_of_exchanges(self):
+        # The boundary, either side of it, because the threshold exists to buy
+        # the interrupted turn the hooks reference says fires no `Stop` at all.
+        # A fixture on one side only would pass for an implementation with no
+        # threshold and for one that never speaks.
+        self.write_registry(last_updated=self.BASE)
+        for completed, expected in (
+            (HOOK_SILENCE_EXCHANGES - 1, HOOKS_TOO_SOON),
+            (HOOK_SILENCE_EXCHANGES, HOOKS_NEVER_SUCCEEDED),
+        ):
+            with self.subTest(completed=completed):
+                shutil.rmtree(self.tmp / "projects", ignore_errors=True)
+                self.db_path.unlink(missing_ok=True)
+                # `completed` finished exchanges needs one more prompt after
+                # the last reply -- which is what a completed exchange IS.
+                self.write_corpus(completed + 1, start=self.BASE + 10)
+                block = self.block()
+                self.assertEqual(block["exchanges_since_install"], completed)
+                self.assertEqual(block["state"], expected)
+
+    # -- the positive record ----------------------------------------------
+
+    def test_a_recorded_success_is_reported_with_its_interpreter(self):
+        # What the hook writes, read back. The interpreter is the half that
+        # closes #116's pair: `hooks.json` launches the hook as a bare
+        # `python3` and the hook resolves its child with `sys.executable`, and
+        # until the report could name the first the two were free to disagree
+        # unobserved.
+        self.write_corpus(HOOK_SILENCE_EXCHANGES + 5, start=self.BASE + 10)
+        self.write_registry(last_updated=self.BASE)
+        self.write_success(self.BASE + 900, interpreter="/opt/py/bin/python3.13")
+
+        block = self.block()
+
+        self.assertEqual(block["state"], HOOKS_RECORDED)
+        self.assertEqual(block["last_success_at"], self.BASE + 900)
+        self.assertEqual(block["interpreter"], "/opt/py/bin/python3.13")
+
+    def test_a_success_outranks_the_silence_it_would_otherwise_be_read_as(self):
+        # A success record with no install date is still a success: the date
+        # exists only to weigh an ABSENCE, and letting a missing registry
+        # suppress a positive observation would be absence outranking evidence.
+        self.write_corpus(HOOK_SILENCE_EXCHANGES + 5, start=self.BASE + 10)
+        self.write_success(self.BASE + 900)
+
+        block = self.block()
+
+        self.assertEqual(block["state"], HOOKS_RECORDED)
+        self.assertIsNone(block["build_installed_at"])
+        self.assertIsNone(block["exchanges_since_install"])
+
+    def test_a_success_that_recorded_no_interpreter_is_still_a_success(self):
+        # `sys.executable` can be empty in an embedded interpreter. Null is the
+        # honest reading; an empty string would render as an interpreter called
+        # nothing.
+        self.write_corpus(1, start=self.BASE + 10)
+        self.write_registry(last_updated=self.BASE)
+        (self.db_path.parent / HOOK_STATE_FILENAME).write_text(
+            json.dumps({"last_success_at": self.BASE + 900, "interpreter": None}),
+            encoding="utf-8",
+        )
+
+        block = self.block()
+
+        self.assertEqual(block["state"], HOOKS_RECORDED)
+        self.assertIsNone(block["interpreter"])
+
+    # -- the refusals -----------------------------------------------------
+
+    def test_a_record_that_will_not_parse_is_neither_a_success_nor_a_silence(self):
+        # Something wrote this file. Reading a truncated one as "no success"
+        # would let a torn write -- two hooks firing at once -- become a
+        # diagnosis.
+        self.write_corpus(HOOK_SILENCE_EXCHANGES + 5, start=self.BASE + 10)
+        self.write_registry(last_updated=self.BASE)
+        (self.db_path.parent / HOOK_STATE_FILENAME).write_text(
+            '{"last_success_at": 178600', encoding="utf-8"
+        )
+
+        block = self.block()
+
+        self.assertIsNone(block["state"])
+        self.assertEqual(block["unknown_reason"], HOOKS_UNKNOWN_UNREADABLE_RECORD)
+        self.assertIsNone(block["last_success_at"])
+
+    def test_a_record_holding_no_timestamp_is_unreadable_rather_than_absent(self):
+        self.write_corpus(1, start=self.BASE + 10)
+        self.write_registry(last_updated=self.BASE)
+        for payload in ('{"interpreter": "/usr/bin/python3"}', '[]', '{"last_success_at": true}'):
+            with self.subTest(payload=payload):
+                (self.db_path.parent / HOOK_STATE_FILENAME).write_text(
+                    payload, encoding="utf-8"
+                )
+                block = self.block()
+                self.assertIsNone(block["state"])
+                self.assertEqual(
+                    block["unknown_reason"], HOOKS_UNKNOWN_UNREADABLE_RECORD
+                )
+
+    def test_no_install_date_refuses_the_verdict_rather_than_guessing_it(self):
+        # The loud state is the only one this date can unlock, so a registry
+        # that cannot be read costs the diagnosis and can never manufacture
+        # one. Asserted with a corpus that would otherwise trip it.
+        self.write_corpus(HOOK_SILENCE_EXCHANGES + 5, start=self.BASE + 10)
+
+        block = self.block()
+
+        self.assertIsNone(block["state"])
+        self.assertEqual(block["unknown_reason"], HOOKS_UNKNOWN_NO_INSTALL_RECORD)
+        self.assertIsNone(block["exchanges_since_install"])
+
+    def test_another_plugins_entry_is_not_this_installs_date(self):
+        # Matching is by containment of THIS script in an entry's installPath.
+        # A registry naming somebody else's plugin says nothing about ours, and
+        # reading its date would anchor our silence to their install.
+        self.write_corpus(HOOK_SILENCE_EXCHANGES + 5, start=self.BASE + 10)
+        self.write_registry(last_updated=self.BASE, path=self.tmp / "someone-else")
+
+        block = self.block()
+
+        self.assertIsNone(block["state"])
+        self.assertEqual(block["unknown_reason"], HOOKS_UNKNOWN_NO_INSTALL_RECORD)
+
+    def test_a_registry_that_will_not_parse_is_no_registry(self):
+        self.write_corpus(HOOK_SILENCE_EXCHANGES + 5, start=self.BASE + 10)
+        for text in ("{not json", "[]", '{"plugins": "nope"}', '{"plugins": {"x": [7]}}'):
+            with self.subTest(text=text):
+                self.registry.write_text(text, encoding="utf-8")
+                self.assertEqual(
+                    self.block()["unknown_reason"], HOOKS_UNKNOWN_NO_INSTALL_RECORD
+                )
+
+    def test_an_undated_or_unzoned_stamp_is_not_a_date(self):
+        # A stamp with no zone is a time in an unknown place, and reading it as
+        # local would shift the anchor by hours -- the scale this comparison
+        # works at.
+        self.assertIsNone(serve._parse_registry_time("2026-08-07T23:50:21.570"))
+        self.assertIsNone(serve._parse_registry_time("not a time"))
+        self.assertIsNone(serve._parse_registry_time(None))
+        self.assertEqual(
+            serve._parse_registry_time("2026-08-07T23:50:21.570Z"),
+            serve._parse_registry_time("2026-08-07T23:50:21.570+00:00"),
+            "the Z suffix must parse on 3.10, whose fromisoformat rejects it",
+        )
+
+    # -- the payload's own contract ---------------------------------------
+
+    def test_the_reason_is_non_null_exactly_when_the_state_is_null(self):
+        # The same contract `stale_unknown_reason` has, asserted over every
+        # state this block can produce rather than over the one in hand.
+        self.write_corpus(HOOK_SILENCE_EXCHANGES + 5, start=self.BASE + 10)
+        seen = set()
+        cases = [
+            (lambda: None, None),
+            (lambda: self.write_registry(last_updated=self.BASE), None),
+            (lambda: self.write_success(self.BASE + 900), None),
+            (
+                lambda: (self.db_path.parent / HOOK_STATE_FILENAME).write_text("x"),
+                None,
+            ),
+        ]
+        for prepare, _ in cases:
+            prepare()
+            block = self.block()
+            seen.add(block["state"])
+            self.assertEqual(
+                block["state"] is None,
+                block["unknown_reason"] is not None,
+                block,
+            )
+        checkout = self.block(
+            script=Path(__file__).resolve().parent.parent / "serve.py"
+        )
+        seen.add(checkout["state"])
+        self.assertIsNone(checkout["unknown_reason"])
+        self.assertEqual(
+            seen,
+            {None, HOOKS_NEVER_SUCCEEDED, HOOKS_RECORDED, HOOKS_NOT_A_PLUGIN},
+            "the contract was asserted over fewer states than this block has",
+        )
+
+
+class AutomaticIngestRenderTest(unittest.TestCase):
+    """Five states, five renderings, and only one of them shouts (#116).
+
+    The API can distinguish "never ran" from "nothing has happened yet" and the
+    page can still collapse them, which would put the whole design back where
+    it started. What is pinned here is the split: every state the payload can
+    carry is named in the page, the loud one reaches the BANNER, and the quiet
+    ones do not -- a "your hooks are broken" banner on a two-minute-old install
+    is the failure this feature is built around, and it would be one edit away.
+    """
+
+    def setUp(self) -> None:
+        self.html = (Path(__file__).resolve().parent.parent / "index.html").read_text()
+        self.page = strip_comments(self.html)
+        self.banner = js_function_body(self.page, "applySummary(payload)")
+
+    def test_every_state_the_payload_can_carry_is_rendered(self):
+        # Read off `serve` rather than listed here: a sixth state added to the
+        # block with no branch on the page would render as nothing at all,
+        # which is the absence-shaped failure this project keeps finding.
+        for state in (
+            HOOKS_RECORDED,
+            HOOKS_NEVER_SUCCEEDED,
+            HOOKS_TOO_SOON,
+            HOOKS_NOT_A_PLUGIN,
+        ):
+            with self.subTest(state=state):
+                self.assertIn(f"'{state}'", self.page)
+        for reason in (
+            HOOKS_UNKNOWN_UNREADABLE_RECORD,
+            HOOKS_UNKNOWN_NO_INSTALL_RECORD,
+        ):
+            with self.subTest(reason=reason):
+                self.assertIn(f"'{reason}'", self.page)
+
+    def test_only_the_never_ran_state_reaches_the_banner(self):
+        # The precedence rule of this feature. The banner is for something
+        # being WRONG; four of the five states are readings, and the fifth is
+        # a fault. A quiet state in this function is a false alarm shipped.
+        self.assertIn(f'"{HOOKS_NEVER_SUCCEEDED}"', self.banner)
+        # Compared QUOTED, both ways a state can be spelled in this file: the
+        # loud message's own prose contains the word "recorded", and a bare
+        # substring test would report the quiet state as banner-bound because
+        # the loud one describes it.
+        for quiet in (HOOKS_TOO_SOON, HOOKS_NOT_A_PLUGIN, HOOKS_RECORDED):
+            for spelling in (f'"{quiet}"', f"'{quiet}'"):
+                with self.subTest(state=spelling):
+                    self.assertNotIn(spelling, self.banner)
+
+    def test_the_loud_message_names_a_next_action(self):
+        # "Your hooks have not run" with no remedy is the same dead end as an
+        # unknown age with no cause -- the criterion #116 opens with. The
+        # interpreter is the first thing to check, because the documented
+        # launch is a bare PATH lookup for a name Windows does not have.
+        message = self.banner[self.banner.index(f'"{HOOKS_NEVER_SUCCEEDED}"'):]
+        message = message[: message.index(");")]
+        for expected in ("/hooks", "python3", "--debug"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, message)
+
+    def test_the_page_names_the_record_by_the_name_that_is_written(self):
+        # The page tells a reader which file to look at when it will not parse.
+        # A third copy of that literal, tied to the one `serve.py` reads.
+        self.assertIn(HOOK_STATE_FILENAME, self.page)
+
+    def test_the_quiet_states_say_they_are_not_faults(self):
+        # A new install is told, in words, that nothing is wrong. Getting this
+        # wrong turns a correct first run into a false alarm -- which is the
+        # defect #105 fixed, and the one this feature could most easily
+        # reintroduce.
+        line = html_element(self.html, 'class="data-age"')
+        too_soon = line[line.index(HOOKS_TOO_SOON):]
+        self.assertIn("This is not a fault", too_soon[: too_soon.index("</template>")])
 
 
 class StalenessThresholdTest(unittest.TestCase):
