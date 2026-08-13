@@ -52,7 +52,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path, PurePath
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -79,6 +79,8 @@ from ingest import (
     TASKS_DIR,
     announced_default_database,
     census_coverage,
+    plugin_root_naming,
+    plugin_store_ancestor,
 )
 from recommendations import (
     METRIC_CACHE_READS_PER_WRITE,
@@ -1045,6 +1047,121 @@ FULL_SCAN_UNKNOWN_NO_SCOPE_COLUMN = "no-scope-column"
 # the sessions its hooks were handed and has never been swept for anything else.
 FULL_SCAN_UNKNOWN_NONE_RECORDED = "no-full-scan-recorded"
 
+# IS THE AUTOMATIC INGEST RUNNING? (#116)
+#
+# The plugin's three hooks are the whole of "CPB measures without being asked".
+# They are launched by `hooks.json` as a bare `python3` on `PATH` -- the form
+# the hooks reference documents (see `docs/plugin.md`) -- and on a machine
+# where that name does not resolve they fail on every trigger, permanently and
+# silently. Nothing about that state was visible: #93 and #105 made the report
+# honest about an empty or hook-maintained database, so it said "unknown age"
+# and declined to assert freshness, which is the rule working and is NOT a
+# diagnosis. "I do not know how old this is" and "your hooks have never run"
+# are different sentences with different remedies, and only the second is
+# actionable.
+#
+# Made distinguishable by a POSITIVE record: a successful hook run overwrites
+# `cpb-hook-state.json` beside the database (see `hooks/cpb_ingest_hook.py`).
+# Present, it is evidence. Absent, it is an absence -- and which of the two
+# absences it is gets decided below, from the date Claude Code recorded this
+# build as installed and from what the corpus shows happened since.
+#
+# A hook success is on record, with the time it happened and the interpreter it
+# ran under. The only state that asserts the hooks work.
+HOOKS_RECORDED = "recorded"
+# No success on record, and the corpus shows enough completed exchanges since
+# this build arrived that a working hook would have written one. Loud, and the
+# one state that names a next action.
+HOOKS_NEVER_SUCCEEDED = "never-succeeded"
+# No success on record, and nothing has finished since this build arrived that
+# a hook could have recorded. THE NORMAL STATE OF A NEW INSTALL, and of the
+# first minutes after an update -- `Stop` has not fired yet, so a hook that
+# works perfectly has still written nothing. Telling that reader their hooks
+# are broken is the false alarm #105 exists to have removed, so it is a state
+# of its own rather than the loud one with a softer sentence.
+HOOKS_TOO_SOON = "too-soon-to-tell"
+# This copy of CPB is a checkout, not an installed plugin. A checkout ships no
+# hooks, so "have the hooks run" is not a question about it -- distinct from
+# both "no" and "cannot tell", and the state every test fixture is in.
+HOOKS_NOT_A_PLUGIN = "not-a-plugin-install"
+
+# Why the hook state is null, when it is -- the same shape as
+# `stale_unknown_reason` and for the same reason: the page may state which
+# absence it has, never guess one.
+#
+# The success record is there and unreadable -- truncated, or holding no usable
+# timestamp. It cannot be read as "no success" (the record exists) or as a
+# success (nothing dates it), so it is neither.
+HOOKS_UNKNOWN_UNREADABLE_RECORD = "unreadable-record"
+# This copy sits in a plugin install and Claude Code's plugin registry does not
+# say when this build arrived -- no registry file, an unreadable one, or no
+# entry naming this directory. Without that date the absence of a success
+# record cannot be weighed against anything, so the verdict is refused rather
+# than guessed in either direction.
+HOOKS_UNKNOWN_NO_INSTALL_RECORD = "no-install-record"
+
+# The success record's filename. `hooks/cpb_ingest_hook.HOOK_STATE_FILENAME`
+# repeats this literal and `tests/test_plugin_manifest.py` pins them equal --
+# see the comment there for why the hook cannot import it from here.
+HOOK_STATE_FILENAME = "cpb-hook-state.json"
+
+# Claude Code's own record of which plugins are installed, where, and when it
+# put them there. Read for ONE field: when the currently-installed build
+# arrived, which is what makes "no hook has ever succeeded" different from
+# "this was installed a minute ago".
+#
+# MEASURED 2026-08-11 on macOS 15 against Claude Code 2.1.222, on this
+# machine's real install:
+#
+#     ~/.claude/plugins/installed_plugins.json
+#     {"version": 2, "plugins": {"claude-piggy-bank@claude-piggy-bank": [
+#       {"scope": "user",
+#        "installPath": ".../plugins/cache/<marketplace>/<plugin>/<version>",
+#        "version": <the installed build, elided: a version literal in this
+#                    file would defeat ReportNamesTheBuildTest>,
+#        "installedAt":  "2026-08-07T23:50:21.570Z",
+#        "lastUpdated":  "2026-08-08T03:33:23.470Z"}]}}
+#
+# `lastUpdated` is the field this reads and `installedAt` is only its fallback,
+# because the two differ exactly when it matters: an update moves the first and
+# not the second, and an install that has been working for weeks acquires its
+# FIRST success record only after the update that started writing them. Dating
+# the wait from `installedAt` would tell that reader, once, that hooks which
+# have worked for weeks have never run. Dating it from `lastUpdated` starts the
+# clock where the evidence starts.
+#
+# It is undocumented internal state, so every way of failing to read it ends at
+# `HOOKS_UNKNOWN_NO_INSTALL_RECORD` rather than at a default. That is the safe
+# direction by construction: the loud verdict is the only one this date can
+# unlock, so a format change costs the diagnosis and can never manufacture one.
+# The location is derived from this script's own path rather than from `~`,
+# through the same `plugin_store_ancestor()` that `ingest.default_database()`
+# uses, so `CLAUDE_CONFIG_DIR` moving the whole tree moves this with it.
+PLUGIN_REGISTRY_FILENAME = "installed_plugins.json"
+
+# How many completed exchanges must pass with no hook success recorded before
+# the report says the hooks have never run.
+#
+# An exchange here is MEASURED, not assumed: an API call after this build
+# arrived, followed by a user turn later than that call. The user prompting
+# again after Claude replied is the ordinary shape of a turn that ended, and a
+# turn that ends is what `Stop` fires on.
+#
+# It is evidence and not proof, which is what the threshold is for. The hooks
+# reference (checked 2026-08-11) says `Stop` "does not run if the stoppage
+# occurred due to a user interrupt", and that an API error fires `StopFailure`
+# instead -- so ONE exchange can complete with no `Stop` at all, and a reader
+# who pressed escape once would be told their hooks are broken. Three
+# consecutive exchanges every one of which was interrupted or failed is not a
+# session anybody is reading a spend report about. The cost of the wait is that
+# a genuinely dead hook is named three exchanges later; the cost of not waiting
+# is a false alarm on a working install, and those are not the same price.
+#
+# `SubagentStop` and `SessionEnd` fire on the same install and would each have
+# written the record too, so three exchanges is three chances at the LOWEST
+# count, not at the only one.
+HOOK_SILENCE_EXCHANGES = 3
+
 MIN_LIMIT = 1
 MAX_LIMIT = 500
 DEFAULT_LIMIT = 20
@@ -1085,6 +1202,137 @@ def clamp_limit(raw: Optional[str]) -> int:
     """
     value = int(raw) if raw is not None else DEFAULT_LIMIT
     return max(MIN_LIMIT, min(value, MAX_LIMIT))
+
+
+def is_plugin_install(script: Path, env: Mapping[str, str]) -> bool:
+    """Is this copy of CPB an installed plugin rather than a checkout?
+
+    ONE rule, shared with `ingest.default_database()` rather than restated:
+    either `${CLAUDE_PLUGIN_ROOT}` names the directory this script is in, or
+    this script sits under Claude Code's plugin store. Each covers the other's
+    blind spot and both are dated in `docs/plugin.md`. A second spelling of
+    "is this an install" would be free to disagree with the one that decides
+    where the database goes, and then the report would diagnose the hooks of
+    an install whose database it does not believe in.
+    """
+    script_dir = script.resolve().parent
+    return (
+        plugin_root_naming(script_dir, env) is not None
+        or plugin_store_ancestor(script_dir) is not None
+    )
+
+
+def _parse_registry_time(raw: Any) -> Optional[float]:
+    """An ISO-8601 stamp from Claude Code's plugin registry, as epoch seconds.
+
+    `Z` is spelled out as `+00:00` because `datetime.fromisoformat` did not
+    accept the military suffix until 3.11 and CPB's floor is 3.10 -- a version
+    difference that would otherwise make this field readable on CI's newer legs
+    and unreadable on its oldest, i.e. a diagnosis that appears and disappears
+    with the interpreter.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # A stamp with no zone is a time in an unknown place. Reading it as
+        # local would silently shift the anchor by hours, and hours is the
+        # scale this whole comparison works at.
+        return None
+    return parsed.timestamp()
+
+
+def build_installed_at(script: Path) -> Optional[float]:
+    """When Claude Code put THIS build here, or `None` if it does not say.
+
+    See `PLUGIN_REGISTRY_FILENAME` for the measured shape of the file and for
+    why `lastUpdated` is the field rather than `installedAt`.
+
+    Matching is by CONTAINMENT of this script in an entry's `installPath`, not
+    by plugin name: the name in the registry is `<plugin>@<marketplace>` on the
+    reader's machine and a copy installed from a fork would carry a different
+    one, while "the directory this file is running from" is a fact about this
+    process. A registry with no entry naming us is not our registry, and that
+    is `None` -- the same answer as no registry at all, because both leave the
+    date unknown and the date is the only thing being asked for.
+    """
+    script_dir = script.resolve().parent
+    store = plugin_store_ancestor(script_dir)
+    if store is None:
+        return None
+    try:
+        raw = (store.parent / PLUGIN_REGISTRY_FILENAME).read_text(encoding="utf-8")
+        registry = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(registry, dict):
+        return None
+    plugins = registry.get("plugins")
+    if not isinstance(plugins, dict):
+        return None
+    for entries in plugins.values():
+        for entry in entries if isinstance(entries, list) else ():
+            if not isinstance(entry, dict):
+                continue
+            declared = entry.get("installPath")
+            if not isinstance(declared, str) or not declared.strip():
+                continue
+            try:
+                root = Path(os.path.expanduser(declared.strip())).resolve()
+            except (OSError, ValueError):
+                continue
+            if script_dir != root and root not in script_dir.parents:
+                continue
+            return _parse_registry_time(
+                entry.get("lastUpdated")
+            ) or _parse_registry_time(entry.get("installedAt"))
+    return None
+
+
+def hook_success_record(path: Path) -> tuple[Optional[float], Optional[str], Optional[str]]:
+    """`(when a hook last succeeded, under which interpreter, why unreadable)`.
+
+    Three outcomes, and the middle one is the reason this returns a reason at
+    all:
+
+    * the file is absent -- `(None, None, None)`. Nothing has recorded a
+      success here, which is an absence and not yet a verdict; what it means
+      is decided by the caller against the install date.
+    * the file is present and cannot be read as a success -- `(None, None,
+      reason)`. It is not "no success": something wrote this. Reporting it as
+      an absence would let a truncated file read as a diagnosis.
+    * a usable record -- `(timestamp, interpreter or None, None)`.
+
+    `interpreter` is null-tolerant on purpose. `sys.executable` can be empty in
+    an embedded interpreter, and the hook records `None` there rather than an
+    empty string that would render as an interpreter called nothing.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, None, None
+    except OSError:
+        return None, None, HOOKS_UNKNOWN_UNREADABLE_RECORD
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return None, None, HOOKS_UNKNOWN_UNREADABLE_RECORD
+    if not isinstance(record, dict):
+        return None, None, HOOKS_UNKNOWN_UNREADABLE_RECORD
+    when = record.get("last_success_at")
+    # `bool` is an `int` in Python and `True` is not a timestamp.
+    if isinstance(when, bool) or not isinstance(when, (int, float)):
+        return None, None, HOOKS_UNKNOWN_UNREADABLE_RECORD
+    interpreter = record.get("interpreter")
+    if not isinstance(interpreter, str) or not interpreter.strip():
+        interpreter = None
+    return float(when), interpreter, None
 
 
 def staleness_verdict(
@@ -1202,9 +1450,22 @@ def project_of(source_path: str, source_kind: str) -> Optional[str]:
 class Api:
     """Query layer over the ingested DB. One connection per server (serialized)."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        script: Optional[Path] = None,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> None:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # Kept for #116, which asks two questions this class could not answer:
+        # WHERE the database sits (the hook's success record is beside it) and
+        # WHAT this copy of CPB is (a checkout has no hooks to diagnose).
+        # Injectable so a test can stand a fake install up in a temp directory
+        # rather than depending on where the suite happens to be checked out.
+        self.db_path = Path(db_path)
+        self.script = Path(__file__) if script is None else Path(script)
+        self.env: Mapping[str, str] = os.environ if env is None else env
 
     def _has_ingest_runs_table(self) -> bool:
         """Can this database record an ingest run AT ALL?
@@ -1389,6 +1650,113 @@ class Api:
             "stale_after_seconds": STALE_AFTER_SECONDS,
             "stale": stale,
             "stale_unknown_reason": stale_unknown_reason,
+        }
+
+    def _exchanges_since(self, anchor: float) -> int:
+        """Completed exchanges the corpus records after `anchor` (#116).
+
+        An exchange counted here is an API call later than `anchor` followed by
+        a USER TURN later than that call. Both halves are needed and neither
+        substitutes:
+
+        * calls alone would count the report's own invocation. The skill
+          refreshes before it serves, so opening the report ingests the turn it
+          is being opened from -- every render would find calls newer than any
+          anchor, and a fresh install would count its own first use as evidence
+          against itself.
+        * turns alone would count the prompt that asked for the report, for the
+          same reason.
+
+        A user prompt LATER than a reply is the ordinary shape of a turn that
+        ended, and it is the one thing the pair rules in that neither half
+        does. `turns` holds user-side turns only (`ingest.classify_turn`), so
+        the reply side is read from `api_calls`; a null `ts` fails the
+        comparison and is excluded, which is right -- an undated turn cannot be
+        placed either side of anything.
+
+        Zero is a real count and stays one: it says this build arrived and
+        nothing has finished since, which is exactly the state that must not be
+        rendered as a fault.
+
+        Both queries ride existing indexes (`idx_api_calls_ts`,
+        `idx_turns_ts`), so this is a seek and a range count rather than two
+        table scans -- worth checking before adding anything to a path that
+        runs on every summary request.
+        """
+        first_reply = self.conn.execute(
+            "SELECT MIN(ts) first FROM api_calls WHERE ts > ?", (anchor,)
+        ).fetchone()["first"]
+        if first_reply is None:
+            return 0
+        return self.conn.execute(
+            "SELECT COUNT(*) n FROM turns WHERE ts > ?", (first_reply,)
+        ).fetchone()["n"]
+
+    def _hook_health(self) -> dict[str, Any]:
+        """Is the AUTOMATIC ingest running? -- the state #116 could not name.
+
+        Beside `ingest` rather than inside it, deliberately. That block
+        describes the database: how old its reading of the transcripts is and
+        how much of it parsed. This one describes the INSTALL: whether the
+        thing that is supposed to keep that database current has ever run. They
+        answer different questions and a hook-maintained database can be
+        perfectly fresh while the hooks are dead -- somebody has been running
+        ingest by hand -- so folding one into the other would let either fact
+        hide the other.
+
+        The verdict, in the order the evidence is weighed:
+
+        * not an installed plugin -- there are no hooks here to have run. Not
+          "no" and not "cannot tell".
+        * a success record that will not parse -- refuse. Something wrote it.
+        * a success record -- the hooks work, and it says when and under which
+          interpreter.
+        * no record, and no date for when this build arrived -- refuse. The
+          absence cannot be weighed against anything.
+        * no record, and fewer than `HOOK_SILENCE_EXCHANGES` completed
+          exchanges since it arrived -- too soon to tell, and SAID that way.
+        * no record, with the exchanges to have expected one -- the loud state.
+
+        The two absences that reach a null verdict name themselves in
+        `unknown_reason`, which is non-null exactly when `state` is null.
+
+        `build_installed_at` and `exchanges_since_install` are reported
+        whenever they are known, including alongside a success -- the age of a
+        record is only readable next to the period it ranges over.
+        """
+        if not is_plugin_install(self.script, self.env):
+            return {
+                "state": HOOKS_NOT_A_PLUGIN,
+                "unknown_reason": None,
+                "last_success_at": None,
+                "interpreter": None,
+                "build_installed_at": None,
+                "exchanges_since_install": None,
+                "exchanges_before_silence": HOOK_SILENCE_EXCHANGES,
+            }
+        last_success_at, interpreter, unreadable = hook_success_record(
+            self.db_path.parent / HOOK_STATE_FILENAME
+        )
+        installed_at = build_installed_at(self.script)
+        exchanges = None if installed_at is None else self._exchanges_since(installed_at)
+        if unreadable is not None:
+            state, reason = None, unreadable
+        elif last_success_at is not None:
+            state, reason = HOOKS_RECORDED, None
+        elif installed_at is None:
+            state, reason = None, HOOKS_UNKNOWN_NO_INSTALL_RECORD
+        elif exchanges >= HOOK_SILENCE_EXCHANGES:
+            state, reason = HOOKS_NEVER_SUCCEEDED, None
+        else:
+            state, reason = HOOKS_TOO_SOON, None
+        return {
+            "state": state,
+            "unknown_reason": reason,
+            "last_success_at": last_success_at,
+            "interpreter": interpreter,
+            "build_installed_at": installed_at,
+            "exchanges_since_install": exchanges,
+            "exchanges_before_silence": HOOK_SILENCE_EXCHANGES,
         }
 
     def _has_source_shape_table(self) -> bool:
@@ -3733,6 +4101,11 @@ class Api:
             # where it cannot be read, which the page states as UNKNOWN.
             "build": {"version": cpb_version()},
             "ingest": ingest,
+            # #116: whether the ingest above is happening BY ITSELF. `ingest`
+            # is the database's age; this is the health of the thing that is
+            # supposed to keep it young. Two facts, two blocks -- see
+            # `_hook_health`.
+            "hooks": self._hook_health(),
             # #64: the VERDICT over the figures below, derived from the two
             # blocks either side of it and from the census -- never computed a
             # second time. It is built from `ingest` and `context` as ARGUMENTS

@@ -42,6 +42,42 @@ require entries for historical
 versions: pinning history would force a rewrite at every release, which is how
 a check becomes something people route around.
 
+## 4.1.0 — 2026-08-11
+
+**No migration.** The database is unchanged; nothing you have measured moves.
+
+**What changed for a user:** two things, both about ingest happening without
+being asked for.
+
+`/claude-piggy-bank:cpb` now **refreshes before it opens the report**. The
+hooks fire when a turn or a session *ends*, so the turn you are in when you ask
+for the report was never in it; now it is. The refresh is incremental — 0.22 s
+over this project's own 75 transcripts, measured 2026-08-11 on macOS, against
+8.5 s for the first cold run — and **a refresh that fails does not withhold the
+report**: it opens over the data already there, saying how old that data is.
+
+The report can now say **"AUTOMATIC INGEST IS NOT RUNNING"**. A plugin whose
+hooks never fire held a database nothing updated, and the page said its age was
+unknown — honest, and no help at all, because a plugin installed a minute ago
+says exactly the same thing. A successful hook run now leaves a record beside
+the database, and `/api/summary` gained a `hooks` block distinguishing *the
+hooks have run* from *nothing has ended yet* from *this is a checkout* from
+*cannot tell*, with the interpreter each run used. The loud state names what to
+check.
+
+**Why you might see it.** Claude Code launches the hooks by resolving `python3`
+on your `PATH`, with no shell. On Windows the interpreter is `python.exe`, the
+launcher `py.exe`, and the Store's `python3.exe` opens the Store — so on such a
+machine all three triggers fail on every turn and always have. **This release
+does not fix that**, because no portable launcher exists to fix it with: the
+alternatives, and what taking one would need, are in
+[`plugin.md`](plugin.md#which-interpreter-launches-the-hooks--and-why-it-is-not-portable).
+What it does is stop the failure from being silent — and the refresh above
+means the report is current whenever you open it either way.
+
+**Nothing was removed and no figure changed definition.** The `hooks` block is
+a new field; every existing one measures what it measured yesterday.
+
 ## 4.0.1 — 2026-08-07
 
 **No migration.** A correction to three strings that ship with the plugin.

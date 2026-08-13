@@ -41,9 +41,39 @@ Claude Code's exit-code contract is what makes both achievable at once
 The transcript notice is loud but ephemeral, so every failure is also appended
 to `cpb-hook.log` in the plugin's persistent data directory, beside the
 database. A failure that scrolled past is still on disk, and the report can
-surface it later from a fixed, known location. Successes write nothing: `Stop`
-fires every turn, and a success line per turn would grow without bound in a
-directory that deliberately survives plugin updates.
+surface it later from a fixed, known location. Successes are not APPENDED
+anywhere: `Stop` fires every turn, and a success line per turn would grow
+without bound in a directory that deliberately survives plugin updates.
+
+
+Why a success writes a fixed-size file anyway (#116)
+----------------------------------------------------
+
+A hook that never launches leaves nothing behind at all, and that state -- the
+one a machine without `python3` on `PATH` is permanently in -- is
+indistinguishable from a plugin installed thirty seconds ago. The report was
+honest about it and mute about the cause: "unknown age", forever, with advice
+that could never clear it.
+
+So a SUCCESS overwrites `cpb-hook-state.json` beside the database with the one
+fact only this process can attest to: that a hook ran here, when, and under
+which interpreter. Overwritten rather than appended, so it is bounded at one
+small record however many turns run -- which is the objection to logging
+successes, answered rather than ignored. `serve.py` reads it and the report
+says "automatic ingest: last succeeded <age>" instead of inferring it.
+
+The file is a POSITIVE observation and nothing else. Its absence is not a
+verdict: `serve.py` weighs it against when Claude Code recorded this build as
+installed, so a fresh install reads as "nothing has ended yet" and never as a
+fault. That judgment lives entirely in the report, because this process cannot
+run to make it.
+
+`interpreter` is `sys.executable`, and it is the point of recording anything
+beyond a timestamp. `hooks.json` launches this file by the bare name `python3`
+and this file resolves its own child with `sys.executable`; those two can
+disagree and nothing here could ever have said so. Recording the second lets
+the report state which interpreter the first actually resolved, on the reader's
+machine, rather than leaving the asymmetry undeclared.
 
 Everything this module refuses to do is a case where it would otherwise have to
 guess: a missing `agent_transcript_path`, a relative path, a database location
@@ -131,6 +161,16 @@ CONTENTION_MARKERS = ("database is locked", "database table is locked")
 DB_FILENAME = "usage.db"
 LOG_FILENAME = "cpb-hook.log"
 LOG_MAX_BYTES = 256 * 1024
+#: Where a SUCCESSFUL run records that it happened (#116). Beside the database
+#: rather than beside the log, because `serve.py` is handed a database and not
+#: a data directory -- `--db "${CLAUDE_PLUGIN_DATA}/usage.db"` is the only
+#: thing the skill tells it, and a file it cannot find is a fact it cannot
+#: read. `serve.HOOK_STATE_FILENAME` repeats this literal and
+#: `tests/test_plugin_manifest.py` pins the two equal: the hook must not import
+#: `serve.py` (it spawns one bounded child and opens nothing), so the tie is a
+#: test rather than a shared constant -- the same arrangement `VERSION` has
+#: with `.claude-plugin/plugin.json`.
+HOOK_STATE_FILENAME = "cpb-hook-state.json"
 
 #: The plugin root is this file's parent's parent: the repository is the
 #: plugin. Derived from `__file__` rather than `${CLAUDE_PLUGIN_ROOT}` because
@@ -283,6 +323,65 @@ def resolve_db_override(env: Mapping[str, str]) -> Optional[Path]:
     return None
 
 
+def hook_state_path(env: Mapping[str, str], db: Optional[Path]) -> Optional[Path]:
+    """Where to record a successful run, or `None` when nothing could read it.
+
+    Beside the database this run ingests into, in all three cases:
+
+    * `db` is set -- an install with a persistent data directory, and the file
+      lands next to `${CLAUDE_PLUGIN_DATA}/usage.db`, which is exactly the path
+      the skill hands `serve.py`;
+    * `db` is `None` because the user exported `CPB_DB` -- then that is the
+      database, the skill is told to serve `--db "$CPB_DB"`, and beside it is
+      still where the report will look;
+    * `db` is `None` because this is a plain checkout -- then there is no
+      install to diagnose. The report says "not a plugin install" from its own
+      location and never consults this file, so writing one would be a record
+      with no reader.
+
+    `None` is that third case. It is not a failure and is not reported: nothing
+    was lost, because nothing asks.
+    """
+    if db is not None:
+        return db.parent / HOOK_STATE_FILENAME
+    raw = (env.get("CPB_DB") or "").strip()
+    if raw:
+        return Path(os.path.expanduser(raw)).parent / HOOK_STATE_FILENAME
+    return None
+
+
+def record_success(path: Optional[Path], *, now: float, interpreter: str) -> None:
+    """Overwrite the success record. Never raises, never blocks the turn.
+
+    Written to a per-process temporary name and moved into place with
+    `os.replace`, which is atomic on POSIX and on Windows. `Stop` and
+    `SubagentStop` fire together often enough that two of these overlap
+    routinely, and a torn file would be read by the report as UNREADABLE --
+    a loud state, raised over a condition that resolved itself. The rename
+    makes a reader see one whole record or the previous one.
+
+    An `OSError` is swallowed for the same reason the log's is: this record is
+    a courtesy to a later reader, and turning a full disk or a read-only data
+    directory into a `hook error` notice on every turn would report a failure
+    against the one thing that did NOT fail -- the ingest already succeeded.
+    The cost of losing it is that the report says a success is not recorded,
+    which is true of the record and is the safe direction.
+    """
+    if path is None:
+        return
+    payload = {"last_success_at": now, "interpreter": interpreter or None}
+    scratch = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        scratch.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(scratch, path)
+    except OSError:
+        try:
+            scratch.unlink()
+        except OSError:
+            pass
+
+
 def build_argv(transcript: Path) -> list[str]:
     """The single documented invocation: one file, ingested incrementally.
 
@@ -387,6 +486,16 @@ def main(
             return EXIT_NONBLOCKING_ERROR
 
         if completed.returncode == 0:
+            # AFTER the child exited 0, never before it (#116). This record is
+            # read as "a hook run ingested successfully here"; writing it on
+            # the way in would say that about a run that then failed, which is
+            # the same defect as an ingest that stamps `ingest_runs` before it
+            # finishes.
+            record_success(
+                hook_state_path(env, db),
+                now=time.time(),
+                interpreter=sys.executable,
+            )
             return EXIT_OK
 
         # Contention is the only retryable failure. Everything else -- an
