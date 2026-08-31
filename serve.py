@@ -535,20 +535,16 @@ HEALTH_ORDER = (HEALTH_FAILED, HEALTH_UNCHECKED, HEALTH_OK)
 # `failed` is the ONE verdict that expands its own detail.
 HEALTH_STATEMENTS = {
     HEALTH_FAILED: (
-        "Yes. At least one check FAILED, and that is not softened by the "
-        "checks that passed -- read the failing line first, and treat every "
-        "figure it qualifies as suspect until it is fixed."
+        "Yes. Something failed a check below -- read that one first, and "
+        "treat any related numbers as unreliable until it's fixed."
     ),
     HEALTH_UNCHECKED: (
-        "Nothing is proven broken, and at least one check COULD NOT BE MADE. "
-        "This is not a clean bill of health, it is an incomplete one: the "
-        "unchecked lines below name what was not established, and each of them "
-        "is unknown rather than fine."
+        "Not fully checked. Nothing here is proven broken, but at least one "
+        "check couldn't be completed -- see below for what's unverified."
     ),
     HEALTH_OK: (
-        "No. Every check this build can make passed: nothing unreadable, "
-        "nothing skipped, nothing guessed at, and nothing measured against a "
-        "limit this build does not know."
+        "No. Every check passed -- nothing unreadable, nothing skipped, "
+        "nothing guessed at."
     ),
 }
 
@@ -643,31 +639,29 @@ CONTEXT_ANSWER_STATES = (
 # a first line that opens with a caveat has not answered it.
 CONTEXT_ANSWER_STATEMENTS = {
     CONTEXT_ANSWER_YES: (
-        "Yes. Calls are running at or above half the context window their "
-        "model documents -- the judged boundary dated below -- and the scope "
-        "doing most of it is named beside this line."
+        "Yes. Your chats are often more than half full before you even hit "
+        "send -- that's why replies feel slow and cost more. See below for "
+        "exactly where it's happening."
     ),
     CONTEXT_ANSWER_NO: (
-        "No. Every scope's banded calls sat below half the context window "
-        "their models document, and every call in this period was measured, "
-        "banded and inside its window. That is a measured no over a complete "
-        "sample, not an absence of evidence."
+        "No. Every conversation stayed comfortably under half full, and "
+        "every single one was actually checked -- not a guess, a real "
+        "measurement."
     ),
     CONTEXT_ANSWER_INCONCLUSIVE: (
-        "Not established. No scope reached half its models' documented "
-        "window, but part of this period could not be read against one, so "
-        "this is not a clean no. The counts beside this line say how much, "
-        "and each of them is UNKNOWN rather than low."
+        "Not established. Nothing crossed the halfway mark, but part of "
+        "this period couldn't be measured -- so this is a clean-ish result "
+        "with a gap in it, not a clean pass. The numbers below show how "
+        "much is missing."
     ),
     CONTEXT_ANSWER_UNKNOWN: (
-        "Unknown. Contexts were measured in this period and not one of them "
-        "could be compared with a documented window, so there is no "
-        "utilisation to answer with -- unknown, not none."
+        "Unknown. Some conversations were measured, but none of them could "
+        "be checked against a known limit -- so there's nothing to compare "
+        "them to. That's a data gap, not a clean bill of health."
     ),
     CONTEXT_ANSWER_NO_SAMPLE: (
-        "No sample. No call in this period carried a measured context size, "
-        "so there is no median and no utilisation to report. None of that is "
-        "a zero."
+        "No sample. Nothing in this period had its size recorded, so "
+        "there's no typical size to show. That's missing data, not a zero."
     ),
 }
 
@@ -855,14 +849,11 @@ GROWTH_SHAPES = (
 GROWTH_MATERIAL_CHANGE = 0.25
 GROWTH_SHAPE_AS_OF = "2026-08-05"
 GROWTH_SHAPE_PROVENANCE = (
-    "Product-owner judgment: a quarter counts as having moved only if the "
-    "typical reply changed by at least "
-    f"{GROWTH_MATERIAL_CHANGE:.0%} of the previous quarter's. Anthropic "
-    "publishes nothing about this and it is derived from no measurement -- it "
-    "is where this project judged a change worth a sentence. Set higher, every "
-    "period reads as flat; set lower, ordinary variation reads as a trend. It "
-    "is stated with its date so the verdict can be weighed against it rather "
-    "than taken on trust."
+    "This is our judgment call, not Anthropic's: we only count a quarter as "
+    f"'changed' if the typical reply moved by at least {GROWTH_MATERIAL_CHANGE:.0%} "
+    "from the quarter before. Set that higher and every period looks flat; "
+    "set it lower and normal ups and downs look like a trend. Dated so you "
+    "can weigh it yourself rather than take it on trust."
 )
 
 # One sentence per shape, spelled ONCE and carried in the payload -- so the
@@ -877,33 +868,29 @@ GROWTH_SHAPE_STATEMENTS = {
         "UNKNOWN -- not flat, and not none."
     ),
     GROWTH_SHAPE_FLAT: (
-        "The typical reply HELD STEADY across this period: no quarter differs "
-        "from the one before it by enough to count as a change. Nothing here "
-        "is accumulating, and nothing here needs acting on."
+        "Steady. Your typical reply size stayed about the same all period -- "
+        "nothing is piling up, nothing to fix here."
     ),
     GROWTH_SHAPE_RISING: (
-        "The typical reply GREW across this period: every change large enough "
-        "to count was upward. This is context accumulating -- the session is "
-        "re-reading more of its own history each time and never shedding it."
+        "Growing. Your typical reply kept getting bigger all period -- each "
+        "one is re-reading more history than the last, and none of it is "
+        "getting cleared out."
     ),
     GROWTH_SHAPE_FALLING: (
-        "The typical reply SHRANK across this period: every change large "
-        "enough to count was downward. There is nothing to act on here -- "
-        "whatever was keeping the context down was working."
+        "Shrinking. Your typical reply kept getting smaller all period -- "
+        "nothing to fix, whatever is keeping it down is working."
     ),
     GROWTH_SHAPE_ROSE_THEN_FELL: (
-        "The typical reply CLIMBED AND THEN DROPPED: it peaked in the quarter "
-        "named below, and the last measured quarter sits well under that peak. "
-        "A fall this size is what a context RESET looks like -- a compaction, "
-        "a new session, or a change of subject -- but this report measures the "
-        "drop and never its cause, so which of those it was is not something "
-        "these figures can say."
+        "Rose, then fell. Your typical reply climbed, peaked, then dropped "
+        "well below that peak. A drop this size usually means a context "
+        "reset -- a compaction, a new session, or a topic change -- but this "
+        "report measures the drop and never its cause, so it can't say which "
+        "one happened."
     ),
     GROWTH_SHAPE_MIXED: (
-        "NO TREND IS CLAIMED: the typical reply moved materially in BOTH "
-        "directions across this period and settles into none of the shapes "
-        "this build can name. Read the four quarters themselves rather than a "
-        "summary of them."
+        "No clear trend. Your typical reply size moved up and down enough "
+        "that it doesn't fit a simple pattern -- look at the four quarters "
+        "below instead of a one-line summary."
     ),
 }
 
@@ -1862,8 +1849,7 @@ class Api:
             return cls._health_check(
                 CHECK_RECORDS_PARSED,
                 HEALTH_UNCHECKED,
-                "No transcript has been ingested, so nothing has been read and "
-                "nothing can be said about it. Run ingest.py.",
+                "Nothing has been read yet -- run ingest.py first.",
                 count=0,
                 of=None,
             )
@@ -1874,8 +1860,8 @@ class Api:
             return cls._health_check(
                 CHECK_RECORDS_PARSED,
                 HEALTH_UNCHECKED,
-                "The ingest ledger holds files but reports no parse count for "
-                "them, so whether anything failed to parse is UNKNOWN, not no.",
+                "We have files but no parse count for them, so we can't tell if "
+                "anything failed to read. That's unknown, not a clean pass.",
                 count=None,
                 of=None,
             )
@@ -1883,17 +1869,15 @@ class Api:
             return cls._health_check(
                 CHECK_RECORDS_PARSED,
                 HEALTH_FAILED,
-                "Record(s) in the ingested transcripts could not be parsed, so "
-                "every total in this report undercounts by an unknown amount. "
-                "This is a real gap, not a rounding one.",
+                "Some records couldn't be read, so every total below is missing an "
+                "unknown amount. This is a real gap in the data.",
                 count=unparsed,
                 of=None,
             )
         return cls._health_check(
             CHECK_RECORDS_PARSED,
             HEALTH_OK,
-            "Every record in every ingested transcript parsed cleanly -- "
-            "nothing unreadable, nothing skipped, nothing guessed at.",
+            "Every record read cleanly -- nothing unreadable, nothing skipped.",
             count=0,
             of=None,
         )
@@ -1923,8 +1907,7 @@ class Api:
             return self._health_check(
                 CHECK_FORMAT_CENSUS,
                 HEALTH_UNCHECKED,
-                "No transcript is tracked, so there is no format to census. "
-                "Nothing here has been found clean; nothing has been looked at.",
+                "Nothing has been looked at yet, so there's nothing to report here.",
                 count=censused,
                 of=tracked,
             )
@@ -1932,19 +1915,17 @@ class Api:
             return self._health_check(
                 CHECK_FORMAT_CENSUS,
                 HEALTH_UNCHECKED,
-                "Some tracked transcripts carry no format census: they were "
-                "ingested before the census existed and are unchanged, so they "
-                "will be censused when they next change. They are UNCENSUSED, "
-                "not clean -- a format change in them would not have been seen.",
+                "Some older files haven't been checked for format changes yet -- "
+                "they'll be checked the next time they update. Not checked "
+                "yet, not confirmed clean.",
                 count=censused,
                 of=tracked,
             )
         return self._health_check(
             CHECK_FORMAT_CENSUS,
             HEALTH_OK,
-            "Every tracked transcript has been censused for its record shape, "
-            "so a Claude Code release that renamed a token key or emitted an "
-            "unknown record type would have been counted rather than absorbed.",
+            "Every file has been checked for format changes, so a Claude Code "
+            "update that changed the data shape would have been caught.",
             count=censused,
             of=tracked,
         )
@@ -1960,8 +1941,8 @@ class Api:
             return cls._health_check(
                 CHECK_MODEL_WINDOW_KNOWN,
                 HEALTH_UNCHECKED,
-                "No call in this period carried a context measurement, so "
-                "there is no call whose model window could be looked up.",
+                "No calls in this period had size data, so there's nothing to look "
+                "up yet.",
                 count=unknown,
                 of=sample_calls,
             )
@@ -1969,17 +1950,17 @@ class Api:
             return cls._health_check(
                 CHECK_MODEL_WINDOW_KNOWN,
                 HEALTH_UNCHECKED,
-                "Call(s) ran on a model this build has no documented context "
-                "window for, so their utilisation is UNKNOWN, not low. The "
-                "models are named beside the bands below.",
+                "Some calls ran on a model we don't have size-limit info for, so "
+                "we can't say how full they were -- that's unknown, not low. "
+                "See below for which models.",
                 count=unknown,
                 of=sample_calls,
             )
         return cls._health_check(
             CHECK_MODEL_WINDOW_KNOWN,
             HEALTH_OK,
-            "Every measured call ran on a model whose context window this "
-            "build has documented, so none of them was banded against a guess.",
+            "Every call ran on a model we have accurate limits for, so every "
+            "measurement below is real, not a guess.",
             count=0,
             of=sample_calls,
         )
@@ -1999,8 +1980,8 @@ class Api:
             return cls._health_check(
                 CHECK_WITHIN_WINDOW,
                 HEALTH_UNCHECKED,
-                "No call in this period was banded against a documented "
-                "window, so no call could be compared to one.",
+                "No calls in this period could be measured against a known limit "
+                "yet.",
                 count=over,
                 of=banded,
             )
@@ -2008,18 +1989,17 @@ class Api:
             return cls._health_check(
                 CHECK_WITHIN_WINDOW,
                 HEALTH_FAILED,
-                "Call(s) measure ABOVE 100% of their model's documented "
-                "window. That is impossible unless this build's window table "
-                "has gone stale, so treat the bands as suspect rather than the "
-                "calls as extraordinary.",
+                "Some calls measured over 100% of their model's limit, which "
+                "shouldn't be possible -- it means this tool's limit numbers "
+                "are out of date. Don't trust the percentages below until "
+                "that's fixed.",
                 count=over,
                 of=banded,
             )
         return cls._health_check(
             CHECK_WITHIN_WINDOW,
             HEALTH_OK,
-            "No reply exceeded the context window it had, so this build's "
-            "window table is not contradicted by anything in this period.",
+            "Nothing exceeded its limit, so the size numbers below check out.",
             count=0,
             of=banded,
         )
@@ -2035,8 +2015,7 @@ class Api:
             return cls._health_check(
                 CHECK_CONTEXT_MEASURED,
                 HEALTH_UNCHECKED,
-                "No API call falls in this period, so there is nothing here "
-                "whose context could have been measured.",
+                "No calls happened in this period, so there's nothing to measure.",
                 count=unmeasured,
                 of=calls,
             )
@@ -2044,18 +2023,17 @@ class Api:
             return cls._health_check(
                 CHECK_CONTEXT_MEASURED,
                 HEALTH_UNCHECKED,
-                "Call(s) carry no prompt accounting at all -- every token "
-                "class reported zero -- so their context is UNMEASURED, not "
-                "small. They are counted and kept out of every context figure.",
+                "Some calls have no size data at all -- not small, just missing. "
+                "They're counted separately and left out of every average "
+                "below.",
                 count=unmeasured,
                 of=calls,
             )
         return cls._health_check(
             CHECK_CONTEXT_MEASURED,
             HEALTH_OK,
-            "Every call in this period carried a context measurement, so no "
-            "context figure below ranges over a smaller set than the calls "
-            "beside it.",
+            "Every call in this period has real size data, so every number "
+            "below reflects all of them.",
             count=0,
             of=calls,
         )
@@ -2074,23 +2052,22 @@ class Api:
             return cls._health_check(
                 CHECK_INGEST_AGE,
                 HEALTH_UNCHECKED,
-                "The age of this database cannot be measured "
-                f"({ingest['stale_unknown_reason']}), so nothing below is "
-                "qualified as fresh or stale. Unknown, not fresh.",
+                "We can't tell how old this data is "
+                f"({ingest['stale_unknown_reason']}) -- treat it as "
+                "unverified, not fresh.",
             )
         if stale:
             return cls._health_check(
                 CHECK_INGEST_AGE,
                 HEALTH_FAILED,
-                "The last ingest run is older than this build's staleness "
-                "threshold, so every figure here describes the transcripts as "
-                "of THEN, not as of now. Re-run ingest.py.",
+                "This data is outdated -- everything below describes an earlier "
+                "snapshot, not right now. Run ingest.py to refresh it.",
             )
         return cls._health_check(
             CHECK_INGEST_AGE,
             HEALTH_OK,
-            "ingest.py has run within this build's staleness threshold, so "
-            "these figures describe the transcripts as they are now.",
+            "Data is fresh -- ingest.py ran recently, so these numbers reflect "
+            "right now.",
         )
 
     def _durability(self, start: float, end: float) -> dict[str, Any]:
@@ -3357,6 +3334,15 @@ class Api:
                 # composed here would be a claim with no date and no owner,
                 # which is what `RECOMMENDATION_PROVENANCE` is about.
                 "means": METRICS[a.metric].means,
+                # THE ONE-SENTENCE ANSWER TO "WHAT DO I DO?" (product-owner
+                # direction, #122, 2026-08-31): "{directive}. {detail}", already
+                # computed on `Assessment` and already sent one level down at
+                # `_assessment_payload` -- exposed here too so the summary's
+                # primary line can be the SAME string as the diagnosis card's,
+                # never a second composition of it. Present only on a banded
+                # row: an under-sampled or unmeasured metric has no lever and
+                # therefore no directive to lead a sentence with.
+                "recommendation": a.recommendation,
                 "value": a.value,
                 "unit": METRICS[a.metric].unit,
                 "severity": a.severity,

@@ -3132,6 +3132,39 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
             "/api/summary carries them for anyone who needs the list. #44's "
             "decision about project names, one axis over."
         ),
+        # Product-owner direction, #122, 2026-08-31: `advice-note` and `next-detail`
+        # were rewritten to show ONE sentence per reading -- `a.recommendation`
+        # -- rather than composing it from the raw metric key, its
+        # specification and the lever's action/target around a separately
+        # printed directive. That sentence already carries what a first-time
+        # reader needs; these three fields are still computed (a caller of
+        # /api/summary directly still gets them) and still rendered ONE level
+        # down, in `knobs-provenance` for `measurement` and in the metric
+        # itself for the lever's registry phrase -- just no longer as a
+        # second, jargon-heavier composition of the same fact on this page.
+        "recommendations.ranked[].measurement": (
+            "#122, 2026-08-31: superseded by `a.recommendation`; the specification "
+            "is still one level down, in `knobs-provenance`."
+        ),
+        "recommendations.ranked[].lever.action": (
+            "#122, 2026-08-31: `a.recommendation`'s directive clause already names "
+            "the action in words; the machine-readable verb has no reader "
+            "left to serve on this page."
+        ),
+        "recommendations.ranked[].lever.target": (
+            "#122, 2026-08-31: `a.recommendation`'s directive clause already names "
+            "the target in words (`LEVER_TARGETS`' own phrase); the raw "
+            "registry key has no reader left to serve on this page."
+        ),
+        "recommendations.ranked[].lever.directive": (
+            "#122, 2026-08-31: genuinely rendered, in `next-note`'s \"First: "
+            "{directive}.\" line -- but through `topOpportunity`, a computed "
+            "JS property aliasing one element of this same array, which the "
+            "path-walker cannot trace back to `recommendations.ranked[]`. "
+            "`OverviewRestingStateTest.RESTING['next-note']` is what actually "
+            "pins this reading; this entry only concedes the walker's blind "
+            "spot rather than claiming the field is unread."
+        ),
     }
 
     @classmethod
@@ -3406,7 +3439,7 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
     # statistics (#82 group 1) a reader. They were consumed, not deleted -- the
     # scoped meters needed exactly those figures, which is why #82 sequenced
     # them here rather than removing a correct measurement.
-    EXPECTED_NOT_RENDERED = 15
+    EXPECTED_NOT_RENDERED = 19
 
     def test_moving_a_field_between_views_does_not_widen_the_register(self) -> None:
         # #70 splits the page into an overview and a detail view. A field that
@@ -9453,7 +9486,14 @@ class SummaryLevelRenderTest(unittest.TestCase):
         self.assertNotIn('x-text="k.metric"', self.full_rows)
         disclosure = html_element(self.raw, 'id="knobs-provenance"')
         self.assertIn('x-text="k.metric"', disclosure)
-        self.assertIn('x-text="a.metric"', html_element(self.raw, 'id="advice-note"'))
+        # `advice-note` no longer shows the key at all, one click down
+        # included (product-owner direction, #122, 2026-08-31): a reader chasing a
+        # cost down does not need the internal identifier for the metric that
+        # is costing them money, only the sentence `a.recommendation` already
+        # states about it. `knobs-provenance` above is still the place a key
+        # is genuinely useful -- it identifies which dial a boundary belongs
+        # to, which a plain sentence cannot.
+        self.assertNotIn('x-text="a.metric"', html_element(self.raw, 'id="advice-note"'))
 
     def test_the_row_says_what_the_number_means_and_not_what_defines_it(
         self,
@@ -9477,8 +9517,15 @@ class SummaryLevelRenderTest(unittest.TestCase):
         disclosure = html_element(self.raw, 'id="knobs-provenance"')
         self.assertIn('x-text="k.measurement"', disclosure)
         self.assertIn('x-text="k.metric"', disclosure)
-        # And it is still stated in full at the level whose job is "why".
-        self.assertIn(
+        # `advice-note` no longer restates the specification either
+        # (product-owner direction, #122, 2026-08-31): `a.recommendation` already
+        # says what the reading means for the reader, and "Measures: <a
+        # SQL-flavoured definition>" one line under that answered a question
+        # the sentence above it had already answered better. Still true one
+        # level down, in `knobs-provenance` and at the payload path itself --
+        # `recommendations.ranked[].measurement` is a declared `NOT_RENDERED`
+        # exemption, not a dropped field.
+        self.assertNotIn(
             'x-text="a.measurement"', html_element(self.raw, 'id="advice-note"')
         )
 
@@ -9753,8 +9800,15 @@ class RecommendationRenderTest(unittest.TestCase):
     def test_the_healthy_case_renders_a_statement_rather_than_a_blank(self) -> None:
         # The other half: a reading with no lever must SAY it has none, or the
         # reader sees a row where the others have a directive and cannot tell
-        # "nothing to change" from "we forgot".
-        self.assertIn('x-if="!a.lever"', self.band)
+        # "nothing to change" from "we forgot". Product-owner direction,
+        # #122, 2026-08-31: the separate `x-if="!a.lever"` line ("No lever: this is
+        # a healthy reading...") this used to check for is gone because it
+        # was restating what `a.recommendation` already says for every OK
+        # entry -- `Recommendation.__post_init__` refuses an empty `detail`
+        # and every OK-severity `detail` in `recommendations.py` ends "Nothing
+        # to change here" or "Do not change this" verbatim, so the one bound
+        # sentence still can never render as a blank.
+        self.assertIn('x-text="a.recommendation"', self.band)
 
     def test_the_two_provenance_voices_are_distinct_classes(self) -> None:
         # A judged boundary rendered in a cited one's voice is the mutation
@@ -10177,13 +10231,14 @@ def summary_paths(source: str) -> set[str]:
 # field. One derivation, published twice, tied in Python where a test can
 # execute it -- `RANKED_BY`'s discipline, at the level of a page split.
 SHARED_READINGS = {
-    "recommendations.as_of": (
-        "#89: the date the judged boundaries were decided. The summary's "
-        "gauges and the diagnosis card below both draw those boundaries, and a "
-        "judged table whose date appears on only one level is a judgment "
-        "presented as a fact on the other. One string, two renderings, nothing "
-        "between them to drift."
-    ),
+    # `recommendations.as_of` was here under #89: the summary's gauges and
+    # `optimize-detail`'s answer both drew the judged boundaries' date. It is
+    # gone under product-owner direction, #122, 2026-08-31: `optimize-detail`'s
+    # answer no longer states the date at rest (`OverviewRestingStateTest`),
+    # so the reading is down to one level -- the gauges' own
+    # `knobs-provenance` disclosure -- and a register entry for a path only
+    # one level reads is exactly the "asserts a decision nobody made" defect
+    # this dict's own sibling test refuses.
     "recommendations.provenance": (
         "#89: the table's own provenance, for the same reason as `as_of` -- "
         "the summary draws the boundaries and must say in whose voice they "
@@ -12508,12 +12563,14 @@ class OverviewRestingStateTest(unittest.TestCase):
             "summary.context.utilisation.windows_as_of",
             "summary.context.utilisation.bands_as_of",
         ),
-        "advice-note": (
-            "topOpportunity.metric",
-            "topOpportunity.value",
-            "topOpportunity.severity",
-            "summary.recommendations.as_of",
-        ),
+        # Product-owner direction, #122, 2026-08-31: the answer at rest is now the
+        # ONE sentence `topOpportunity.recommendation` already states
+        # ("{directive}. {detail}"), not the raw metric key, its bare value
+        # and severity word, and the table's decision date beside them -- four
+        # things a first-time reader had to assemble into one thought
+        # themselves. Superseded, not deleted: all four are still one click
+        # down, in `optimize-detail` and `knobs-provenance`.
+        "advice-note": ("topOpportunity.recommendation",),
         "next-note": ("topOpportunity.lever.directive",),
     }
 
@@ -12862,17 +12919,16 @@ class OverviewRestingStateTest(unittest.TestCase):
                 self.assertIn('x-if="topOpportunity !== null"', card)
 
     def test_the_moves_are_a_numbered_list_naming_their_figures(self) -> None:
-        # #88 asks for next steps as a numbered list, each naming the figure
-        # that justifies it -- so the move and its evidence cannot be read
-        # apart, and neither is prose this page composed.
+        # #88 asked for next steps as a numbered list, each naming the figure
+        # that justifies it. Product-owner direction, #122, 2026-08-31, supersedes
+        # HOW the move states its evidence: `a.recommendation` already reads
+        # "{directive}. {detail}", so a raw metric key plus a bare value and
+        # severity word beside it repeated the same evidence in the page's
+        # own composed sentence, not the module's -- exactly the "prose this
+        # page composed" #88 refused. One binding, the module's own string.
         detail = html_element(self.raw, 'id="next-detail"')
         self.assertIn('<ol class="next">', detail)
-        self.assertIn('x-text="a.lever.directive"', detail)
-        for evidence in (
-            'x-text="a.metric"', "fmtUnit(a.value, a.unit)", 'x-text="a.severity"'
-        ):
-            with self.subTest(evidence=evidence):
-                self.assertIn(evidence, detail)
+        self.assertIn('x-text="a.recommendation"', detail)
         self.assertRegex(self.html, r"ol\.next\s*\{[^}]+\}")
 
     def test_the_raw_token_deck_answers_nothing_and_sits_one_level_down(

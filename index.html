@@ -261,7 +261,7 @@
      with no reading has no pivot either -- a lone hub at the centre of an
      empty dial still reads as an instrument pointing at something. */
   .needle { stroke:var(--ink); stroke-width:3; }
-  .kh { font-size:14px; font-weight:650; letter-spacing:-.01em; }
+  .kh { font-size:15px; font-weight:650; letter-spacing:-.01em; }
   .kh .tag { font-size:10px; font-weight:700; letter-spacing:.05em; padding:1px 5px;
              border-radius:3px; margin-right:7px; vertical-align:1px; }
   .tag-now { background:#fee2e2; color:var(--red); }
@@ -269,7 +269,15 @@
   .tag-fine { background:#ecfdf5; color:var(--ok); }
   /* An unmeasured knob's tag: neither an urgency nor a clean bill of health. */
   .tag-none { background:#eef2ff; color:var(--neutral); }
-  .kw { font-size:12px; color:var(--muted); margin-top:3px; }
+  /* THE ACTION LINE (product-owner direction, #122, 2026-08-31): this used to be
+     `means`, a metric DEFINITION, at 12px muted -- quieter than the figure
+     beside it, so the loudest thing on the card was a percentage and not the
+     move to make. It is now the one-sentence reason/action `actionDetail()`
+     derives from `k.recommendation`, sized and coloured to read FIRST; the
+     figure and gauge are demoted below for exactly the reason the charts
+     stay -- they are for understanding this line, not a second place to look
+     for what to do. -->
+  .kw { font-size:13.5px; color:var(--ink); margin-top:3px; line-height:1.4; }
   /* #93: THE COMPACT ROWS. A knob with no basis costs one line rather than a
      61px row carrying a dial with nothing to point at. It is still on screen,
      still named, and now also states its own shortfall -- "dimmed, not hidden"
@@ -292,8 +300,14 @@
      level; on the row itself it was a debugging aid. */
   .kcuts { margin-top:9px; }
   .kcuts-h { font-size:11.5px; color:var(--muted); }
+  /* THE FIGURE, DEMOTED (product-owner direction, #122, 2026-08-31): this was 20px
+     bold, the single largest thing on the card -- the eye landed on a percent
+     sign before the sentence saying what to do about it. Charts and numbers
+     are for understanding, per direction, so this is now sized and coloured
+     as supporting evidence beside `.kw`'s sentence, not competing with it. */
   .kfig { text-align:right; }
-  .kfig .n { font-size:20px; font-weight:650; letter-spacing:-.02em; line-height:1.15; }
+  .kfig .n { font-size:14px; font-weight:600; letter-spacing:-.01em; line-height:1.15;
+             color:var(--muted); }
   .kfig .aim { font-size:11px; margin-top:3px; }
   .kfig .none { font-size:11px; color:var(--muted); margin-top:3px; }
   /* An OBSERVATION, and visibly not a knob: no tag, no gauge, no target and no
@@ -709,11 +723,11 @@
            never the six lines of a proven failure. -->
       <template x-if="!healthOneLine">
       <details class="disclosure" id="health-detail" :open="healthOpen">
-        <summary>The checks behind that verdict, one line each</summary>
+        <summary>Show the individual checks</summary>
         <template x-for="c in summary.health.checks" :key="c.check">
           <span class="check-line">
             <strong x-text="c.state.toUpperCase()"></strong> &mdash;
-            <strong x-text="c.check"></strong>:
+            <strong x-text="checkLabel(c.check)"></strong>:
             <span x-text="c.statement"></span>
             <!-- `count` and `of` are one unit or both null; `fmtCount` renders
                  a null as the em-dash, never as 0, so "this database does not
@@ -933,7 +947,7 @@
                  the disclosure at the foot of this panel, and under "Measures:"
                  on the diagnosis card one level down. Moving a figure behind a
                  disclosure is not dropping it. -->
-            <div class="kw" x-text="k.means"></div>
+            <div class="kw" x-text="actionDetail(k)"></div>
           </div>
 
           <!-- THE FIGURE, AND THE DIRECTION TO MOVE, both in the metric's own
@@ -1044,8 +1058,7 @@
            boundary it names, it carries that boundary's kind and statement in
            its own tooltip, and this list sits directly beneath it. -->
       <details class="disclosure" id="knobs-provenance">
-        <summary>What each row measures, where its lines are drawn, and what
-          they are not</summary>
+        <summary>Show what these numbers mean</summary>
         <span class="context-line">Every arc, tick and target above is a range in
           one dated table, decided
           <strong x-text="summary ? summary.recommendations.as_of : ''"></strong>.
@@ -1127,7 +1140,7 @@
         with <span x-text="fmtCount(summary.model_mix.models)"></span> model(s) named
         in all.
         <details class="disclosure" id="observation-detail">
-          <summary>What this counts, and why it is not a knob</summary>
+          <summary>Show what this counts</summary>
           <span class="obs-note">Over <span x-text="summary.model_mix.sample_is"></span>.
             Stated, not recommended: this report counts tokens and cannot see whether
             a cheaper model would have needed more attempts, so there is no target
@@ -1272,7 +1285,7 @@
            lost a figure -- a proven YES opens this by default, so on the one
            state where they matter most they are on screen without a click. -->
       <details class="disclosure" id="context-detail" :open="contextOpen">
-        <summary>The meters, the growth curve, and how all of it is computed</summary>
+        <summary>Show the numbers behind this</summary>
 
         <!-- WHAT MAKES THE ANSWER SO, and it is the ranking's own winner with
              the VALUE of the key it was ranked by. Both figures come off the
@@ -1555,16 +1568,14 @@
              than only stated. -->
         <div class="scope-row">
           <div class="scope-head">
-            <div><strong>Pooled across
-              <span x-text="summary.context.utilisation.includes"></span></strong>
-              <span class="scope-n">the same calls under one denominator, which is
-                where the split above disappears &mdash;
-                <span x-text="fmtCount(summary.context.utilisation.banded_calls)"></span>
-                banded of <span x-text="fmtCount(summary.context.utilisation.calls)"></span>
-                (<span x-text="fmtCount(summary.context.utilisation.sample_calls)"></span>
-                measured,
-                <span x-text="fmtCount(summary.context.utilisation.unmeasured_calls)"></span>
-                not)</span></div>
+            <div><strong>Everything combined
+              (<span x-text="summary.context.utilisation.includes"></span>)</strong>
+              <span class="scope-n">
+                <span x-text="fmtCount(summary.context.utilisation.sample_calls)"></span>
+                of <span x-text="fmtCount(summary.context.utilisation.calls)"></span> calls had size data
+                (<span x-text="fmtCount(summary.context.utilisation.unmeasured_calls)"></span> didn't) --
+                <span x-text="fmtCount(summary.context.utilisation.banded_calls)"></span> of those
+                could be checked against a known limit</span></div>
             <div class="scope-share"><span
                 x-text="fmtPct(summary.context.utilisation.over_half_window_share)"></span>
               (<span x-text="fmtCount(summary.context.utilisation.over_half_window_calls)"></span>)
@@ -1628,15 +1639,16 @@
              product-owner judgment in a documented fact's voice -- the failure
              `band_provenance` exists as a separate field to prevent. What was
              wrong was the WEIGHT. -->
-        <div class="body"><strong>Median, not mean.</strong> The mean over the
-          same sample is <span x-text="fmtTok(summary.context.mean)"></span>,
-          <span x-text="fmtRatio(summary.context.mean_over_median)"></span> the
-          median, and only
-          <span x-text="fmtPct(summary.context.share_above_mean)"></span> of
-          measured calls
+        <div class="body"><strong>Median, not mean.</strong> We use the
+          middle value on purpose: the average is
+          <span x-text="fmtTok(summary.context.mean)"></span> --
+          <span x-text="fmtRatio(summary.context.mean_over_median)"></span>x the
+          typical size -- because just
+          <span x-text="fmtPct(summary.context.share_above_mean)"></span> of calls
           (<span x-text="fmtCount(summary.context.calls_above_mean)"></span> of
-          <span x-text="fmtCount(summary.context.sample_calls)"></span>) sit
-          above it, so it describes the tail rather than a typical call.</div>
+          <span x-text="fmtCount(summary.context.sample_calls)"></span>) are
+          pulling that average up. The average describes the biggest calls,
+          not a typical one.</div>
 
         <!-- #25 CHANGED WHAT THIS SENTENCE COULD SAY. It used to read that the
              window's `avg_context` was "a different figure over a different
@@ -1646,13 +1658,11 @@
              through one predicate for what counts as a measurement, so they
              are the same number over the same sample. Saying they differ would
              now be the page asserting a discrepancy that no longer exists. -->
-        <div class="body"><strong>One sample, one definition.</strong>
-          The window's <em>avg_context</em> reads
-          <span x-text="fmtTokRounded(summary.avg_context)"></span> &mdash; the
-          same figure as the mean above rather than a second opinion on it,
-          because since #25 both are computed through one definition of what
-          counts as a measurement. A call that reported no prompt accounting is
-          excluded from both instead of being averaged in as a zero.</div>
+        <div class="body"><strong>One sample, one definition.</strong> This
+          window's average (<span x-text="fmtTokRounded(summary.avg_context)"></span>)
+          is the same number as the mean above -- not a second, rival figure
+          -- and any call with no size data is left out of both instead of
+          counted as a zero.</div>
 
         <div class="body">Spread: <span x-text="contextSpread"></span></div>
 
@@ -1702,16 +1712,10 @@
     <template x-if="!summary"><div class="answer">Loading&hellip;</div></template>
     <template x-if="summary"><div>
       <template x-if="topOpportunity === null"><div class="answer">
-        <span class="tag">NOTHING</span> No reading in the dated table is
-        outside its healthy range, so there is no lever to pull.
+        Nothing to do here &mdash; everything's already in a healthy range.
       </div></template>
-      <template x-if="topOpportunity !== null"><div class="answer">
-        Biggest first: <span class="mono" x-text="topOpportunity.metric"></span>
-        reads <strong x-text="fmtUnit(topOpportunity.value, topOpportunity.unit)"></strong> &mdash;
-        <strong x-text="topOpportunity.severity.toUpperCase()"></strong>.
-      </div></template>
-      <div class="answer-key">Each reading is looked up in a dated table of
-        ranges (decided <span x-text="summary.recommendations.as_of"></span>).
+      <template x-if="topOpportunity !== null"><div class="answer" x-text="topOpportunity.recommendation"></div></template>
+      <div class="answer-key">See "What you can change today" above for the full list, ranked biggest first.
         <!-- THE UNMEASURED COUNT IS THE PRICE OF COLLAPSING ON IT. This card
              no longer opens itself for a metric with no sample -- a project
              that dispatches no subagent has no main-to-subagent ratio and
@@ -1725,7 +1729,7 @@
           healthy.</span></template></div>
 
       <details class="disclosure" id="optimize-detail" :open="opportunitiesOpen">
-        <summary>Every reading, worst first &mdash; and where each range comes from</summary>
+        <summary>Show every reading</summary>
         <span class="context-line context-judged">Table:
           <span x-text="summary.recommendations.provenance"></span></span>
         <span class="context-line context-judged">Order:
@@ -1735,27 +1739,17 @@
           <div class="opp">
             <div class="rank" x-text="i + 1"></div>
             <div class="txt">
-              <div class="h"><span class="mono" x-text="a.metric"></span></div>
-              <div class="d">Measures: <span x-text="a.measurement"></span></div>
+              <!-- `a.recommendation` is already the one-sentence "do this,
+                   because X" answer ("{directive}. {detail}", or just the
+                   detail for a healthy reading with no directive) -- the SAME
+                   text the summary card shows. The raw metric key, the
+                   `measurement` definition and a separate "Lever:" line that
+                   only restated the recommendation's own first sentence are
+                   gone (product-owner direction, #122, 2026-08-31): a second,
+                   jargon-heavier rendering of one fact is not a second fact. -->
               <div class="d" x-text="a.recommendation"></div>
-              <!-- The lever is the machine-readable half, shown beside the
-                   prose so a reader can see WHAT is being changed and WHICH
-                   WAY without parsing the sentence. `directive` is composed in
-                   the module from a closed registry -- never here -- which is
-                   what makes "reduce your cache-read" unrepresentable rather
-                   than merely absent. -->
-              <template x-if="a.lever"><div class="d">Lever:
-                <strong x-text="a.lever.directive"></strong>
-                (<span x-text="a.lever.action"></span>
-                <span class="mono" x-text="a.lever.target"></span>).</div></template>
-              <!-- A healthy entry carries NO lever by construction, and says so
-                   rather than showing an empty space where the other rows have
-                   one. Absence with no explanation is the thing this page
-                   refuses to render. -->
-              <template x-if="!a.lever"><div class="d">No lever: this is a
-                healthy reading, so there is nothing here to change.</div></template>
               <details class="disclosure">
-                <summary>Where this range comes from</summary>
+                <summary>Where this number comes from</summary>
                 <span class="advice-line">Range
                   <strong x-text="fmtUnit(a.range_lower, a.unit)"></strong> to
                   <strong x-text="a.range_upper === null ? 'no ceiling' : fmtUnit(a.range_upper, a.unit)"></strong>,
@@ -1902,16 +1896,17 @@
           for them &mdash; unmeasured, not healthy.</span></template></div>
 
       <details class="disclosure" id="next-detail" :open="opportunitiesOpen">
-        <summary>Every move, in order</summary>
+        <summary>Show the full timeline</summary>
+        <!-- One line per move, and the line IS `a.recommendation` -- the same
+             "{directive}. {detail}" sentence question 3 shows, not a second
+             composition of the raw metric key, value and severity around it
+             (product-owner direction, #122, 2026-08-31: that repeated the directive
+             a third time on this page alone and named a debugging identifier
+             no first-time reader needs). -->
         <ol class="next">
           <template x-for="a in summary.recommendations.ranked" :key="a.metric">
             <template x-if="a.lever">
-              <li><strong x-text="a.lever.directive"></strong>
-                <span class="why">Because
-                  <span class="mono" x-text="a.metric"></span> reads
-                  <strong x-text="fmtUnit(a.value, a.unit)"></strong>, which the dated
-                  table calls <strong x-text="a.severity"></strong>.
-                  <span x-text="a.recommendation"></span></span></li>
+              <li x-text="a.recommendation"></li>
             </template>
           </template>
         </ol>
@@ -2355,6 +2350,39 @@ function fmtTok(n) {
 function fmtCount(n) {
   if (n === null || n === undefined) return "—";
   return n.toLocaleString();
+}
+// Plain-language display names for the health-check ids the API returns
+// (`c.check`, e.g. "records-parsed"). Purely presentational -- the id itself
+// is still the payload's `:key` and untouched by this map. A check this map
+// has never seen renders its raw id rather than going blank, since a stale
+// label is a smaller problem than a missing one.
+const CHECK_LABELS = {
+  "records-parsed": "Files read correctly",
+  "transcript-format-census": "Format checked for changes",
+  "model-window-known": "Model size limits known",
+  "within-window": "Nothing over its limit",
+  "context-measured": "Size data present",
+  "ingest-age": "Data freshness",
+};
+function checkLabel(id) {
+  return CHECK_LABELS[id] ?? id;
+}
+// The knob's one-sentence action line (product-owner direction, #122, 2026-08-31):
+// `k.recommendation` is "{directive}. {detail}" -- the SAME string the
+// diagnosis card one level down renders as `a.recommendation`, never a second
+// composition of it (`_knobs()`'s own comment). The directive clause is
+// stripped here, presentationally only, because `.kh` already shows it as the
+// tag line above -- so this returns just the reason/action-detail half rather
+// than repeating the directive verbatim. A row with no recommendation (an
+// under-sampled or unmeasured metric never gets one) falls back to `k.means`,
+// which is still the table's own sentence, never one composed in this file.
+function actionDetail(k) {
+  const full = k.recommendation;
+  if (full == null) return k.means;
+  if (k.directive && full.startsWith(k.directive + ". ")) {
+    return full.slice(k.directive.length + 2);
+  }
+  return full;
 }
 function orDash(v) {
   return v ?? "—";
@@ -3679,10 +3707,14 @@ function report() {
       // from. Undated, it would sit under a data-age line that now counts
       // forward (#24) and quote a smaller age for the same fact: two ages of
       // one measurement disagreeing on a single screen.
+      // #122, 2026-08-31: plain-language rewrite. Everything the old message
+      // stated is still true and still computed from the same fields --
+      // `fmtAge`/`fmtSpan` are unchanged -- only the sentence is shorter and
+      // leads with the action.
       this.banner.stale = this.summary.ingest.stale === true
-        ? `Data is STALE: ingest.py had last run ${fmtAge(this.summary.ingest.as_of - this.summary.ingest.last_run_at)} `
-          + `when this page loaded, past the threshold of ${fmtSpan(this.summary.ingest.stale_after_seconds)}. `
-          + `Every figure below describes the transcripts as of THEN, not as of now — re-run ingest.py.`
+        ? `This data was ${fmtAge(this.summary.ingest.as_of - this.summary.ingest.last_run_at)} old `
+          + `when this page loaded (older than the ${fmtSpan(this.summary.ingest.stale_after_seconds)} we trust). `
+          + `Run ingest.py to refresh it before trusting the numbers below.`
         : null;
       // An UNKNOWN age is not a staleness verdict, so it never takes the
       // banner's `stale` slot above — but it must not be left to the grey
