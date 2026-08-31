@@ -171,7 +171,7 @@ from typing import NamedTuple, Optional, Sequence
 # about the reader's machine CPB cannot know -- so they now name the form
 # that always resolves. A correction to prose; nothing a caller depends on
 # changes, so patch.
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 
 PROG = "cpb"
 

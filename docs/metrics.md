@@ -14,19 +14,25 @@ one-screen version — what a first run looks like against a settled one — is 
 
 ## How big your calls are, and whether that is a lot
 
-The headline card is **`Median context/call`**. It used to be the mean, and the
-change is not cosmetic: measured 2026-08-05 over the reference corpus, the mean
-was 237,153 tokens against a median of 155,255 — **1.53x** — with only **28.7%**
-of calls above the mean. A figure that 71.3% of calls fall below is not
-describing them. The mean is still on the page, but only as **evidence of the
-skew** it demonstrates, printed beside the ratio and the share above it.
+**Short version:** we show the *typical* call size (the median), not the
+average — the average gets dragged up by a few huge calls and stops
+representing anything typical. Then we compare each call's size to the actual
+limit for the model it ran on, so "266.6k tokens" becomes "68% full" instead
+of a number with nothing to compare it to.
 
-A context size on its own is a fact with no referent — nothing says whether
-266.6k is a lot. Self-comparison cannot supply one, because a percentile of your
-own calls compares waste to waste and says nothing if every call is wasteful. So
-the referent is external: each call's context is divided by **that model's own
-documented context window**, a published hard limit, and the calls are grouped
-into four bands.
+**Why median, not average.** Measured 2026-08-05 over the reference corpus,
+the average was 237,153 tokens against a typical (median) call of 155,255 —
+1.53x higher — because only 28.7% of calls were even above that average. A
+number that most calls fall *under* isn't describing "typical." The average
+is still shown, just labeled as what it is: evidence of how skewed your usage
+is, not the headline figure.
+
+A context size alone means nothing — nothing says whether 266.6k tokens is a
+lot. Comparing your own calls to each other doesn't help either: if every
+call is bloated, that comparison just says "average bloat," which tells you
+nothing. So we compare against something outside your own data: **each
+model's own published limit.** Every call gets sorted into one of four
+bands, by what share of that limit it used.
 
 | band | reading |
 |---|---|
@@ -97,9 +103,10 @@ denominator of every band share is published beside them.
 
 ## How old the data is
 
-`serve` reads whatever the database holds, and `ingest` never runs on its own —
-so the page is exactly as current as your last ingest, and one left open for a
-week would otherwise look identical to one opened a second ago.
+**Short version:** the report only knows what's been ingested. Leave a tab
+open for a week without re-ingesting, and it'll look identical to one you
+just opened — nothing refreshes itself, so the page tells you exactly how
+stale it is instead of pretending to be live.
 
 Directly above the totals it states **two facts, never merged into one
 "data age"**:
@@ -202,14 +209,13 @@ is judged, dated, and says so. The reasoning is in the 3.1.0 entry of
 
 ## There are no dollar figures
 
-CPB reports measured tokens and never converts them into money. It used to:
-list-rate arithmetic over a hand-maintained rate table, which modelled no
-subscription accounting, discount or overage, went stale twice, and on one real
-session produced ~$57 where the subscription-accounted spend was ~$21 — over
-2.5x out. A precise-looking number that is wrong by a factor of two is worse
-than no number, because the reader has no way to see the error; that is the rule
-above turned on the tool's own headline, so the estimate was removed rather than
-qualified ([#30](https://github.com/vlad-ko/claude-piggy-bank/issues/30)).
+CPB reports tokens, on purpose, never a dollar estimate. We tried it once —
+list-rate arithmetic over a hand-maintained price table — and it was wrong by
+over 2.5x on a real session (~$57 shown, ~$21 actually spent), because it had
+no idea about your subscription, discounts, or overage rules. A confident,
+wrong-looking-right number is worse than no number at all, so we removed the
+estimate instead of trying to patch it
+([#30](https://github.com/vlad-ko/claude-piggy-bank/issues/30)).
 
 What replaced it is the honest version of the same question: panels that
 claimed to rank "by spend" rank by **total tokens** and say so in the heading,

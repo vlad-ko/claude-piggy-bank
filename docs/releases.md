@@ -42,6 +42,25 @@ require entries for historical
 versions: pinning history would force a rewrite at every release, which is how
 a check becomes something people route around.
 
+## 4.2.0 — 2026-08-31
+
+**No migration.** A rewrite of the report's action-oriented prose, plus one
+additive API field.
+
+**What changed for a user:** the "What you can change today" cards, the
+"Where can I optimize?" panel, "What do I do next?", the health and
+context-window verdicts, the growth-shape summary, and the stale-data banner
+all now state one plain-language sentence instead of composing their own,
+denser version of the same fact across up to three places. No figure or
+provenance was removed — each moved behind a disclosure that already existed.
+
+**Why a minor, not a patch.** `/api/summary`'s `recommendations.knobs[]` rows
+gained one new field, `recommendation` — the same "{directive}. {detail}"
+sentence `recommendations.ranked[]` already carried, now on the summary-level
+payload too. An added field is additive, not breaking (`docs/versioning.md`'s
+HTTP API clause), but it is still a change to a governed surface, so it is not
+a patch either.
+
 ## 4.1.0 — 2026-08-11
 
 **No migration.** The database is unchanged; nothing you have measured moves.

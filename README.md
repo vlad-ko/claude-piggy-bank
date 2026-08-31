@@ -5,25 +5,17 @@
 > Anthropic; this project only reads files Claude Code writes on your own
 > machine.
 
-CPB answers a question Claude Code does not: **where does your context and
-token spend actually go?** It reads the session transcripts Claude Code already
-writes to your disk, loads them into SQLite, and serves a single-page report
-over them — per session, per model, main thread against subagents.
+CPB answers the question Claude Code doesn't: **where is your context and
+token spend actually going?** It reads the session history Claude Code already
+saves on your machine and turns it into one report — one sentence per finding,
+plus the numbers behind it if you want them.
 
-- **Nothing leaves your machine.** No network calls, no telemetry, no CDN. The
-  page renders your own prompts, paths and source code, so both browser
-  libraries it uses are vendored into `vendor/` and served from there.
-- **No model produces a figure.** Every number is SQL, arithmetic or JSON
-  parsing. Ingesting and reading the report is free and offline. (The
-  in-session skill *reads* the finished report and summarises it, so it spends
-  tokens in a session you are already paying for — it never computes a figure.
-  The line is drawn in [`docs/plugin.md`](docs/plugin.md).)
-- **A number that cannot be trusted refuses.** Absence is reported as
-  "not measured" or INCONCLUSIVE, never as a plausible `0`, and there are no
-  dollar estimates — [`docs/metrics.md`](docs/metrics.md) is the long form.
-- **Python 3.10+, standard library only.** No pip, no Node, no build step. CI
-  runs the suite on 3.10–3.13 and fails the build if any import in any shipped
-  module resolves outside the standard library.
+- **Private.** Nothing leaves your machine — no network calls, no telemetry.
+- **Honest.** Every number is plain SQL and arithmetic — no AI guessing at a
+  figure. And if something genuinely can't be measured, the report says so
+  instead of showing a fake zero.
+- **Zero setup.** Python 3.10+, standard library only. No pip, no Node, no
+  build step.
 
 **Contents:** [Install](#install) · [What you get](#what-you-get) ·
 [Documentation](#documentation) · [Contributing](#contributing)
@@ -79,33 +71,19 @@ and where that database lives: [`docs/install.md`](docs/install.md). Flags,
 
 ## What you get
 
-One page, served on loopback, answering four questions in order — **Is anything
-blowing up? · Am I wasting context? · Where can I optimize? · What do I do
-next?** — over totals for input, cache-read, cache-write and output tokens,
-sessions, API calls split main-thread against subagent, and a headline
-**median context per call**.
+One page answering four questions, in order: **Is anything blowing up? · Am I
+wasting context? · Where can I optimize? · What do I do next?** Each answer is
+one sentence, plus a "show me the numbers" link if you want the detail — token
+totals, sessions, per-model breakdowns, your daily usage over time, and the
+biggest individual dispatches and calls. Every context figure is shown as a
+share of that model's actual limit, so "266.6k tokens" reads as "68% full"
+instead of a number with nothing to compare it to.
 
-Under those: daily token usage over time, usage by model, every session with a
-per-session breakdown (by scope, turn type and model), the top subagent
-dispatches ranked by total tokens, and the outlier calls by cache-read. Each
-call's context is divided by **that model's own documented context window**, so
-"266.6k tokens" becomes a share of a published hard limit rather than a number
-with no referent.
-
-**A first run deliberately looks thinner than you expect.** CPB starts
-measuring when you install it, so a new database is empty by construction — the
-skill checks whether there is unmeasured history already on disk and offers to
-backfill it, stating the size and an estimate before it starts. And until a
-metric has enough calls to judge, the page shows you the reading and withholds
-the verdict: `TOO FEW`, or **"Not enough data yet"** where a settled corpus
-would show a green dot. That is the tool refusing to certify a clean bill of
-health on three calls, not a fault.
-
-**A settled run** adds the things only history can show: which sessions and
-subagent dispatches actually carry the spend, whether your cache writes are
-being repaid, and where context sits against each model's window. Above the
-totals it always states when it last *looked* at your transcripts and the
-newest call it *found* — two separate facts, because either alone misleads.
+**First run looks thin on purpose.** CPB only measures from the moment you
+install it, so a brand-new database starts empty — the skill offers to
+backfill your existing history first, and tells you how much before it starts.
+Until there's enough data to judge a metric fairly, the report says so
+("Not enough data yet") instead of guessing.
 
 What each figure means, and what it refuses to say:
 [`docs/metrics.md`](docs/metrics.md).
