@@ -46,16 +46,39 @@ classify is therefore a **refusal**, not a pass: a new `bin/` or `settings.json`
 at the plugin root is a real plugin component, and a check that quietly ignored
 it would report a clean result it had no basis for. Extending one of the two
 tables below is a deliberate decision; inheriting a silent gap is not.
+
+`--bump {patch,minor,major}`: the mechanical half, not the judgment
+--------------------------------------------------------------------
+
+`docs/versioning.md` is explicit that *which* bump a release needs is a
+decision nothing here can make -- an added API field, a removed one and a
+redefined figure are three different severities, and "redefined" in
+particular is a claim about *meaning* no diff can see. So this flag does not
+choose a size; the contributor still does, same as always.
+
+What it removes is the toil the size-choice never needed: writing the same
+new string into `cpb.py`, `.claude-plugin/plugin.json`, `CLAUDE.md` and
+`docs/versioning.md` by hand, in four different surrounding syntaxes, is a
+place to typo one of them and ship two answers to "which version is this" --
+exactly the failure `authority_version_at`/`manifest_version_at` exist to
+catch one level up. `--bump` reads the CURRENT version once, off the working
+tree (not HEAD -- this runs *before* the bump is committed), refuses if the
+four files do not already agree, computes the next SemVer release, and writes
+it to all four. It never touches `docs/releases.md`: that entry is prose
+about what changed *for a user*, which is exactly the kind of claim this
+project refuses to author on a contributor's behalf. It prints a heading and a
+reminder instead.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import subprocess
 import sys
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 MANIFEST = ".claude-plugin/plugin.json"
 
@@ -99,6 +122,131 @@ NOT_SHIPPED_FILES = (
 
 class Refusal(Exception):
     """The check cannot see its answer, so it must not report a clean one."""
+
+
+# The four places `--bump` writes, each a (path, compiled pattern, template)
+# triple. The pattern's one capture group is the version substring; the
+# template is `str.format`-ed with `version=` to build the replacement line.
+# `CLAUDE.md` and `docs/versioning.md` share the marker syntax
+# `docs/versioning.md` documents as the mechanism -- one pattern, two paths,
+# so a third marker-bearing doc is added here rather than pattern-matched by
+# coincidence elsewhere.
+_MD_MARKER = re.compile(r"<!--cpb:version-->([^<]+)<!--/cpb:version-->")
+VERSION_FILE_SPECS: tuple[tuple[str, re.Pattern, str], ...] = (
+    ("cpb.py", AUTHORITY_PATTERN, 'VERSION = "{version}"'),
+    (MANIFEST, re.compile(r'"version":\s*"([^"]+)"'), '"version": "{version}"'),
+    ("CLAUDE.md", _MD_MARKER, "<!--cpb:version-->{version}<!--/cpb:version-->"),
+    (
+        "docs/versioning.md",
+        _MD_MARKER,
+        "<!--cpb:version-->{version}<!--/cpb:version-->",
+    ),
+)
+
+BUMP_KINDS = ("major", "minor", "patch")
+
+
+def next_version(current: str, kind: str) -> str:
+    """The next SemVer release after `current`. Pre-release/build tags refused.
+
+    Pure, and deliberately ignorant of what changed -- the CALLER decided
+    `kind`; this only knows how MAJOR.MINOR.PATCH moves once a size is
+    chosen (SemVer 2.0.0 §8: raising a field zeroes every field to its
+    right).
+    """
+    if kind not in BUMP_KINDS:
+        raise Refusal(f"unknown bump kind {kind!r}; must be one of {BUMP_KINDS}")
+    core, _, pre = current.partition("-")
+    parts = core.split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        raise Refusal(f"{current!r} is not MAJOR.MINOR.PATCH; refusing to bump it")
+    if pre:
+        raise Refusal(
+            f"{current!r} carries a pre-release tag ({pre!r}); this project "
+            "has never shipped one and this script does not know what "
+            "bumping past one means"
+        )
+    major, minor, patch = (int(p) for p in parts)
+    if kind == "major":
+        return f"{major + 1}.0.0"
+    if kind == "minor":
+        return f"{major}.{minor + 1}.0"
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def _read_version(path: str, pattern: re.Pattern, repo: str) -> str:
+    text = (Path(repo) / path).read_text(encoding="utf-8")
+    match = pattern.search(text)
+    if match is None:
+        raise Refusal(f"{path}: found no match for {pattern.pattern!r}")
+    return match.group(1)
+
+
+def _write_version(
+    path: str, pattern: re.Pattern, template: str, new_version: str, repo: str
+) -> None:
+    file_path = Path(repo) / path
+    text = file_path.read_text(encoding="utf-8")
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1:
+        raise Refusal(
+            f"{path}: expected exactly one match for {pattern.pattern!r}, "
+            f"found {len(matches)} -- refusing to guess which one is the "
+            "version"
+        )
+    replacement = template.format(version=new_version)
+    new_text = text[: matches[0].start()] + replacement + text[matches[0].end() :]
+    file_path.write_text(new_text, encoding="utf-8")
+
+
+def apply_bump(kind: str, repo: str = ".") -> tuple[str, str, list[str]]:
+    """Write the next `kind`-sized version to all four locations.
+
+    Refuses (raises `Refusal`, touches nothing) if the four files do not
+    already agree on the current version -- that disagreement is a defect
+    this script's own `check()` exists to catch, and bumping forward from an
+    unknown starting point would paper over it rather than surface it.
+    """
+    current_by_file = {
+        path: _read_version(path, pattern, repo)
+        for path, pattern, _template in VERSION_FILE_SPECS
+    }
+    distinct = set(current_by_file.values())
+    if len(distinct) != 1:
+        raise Refusal(
+            "the four version locations do not already agree, so there is "
+            "no single 'current version' to bump forward from:\n  "
+            + "\n  ".join(f"{path}: {v}" for path, v in current_by_file.items())
+        )
+    (current,) = distinct
+    new_version = next_version(current, kind)
+    changed: list[str] = []
+    for path, pattern, template in VERSION_FILE_SPECS:
+        _write_version(path, pattern, template, new_version, repo)
+        changed.append(path)
+    return current, new_version, changed
+
+
+def releases_stub(old: str, new: str) -> str:
+    """A heading to paste into `docs/releases.md`, never written there directly.
+
+    `docs/releases.md`'s own rule is that an entry states what changed FOR A
+    USER, and `tests/test_release_notes.py` refuses a bare heading or a
+    placeholder -- so a script writing one automatically would either ship
+    prose nobody wrote or ship a file this project's own suite fails on. The
+    heading format is the one mechanical part; the content is not this
+    script's to invent.
+    """
+    today = datetime.date.today().isoformat()
+    return (
+        f"## {new} — {today}\n\n"
+        "**No migration.** <!-- or: describe what a user must do -->\n\n"
+        "**What changed for a user:** <!-- fill in -->\n\n"
+        f"(bumped {old} -> {new}; add this above the previous entry in "
+        "docs/releases.md)"
+    )
+
+
 
 
 def git(*args: str, repo: str = ".") -> str:
@@ -288,14 +436,35 @@ def check(base: str, repo: str = ".") -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "--base",
-        required=True,
-        help="the commit users are currently served: the PR's base, or the "
-        "previous tip of main",
+        help="CI mode: the commit users are currently served -- the PR's "
+        "base, or the previous tip of main. Refuses if a shipped path "
+        "changed and the version did not move.",
+    )
+    mode.add_argument(
+        "--bump",
+        choices=BUMP_KINDS,
+        help="local mode: write the next {major,minor,patch} version to all "
+        "four locations on the working tree. The SIZE is still yours to "
+        "choose -- docs/versioning.md says how -- this only does the typing.",
     )
     parser.add_argument("--repo", default=".", help="repository to inspect")
     args = parser.parse_args(argv)
+
+    if args.bump is not None:
+        try:
+            old, new, changed = apply_bump(args.bump, args.repo)
+        except Refusal as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 1
+        print(f"{old} -> {new} ({args.bump})")
+        for path in changed:
+            print(f"  wrote {path}")
+        print(f"\nStill needed -- docs/releases.md is not written for you:\n")
+        print(releases_stub(old, new))
+        return 0
 
     try:
         lines = check(args.base, args.repo)
