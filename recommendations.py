@@ -470,12 +470,12 @@ ACTION_VERBS = {ACTION_REDUCE: "Reduce", ACTION_INCREASE: "Increase"}
 # thing to change that the report never measured.
 LEVER_TARGETS: dict[str, str] = {
     "input_tokens": "uncached input tokens",
-    "cache_write": "cache-write tokens -- the 1.25x class",
+    "cache_write": "how much you cache that never gets reused",
     "cache_read": "cache-read tokens -- the 0.1x class, which is the discount",
     "output_tokens": "output tokens",
     "main_thread_context": "the context the main session carries",
     "subagent_dispatch": "the work handed to subagents",
-    "prompt_prefix_stability": "the stability of the prompt prefix between calls",
+    "prompt_prefix_stability": "how much your cached setup actually gets reused",
 }
 
 # The token classes that cost LESS than base input. Shrinking one of these
@@ -1184,10 +1184,11 @@ METRICS: dict[str, Metric] = {
                     severity=SEVERITY_WATCH,
                     lever=lever(ACTION_INCREASE, "subagent_dispatch"),
                     detail=(
-                        "Part of this session's work now runs with more than "
-                        "half the window in play. Nothing is broken; watch "
-                        "whether the share climbs as the session goes on, and "
-                        "hand the next long file-reading task to a subagent."
+                        "Part of this session is already running over half "
+                        "your context limit. Nothing's broken yet -- just "
+                        "keep an eye on whether it climbs, and next time you "
+                        "have a big search or file-reading task, try saying "
+                        "'use a subagent for this'."
                     ),
                 ),
             ),
@@ -1198,11 +1199,15 @@ METRICS: dict[str, Metric] = {
                     severity=SEVERITY_ACT,
                     lever=lever(ACTION_REDUCE, "main_thread_context"),
                     detail=(
-                        "More than a quarter of main-thread calls carry over "
-                        "half the window, and every later call in the session "
-                        "re-sends that context. Dispatch long file-reading and "
-                        "search work to subagents earlier, or start a fresh "
-                        "session at the next natural break."
+                        "More than a quarter of your replies are already over "
+                        "half your context limit, and every later message "
+                        "re-sends all of it -- that's why a long session gets "
+                        "slower and pricier as it goes. Two things to try: "
+                        "next time you ask for a big search or file-reading "
+                        "task, say 'use a subagent for this' so it doesn't "
+                        "pile into your main conversation; and when you "
+                        "finish a chunk of work, run /clear to start fresh "
+                        "instead of continuing the same long conversation."
                     ),
                 ),
             ),
@@ -1248,13 +1253,14 @@ METRICS: dict[str, Metric] = {
                     severity=SEVERITY_ACT,
                     lever=lever(ACTION_INCREASE, "prompt_prefix_stability"),
                     detail=(
-                        "Under one read per write: the stored prefix is being "
-                        "thrown away as fast as it is built, so the write "
-                        "markup -- 1.25x base input tokens on a five-minute "
-                        "TTL, 2x on a one-hour one -- is not repaid either way "
-                        "(TA-8). Keep the prompt prefix byte-identical between "
-                        "calls: a system prompt, tool list or early file read "
-                        "that changes invalidates everything stored after it."
+                        "You're paying extra to cache your setup (25-100% "
+                        "more tokens, TA-8) but it's being thrown away before "
+                        "that pays for itself. This usually means something "
+                        "early in the conversation -- your CLAUDE.md, your "
+                        "available tools, or an early message -- is changing "
+                        "between requests. Avoid editing CLAUDE.md or "
+                        "switching tools mid-conversation; if you need to, "
+                        "run /clear first and start over."
                     ),
                 ),
             ),
@@ -1359,15 +1365,14 @@ METRICS: dict[str, Metric] = {
                     severity=SEVERITY_ACT,
                     lever=lever(ACTION_INCREASE, "prompt_prefix_stability"),
                     detail=(
-                        "These writes are not repaid at the break-even of the "
-                        "TTL they asked for: a five-minute write is 1.25x base "
-                        "input tokens and needs one read token back per write "
-                        "token, a one-hour write is 2x and needs two, and this "
-                        "period's reads fall short of what its own mix "
-                        "requires (TA-8). Keep the prompt prefix "
-                        "byte-identical between calls: a system prompt, tool "
-                        "list or early file read that changes invalidates "
-                        "everything stored after it."
+                        "These writes are not repaid at the break-even of "
+                        "the TTL they asked for (TA-8's math). Same cause as "
+                        "usual: something early in the conversation -- your "
+                        "CLAUDE.md, your available tools, or an early message "
+                        "-- is changing between requests, so the cache keeps "
+                        "getting thrown out. Avoid editing CLAUDE.md or "
+                        "switching tools mid-conversation; if you need to, "
+                        "run /clear first and start over."
                     ),
                 ),
             ),
@@ -1470,12 +1475,13 @@ METRICS: dict[str, Metric] = {
                     severity=SEVERITY_ACT,
                     lever=lever(ACTION_REDUCE, "cache_write"),
                     detail=(
-                        "More than one stored prefix in ten is never read back, "
-                        "and an unread write is markup for nothing -- 1.25x "
-                        "the base input tokens on a five-minute TTL and 2x on "
-                        "a one-hour one, with no read to repay either (TA-8). "
-                        "Either keep the prefix stable long enough to be read, "
-                        "or stop marking a prefix that changes every turn."
+                        "More than 1 in 10 of your cached setups is never "
+                        "reused at all -- you paid the storage markup "
+                        "(25-100% more tokens, TA-8) for nothing. Same fix as "
+                        "always: keep your CLAUDE.md and tool setup stable "
+                        "within one conversation, and run /clear to start "
+                        "fresh when you're switching to something different "
+                        "rather than letting the cache go stale."
                     ),
                 ),
             ),
@@ -1532,9 +1538,12 @@ METRICS: dict[str, Metric] = {
                     severity=SEVERITY_WATCH,
                     lever=lever(ACTION_INCREASE, "subagent_dispatch"),
                     detail=(
-                        "A main-thread reply carries appreciably more than a "
-                        "subagent one. That is normal for a session that mostly "
-                        "coordinates; it is worth watching if the gap widens."
+                        "Your main conversation is carrying noticeably more "
+                        "per reply than a subagent does for the same kind of "
+                        "work. Normal if you're mostly coordinating rather "
+                        "than doing the work yourself -- worth trying 'use a "
+                        "subagent for this' next time if the gap keeps "
+                        "growing."
                     ),
                 ),
             ),
@@ -1545,11 +1554,13 @@ METRICS: dict[str, Metric] = {
                     severity=SEVERITY_ACT,
                     lever=lever(ACTION_INCREASE, "subagent_dispatch"),
                     detail=(
-                        "A main-thread reply carries three times or more what a "
-                        "subagent reply does, so the same work runs on far "
-                        "fewer tokens dispatched. Move file reading, search and "
-                        "long analysis into subagents and keep the main thread "
-                        "for decisions."
+                        "Your main conversation is doing about 3x (or more) "
+                        "the work of a subagent for the same kind of task -- "
+                        "that's tokens spent somewhere more expensive than it "
+                        "needs to be. Next time you ask for file reading, "
+                        "searching, or long research, say 'use a subagent "
+                        "for this' and keep your main conversation for "
+                        "decisions."
                     ),
                 ),
             ),

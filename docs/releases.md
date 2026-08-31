@@ -42,6 +42,27 @@ require entries for historical
 versions: pinning history would force a rewrite at every release, which is how
 a check becomes something people route around.
 
+## 4.2.1 — 2026-08-31
+
+**No migration.** A correction to the recommendation table's advice text; no
+boundary, severity or field changed.
+
+**What changed for a user:** the "reduce main-thread context" and "increase
+subagent dispatch" advice told you WHAT was wrong but not what to actually
+do about it -- "dispatch work to subagents" and "start a fresh session at a
+natural break" are true, but neither says what to type. Every ACT/WATCH
+detail across all five metrics now names the literal action: say "use a
+subagent for this" when you have a big search or file-reading task, and run
+`/clear` to start over instead of continuing a long conversation. The
+prompt-prefix-stability advice similarly now says what changes between calls
+usually breaks the cache (editing `CLAUDE.md`, switching tools mid-session)
+and what to do about it.
+
+**Why, precisely.** 4.2.0's copy sweep made every panel state one plain
+sentence; it did not go far enough on WHAT that sentence asked the reader to
+do. Reported directly by a first-time reader looking at the live report:
+"what does it mean? how do I do that?"
+
 ## 4.2.0 — 2026-08-31
 
 **No migration.** A rewrite of the report's action-oriented prose, plus one
