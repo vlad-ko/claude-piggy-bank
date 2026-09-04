@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -37,7 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import serve as serve_mod  # noqa: E402
-from ingest import ingest  # noqa: E402
+from ingest import default_projects_dir, ingest  # noqa: E402
 from serve import Api, make_handler  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "session-fixture.jsonl"
@@ -55,6 +56,28 @@ class RefreshEndpointTest(unittest.TestCase):
         shutil.copy(FIXTURE, projects / "session-fixture.jsonl")
         cls.db = cls.tmp / "usage.db"
         ingest(projects, cls.db)
+
+        # A HOME OF OUR OWN, and it is the difference between testing this
+        # code and testing this machine. `run_refresh` runs the same bare
+        # `ingest.py --db ...` a user's button does, and that command derives
+        # its transcript directory from `~/.claude/projects/<repo path>`. On
+        # the author's laptop that directory is full, so the happy path passed;
+        # on a CI runner it does not exist, so the refresh correctly REFUSED
+        # and the test read that refusal as a bug in the feature.
+        #
+        # The refusal was right and the test was wrong: it asserted an
+        # environment. So the child gets a temporary HOME with exactly one
+        # transcript in exactly the directory the convention names, computed by
+        # `default_projects_dir` rather than spelled out here -- a hand-written
+        # copy of that convention would pass while disagreeing with the code
+        # that implements it.
+        cls.home = cls.tmp / "home"
+        derived = default_projects_dir(cwd=Path.cwd(), home=cls.home)
+        derived.mkdir(parents=True)
+        shutil.copy(FIXTURE, derived / "session-fixture.jsonl")
+        cls._real_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(cls.home)
+
         cls.api = Api(cls.db)
         cls.server = HTTPServer(("127.0.0.1", 0), make_handler(cls.api))
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -66,6 +89,10 @@ class RefreshEndpointTest(unittest.TestCase):
         cls.server.server_close()
         cls.thread.join(timeout=5)
         cls.api.conn.close()
+        if cls._real_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = cls._real_home
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def post(self, path: str, host: str | None = None) -> tuple[int, dict]:
