@@ -47,12 +47,15 @@ import bisect
 import json
 import os
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path, PurePath
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Mapping, Optional
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -97,10 +100,7 @@ from recommendations import (
     SAMPLE_STATES,
     SAMPLE_UNDER_SAMPLED,
     SAMPLE_UNMEASURED,
-    SEVERITY_ACT,
     SEVERITY_OK,
-    SEVERITY_RANK,
-    SEVERITY_WATCH,
     UNDER_SAMPLED_NOTE,
     UNMEASURED_NOTE,
     WORSE_WHEN_HIGHER,
@@ -224,17 +224,22 @@ def _refuse_unwired_metrics(declared: frozenset[str], table: frozenset[str]) -> 
 _refuse_unwired_metrics(RECOMMENDED_METRICS, frozenset(METRICS))
 
 # --------------------------------------------------------------------------
-# #89: the summary level -- the four-dot status strip and the knob rows.
+# #89: the summary level -- the knob rows.
 #
 # Three levels over ONE payload: the summary (what do I do?), the four question
 # cards (why?), and the raw data (show me everything). Everything this block
 # adds is a READING of something already computed for the other two levels --
 # `health`, `context`, and the `recommendations` table -- never a second
-# derivation of it. That is why `_status()` takes those three blocks as
-# arguments, exactly as `_health()` and `_recommendations()` take `context`: a
-# strip that ran its own queries would be a second opinion on the numbers it
-# summarises, and a summary that disagreed with the level below it is the one
-# defect a three-level page makes easy.
+# derivation of it: a summary that ran its own queries would be a second
+# opinion on the numbers it summarises, and a summary that disagreed with the
+# level below it is the one defect a three-level page makes easy.
+#
+# A four-dot status strip sat here too until 2026-08-31, when the product
+# owner removed it: every one of its dots restated something already on the
+# same screen -- `#health-note`, the Overview's second question card, and the
+# knob rows immediately below it. The two enumerations that existed only to
+# feed it (`CACHE_METRICS`, `CONTEXT_DOT_METRIC`) went with it rather than
+# staying behind as import-time guards over a reader nothing has.
 #
 # NO THRESHOLD IS AUTHORED HERE OR IN THE PAGE. Every number a gauge draws --
 # where an arc starts and stops, where a tick sits, what the reader should aim
@@ -243,74 +248,6 @@ _refuse_unwired_metrics(RECOMMENDED_METRICS, frozenset(METRICS))
 # fraction of a semicircular sweep a value sits at, which is arithmetic over
 # the table's own ordered ranges.
 # --------------------------------------------------------------------------
-
-# Which metrics the summary's cache dot ranges over. A SECOND enumeration of a
-# subset of one set, so it gets `RECOMMENDED_METRICS`' treatment rather than
-# its own habits: checked against the wired set AT IMPORT, because a cache
-# metric added to the table and not named here would leave the dot reporting
-# "working" over a reading it never looked at -- the milder of two true
-# statements, chosen by an omission.
-#
-# It carries NO number. Which metrics measure the cache is a statement about
-# what was divided by what; where a cache reading stops being healthy is the
-# table's, and this set never decides it.
-CACHE_METRICS = frozenset(
-    {
-        METRIC_CACHE_READS_PER_WRITE,
-        METRIC_CACHE_WRITE_REPAYMENT_AT_OWN_TTL,
-        METRIC_CACHE_WRITE_ONLY_SHARE,
-    }
-)
-
-
-def _refuse_ungrouped_cache_metrics(
-    cache: frozenset[str], wired: frozenset[str]
-) -> None:
-    """Refuse to import if the cache group names a metric nothing computes."""
-    stray = sorted(cache - wired)
-    if stray:
-        raise RuntimeError(
-            f"serve.CACHE_METRICS names {stray}, which serve.RECOMMENDED_METRICS "
-            "does not: a dot cannot report on a reading nothing measures."
-        )
-
-
-_refuse_ungrouped_cache_metrics(CACHE_METRICS, RECOMMENDED_METRICS)
-
-# WHICH METRIC THE CONTEXT DOT ANSWERS TO (#93, second pass).
-#
-# The dot asks "Wasting context?" and that is a JUDGMENT, not an observation.
-# The observation underneath it -- did any call in this period reach half its
-# model's documented window -- is complete over whatever ran, however little
-# ran, and `_context()` answers it honestly on any sample. Turning that into
-# "No, you are not wasting context" is a different claim, and it is the same
-# claim `main_thread_share_over_half_window` makes; so it is owed the same
-# floor.
-#
-# THIS WAS SHIPPED WRONG AND CAUGHT IN REVIEW. The first pass exempted this dot
-# on the grounds that its verdict is a complete statement over the period. That
-# is true of the question the CARD asks and false of the question the DOT asks,
-# and the two sat on one screen contradicting each other: a green "Wasting
-# context? -- No" directly above a row reading `TOO FEW -
-# main_thread_share_over_half_window - 5 of 11`. A reader cannot hold both.
-#
-# Named here rather than reached for inside `_status()`, and checked against
-# the wired set at import, for `CACHE_METRICS`' reason: a dot that answers to a
-# metric nothing computes would report a verdict it never looked at.
-CONTEXT_DOT_METRIC = METRIC_MAIN_THREAD_SHARE_OVER_HALF_WINDOW
-
-
-def _refuse_unbacked_context_dot(metric: str, wired: frozenset[str]) -> None:
-    """Refuse to import if the context dot answers to nothing this file computes."""
-    if metric not in wired:
-        raise RuntimeError(
-            f"serve.CONTEXT_DOT_METRIC is {metric!r}, which "
-            "serve.RECOMMENDED_METRICS does not name: a dot cannot inherit the "
-            "floor of a reading nothing measures."
-        )
-
-
-_refuse_unbacked_context_dot(CONTEXT_DOT_METRIC, RECOMMENDED_METRICS)
 
 # WHAT KIND OF NUMBER EACH READING IS -- `30.3%` rather than `0.3034`, `3.20x`
 # rather than `3.195` -- IS NOT DECLARED HERE ANY MORE. It shipped as a
@@ -324,22 +261,15 @@ _refuse_unbacked_context_dot(CONTEXT_DOT_METRIC, RECOMMENDED_METRICS)
 # `RECOMMENDED_METRICS` exists to prevent.
 
 
-def _refuse_unhandled_states(
-    what: str, handled: Iterable[str], declared: Iterable[str]
-) -> None:
-    """Refuse to import unless a state table covers its vocabulary exactly.
-
-    Both directions. A state with no entry is the one a `.get()` default would
-    render as whichever verdict was convenient; an entry for a state that no
-    longer exists is a translation nothing can reach, and it makes the table
-    look more complete than it is.
-    """
-    handled, declared = frozenset(handled), frozenset(declared)
-    if handled != declared:
-        raise RuntimeError(
-            f"{what} does not cover its states exactly: unhandled "
-            f"{sorted(declared - handled)}, unknown {sorted(handled - declared)}"
-        )
+# `_refuse_unhandled_states` STOOD HERE until 2026-09-01. It refused to import
+# unless a state table covered its vocabulary in BOTH directions, and every one
+# of its five call sites was a `STRIP_*` table -- so removing the status strip
+# as duplication (product-owner direction, 2026-08-31) left it defined and
+# never called. It is deleted rather than kept "in case": an uncalled guard
+# proves nothing, and a future state table that wants this property should
+# reintroduce it with its own caller and its own test rather than inherit an
+# orphan. The property it enforced is not lost with it -- the tables it guarded
+# are gone too.
 
 
 # What the model-mix observation ranges over, named ONCE and carried in the
@@ -665,97 +595,6 @@ CONTEXT_ANSWER_STATEMENTS = {
     ),
 }
 
-
-# The strip's own four states. THREE vocabularies reach this line -- the health
-# verdict's, the context answer's and the table's severities -- and each is
-# translated into these rather than rendered raw, so the four dots can be read
-# in one glance without the reader learning three sets of words.
-#
-# `STRIP_UNKNOWN` is the load-bearing member and is NOT a fourth shade of
-# `STRIP_WATCH`: "we could not check" and "we checked and it is middling" are
-# different claims, and collapsing them is the substitution this repository
-# refuses everywhere else. A dot with no measurement behind it must never wear
-# the colour of one that has.
-STRIP_GOOD = "good"
-STRIP_WATCH = "watch"
-STRIP_BAD = "bad"
-STRIP_UNKNOWN = "unknown"
-# Worst first, so "the worst state any reading reached" is a lookup rather than
-# a comparison somebody writes out. `STRIP_UNKNOWN` sits between `watch` and
-# `good` for the same reason `HEALTH_ORDER` puts `unchecked` there: an
-# unestablished answer may weaken a clean one and may never soften a bad one.
-STRIP_ORDER = (STRIP_BAD, STRIP_WATCH, STRIP_UNKNOWN, STRIP_GOOD)
-
-# One entry per state of each vocabulary, checked EXHAUSTIVE at import. A state
-# added upstream with no entry here would otherwise reach `KeyError` at request
-# time -- a 500 over the whole payload -- or, worse, a `.get(..., default)`
-# that quietly rendered a new failure state as a clean dot.
-STRIP_FROM_HEALTH: dict[str, tuple[str, str]] = {
-    HEALTH_OK: (STRIP_GOOD, "Nothing broken"),
-    HEALTH_UNCHECKED: (STRIP_UNKNOWN, "Not fully checked"),
-    HEALTH_FAILED: (STRIP_BAD, "Something is broken"),
-}
-STRIP_FROM_CONTEXT: dict[str, tuple[str, str]] = {
-    CONTEXT_ANSWER_YES: (STRIP_BAD, "Yes"),
-    CONTEXT_ANSWER_NO: (STRIP_GOOD, "No"),
-    CONTEXT_ANSWER_INCONCLUSIVE: (STRIP_UNKNOWN, "Not established"),
-    CONTEXT_ANSWER_UNKNOWN: (STRIP_UNKNOWN, "Unknown"),
-    CONTEXT_ANSWER_NO_SAMPLE: (STRIP_UNKNOWN, "No sample"),
-}
-STRIP_FROM_SEVERITY: dict[str, tuple[str, str]] = {
-    SEVERITY_OK: (STRIP_GOOD, "Repaying"),
-    SEVERITY_WATCH: (STRIP_WATCH, "Watch"),
-    SEVERITY_ACT: (STRIP_BAD, "Not repaying"),
-}
-# WHAT A DOT SAYS WHEN IT HAS NO VERDICT, and there are TWO such sentences
-# because there are two absences. Spelled once each and shared by every dot
-# that can reach them: three dots arrive here by three different routes, and a
-# reader meets one phrase per state rather than one phrase per dot.
-#
-# "Nobody measured this" and "this was measured over too little" send a reader
-# to two different remedies, and only one of them is "come back later". A
-# project that never dispatches a subagent is not waiting for more sessions.
-STRIP_NOT_MEASURED = "Not measured"
-STRIP_UNDER_SAMPLED = "Not enough data yet"
-# The suffix the knobs dot adds where SOME of its knobs have a basis. Where
-# some do, the count still ranges over all of them -- narrowing the denominator
-# to the measured ones would be a second, smaller truth told in place of the
-# first -- and this names the rest. Where NONE does, "0 of 5" is arithmetic
-# over an empty set wearing the look of five checks passed, which is the
-# composition defect #93 is about in four characters, and the dot says which
-# absence it is instead.
-STRIP_KNOBS_SHORT_SUFFIX = "{short} not yet measurable"
-
-# The four questions, in the order they are read. Chosen so the strip runs from
-# "is it broken" to "is the discount working": a reader who stops after one dot
-# has stopped on the one that would invalidate the rest.
-STRIP_DOT_BROKEN = "broken"
-STRIP_DOT_CONTEXT = "context"
-STRIP_DOT_KNOBS = "knobs"
-STRIP_DOT_CACHE = "cache"
-STRIP_QUESTIONS: dict[str, str] = {
-    STRIP_DOT_BROKEN: "Anything broken?",
-    STRIP_DOT_CONTEXT: "Wasting context?",
-    STRIP_DOT_KNOBS: "Knobs worth turning",
-    STRIP_DOT_CACHE: "Cache health",
-}
-STRIP_DOTS = (
-    STRIP_DOT_BROKEN,
-    STRIP_DOT_CONTEXT,
-    STRIP_DOT_KNOBS,
-    STRIP_DOT_CACHE,
-)
-_refuse_unhandled_states("STRIP_FROM_HEALTH", STRIP_FROM_HEALTH, HEALTH_ORDER)
-_refuse_unhandled_states(
-    "STRIP_FROM_CONTEXT", STRIP_FROM_CONTEXT, CONTEXT_ANSWER_STATES
-)
-_refuse_unhandled_states("STRIP_FROM_SEVERITY", STRIP_FROM_SEVERITY, SEVERITY_RANK)
-_refuse_unhandled_states("STRIP_QUESTIONS", STRIP_QUESTIONS, STRIP_DOTS)
-_refuse_unhandled_states(
-    "STRIP_ORDER",
-    STRIP_ORDER,
-    {STRIP_GOOD, STRIP_WATCH, STRIP_BAD, STRIP_UNKNOWN},
-)
 
 # #65: the growth curve. THE finding that makes the context figures actionable
 # -- typical main-session context across the four quarters of its own life,
@@ -3343,6 +3182,13 @@ class Api:
                 # row: an under-sampled or unmeasured metric has no lever and
                 # therefore no directive to lead a sentence with.
                 "recommendation": a.recommendation,
+                # THE LITERAL STEP (#124): "run /clear", "say 'use a subagent
+                # for this'" -- kept as its OWN field, never parsed back out
+                # of `recommendation`'s prose, so the page can put it in a
+                # callout of its own rather than guessing which clause of a
+                # sentence is the command. `None` on a healthy reading, same
+                # rule as `directive`.
+                "action": a.action,
                 "value": a.value,
                 "unit": METRICS[a.metric].unit,
                 "severity": a.severity,
@@ -3378,6 +3224,7 @@ class Api:
                 "value": u.value,
                 "severity": None,
                 "directive": None,
+                "action": None,
                 # No needle. See the class docstring: the needle's position
                 # under a coloured arc is the verdict in a second notation.
                 "gauge": cls._gauge(METRICS[u.metric], None),
@@ -3402,13 +3249,14 @@ class Api:
                 # the absence than about the reading.
                 "means": METRICS[key].means,
                 "unit": METRICS[key].unit,
-                # THREE NULLS, and none of them a zero. No reading, no
+                # FOUR NULLS, and none of them a zero. No reading, no
                 # severity, nothing to do -- the gauge below carries no needle
                 # for the same reason, and `unmeasured_note` beside it says so
                 # in words.
                 "value": None,
                 "severity": None,
                 "directive": None,
+                "action": None,
                 "gauge": cls._gauge(METRICS[key], None),
                 # An unmeasured metric still HAS a floor, and its sample size is
                 # a real count rather than an absence -- usually 0, and not
@@ -3546,224 +3394,6 @@ class Api:
         return (index + within) / span
 
     # ----------------------------------------------------------------------
-    # #89: the four-dot status strip
-    # ----------------------------------------------------------------------
-
-    @classmethod
-    def _status(
-        cls,
-        health: dict[str, Any],
-        context: dict[str, Any],
-        recommendations: dict[str, Any],
-    ) -> dict[str, Any]:
-        """The summary's one-line strip: four questions, four states.
-
-        STATUS, NOT CONTENT. Each dot says which of four states its question is
-        in and answers it in two or three words; everything that makes the
-        answer true is one level down, on the card that already states it.
-
-        EVERY ANSWER IS READ, NEVER RE-DERIVED. The three blocks arrive as
-        arguments -- the same objects the rest of the payload carries -- so a
-        dot cannot disagree with the card it summarises. A strip that ran its
-        own queries would be a fifth opinion in a payload that has spent this
-        much effort having one.
-        """
-        health_state, health_answer = STRIP_FROM_HEALTH[health["verdict"]]
-        utilisation = context["utilisation"]
-        context_verdict = utilisation["answer"]["verdict"]
-        context_state, context_answer = STRIP_FROM_CONTEXT[context_verdict]
-        # WHICH SCOPE, where there is a proven one and only there. The worst
-        # scope is the ranking's own winner, off the same tally question 2
-        # ranks on; where the answer is not a proven yes there is no winner to
-        # name and the verdict already says so.
-        if context_verdict == CONTEXT_ANSWER_YES and utilisation["worst_scope"]:
-            context_answer = f"{context_answer} — {utilisation['worst_scope']}"
-        knobs = recommendations["knobs"]
-        # THE CONTEXT DOT INHERITS ITS BACKING METRIC'S FLOOR (#93). "Wasting
-        # context?" is answered by `main_thread_share_over_half_window`, and a
-        # dot may not state a verdict its own metric has just refused to state.
-        #
-        # THROUGH `STRIP_ORDER`, so no new precedence rule is invented here:
-        # the floor contributes an UNKNOWN and the worst of the two wins. That
-        # gives the direction this repository takes everywhere -- an unknown
-        # WEAKENS a clean answer and NEVER softens a bad one, which
-        # `CONTEXT_ANSWER_STATES` already spells out for the card. A proven
-        # `yes` is a call observed at or above half its window; it happened,
-        # the remedy is real, and a thin sample is no reason to hide it. A `no`
-        # over five banded calls is the over-claim.
-        context_state, context_answer = cls._floored(
-            context_state,
-            context_answer,
-            next(k for k in knobs if k["metric"] == CONTEXT_DOT_METRIC),
-        )
-        turnable = [k for k in knobs if k["directive"]]
-        # EVERY KNOB, INCLUDING THE ONES WITH NO SEVERITY (#93). This used to
-        # filter the severity-less rows out and take the worst of what was
-        # left, which is how a dot went green over readings nobody could take:
-        # on a fresh install all five were severity-less and the strip reported
-        # four good dots. A missing severity is now `STRIP_UNKNOWN` and joins
-        # the comparison, where `STRIP_ORDER` already says what it does --
-        # weaken a clean answer, never soften a bad one.
-        knob_state = cls._worst_strip_state([k["severity"] for k in knobs])
-        cache = [k for k in knobs if k["metric"] in CACHE_METRICS]
-        cache_state = cls._worst_strip_state([k["severity"] for k in cache])
-        answers = {
-            STRIP_DOT_BROKEN: (health_state, health_answer),
-            STRIP_DOT_CONTEXT: (context_state, context_answer),
-            # A COUNT, not a verdict in words: "2 of 5" says both how many
-            # knobs are worth turning and how many exist, and the second half
-            # is what stops a page of two rows reading as a page of two
-            # problems.
-            STRIP_DOT_KNOBS: (knob_state, cls._knobs_answer(knobs, turnable)),
-            STRIP_DOT_CACHE: (cache_state, cls._severity_answer(cache, cache_state)),
-        }
-        return {
-            "dots": [
-                {
-                    "key": key,
-                    "question": STRIP_QUESTIONS[key],
-                    "state": answers[key][0],
-                    "answer": answers[key][1],
-                }
-                for key in STRIP_DOTS
-            ]
-        }
-
-    @staticmethod
-    def _worst_strip_state(severities: list[Optional[str]]) -> str:
-        """The worst of a run of table severities, as a strip state.
-
-        NO SEVERITY ORDERING IS SPELLED HERE. `SEVERITY_RANK` is the module's
-        own explicit ordering -- not alphabetical and not declaration order --
-        and this reads it; the comparison across the FOUR strip states is
-        `STRIP_ORDER`'s, for the same reason.
-
-        A `None` SEVERITY IS `STRIP_UNKNOWN` AND IS COMPARED, NOT DROPPED
-        (#93). It used to be filtered out by every caller, so a dot took the
-        worst of whatever happened to be measured and went green over a set
-        whose other members had no basis at all -- at the limit, over a set
-        where none of them did. `STRIP_ORDER` already fixes what an unknown
-        does when it meets a verdict: it sits between `watch` and `good`, so it
-        weakens a clean answer and never softens a bad one. This function now
-        applies that rule instead of leaving the caller to discard the case.
-
-        An EMPTY run is `STRIP_UNKNOWN`, never `STRIP_GOOD`. No reading is not
-        a clean reading, and a dot that went green because nothing was measured
-        is the exact failure this project is arranged against.
-
-        Returns the STATE ALONE. It used to return the state and an answer, and
-        the answer for the empty case was a cache-specific string -- one dot's
-        wording living inside the helper every dot shares. Each caller composes
-        its own words now, off the state this returns.
-        """
-        states = [
-            STRIP_UNKNOWN
-            if severity is None
-            else STRIP_FROM_SEVERITY[severity][0]
-            for severity in severities
-        ]
-        if not states:
-            return STRIP_UNKNOWN
-        return min(states, key=STRIP_ORDER.index)
-
-    @staticmethod
-    def _no_basis_answer(rows: list[dict[str, Any]]) -> str:
-        """WHICH absence a dot with no verdict is reporting (#93).
-
-        Under-sampled beats unmeasured where both are present, and the
-        direction is the useful one rather than the cautious one: if ANY of
-        these readings is only waiting for more data, "come back after a few
-        more sessions" is true and actionable for this dot. If none is, nothing
-        here is waiting for anything, and saying so would be a promise the
-        arithmetic will not keep.
-
-        SHARED BY EVERY DOT THAT CAN HAVE NO VERDICT, so the two absences
-        cannot be told apart on one dot and collapsed on another -- which is
-        precisely what shipped in this change's first pass, where the knobs dot
-        said "Not enough data yet" over an empty corpus that was waiting for
-        nothing.
-        """
-        if any(row["sample"]["state"] == SAMPLE_UNDER_SAMPLED for row in rows):
-            return STRIP_UNDER_SAMPLED
-        return STRIP_NOT_MEASURED
-
-    @classmethod
-    def _floored(
-        cls, state: str, answer: str, backing: dict[str, Any]
-    ) -> tuple[str, str]:
-        """One dot's state and words, held to its backing reading's floor.
-
-        The floor contributes an UNKNOWN and `STRIP_ORDER` decides, so this
-        adds no precedence rule of its own: a clean verdict is weakened, a bad
-        one is not softened, and a dot already unknown keeps whatever more
-        specific words it had (`no sample` and `unknown` say different things,
-        and neither is improved by this sentence).
-
-        UNDER-SAMPLED ONLY, NEVER UNMEASURED, and the difference is reachable
-        rather than theoretical. A window holding only subagent calls has no
-        main-thread share at all -- the metric is unmeasured because no such
-        call ran, not because too few did -- while the context card still
-        answers cleanly, every call in the period having been measured, banded
-        and inside its window. There is nothing missing there and nothing to
-        wait for, so "come back after a few more sessions" would be a promise
-        with no arithmetic behind it. An absent question is not an unanswered
-        one.
-        """
-        if backing["sample"]["state"] != SAMPLE_UNDER_SAMPLED:
-            return state, answer
-        weakened = min((state, STRIP_UNKNOWN), key=STRIP_ORDER.index)
-        if weakened == state:
-            return state, answer
-        return weakened, STRIP_UNDER_SAMPLED
-
-    @staticmethod
-    def _knobs_answer(
-        knobs: list[dict[str, Any]], turnable: list[dict[str, Any]]
-    ) -> str:
-        """The knobs dot's words: how many are worth turning, of how many.
-
-        THE DENOMINATOR IS NEVER QUIETLY NARROWED. Where every knob has a
-        basis this is the count it always was. Where some do not, the count
-        stays over ALL of them and the shortfall is named beside it -- reporting
-        "0 of 1" on a page showing five rows would be a second, smaller truth
-        told in place of the first.
-
-        Where NONE has a basis there is no count worth printing: "0 of 5" is
-        arithmetic over an empty set, and it reads exactly like five checks
-        that passed. That is the sentence a fresh install saw, and it is
-        replaced by one that says what is actually true.
-        """
-        without_basis = [k for k in knobs if k["severity"] is None]
-        if knobs and len(without_basis) == len(knobs):
-            # WHICH absence, not merely that there is one. An empty corpus and
-            # a fresh install both leave every knob without a verdict, and only
-            # one of them is waiting for more sessions.
-            return Api._no_basis_answer(knobs)
-        answer = f"{len(turnable)} of {len(knobs)}"
-        if without_basis:
-            suffix = STRIP_KNOBS_SHORT_SUFFIX.format(short=len(without_basis))
-            return f"{answer} — {suffix}"
-        return answer
-
-    @staticmethod
-    def _severity_answer(rows: list[dict[str, Any]], state: str) -> str:
-        """A dot's words where its readings carry severities (#93).
-
-        The worst severity's own phrase where there is one. Where there is not,
-        WHICH absence it is: a metric with a reading too thin to band sends the
-        reader to "come back later", and one with no reading at all does not.
-        Both were one string before, which made a first run and a project that
-        never cached look identical.
-        """
-        if state != STRIP_UNKNOWN:
-            worst = max(
-                (row["severity"] for row in rows if row["severity"] is not None),
-                key=lambda s: SEVERITY_RANK[s],
-            )
-            return STRIP_FROM_SEVERITY[worst][1]
-        return Api._no_basis_answer(rows)
-
-    # ----------------------------------------------------------------------
     # #89: the model mix -- an observation, and deliberately not advice
     # ----------------------------------------------------------------------
 
@@ -3834,6 +3464,7 @@ class Api:
             "unit": METRICS[assessment.metric].unit,
             "severity": assessment.severity,
             "recommendation": assessment.recommendation,
+            "action": assessment.action,
             "lever": cls._lever_payload(assessment.lever),
             # The key the ranking orders by, published beside the order it
             # produced -- `RANKED_BY`'s rule, and the reason
@@ -4104,13 +3735,11 @@ class Api:
             "durability": self._durability(start, end),
             "models": models,
             "recommendations": recommendations,
-            # #89's summary level. Both blocks are READINGS of what is already
-            # in this dict -- the strip of `health`, `context` and the table's
-            # own knobs; the mix of `models` -- so the level that says what to
-            # do and the levels that say why cannot report different numbers.
+            # #89's summary level. The mix is a READING of what is already in
+            # this dict -- `models` -- so the level that says what to do and
+            # the levels that say why cannot report different numbers.
             # `models` and `recommendations` are computed into locals above for
             # exactly that reason: calling them twice would be two samples.
-            "status": self._status(health, context, recommendations),
             "model_mix": self._model_mix(models),
         }
 
@@ -4421,8 +4050,126 @@ class Api:
         ]
 
 
+# THE REFRESH THE PAGE CAN PERFORM ITSELF (product-owner direction,
+# 2026-08-31). The staleness banner used to end "Run ingest.py to refresh it",
+# which is a true sentence naming a remedy its reader cannot perform: they are
+# in a browser, and that is a script path plus a `--db` flag nobody showed
+# them. The page now offers a button, and the button runs THIS.
+#
+# IT SHELLS OUT TO THE SAME COMMAND A USER WOULD TYPE rather than importing
+# `ingest` and calling into it. That is deliberate: `ingest.main()` is an
+# argparse entry point, and a second in-process route into the ingest would be
+# a second implementation of "refresh" that could drift from the one the
+# hooks, the skill and the CLI all use. One way to do it, exercised the same
+# way from every caller.
+INGEST_SCRIPT = HERE / "ingest.py"
+# Long enough for a real incremental refresh (which re-reads only what
+# changed), short enough that a wedged process cannot hold a socket open
+# forever. A first-ever scan over a large corpus can exceed this -- and then it
+# says so, which is the honest answer, not a spinner that never resolves.
+REFRESH_TIMEOUT_SECONDS = 600.0
+# Two clicks must not start two ingests over one database. The lock is held for
+# the duration of the run, so the second request WAITS for the first and then
+# reports that same run's outcome.
+_REFRESH_LOCK = threading.Lock()
+# How much of a failed process's own output to hand back. Enough to carry a
+# traceback's last frame and its message; not so much that a runaway log
+# becomes the response body.
+REFRESH_ERROR_TAIL_CHARS = 2000
+
+
+def run_refresh(
+    db_path: Path,
+    script: Optional[Path] = None,
+    timeout: float = REFRESH_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Re-run the ingest over `db_path` and say -- truthfully -- what happened.
+
+    `ok` is True ONLY when the ingest process exited 0. Every other outcome is
+    `ok: False` with an `error` the reader can act on, because the failure this
+    guards against is a green "refreshed" printed over numbers that never
+    moved: the reader would then trust stale figures MORE than before they
+    clicked, which is worse than the banner this replaced.
+    """
+    target = Path(script) if script is not None else INGEST_SCRIPT
+    if not target.is_file():
+        # A partial install. Named as such, with the path, so the reader is not
+        # left guessing whether the click did nothing or did something silently.
+        return {
+            "ok": False,
+            "error": (
+                f"cannot refresh: {target.name} is not next to the report "
+                f"server (looked in {target.parent}). This copy is missing the "
+                "ingest script."
+            ),
+        }
+    with _REFRESH_LOCK:
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(target), "--db", str(db_path)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(target.parent),
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "error": (
+                    f"the refresh timed out after {int(timeout)}s and was "
+                    "stopped. Nothing below has changed. A first scan over a "
+                    "large history can take longer than this -- run "
+                    "ingest.py in a terminal for one that reports its own "
+                    "progress."
+                ),
+            }
+        except OSError as exc:
+            return {"ok": False, "error": f"the refresh could not start: {exc}"}
+    if proc.returncode != 0:
+        # The process's OWN words, not a generic failure line: a stale schema
+        # and a permissions error send the reader to different places.
+        detail = (proc.stderr or proc.stdout or "").strip()
+        detail = detail[-REFRESH_ERROR_TAIL_CHARS:]
+        return {
+            "ok": False,
+            "error": (
+                f"the refresh failed (exit {proc.returncode})"
+                + (f": {detail}" if detail else " and printed nothing.")
+            ),
+        }
+    return {"ok": True, "output": (proc.stdout or "").strip()[-REFRESH_ERROR_TAIL_CHARS:]}
+
+
 def make_handler(api: Api) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 (http.server API)
+            """The ONE mutation this server accepts: re-run the ingest.
+
+            It is a POST rather than a GET because it changes the database --
+            behind GET, a browser prefetch or a history revisit would each
+            silently start an ingest. The loopback host check is the same one
+            `do_GET` performs and for the same DNS-rebinding reason; a
+            mutation route that skipped it would be strictly worse than the
+            read routes it sits beside.
+            """
+            host = (self.headers.get("Host") or "").split(":")[0]
+            if host not in LOOPBACK_HOSTS:
+                self._respond(403, b"bad host", "text/plain")
+                return
+            if urlparse(self.path).path != "/api/refresh":
+                self._respond(
+                    404, json.dumps({"error": "not found"}).encode(), "application/json"
+                )
+                return
+            try:
+                result = run_refresh(api.db_path)
+            except Exception as exc:  # noqa: BLE001 -- never drop the response
+                result = {
+                    "ok": False,
+                    "error": f"internal error during refresh: {type(exc).__name__}",
+                }
+            self._respond(200, json.dumps(result).encode(), "application/json")
+
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             # Reject any request whose Host header isn't loopback BEFORE
             # doing anything else: the bind address (127.0.0.1) blocks a

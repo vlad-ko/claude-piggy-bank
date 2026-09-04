@@ -560,17 +560,28 @@ SEVERITY_RANK = {SEVERITY_OK: 0, SEVERITY_WATCH: 1, SEVERITY_ACT: 2}
 
 @dataclass(frozen=True)
 class Recommendation:
-    """What one range says: a severity, an optional lever, and the prose.
+    """What one range says: a severity, an optional lever, the prose, and the step.
 
     `SEVERITY_OK` must have no lever and every other severity must have one.
     A healthy entry that also told the reader to change something would be
     contradicting itself, and a firing entry with nothing to change would be
     an alarm with no action -- the shape that trains readers to ignore a page.
+
+    `action` is a SECOND, STRICTER promise than `lever`/`detail` (product-owner
+    direction, #124 follow-up: a first-time reader could not turn "dispatch
+    work to subagents" into anything to type). `lever.directive` names WHAT
+    changes ("reduce the context the main session carries"); `detail`
+    explains WHY; `action` is the literal, short, copy-pasteable THING TO DO
+    -- a slash command or the exact words to say to Claude -- kept as its own
+    field precisely so the page can put it in a callout of its own rather
+    than parsing it back out of a sentence. Same rule as `lever`: `SEVERITY_OK`
+    carries none, everything else must.
     """
 
     severity: str
     lever: Optional[Lever]
     detail: str
+    action: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.severity not in SEVERITY_RANK:
@@ -586,6 +597,16 @@ class Recommendation:
             raise ValueError(
                 f"a {self.severity!r} entry must name the lever to pull; an "
                 "alarm with no action is noise"
+            )
+        if self.severity == SEVERITY_OK and self.action is not None:
+            raise ValueError(
+                "a healthy entry must carry no action -- the same "
+                "contradiction as a healthy entry carrying a lever"
+            )
+        if self.severity != SEVERITY_OK and not (self.action or "").strip():
+            raise ValueError(
+                f"a {self.severity!r} entry must name a literal action -- "
+                "the thing to type or say, not only what changes and why"
             )
         _refuse_forbidden_prose(self.detail)
 
@@ -1190,6 +1211,7 @@ METRICS: dict[str, Metric] = {
                         "have a big search or file-reading task, try saying "
                         "'use a subagent for this'."
                     ),
+                    action="Try saying: \"use a subagent for this\"",
                 ),
             ),
             Range(
@@ -1209,6 +1231,7 @@ METRICS: dict[str, Metric] = {
                         "finish a chunk of work, run /clear to start fresh "
                         "instead of continuing the same long conversation."
                     ),
+                    action="Run: /clear",
                 ),
             ),
         ),
@@ -1262,6 +1285,7 @@ METRICS: dict[str, Metric] = {
                         "switching tools mid-conversation; if you need to, "
                         "run /clear first and start over."
                     ),
+                    action="Run: /clear before changing setup",
                 ),
             ),
             Range(
@@ -1283,6 +1307,7 @@ METRICS: dict[str, Metric] = {
                         "cannot be called either way. One more read per write "
                         "settles it in your favour whichever it was."
                     ),
+                    action="No action needed yet -- keep going",
                 ),
             ),
             Range(
@@ -1299,6 +1324,7 @@ METRICS: dict[str, Metric] = {
                         "shuffled tool list, a file read that lands before the "
                         "stable part."
                     ),
+                    action="Check: is something early in your prompt changing each time?",
                 ),
             ),
             Range(
@@ -1374,6 +1400,7 @@ METRICS: dict[str, Metric] = {
                         "switching tools mid-conversation; if you need to, "
                         "run /clear first and start over."
                     ),
+                    action="Run: /clear before changing setup",
                 ),
             ),
             Range(
@@ -1392,6 +1419,7 @@ METRICS: dict[str, Metric] = {
                         "between calls -- a timestamp, a shuffled tool list, a "
                         "file read that lands before the stable part."
                     ),
+                    action="Check: is something early in your prompt changing each time?",
                 ),
             ),
             Range(
@@ -1466,6 +1494,7 @@ METRICS: dict[str, Metric] = {
                         "first call, or a prefix that changes on the very next "
                         "turn; worth a look if it grows."
                     ),
+                    action="No action needed yet -- keep an eye on it",
                 ),
             ),
             Range(
@@ -1483,6 +1512,7 @@ METRICS: dict[str, Metric] = {
                         "fresh when you're switching to something different "
                         "rather than letting the cache go stale."
                     ),
+                    action="Run: /clear before changing setup",
                 ),
             ),
         ),
@@ -1545,6 +1575,7 @@ METRICS: dict[str, Metric] = {
                         "subagent for this' next time if the gap keeps "
                         "growing."
                     ),
+                    action="Try saying: \"use a subagent for this\"",
                 ),
             ),
             Range(
@@ -1562,6 +1593,7 @@ METRICS: dict[str, Metric] = {
                         "for this' and keep your main conversation for "
                         "decisions."
                     ),
+                    action="Say: \"use a subagent for this\"",
                 ),
             ),
         ),
@@ -1725,6 +1757,7 @@ class Assessment:
     severity: str
     recommendation: str
     lever: Optional[Lever]
+    action: Optional[str]
     depth_in_severity: float
     range_lower: float
     range_upper: Optional[float]
@@ -1829,6 +1862,7 @@ def assess(metric_key: str, value: Optional[float]) -> Optional[Assessment]:
         severity=entry.recommendation.severity,
         recommendation=entry.recommendation.text,
         lever=entry.recommendation.lever,
+        action=entry.recommendation.action,
         depth_in_severity=metric.depth(value),
         range_lower=entry.lower.value,
         range_upper=None if entry.upper is None else entry.upper.value,
