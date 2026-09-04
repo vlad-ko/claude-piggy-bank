@@ -88,10 +88,8 @@ from recommendations import (  # noqa: E402
     RECOMMENDATION_PROVENANCE,
     RECOMMENDATIONS_AS_OF,
     SAMPLE_FLOOR_AS_OF,
-    SEVERITY_ACT,
     SEVERITY_OK,
     SEVERITY_RANK,
-    SEVERITY_WATCH,
     UNDER_SAMPLED_NOTE,
     UNMEASURED_NOTE,
     WORSE_WHEN_HIGHER,
@@ -106,7 +104,6 @@ from serve import (  # noqa: E402
     CHECK_FORMAT_CENSUS,
     CHECK_INGEST_AGE,
     CHECK_MODEL_WINDOW_KNOWN,
-    CACHE_METRICS,
     CHECK_RECORDS_PARSED,
     CHECK_WITHIN_WINDOW,
     CONTEXT_ANSWER_INCONCLUSIVE,
@@ -114,7 +111,6 @@ from serve import (  # noqa: E402
     CONTEXT_ANSWER_NO_SAMPLE,
     CONTEXT_ANSWER_STATEMENTS,
     CONTEXT_ANSWER_STATES,
-    CONTEXT_DOT_METRIC,
     CONTEXT_ANSWER_UNKNOWN,
     CONTEXT_ANSWER_YES,
     CONTEXT_SAMPLE,
@@ -172,22 +168,6 @@ from serve import (  # noqa: E402
     STALE_UNKNOWN_NO_RUN_TABLE,
     STALE_UNKNOWN_RUN_IN_FUTURE,
     STATUS_ARCHIVED,
-    STRIP_NOT_MEASURED,
-    STRIP_BAD,
-    STRIP_DOTS,
-    STRIP_DOT_BROKEN,
-    STRIP_DOT_CACHE,
-    STRIP_DOT_CONTEXT,
-    STRIP_DOT_KNOBS,
-    STRIP_FROM_CONTEXT,
-    STRIP_FROM_HEALTH,
-    STRIP_FROM_SEVERITY,
-    STRIP_GOOD,
-    STRIP_ORDER,
-    STRIP_QUESTIONS,
-    STRIP_UNDER_SAMPLED,
-    STRIP_WATCH,
-    STRIP_UNKNOWN,
     UTIL_NO_SAMPLE_NO_CALLS,
     UTIL_NO_SAMPLE_NO_CONTEXT_MEASUREMENT,
     UTIL_NO_SAMPLE_NO_DOCUMENTED_WINDOW,
@@ -3098,6 +3078,15 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
     # decision (`test_every_exemption_cites_the_decision_it_records`). Empty is
     # the healthy state and this is not it -- see the class docstring.
     NOT_RENDERED: dict[str, str] = {
+        "ingest.stale_after_seconds": (
+            "#122 (2026-08-31, product-owner direction): the staleness banner "
+            "used to read 'older than the 15 minutes we trust', which explains "
+            "the tool's own threshold to a reader who wants to know what to do "
+            "about their spend. The banner now states the AGE and offers the "
+            "Refresh button that fixes it; the threshold is the reason the "
+            "banner appeared at all, not something the reader acts on. Still "
+            "published, and still the only place `stale` is decided."
+        ),
         "scope.includes": (
             "#4966: the scope band composes its own sentence from `coverage` "
             "and SHOUTS 'MAIN-THREAD ONLY' where this string would merely say "
@@ -3156,14 +3145,26 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
             "the target in words (`LEVER_TARGETS`' own phrase); the raw "
             "registry key has no reader left to serve on this page."
         ),
-        "recommendations.ranked[].lever.directive": (
-            "#122, 2026-08-31: genuinely rendered, in `next-note`'s \"First: "
-            "{directive}.\" line -- but through `topOpportunity`, a computed "
-            "JS property aliasing one element of this same array, which the "
-            "path-walker cannot trace back to `recommendations.ranked[]`. "
-            "`OverviewRestingStateTest.RESTING['next-note']` is what actually "
-            "pins this reading; this entry only concedes the walker's blind "
-            "spot rather than claiming the field is unread."
+        # The entry that stood here for `lever.directive` is GONE, and its
+        # going is the point of the 2026-09-01 merge rather than an accident
+        # of it. It conceded the path-walker's blind spot: the directive was
+        # rendered only through `topOpportunity`, a JS alias for one element of
+        # this array, which the walker cannot trace back. `advice-note` now
+        # renders `a.lever.directive` inside the loop over
+        # `recommendations.ranked` itself, so the walker sees it through the
+        # loop alias and an exemption would be a claim the page contradicts --
+        # which `test_the_allowlist_cannot_exempt_a_field_that_is_rendered`
+        # would turn red. One entry out, one in, and the register's size is
+        # restated below rather than left to net out silently.
+        "recommendations.ranked[].action": (
+            "Product-owner direction, 2026-09-01, and #124's field read at ONE "
+            "level rather than two. `action` is the literal step -- \"Run: "
+            "/clear\" -- and the page's own tab hint says the SUMMARY level "
+            "is what to do and the overview is why. It is rendered, once, in "
+            "the `k-callout` on the summary's knob card off "
+            "`recommendations.knobs[].action`, which is the same string built "
+            "from the same `Assessment`. Rendering it here too put the two "
+            "actions this report has to offer on the page three times."
         ),
     }
 
@@ -3439,7 +3440,17 @@ class SummaryPayloadIsWiredTest(unittest.TestCase):
     # statistics (#82 group 1) a reader. They were consumed, not deleted -- the
     # scoped meters needed exactly those figures, which is why #82 sequenced
     # them here rather than removing a correct measurement.
-    EXPECTED_NOT_RENDERED = 19
+    # 20 since 2026-08-31 (#122): `ingest.stale_after_seconds` left the
+    # staleness banner when that sentence stopped explaining the tool's
+    # threshold and started offering the button that fixes it.
+    # STILL 20 after the 2026-09-01 merge of the overview's last two cards,
+    # and the number is unchanged for a reason worth writing down rather than
+    # for none: one entry LEFT (`ranked[].lever.directive`, now genuinely
+    # bound inside the ranked loop) and one ARRIVED (`ranked[].action`, whose
+    # one rendering is the summary level's callout). A swap, restated here,
+    # because a count that nets out in silence is exactly the rubber stamp
+    # this literal exists to prevent.
+    EXPECTED_NOT_RENDERED = 20
 
     def test_moving_a_field_between_views_does_not_widen_the_register(self) -> None:
         # #70 splits the page into an overview and a detail view. A field that
@@ -7951,9 +7962,6 @@ class FirstRunRendersNoVerdictTest(unittest.TestCase):
     def block(self) -> dict:
         return self.summary()["recommendations"]
 
-    def dot(self, key: str) -> dict:
-        return next(d for d in self.summary()["status"]["dots"] if d["key"] == key)
-
     # --- the corpus is the one the issue described -------------------------
 
     def test_the_fixture_is_a_first_run_and_reproduces_the_issues_reading(self):
@@ -8059,56 +8067,6 @@ class FirstRunRendersNoVerdictTest(unittest.TestCase):
         block = self.block()
         self.assertNotEqual(block["under_sampled_note"], block["unmeasured_note"])
 
-    # --- the strip cannot go green over it ---------------------------------
-
-    def test_the_knob_dot_is_not_green_and_does_not_count_to_five(self):
-        dot = self.dot(STRIP_DOT_KNOBS)
-        self.assertEqual(dot["state"], STRIP_UNKNOWN)
-        # "0 of 5" is arithmetic over an empty set that reads exactly like five
-        # checks passing. That sentence is what a fresh install saw.
-        self.assertNotIn("of 5", dot["answer"])
-        self.assertEqual(dot["answer"], STRIP_UNDER_SAMPLED)
-
-    def test_the_cache_dot_is_not_green_and_names_the_right_absence(self):
-        dot = self.dot(STRIP_DOT_CACHE)
-        self.assertEqual(dot["state"], STRIP_UNKNOWN)
-        # Under-sampled, not unmeasured: two of the three cache metrics have
-        # readings here. A dot that said "Not measured" would send the reader
-        # to the wrong remedy.
-        self.assertEqual(dot["answer"], STRIP_UNDER_SAMPLED)
-        self.assertNotEqual(dot["answer"], STRIP_NOT_MEASURED)
-
-    def test_the_context_dot_is_not_green_either(self):
-        # #93, second pass, and the defect this class first shipped WITH. The
-        # page rendered a green "Wasting context? -- No" directly above a row
-        # reading `TOO FEW - main_thread_share_over_half_window - 5 of 11`, and
-        # a reader cannot hold both. "Am I wasting context?" is a judgment; it
-        # is the judgment that metric makes, and it is owed that metric's floor.
-        dot = self.dot(STRIP_DOT_CONTEXT)
-        self.assertEqual(dot["state"], STRIP_UNKNOWN)
-        self.assertEqual(dot["answer"], STRIP_UNDER_SAMPLED)
-        # The card underneath still answers its own, narrower question -- the
-        # observation is complete over these three calls and is not withdrawn.
-        # Only the judgment built on top of it is.
-        self.assertEqual(
-            self.summary()["context"]["utilisation"]["answer"]["verdict"],
-            CONTEXT_ANSWER_NO,
-        )
-
-    def test_no_dot_backed_by_the_table_is_good(self):
-        # GREEN MEANS MEASURED AND HEALTHY. Every dot whose question is
-        # answered by a metric in the table has no basis here and may not wear
-        # the colour of one that has.
-        #
-        # "Anything broken?" is deliberately excluded and deliberately still
-        # green-capable: nothing was unparsed, nothing skipped and no model
-        # unknown, which is a COMPLETE statement over whatever was ingested
-        # rather than a rate estimated from a sample. It answers to no floor
-        # because there is no floor a count of parse failures could need.
-        for key in (STRIP_DOT_CONTEXT, STRIP_DOT_KNOBS, STRIP_DOT_CACHE):
-            with self.subTest(dot=key):
-                self.assertNotEqual(self.dot(key)["state"], STRIP_GOOD)
-
     # --- growing out of it -------------------------------------------------
 
     def test_enough_sessions_earn_the_verdicts_back(self):
@@ -8142,192 +8100,6 @@ class FirstRunRendersNoVerdictTest(unittest.TestCase):
             a for a in block["ranked"] if a["metric"] == METRIC_CACHE_READS_PER_WRITE
         )
         self.assertEqual(reads["value"], FIRST_RUN_READS_PER_WRITE)
-
-
-class AProvenYesSurvivesTheFloorTest(unittest.TestCase):
-    """#93, second pass: the floor weakens a clean answer, never a bad one.
-
-    The direction is `CONTEXT_ANSWER_STATES`' own, written down long before
-    this change: "an unknown may weaken a `no` and never a `yes` -- a proven
-    saturation is not softened by the calls that could not be measured beside
-    it." A call observed at or above half its window HAPPENED; the remedy is
-    real, and a thin sample is no reason to hide it. Holding the dot to a floor
-    in both directions would have answered one over-claim with the opposite
-    error, and it is the error this repository never makes.
-    """
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-93-yes-"))
-        db_path = cls.tmp / "usage.db"
-        # Three replies, each carrying 70% of a 1,000,000-token window: too few
-        # to band the share, and every one of them proven over half.
-        ingest(
-            build_first_run_corpus(cls.tmp, read=700_000),
-            db_path,
-            tasks_dir=cls.tmp / "no-task-index",
-        )
-        cls.api = Api(db_path)
-        cls.payload = cls.api.summary(*day_bounds(None, None))
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.api.conn.close()
-        shutil.rmtree(cls.tmp, ignore_errors=True)
-
-    def test_the_fixture_is_the_case_it_claims_to_be(self):
-        backing = next(
-            k
-            for k in self.payload["recommendations"]["knobs"]
-            if k["metric"] == CONTEXT_DOT_METRIC
-        )
-        self.assertEqual(backing["sample"]["state"], SAMPLE_UNDER_SAMPLED)
-        self.assertEqual(
-            self.payload["context"]["utilisation"]["answer"]["verdict"],
-            CONTEXT_ANSWER_YES,
-        )
-
-    def test_the_dot_stays_bad_over_an_under_sampled_metric(self):
-        dot = next(
-            d for d in self.payload["status"]["dots"] if d["key"] == STRIP_DOT_CONTEXT
-        )
-        self.assertEqual(dot["state"], STRIP_BAD)
-        self.assertNotEqual(dot["answer"], STRIP_UNDER_SAMPLED)
-
-    def test_the_proven_answer_keeps_its_named_scope(self):
-        # The scope is the ranking's own winner and is the actionable half of a
-        # proven yes. A floor that swallowed it would leave the reader a red
-        # dot with nothing to act on.
-        dot = next(
-            d for d in self.payload["status"]["dots"] if d["key"] == STRIP_DOT_CONTEXT
-        )
-        self.assertIn(str(self.payload["context"]["utilisation"]["worst_scope"]),
-                      dot["answer"])
-
-    def test_the_floor_helper_never_improves_a_state(self):
-        # Directly, over every state the strip has, so the one-way property is
-        # pinned independently of whatever a corpus happens to reach.
-        under = {"sample": {"state": SAMPLE_UNDER_SAMPLED}}
-        banded = {"sample": {"state": SAMPLE_MEASURED}}
-        for state in STRIP_ORDER:
-            with self.subTest(state=state):
-                floored, _ = Api._floored(state, "answer", under)
-                # `STRIP_ORDER` is WORST FIRST, so a lower index is a worse
-                # state and "never improves" is the floored index being at most
-                # the original's. Spelled through the published order rather
-                # than as a comparison of the four names, so a reordering there
-                # cannot silently invert this.
-                self.assertLessEqual(
-                    STRIP_ORDER.index(floored), STRIP_ORDER.index(state)
-                )
-                self.assertEqual(
-                    Api._floored(state, "answer", banded), (state, "answer")
-                )
-        # ...and specifically: good is weakened, bad is not.
-        self.assertEqual(
-            Api._floored(STRIP_GOOD, "No", under), (STRIP_UNKNOWN, STRIP_UNDER_SAMPLED)
-        )
-        self.assertEqual(Api._floored(STRIP_BAD, "Yes", under), (STRIP_BAD, "Yes"))
-        # An already-unknown dot keeps its own, more specific words: "no
-        # sample" and "unknown" say different things and neither is improved by
-        # being told to come back later.
-        self.assertEqual(
-            Api._floored(STRIP_UNKNOWN, "No sample", under),
-            (STRIP_UNKNOWN, "No sample"),
-        )
-
-
-def build_subagent_only_corpus(root: Path) -> Path:
-    """A window whose only calls are a subagent's.
-
-    The main-thread share is then UNMEASURED -- no such call ran -- while the
-    context card still answers cleanly, because every call in the period was
-    measured, banded and inside its window.
-    """
-    project = root / "projects" / "-fixture-subagent-only"
-    subagents = project / "sub-only" / "subagents"
-    subagents.mkdir(parents=True)
-    (project / "sub-only.jsonl").write_text(
-        json.dumps({"type": "mode", "mode": "normal", "sessionId": "sub-only"}) + "\n"
-    )
-    lines = []
-    for n in range(3):
-        lines.append(json.dumps({
-            "type": "assistant", "sessionId": "sub-only", "agentId": "agent-solo",
-            "isSidechain": True,
-            "timestamp": f"2026-08-06T10:0{n}:00.000Z",
-            "message": {
-                "id": f"msg-sub-only-{n}", "model": REC_OPUS_1M,
-                "usage": {
-                    "input_tokens": 100, "cache_creation_input_tokens": 100,
-                    "cache_read_input_tokens": 1_000, "output_tokens": 50,
-                },
-                "content": [{"type": "text", "text": f"sub {n}"}],
-            },
-        }))
-    (subagents / "agent-solo.jsonl").write_text("\n".join(lines) + "\n")
-    return project
-
-
-class AnAbsentQuestionIsNotAnUnansweredOneTest(unittest.TestCase):
-    """#93, second pass: the floor binds on UNDER-SAMPLED, never on UNMEASURED.
-
-    A window holding only subagent calls has no main-thread share at all. The
-    metric is unmeasured because no such call ran -- not because too few did --
-    and the context card answers cleanly over what did run: every call
-    measured, banded and inside its window.
-
-    Telling that reader "come back after a few more sessions" would be a
-    promise with no arithmetic behind it, and it is the mirror of the defect
-    this change fixes rather than more of the same medicine. The distinction
-    exists precisely because this repository keeps the two absences apart
-    everywhere else.
-    """
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-93-absent-"))
-        db_path = cls.tmp / "usage.db"
-        ingest(
-            build_subagent_only_corpus(cls.tmp),
-            db_path,
-            tasks_dir=cls.tmp / "no-task-index",
-        )
-        cls.api = Api(db_path)
-        cls.payload = cls.api.summary(*day_bounds(None, None))
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.api.conn.close()
-        shutil.rmtree(cls.tmp, ignore_errors=True)
-
-    def test_the_fixture_is_the_case_it_claims_to_be(self):
-        backing = next(
-            k
-            for k in self.payload["recommendations"]["knobs"]
-            if k["metric"] == CONTEXT_DOT_METRIC
-        )
-        self.assertEqual(backing["sample"]["state"], SAMPLE_UNMEASURED)
-        self.assertEqual(
-            self.payload["context"]["utilisation"]["answer"]["verdict"],
-            CONTEXT_ANSWER_NO,
-        )
-
-    def test_the_dot_keeps_its_clean_answer(self):
-        # Nothing here is waiting for data, so nothing here is told to wait.
-        dot = next(
-            d for d in self.payload["status"]["dots"] if d["key"] == STRIP_DOT_CONTEXT
-        )
-        self.assertEqual(dot["state"], STRIP_GOOD)
-        self.assertNotEqual(dot["answer"], STRIP_UNDER_SAMPLED)
-
-    def test_the_floor_helper_ignores_an_unmeasured_backing_reading(self):
-        # Directly, so the decision is pinned independently of what any corpus
-        # happens to reach.
-        unmeasured = {"sample": {"state": SAMPLE_UNMEASURED}}
-        self.assertEqual(
-            Api._floored(STRIP_GOOD, "No", unmeasured), (STRIP_GOOD, "No")
-        )
 
 
 class SampleFloorIsPerPeriodTest(unittest.TestCase):
@@ -8441,95 +8213,13 @@ class SampleFloorIsPerPeriodTest(unittest.TestCase):
         )
 
 
-class GreenMeansMeasuredAndHealthyTest(unittest.TestCase):
-    """#93: a strip dot may not be green over a reading nobody could take.
-
-    The corpus is a first run grown to twelve replies -- deliberately chosen
-    over three. At twelve, two of the five metrics HAVE cleared their floors
-    and both read `ok`, so the old code's "worst of the severities that exist"
-    produced a green dot with three severity-less knobs standing beside it.
-    That is the harder half of the defect: at three calls every knob was
-    absent and the strip at least had nothing to be green about.
-    """
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.tmp = Path(tempfile.mkdtemp(prefix="usage-report-93-green-"))
-        db_path = cls.tmp / "usage.db"
-        ingest(
-            build_first_run_corpus(cls.tmp, replies=12),
-            db_path,
-            tasks_dir=cls.tmp / "no-task-index",
-        )
-        cls.api = Api(db_path)
-        cls.payload = cls.api.summary(*day_bounds(None, None))
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.api.conn.close()
-        shutil.rmtree(cls.tmp, ignore_errors=True)
-
-    def dot(self, key):
-        return next(d for d in self.payload["status"]["dots"] if d["key"] == key)
-
-    def test_the_fixture_is_the_awkward_case_it_claims_to_be(self):
-        # Without this the class could pass over a corpus where something read
-        # `watch`, and the green dot would never have been reachable.
-        knobs = self.payload["recommendations"]["knobs"]
-        severities = [k["severity"] for k in knobs if k["severity"] is not None]
-        self.assertTrue(severities, "no knob is banded; this is not the case")
-        self.assertEqual(set(severities), {SEVERITY_OK})
-        self.assertTrue(
-            [k for k in knobs if k["severity"] is None],
-            "every knob is banded; there is nothing for the dot to be green over",
-        )
-
-    def test_the_knob_dot_is_unknown_rather_than_green(self):
-        # An unknown may WEAKEN a clean answer and may never soften a bad one
-        # -- `STRIP_ORDER`'s own rule, which the strip published and did not
-        # apply, because every caller filtered the unknowns out before
-        # comparing.
-        self.assertEqual(self.dot(STRIP_DOT_KNOBS)["state"], STRIP_UNKNOWN)
-
-    def test_the_cache_dot_is_unknown_rather_than_green(self):
-        self.assertEqual(self.dot(STRIP_DOT_CACHE)["state"], STRIP_UNKNOWN)
-
-    def test_the_count_still_ranges_over_every_knob_and_names_the_rest(self):
-        knobs = self.payload["recommendations"]["knobs"]
-        answer = self.dot(STRIP_DOT_KNOBS)["answer"]
-        # The denominator is not quietly narrowed to the measured ones: a
-        # smaller true statement told in place of the first is its own defect.
-        self.assertTrue(answer.startswith(f"0 of {len(knobs)}"))
-        self.assertIn(str(len([k for k in knobs if k["severity"] is None])), answer)
-
-    def test_an_unknown_does_not_soften_a_bad_reading(self):
-        # The other direction of `STRIP_ORDER`, checked directly so the change
-        # cannot have turned every dot into an unknown.
-        self.assertEqual(
-            Api._worst_strip_state([SEVERITY_ACT, None, SEVERITY_OK]), STRIP_BAD
-        )
-        self.assertEqual(
-            Api._worst_strip_state([SEVERITY_WATCH, None]), STRIP_WATCH
-        )
-        # ...and a run with nothing but verdicts is still green.
-        self.assertEqual(
-            Api._worst_strip_state([SEVERITY_OK, SEVERITY_OK]), STRIP_GOOD
-        )
-        # ...while one unknown among them is enough to withhold it.
-        self.assertEqual(
-            Api._worst_strip_state([SEVERITY_OK, None]), STRIP_UNKNOWN
-        )
-        self.assertEqual(Api._worst_strip_state([]), STRIP_UNKNOWN)
-
-
 class ThreeLevelPayloadTest(unittest.TestCase):
     """#89: three levels, one payload, and no way for them to disagree.
 
     The structural tests over `index.html` can say which binding sits at which
     level. They cannot execute anything, so the property that actually matters
-    -- that the gauge, the diagnosis and the strip are all reading ONE
-    derivation -- is asserted here, against a real payload built through the
-    real ingest path.
+    -- that the gauge and the diagnosis are reading ONE derivation -- is
+    asserted here, against a real payload built through the real ingest path.
 
     The corpus is `build_recommendation_corpus`'s, chosen because it already
     strands the table in every state this level has to render: a day where all
@@ -8765,180 +8455,6 @@ class ThreeLevelPayloadTest(unittest.TestCase):
         self.assertLess(just_past, far_past)
         self.assertLess(far_past, 1.0)
 
-    # --- the strip reads, and never re-derives -----------------------------
-
-    def test_every_dot_answers_its_own_question_in_the_apis_words(self) -> None:
-        for day in self.ALL_DAYS:
-            with self.subTest(day=day):
-                dots = self.summary(day)["status"]["dots"]
-                self.assertEqual([d["key"] for d in dots], list(STRIP_DOTS))
-                for dot in dots:
-                    self.assertEqual(dot["question"], STRIP_QUESTIONS[dot["key"]])
-                    self.assertIn(dot["state"], STRIP_ORDER)
-                    self.assertTrue(dot["answer"].strip())
-
-    def test_the_broken_dot_is_its_cards_own_verdict(self) -> None:
-        # A dot that disagreed with the card it summarises is the three-level
-        # page's own defect in its most literal form. "Anything broken?" is a
-        # complete statement over whatever was ingested -- nothing unparsed,
-        # nothing skipped -- rather than a rate estimated from a sample, so it
-        # answers to no floor and is its card's verdict unconditionally.
-        for day in self.ALL_DAYS:
-            with self.subTest(day=day):
-                payload = self.summary(day)
-                dots = {d["key"]: d for d in payload["status"]["dots"]}
-                self.assertEqual(
-                    dots[STRIP_DOT_BROKEN]["state"],
-                    STRIP_FROM_HEALTH[payload["health"]["verdict"]][0],
-                )
-
-    def test_the_context_dot_is_its_cards_verdict_held_to_its_metrics_floor(self):
-        # #93, second pass. The dot asks "Wasting context?", which is a
-        # JUDGMENT; the card underneath answers "did any call reach half its
-        # window", which is an observation complete over any sample. The two
-        # are not the same claim, and on a five-call corpus the page rendered a
-        # green "No" directly above a row reading `TOO FEW -
-        # main_thread_share_over_half_window - 5 of 11`. A reader cannot hold
-        # both.
-        #
-        # So the dot is the card's verdict EXCEPT where the metric that answers
-        # its question has no basis, and the exception runs one way only.
-        for day in self.ALL_DAYS:
-            with self.subTest(day=day):
-                payload = self.summary(day)
-                dot = next(
-                    d
-                    for d in payload["status"]["dots"]
-                    if d["key"] == STRIP_DOT_CONTEXT
-                )
-                verdict = payload["context"]["utilisation"]["answer"]["verdict"]
-                card = STRIP_FROM_CONTEXT[verdict][0]
-                backing = next(
-                    k
-                    for k in payload["recommendations"]["knobs"]
-                    if k["metric"] == CONTEXT_DOT_METRIC
-                )
-                if backing["sample"]["state"] != SAMPLE_UNDER_SAMPLED:
-                    self.assertEqual(dot["state"], card)
-                    continue
-                # Under-sampled: the floor contributes an unknown and
-                # `STRIP_ORDER` decides, so the dot is never BETTER than the
-                # card and never better than unknown.
-                self.assertEqual(
-                    dot["state"], min((card, STRIP_UNKNOWN), key=STRIP_ORDER.index)
-                )
-                self.assertNotEqual(dot["state"], STRIP_GOOD)
-
-    def test_the_corpus_reaches_a_context_dot_held_to_the_floor(self) -> None:
-        # Without this the test above could pass vacuously over a corpus where
-        # the backing metric is always banded.
-        floored = [
-            day
-            for day in self.ALL_DAYS
-            if next(
-                k
-                for k in self.summary(day)["recommendations"]["knobs"]
-                if k["metric"] == CONTEXT_DOT_METRIC
-            )["sample"]["state"]
-            == SAMPLE_UNDER_SAMPLED
-        ]
-        self.assertTrue(
-            floored, "no window in this corpus under-samples the context metric"
-        )
-
-    def test_the_context_dot_names_the_scope_only_on_a_proven_yes(self) -> None:
-        # A named scope is the ranking's own winner and only exists where the
-        # answer is proven. On any other state there is no winner to name, and
-        # a dot that named one anyway would assert a finding the card below it
-        # does not make.
-        for day in self.ALL_DAYS:
-            payload = self.summary(day)
-            dot = next(
-                d
-                for d in payload["status"]["dots"]
-                if d["key"] == STRIP_DOT_CONTEXT
-            )
-            utilisation = payload["context"]["utilisation"]
-            with self.subTest(day=day, verdict=utilisation["answer"]["verdict"]):
-                if utilisation["answer"]["verdict"] == CONTEXT_ANSWER_YES:
-                    self.assertIn(str(utilisation["worst_scope"]), dot["answer"])
-                else:
-                    for scope in SCOPE_LABELS.values():
-                        self.assertNotIn(scope, dot["answer"])
-
-    def test_the_knob_dot_counts_the_levers_against_every_knob(self) -> None:
-        # "2 of 5", never "2": the second half is what stops a page of two rows
-        # reading as a page of two problems, and it is what makes a dimmed knob
-        # information rather than clutter.
-        #
-        # #93 added the other half of the sentence. Where some knob has no
-        # basis the count still ranges over ALL of them -- narrowing the
-        # denominator to the measured ones would be a second, smaller truth
-        # told in place of the first -- and the shortfall is named beside it.
-        # Where NONE has a basis there is no count worth printing at all: "0 of
-        # 5" is arithmetic over an empty set that reads exactly like five
-        # checks passing, which is the sentence a fresh install saw.
-        for day in self.ALL_DAYS:
-            with self.subTest(day=day):
-                payload = self.summary(day)
-                knobs = payload["recommendations"]["knobs"]
-                dot = next(
-                    d for d in payload["status"]["dots"] if d["key"] == STRIP_DOT_KNOBS
-                )
-                turnable = len([k for k in knobs if k["directive"]])
-                without_basis = [k for k in knobs if k["severity"] is None]
-                if len(without_basis) == len(knobs):
-                    # WHICH absence, not merely that there is one. An empty
-                    # window is waiting for nothing and must not be told to
-                    # come back later; a fresh install is, and must.
-                    under = [
-                        k
-                        for k in knobs
-                        if k["sample"]["state"] == SAMPLE_UNDER_SAMPLED
-                    ]
-                    self.assertEqual(
-                        dot["answer"],
-                        STRIP_UNDER_SAMPLED if under else STRIP_NOT_MEASURED,
-                    )
-                    continue
-                self.assertTrue(
-                    dot["answer"].startswith(f"{turnable} of {len(knobs)}"),
-                    f"{dot['answer']!r} does not count against every knob",
-                )
-                if without_basis:
-                    self.assertIn(str(len(without_basis)), dot["answer"])
-                else:
-                    self.assertEqual(dot["answer"], f"{turnable} of {len(knobs)}")
-
-    def test_the_cache_dot_is_unknown_rather_than_healthy_with_no_sample(self) -> None:
-        # The one substitution this repository refuses, in a new place: a dot
-        # that went green because nothing was measured. `REC_NO_CACHE_DAY`
-        # writes no cache at all, so every cache metric loses its denominator.
-        payload = self.summary(REC_NO_CACHE_DAY)
-        dot = next(d for d in payload["status"]["dots"] if d["key"] == STRIP_DOT_CACHE)
-        self.assertEqual(dot["state"], STRIP_UNKNOWN)
-        self.assertEqual(dot["answer"], STRIP_NOT_MEASURED)
-        self.assertNotEqual(dot["state"], STRIP_GOOD)
-        # And the day where they ARE measured is not unknown, so the assertion
-        # above is not passing on a dot that is always grey.
-        full = next(
-            d
-            for d in self.summary(REC_FULL_DAY)["status"]["dots"]
-            if d["key"] == STRIP_DOT_CACHE
-        )
-        self.assertNotEqual(full["state"], STRIP_UNKNOWN)
-
-    def test_the_cache_dot_takes_the_worst_of_its_own_metrics(self) -> None:
-        payload = self.summary(REC_FULL_DAY)
-        severities = [
-            k["severity"]
-            for k in payload["recommendations"]["knobs"]
-            if k["metric"] in CACHE_METRICS and k["severity"] is not None
-        ]
-        worst = max(severities, key=lambda s: SEVERITY_RANK[s])
-        dot = next(d for d in payload["status"]["dots"] if d["key"] == STRIP_DOT_CACHE)
-        self.assertEqual(dot["state"], STRIP_FROM_SEVERITY[worst][0])
-
     # --- the model mix is an observation ------------------------------------
 
     def test_the_model_mix_names_the_busiest_model_and_its_sample(self) -> None:
@@ -9058,7 +8574,7 @@ class ThreeLevelPayloadTest(unittest.TestCase):
         # one. Rank by tokens and show the model; the reader weighs the tiers.
         payload = self.summary(REC_FULL_DAY)
         blob = json.dumps(
-            {key: payload[key] for key in ("status", "model_mix", "recommendations")}
+            {key: payload[key] for key in ("model_mix", "recommendations")}
         ).lower()
         for token in ("cost", "usd", "dollar", "$", "price", "spend"):
             with self.subTest(token=token):
@@ -9322,7 +8838,6 @@ class SummaryLevelRenderTest(unittest.TestCase):
         # directive to identify itself by, so the metric key is the only handle
         # it has.
         cls.full_rows = cls.rows[: cls.rows.index('x-if="unbandedKnobs.length"')]
-        cls.strip = html_element(cls.raw, 'id="status-strip"')
         cls.observations = html_element(cls.raw, 'id="observations-note"')
 
     def table(self, decl: str) -> dict:
@@ -9593,7 +9108,6 @@ class SummaryLevelRenderTest(unittest.TestCase):
             ("const URGENCY_TAG =", set(SEVERITY_RANK)),
             ("const URGENCY_CLASS =", set(SEVERITY_RANK)),
             ("const TICK_VOICE", set(PROVENANCE_KINDS)),
-            ("const STRIP_DOT_TONE", set(STRIP_ORDER)),
             ("const AIM_WORDS", {WORSE_WHEN_HIGHER, WORSE_WHEN_LOWER}),
         ):
             with self.subTest(table=decl):
@@ -9607,7 +9121,6 @@ class SummaryLevelRenderTest(unittest.TestCase):
             "const URGENCY_TAG =",
             "const URGENCY_CLASS =",
             "const TICK_VOICE",
-            "const STRIP_DOT_TONE",
             "const AIM_WORDS",
         ):
             with self.subTest(table=decl):
@@ -9637,23 +9150,10 @@ class SummaryLevelRenderTest(unittest.TestCase):
             self.html, r'const SEVERITY_ARC_UNRECOGNISED = "arc-extra";'
         )
         self.assertRegex(self.html, r'const URGENCY_TAG_UNRECOGNISED = "DO NOW";')
-        self.assertRegex(self.html, r'const STRIP_DOT_TONE_UNRECOGNISED = "dot-bad";')
         self.assertIn(
             "return TICK_VOICE[kind] ?? TICK_VOICE.judged;",
             js_function_body(self.raw, "function tickVoice("),
         )
-
-    # --- the strip is the API's, dot for dot -------------------------------
-
-    def test_the_strip_iterates_the_apis_own_dots(self) -> None:
-        # Four questions today, and a fifth added server-side reaches the strip
-        # by construction. Nothing here decides a state or writes a question.
-        self.assertIn("d.question", self.strip)
-        self.assertIn("d.answer", self.strip)
-        self.assertIn("dotTone(d.state)", self.strip)
-        for question in STRIP_QUESTIONS.values():
-            with self.subTest(question=question):
-                self.assertNotIn(question, self.html)
 
     # --- the observation is not a knob -------------------------------------
 
@@ -9789,13 +9289,26 @@ class RecommendationRenderTest(unittest.TestCase):
         # the loop would hide healthy readings, and healthy and unmeasured would
         # then look identical on screen -- which is the defect the table's
         # explicit healthy entry exists to prevent.
+        #
+        # TWO LOOPS SINCE 2026-09-01, AND THE RULE IS UNCHANGED. The merged
+        # card renders a reading WITH a lever as a full row and one without as
+        # a counted line one click down, so there are two loops -- and every
+        # one of them still iterates the WHOLE array by its bare path. That is
+        # the property worth pinning: the split is an `x-if` on the row, where
+        # both arms are visible in the markup, and not a `.filter()` on the
+        # iterable, where a dropped arm would leave no trace. A getter named
+        # `healthyReadings` would have been that same filter with a nicer name.
         loops = re.findall(r'x-for="[^"]*\bin\s*([^"]+)"', self.band)
         ranked = [
             iterated.strip()
             for iterated in loops
             if "recommendations.ranked" in iterated
         ]
-        self.assertEqual(ranked, ["summary.recommendations.ranked"])
+        self.assertEqual(ranked, ["summary.recommendations.ranked"] * 2)
+        # Both arms of the split, so neither can be deleted quietly.
+        for arm in ('x-if="a.lever"', 'x-if="!a.lever"'):
+            with self.subTest(arm=arm):
+                self.assertIn(arm, self.band)
 
     def test_the_healthy_case_renders_a_statement_rather_than_a_blank(self) -> None:
         # The other half: a reading with no lever must SAY it has none, or the
@@ -10103,15 +9616,24 @@ CHROME_PANELS = {
     # The affordance itself: one click there, one click back, from either view.
     "view-tabs",
 }
-# #88: #62's four questions, as four cards. Question 1 is `health-note` above,
-# in the chrome; 2, 3 and 4 are here.
+# #88: #62's questions, as cards. Question 1 is `health-note` above, in the
+# chrome; the rest are here.
+#
+# THREE SINCE 2026-09-01, and the register is restated DOWN rather than left
+# to drift. `next-note` ("what do I do next?") and `advice-note` ("where can I
+# optimize?") were one question asked twice: same payload path, same order,
+# same answer, one card directly under the other, and both opening with the
+# same "Do this" callout the summary level already owned. They are merged into
+# `advice-note`, which keeps its id and its number and is now headed "What
+# should I do first?". Nothing was dropped -- every reading, every provenance
+# and the unmeasured count are all still rendered inside it.
 #
 # `overview-period` LEFT THE REGISTER AND DID NOT LEAVE THE PAGE. It is a
 # caption naming the window the figures cover, and its twin `#details-period`
 # was never registered as a panel either -- so #88 removed the asymmetry rather
 # than exploiting it. `test_the_period_caption_is_not_counted_as_a_panel` pins
 # that it is still there and still bound.
-OVERVIEW_PANELS = {"context-note", "advice-note", "next-note"}
+OVERVIEW_PANELS = {"context-note", "advice-note"}
 # #89's LEVEL ONE, and the only surfaces that were ADDED rather than moved.
 #
 # Constraint 4 ("a new detector earns space by displacing or annotating") is
@@ -10127,7 +9649,14 @@ OVERVIEW_PANELS = {"context-note", "advice-note", "next-note"}
 # attempts -- so it carries no urgency tag, no gauge, no target and no
 # direction, and it sits under a heading that says so. A dimmed row among the
 # knobs would have read as a knob somebody had decided was fine.
-SUMMARY_PANELS = {"status-strip", "knobs-note", "observations-note"}
+#
+# `status-strip` was the third summary surface until 2026-08-31, when the
+# product owner removed it as duplication: each of its four dots restated
+# something already on the same screen -- `#health-note`, the Overview's
+# second question card, and the knob rows directly below it. It left the page
+# and the payload together, so nothing here is exempting a surface that is
+# still computed.
+SUMMARY_PANELS = {"knobs-note", "observations-note"}
 # The raw token deck and the scope band MOVED DOWN, they were not dropped: they
 # are inputs to the four answers rather than answers, and "Input tokens 32.1k /
 # Cache-read 443.47M" with no verdict is the reaction #62 was filed over. The
@@ -10141,13 +9670,20 @@ DETAIL_PANELS = {
 }
 # What "net panel count must not rise" (#88) means as a number, restated for
 # the third level (#89). Sixteen through #88 -- 4 chrome + 3 overview + 9
-# detail -- and nineteen now: the summary level added three surfaces and moved
-# nothing off the two levels below it, which both keep every panel they had.
+# detail -- nineteen when #89's summary level added three surfaces and moved
+# nothing off the two levels below it, and EIGHTEEN since 2026-08-31, when the
+# product owner removed the status strip as duplication: the summary level is
+# down to `knobs-note` and `observations-note`, and the two levels below it
+# still keep every panel they had.
 #
 # Asserted as EQUALITY, and per level as well as in total, for
 # `EXPECTED_NOT_RENDERED`'s reason: a ceiling nobody restates is a budget to
 # spend, and raising this literal has to be a line somebody argues for.
-EXPECTED_SURFACES = 19
+# 17 since 2026-09-01: the overview's two recommendation cards merged into
+# one (see OVERVIEW_PANELS). The count moves DOWN, which is the direction
+# constraint 4 never argues with -- but it is restated by hand anyway, because
+# a literal that follows the code automatically is not a budget.
+EXPECTED_SURFACES = 17
 
 # Every JS member name that can sit on the tail of a payload read. Stripped
 # before two views' bindings are compared, so `summary.calls` in one view and
@@ -10386,20 +9922,27 @@ class ReportViewSplitTest(unittest.TestCase):
         surfaces = CHROME_PANELS | SUMMARY_PANELS | OVERVIEW_PANELS | DETAIL_PANELS
         self.assertEqual(len(surfaces), EXPECTED_SURFACES)
         self.assertEqual(len(CHROME_PANELS), 4)
-        self.assertEqual(len(SUMMARY_PANELS), 3)
-        self.assertEqual(len(OVERVIEW_PANELS), 3)
+        self.assertEqual(len(SUMMARY_PANELS), 2)
+        self.assertEqual(len(OVERVIEW_PANELS), 2)
         self.assertEqual(len(DETAIL_PANELS), 9)
 
-    def test_the_four_questions_are_the_overviews_structure(self) -> None:
-        # #62's information architecture, as MARKUP rather than as prose: four
-        # cards, each numbered, each headed by the question it answers. The
-        # first is chrome (see CHROME_PANELS); the other three are the whole of
-        # the overview.
+    def test_the_questions_are_the_overviews_structure(self) -> None:
+        # #62's information architecture, as MARKUP rather than as prose:
+        # numbered cards, each headed by the question it answers. The first is
+        # chrome (see CHROME_PANELS); the other two are the whole of the
+        # overview.
+        #
+        # FOUR UNTIL 2026-09-01. "Where can I optimize?" and "What do I do
+        # next?" were the same question over the same `recommendations.ranked`
+        # array, rendered one card under the other, so the product owner merged
+        # them: `advice-note` keeps its id and its number 3 and is headed by the
+        # merged question. The tuple is the ledger of that decision -- a card
+        # whose heading drifts from the question it is registered under turns
+        # this red.
         questions = [
             ("health-note", "1", "Is anything blowing up?"),
             ("context-note", "2", "Am I wasting context?"),
-            ("advice-note", "3", "Where can I optimize?"),
-            ("next-note", "4", "What do I do next?"),
+            ("advice-note", "3", "What should I do first?"),
         ]
         for panel, number, question in questions:
             with self.subTest(question=question):
@@ -10730,7 +10273,12 @@ class ReportViewSplitTest(unittest.TestCase):
         # multiplied requests would pay for the structure with the one budget
         # this tool does not have -- `serve.py` is a single-threaded
         # HTTPServer.
-        self.assertEqual(self.html.count("await fetch("), 1)
+        # TWO since 2026-08-31 (#122 follow-up): `load()`'s read, plus the
+        # POST in `refreshNow()`. The second is not a request the SPLIT added
+        # -- it is the refresh button, which fires only on a click and never
+        # on a view change, so the property this test defends (switching
+        # views costs no request) is unchanged.
+        self.assertEqual(self.html.count("await fetch("), 2)
         self.assertEqual(
             self.html.count("getJSON("),
             7,
@@ -12528,8 +12076,10 @@ class OverviewRestingStateTest(unittest.TestCase):
     CARDS = (
         ("health-note", "health-detail"),
         ("context-note", "context-detail"),
+        # `next-note`/`next-detail` was the fourth row until 2026-09-01, when
+        # the product owner merged that card into `advice-note`: it asked the
+        # same question of the same array and answered it in the same order.
         ("advice-note", "optimize-detail"),
-        ("next-note", "next-detail"),
     )
 
     # What each card must ANSWER with, at rest, before any evidence. Every one
@@ -12563,15 +12113,23 @@ class OverviewRestingStateTest(unittest.TestCase):
             "summary.context.utilisation.windows_as_of",
             "summary.context.utilisation.bands_as_of",
         ),
-        # Product-owner direction, #122, 2026-08-31: the answer at rest is now the
-        # ONE sentence `topOpportunity.recommendation` already states
-        # ("{directive}. {detail}"), not the raw metric key, its bare value
-        # and severity word, and the table's decision date beside them -- four
-        # things a first-time reader had to assemble into one thought
+        # Product-owner direction, #122, 2026-08-31: the answer at rest is one
+        # sentence the API already states, not the raw metric key, its bare
+        # value and severity word, and the table's decision date beside them --
+        # four things a first-time reader had to assemble into one thought
         # themselves. Superseded, not deleted: all four are still one click
         # down, in `optimize-detail` and `knobs-provenance`.
-        "advice-note": ("topOpportunity.recommendation",),
-        "next-note": ("topOpportunity.lever.directive",),
+        #
+        # WHICH sentence changed on 2026-09-01. It was
+        # `topOpportunity.recommendation`, the "{directive}. {detail}"
+        # paragraph -- which is VERBATIM what the summary level's knob card
+        # prints, so the two levels opened with the same words. The merged card
+        # leads with `topOpportunity.lever.directive` instead: the directive
+        # alone, which is what the card below the merge ("what do I do next?")
+        # always led with, and the detail is what the disclosure holds. This is
+        # also the ONLY pin on that field -- the wiring walker cannot follow
+        # `topOpportunity` back to `recommendations.ranked[]`.
+        "advice-note": ("topOpportunity.lever.directive",),
     }
 
     # What each card must NOT assert at rest -- the evidence, which is one
@@ -12602,7 +12160,6 @@ class OverviewRestingStateTest(unittest.TestCase):
             "summary.recommendations.ranking_provenance",
             "summary.recommendations.unmeasured_note",
         ),
-        "next-note": ("summary.recommendations.ranked",),
     }
 
     @classmethod
@@ -12814,18 +12371,16 @@ class OverviewRestingStateTest(unittest.TestCase):
         body = js_function_body(self.html, "get opportunitiesOpen(")
         self.assertIn("return this.topOpportunity !== null;", body)
         self.assertNotIn("unmeasured", body, "an absence still forces the card open")
-        for card_id, detail_id in (
-            ("advice-note", "optimize-detail"),
-            ("next-note", "next-detail"),
-        ):
-            with self.subTest(card=card_id):
-                resting = self.resting(card_id, detail_id)
-                self.assertIn(
-                    "Object.keys(summary.recommendations.unmeasured).length",
-                    resting,
-                    f"{card_id} collapses on an unmeasured reading without "
-                    "saying there is one",
-                )
+        # ONE card since 2026-09-01, where there were two. The rule did not
+        # narrow with the merge -- it is the merged card that has to carry the
+        # count now, and it is the same count off the same mapping.
+        resting = self.resting("advice-note", "optimize-detail")
+        self.assertIn(
+            "Object.keys(summary.recommendations.unmeasured).length",
+            resting,
+            "advice-note collapses on an unmeasured reading without saying "
+            "there is one",
+        )
 
     def test_no_expansion_getter_holds_a_threshold_of_its_own(self) -> None:
         # What separates "counting" from "judging". Every boundary these
@@ -12912,24 +12467,30 @@ class OverviewRestingStateTest(unittest.TestCase):
         # A healthy table produces no moves, and an empty `<ol>` says nothing
         # about why. Both cards state it in words, in the branch that would
         # otherwise carry the first move.
-        for card_id in ("advice-note", "next-note"):
-            with self.subTest(card=card_id):
-                card = self.card(card_id)
-                self.assertIn('x-if="topOpportunity === null"', card)
-                self.assertIn('x-if="topOpportunity !== null"', card)
+        # Both branches, on the one card the 2026-09-01 merge left. The
+        # healthy case is a SENTENCE in the branch that would otherwise carry
+        # the first move, never an `<ol>` with nothing in it.
+        card = self.card("advice-note")
+        self.assertIn('x-if="topOpportunity === null"', card)
+        self.assertIn('x-if="topOpportunity !== null"', card)
 
-    def test_the_moves_are_a_numbered_list_naming_their_figures(self) -> None:
+    def test_the_moves_are_ranked_rows_naming_their_figures(self) -> None:
         # #88 asked for next steps as a numbered list, each naming the figure
-        # that justifies it. Product-owner direction, #122, 2026-08-31, supersedes
-        # HOW the move states its evidence: `a.recommendation` already reads
-        # "{directive}. {detail}", so a raw metric key plus a bare value and
-        # severity word beside it repeated the same evidence in the page's
-        # own composed sentence, not the module's -- exactly the "prose this
-        # page composed" #88 refused. One binding, the module's own string.
-        detail = html_element(self.raw, 'id="next-detail"')
-        self.assertIn('<ol class="next">', detail)
-        self.assertIn('x-text="a.recommendation"', detail)
-        self.assertRegex(self.html, r"ol\.next\s*\{[^}]+\}")
+        # that justifies it. Product-owner direction, 2026-09-01, supersedes
+        # WHERE that list lives: the separate "what do I do next?" card was a
+        # second rendering of `recommendations.ranked` in the same order with
+        # the same answer, so the moves are the ranked ROWS of the merged card
+        # -- which already carried a rank number and the figure, and now leads
+        # each row with the module's own directive.
+        #
+        # `ol.next` and its four CSS rules went with the card. That is dead
+        # code removal, not a figure dropped: every move is still rendered,
+        # numbered and evidenced, one element over.
+        detail = html_element(self.raw, 'id="optimize-detail"')
+        self.assertIn('<div class="rank" x-text="i + 1"></div>', detail)
+        self.assertIn('x-text="a.lever.directive"', detail)
+        self.assertIn('x-text="fmtUnit(a.value, a.unit)"', detail)
+        self.assertNotIn("ol.next", self.raw)
 
     def test_the_raw_token_deck_answers_nothing_and_sits_one_level_down(
         self,
