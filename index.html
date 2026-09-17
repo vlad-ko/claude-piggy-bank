@@ -11,40 +11,92 @@
 <script src="/vendor/chart.umd.min.js"></script>
 <script defer src="/vendor/alpine.min.js"></script>
 <style>
-  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2430; --muted:#67707c; --line:#e3e6ea; --accent:#2563eb;
-          --red:#b91c1c; --red-bg:#f7a8a8; --amber:#b45309; --amber-bg:#fbcf6b;
-          --neutral:#64748b; --neutral-bg:#cbd5e1; --ok:#15803d; --ok-bg:#a7d8b8;
-          --extra-bg:#a5b4fc; }
+  /* THE PALETTE IS WEALTHBOT'S OWN (product-owner direction, 2026-08-31):
+     the deep navy ramp, the cyan/gold accent pair and the translucent
+     gradient surface are lifted from wealthbot.io's design tokens so this
+     report reads as part of the same product rather than a tool beside it. */
+  :root { --bg-0:#080816; --bg-1:#0d1027; --bg-2:#0b1d3a; --bg-3:#0b2b4f;
+          --bg:var(--bg-1); --card:#0f1530; --ink:#e6ebff; --muted:#b7c0e6;
+          --line:rgba(255,255,255,.09); --accent:#6ee7ff; --accent-2:#ffeb99;
+          --radius:14px; --radius-sm:10px;
+          /* The surface every panel, card and board shares: a soft vertical
+             fade rather than a flat fill, so a stack of them has depth
+             without a stack of borders. */
+          --surface:linear-gradient(180deg, rgba(15,21,48,.85), rgba(15,21,48,.6));
+          --surface-soft:linear-gradient(180deg, rgba(255,255,255,.045), rgba(255,255,255,.015));
+          --shadow:0 10px 30px rgba(0,0,0,.4);
+          --shadow-sm:0 4px 14px rgba(0,0,0,.28);
+          /* SEVERITY, tuned to sit on navy: the `-bg` pair is the saturated
+             tone an arc or a meter segment is drawn in, the bare token is the
+             lighter one words are set in, and the `-tint` is the wash behind
+             a pill. */
+          --red:#ff9b9b; --red-bg:#f2555f; --amber:#ffd28a; --amber-bg:#f0b429;
+          --neutral:#b7c0e6; --neutral-bg:#7f8bb5; --ok:#8df0bd; --ok-bg:#3ad68d;
+          --extra-bg:#9aa5ff;
+          --red-tint:rgba(242,85,95,.14); --amber-tint:rgba(240,180,41,.14);
+          --ok-tint:rgba(58,214,141,.14); --indigo-tint:rgba(110,231,255,.12);
+          --indigo-ink:var(--accent); --wash:rgba(255,255,255,.06);
+          /* THE CALLOUT (product-owner direction, #124 follow-up): warm and
+             separate from the urgency tag's red/amber, which mean "how bad" --
+             this colour means "here's the answer", the same feeling on every
+             card whether the reading is DO NOW or just worth trying. It is the
+             palette's GOLD accent, so the answer is the one warm thing on a
+             cool page. */
+          --warm:#ffeb99; --warm-bg:linear-gradient(135deg, rgba(255,235,153,.14), rgba(110,231,255,.06));
+          --warm-border:rgba(255,235,153,.38); }
   * { box-sizing: border-box; }
   /* Alpine strips x-cloak once it boots; until then it hides the elements
      whose visibility x-show owns, so a panel cannot flash open empty. */
   [x-cloak] { display:none !important; }
-  body { margin:0; font:14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
-  .wrap { max-width:1200px; margin:0 auto; padding:20px; }
-  h1 { font-size:20px; margin:0 0 4px; }
+  /* Wealthbot's own ground: two soft corner glows over a navy ramp, fixed so
+     the page scrolls across the light rather than dragging it along. */
+  body { margin:0; font:15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         color:var(--ink);
+         background:
+           radial-gradient(1200px 800px at 80% -10%, rgba(255,235,153,.18), transparent 60%),
+           radial-gradient(960px 620px at 10% 0%, rgba(83,214,255,.18), transparent 70%),
+           linear-gradient(160deg, var(--bg-0), var(--bg-1) 30%, var(--bg-2) 60%, var(--bg-3));
+         background-attachment:fixed; min-height:100vh; }
+  .wrap { max-width:1200px; margin:0 auto; padding:24px 20px; }
+  h1 { font-size:25px; margin:0 0 4px; letter-spacing:-.02em; }
   .sub { color:var(--muted); margin-bottom:16px; }
-  .banner { background:#fef3c7; border:1px solid #f59e0b; color:#78350f; padding:10px 14px; border-radius:8px; margin-bottom:14px; }
-  .data-age { color:var(--muted); font-size:12px; margin-bottom:8px; }
+  .banner { background:var(--amber-tint); border:1px solid #a16207; color:var(--amber); padding:10px 14px; border-radius:8px; margin-bottom:14px; }
+  /* The banner and the button that answers it, on one row: a warning whose
+     remedy is elsewhere on the page is a warning the reader has to go
+     shopping for. */
+  .banner-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+  .banner-row .banner { flex:1 1 320px; margin-bottom:0; }
+  .refresh-box { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .btn-refresh { background:linear-gradient(135deg, #4dd8f2, #f0d86e); color:#0a0a14;
+                 border:none; border-radius:12px; padding:11px 18px; font:inherit;
+                 font-size:14.5px; font-weight:700; cursor:pointer; white-space:nowrap;
+                 box-shadow:0 4px 15px rgba(77,216,242,.28); }
+  .btn-refresh:hover:not(:disabled) { filter:brightness(1.08); box-shadow:0 6px 20px rgba(77,216,242,.4); }
+  .btn-refresh:disabled { opacity:.6; cursor:default; box-shadow:none; }
+  .refresh-msg { font-size:13px; max-width:420px; }
+  .refresh-msg.good { color:var(--ok); }
+  .refresh-msg.bad { color:var(--red); }
+  .data-age { color:var(--muted); font-size:12.5px; margin-bottom:8px; }
   .data-age strong { color:var(--ink); }
-  .data-age.unknown strong { color:#92400e; }
-  .note-band { background:#eef2ff; border:1px solid #c7d2fe; color:#3730a3; padding:8px 14px; border-radius:8px; margin-bottom:14px; font-size:12px; }
+  .data-age.unknown strong { color:var(--amber); }
+  .note-band { background:var(--indigo-tint); border:1px solid #4c4f9e; color:var(--indigo-ink); padding:8px 14px; border-radius:8px; margin-bottom:14px; font-size:12.5px; }
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:16px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
-  .card .label { color:var(--muted); font-size:12px; }
-  .card .value { font-size:20px; font-weight:600; margin-top:2px; }
-  .card .note { color:var(--muted); font-size:11px; margin-top:2px; }
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:14px 16px; box-shadow:var(--shadow-sm); }
+  .card .label { color:var(--muted); font-size:12.5px; }
+  .card .value { font-size:22px; font-weight:600; margin-top:2px; }
+  .card .note { color:var(--muted); font-size:11.5px; margin-top:2px; }
   .filters { display:flex; gap:8px; align-items:center; margin-bottom:16px; flex-wrap:wrap; }
-  .filters button { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer; }
-  .filters button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
-  .filters input { border:1px solid var(--line); border-radius:8px; padding:6px 8px; }
-  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:16px; }
-  .panel h2 { font-size:15px; margin:0 0 10px; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
+  .filters button { background:var(--wash); border:1px solid var(--line); border-radius:var(--radius-sm); padding:7px 13px; cursor:pointer; color:var(--ink); font:inherit; font-size:13.5px; }
+  .filters button.active { background:linear-gradient(135deg, #4dd8f2, #f0d86e); color:#0a0a14; border-color:transparent; font-weight:600; box-shadow:0 4px 14px rgba(77,216,242,.25); }
+  .filters input { border:1px solid var(--line); border-radius:var(--radius-sm); padding:7px 9px; background:var(--wash); color:var(--ink); font:inherit; }
+  .panel { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:16px; margin-bottom:16px; box-shadow:var(--shadow-sm); }
+  .panel h2 { font-size:16px; margin:0 0 10px; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
   th, td { text-align:right; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
   th:first-child, td:first-child { text-align:left; }
   td.preview { text-align:left; white-space:normal; max-width:420px; color:var(--muted); }
   tbody tr.clickable { cursor:pointer; }
-  tbody tr.clickable:hover { background:#eef2ff; }
+  tbody tr.clickable:hover { background:var(--wash); }
   .toggle { float:right; font-size:12px; }
   /* Named once instead of repeated as an inline style string on every heading
      that carries a caveat, and on the row whose figures are UNMEASURED. */
@@ -62,8 +114,8 @@
      range, so the marking is on the edge rather than on the block. */
   .advice-line { display:block; margin-top:2px; padding-left:14px; }
   .advice-judged { font-style:italic; border-left:3px solid #818cf8; padding-left:8px; margin-left:6px; }
-  .advice-cited { border-left:3px solid #0f766e; padding-left:8px; margin-left:6px; }
-  .advice-structural { border-left:3px solid #9ca3af; padding-left:8px; margin-left:6px; }
+  .advice-cited { border-left:3px solid #2dd4bf; padding-left:8px; margin-left:6px; }
+  .advice-structural { border-left:3px solid #a8b3cc; padding-left:8px; margin-left:6px; }
   .util-band { display:inline-block; margin:0 16px 0 0; }
   /* #64's verdict tones. THREE tones for three states, because the reader must
      be able to tell "nothing is broken" from "we could not check" before
@@ -74,9 +126,9 @@
   .health-ok { border-left:4px solid var(--ok); }
   .health-unchecked { border-left:4px solid var(--amber); }
   .health-failed { border-left:4px solid var(--red); }
-  .health-ok > div > .answer .tag { background:#ecfdf5; color:var(--ok); }
-  .health-unchecked > div > .answer .tag { background:#fef3c7; color:var(--amber); }
-  .health-failed > div > .answer .tag { background:#fee2e2; color:var(--red); }
+  .health-ok > div > .answer .tag { background:var(--ok-tint); color:var(--ok); }
+  .health-unchecked > div > .answer .tag { background:var(--amber-tint); color:var(--amber); }
+  .health-failed > div > .answer .tag { background:var(--red-tint); color:var(--red); }
   .health-count { color:var(--muted); }
   .check-line { display:block; margin-top:5px; font-size:12.5px; color:var(--muted); }
   .check-line strong { color:var(--ink); }
@@ -99,36 +151,36 @@
   .disclosure[open] > summary::before { content:"\25BE\00a0"; }
   .disclosure > summary:hover { color:var(--accent); }
   /* #88: THE QUESTION CARD. The overview's whole idiom, and the reason the
-     `note-band` prose it replaces was unreadable: four numbered questions, the
+     `note-band` prose it replaces was unreadable: numbered questions, the
      question as a heading, the ANSWER stated large and first, and the evidence
      one expansion down. `.panel` is still the DETAIL view's surface and is
      untouched, so the two levels stay visibly different. */
-  .q { background:var(--card); border:1px solid var(--line); border-radius:11px;
-       padding:15px 18px 14px; margin-bottom:12px; }
+  .q { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius);
+       padding:17px 20px 16px; margin-bottom:12px; box-shadow:var(--shadow-sm); }
   /* #89: the one-line form of a card, used by the health verdict on the
      summary level only. It is the same surface with the same tone and the same
      verdict text -- what it loses is the padding a heading and a disclosure
      needed, and nothing else. Never applied to a verdict that expands its own
      evidence: see `healthOneLine`. */
   .q.compact { padding:9px 18px; margin-bottom:10px; }
-  .q > h2 { font-size:15px; margin:0 0 9px; letter-spacing:-.01em; display:flex;
+  .q > h2 { font-size:16px; margin:0 0 9px; letter-spacing:-.01em; display:flex;
             align-items:center; gap:8px; }
   .q > h2 .num { width:20px; height:20px; line-height:20px; text-align:center; border-radius:50%;
-                 background:#eef2ff; color:#3730a3; font-size:11px; font-weight:700; flex:0 0 auto; }
+                 background:var(--indigo-tint); color:var(--indigo-ink); font-size:11px; font-weight:700; flex:0 0 auto; }
   /* THE ANSWER, and it is a size rather than a colour: the verdict must be the
      first thing read on the card whatever tone it wears. */
-  .answer { font-size:15px; font-weight:600; letter-spacing:-.01em; line-height:1.4; }
+  .answer { font-size:16px; font-weight:600; letter-spacing:-.01em; line-height:1.4; }
   .answer .tag { display:inline-block; border-radius:5px; padding:1px 7px; margin-right:6px;
-                 font-size:11px; font-weight:700; letter-spacing:.03em; background:#eef2ff; color:#3730a3; }
+                 font-size:11px; font-weight:700; letter-spacing:.03em; background:var(--indigo-tint); color:var(--indigo-ink); }
   /* The three KINDS of claim an answer can be, as named classes rather than a
      colour spelled at the binding: a measured problem, a measured all-clear,
      and something not established. The health band colours its tag from the
      card's own edge class; a question card has no edge, so the tone rides on
      the tag -- and the state's own word is rendered inside it either way, so
      the colour is never the only thing carrying the verdict. */
-  .answer .tag-alarm { background:#fee2e2; color:var(--red); }
-  .answer .tag-clear { background:#ecfdf5; color:var(--ok); }
-  .answer .tag-incomplete { background:#fef3c7; color:var(--amber); }
+  .answer .tag-alarm { background:var(--red-tint); color:var(--red); }
+  .answer .tag-clear { background:var(--ok-tint); color:var(--ok); }
+  .answer .tag-incomplete { background:var(--amber-tint); color:var(--amber); }
   /* The KEY a ranking is ordered by, and the DATE a lookup table was decided:
      small, but never hidden. A ranking whose key is one click away has not
      named its key (serve.RANKED_BY's rule), and a judged table whose date is
@@ -148,7 +200,7 @@
                 margin-bottom:5px; flex-wrap:wrap; }
   .scope-n { color:var(--muted); font-size:12px; font-weight:400; }
   .scope-share { font-size:12px; font-weight:600; }
-  .meter { display:flex; height:22px; border-radius:6px; overflow:hidden; background:var(--line); }
+  .meter { display:flex; height:22px; border-radius:8px; overflow:hidden; background:rgba(255,255,255,.07); }
   .seg { min-width:5px; }
   .seg-hot { background:var(--red-bg); }
   .seg-warm { background:var(--amber-bg); }
@@ -171,7 +223,7 @@
      minimum through the same `barWidth()` the meter segments use. */
   .growth { display:flex; align-items:flex-end; gap:6px; height:76px; margin:10px 0 4px; }
   .gcol { flex:1; height:100%; display:flex; align-items:flex-end; }
-  .gbar { width:100%; background:linear-gradient(180deg,#818cf8,#4338ca); border-radius:4px 4px 0 0;
+  .gbar { width:100%; background:linear-gradient(180deg,#a5b4fc,#6366f1); border-radius:4px 4px 0 0;
           display:flex; align-items:flex-start; justify-content:center; }
   .gbar span { font-size:10px; font-weight:600; color:#fff; margin-top:3px; }
   .glabels { display:flex; gap:6px; font-size:11px; color:var(--muted); }
@@ -180,47 +232,24 @@
      The same readings that were four stacked paragraphs each. */
   .opp { display:flex; gap:12px; align-items:flex-start; padding:10px 0; border-top:1px solid var(--line); }
   .opp .rank { flex:0 0 22px; height:22px; line-height:22px; text-align:center; border-radius:50%;
-               background:#f1f3f5; color:var(--muted); font-size:11px; font-weight:700; }
-  .opp .txt { flex:1; font-size:13px; min-width:0; }
+               background:var(--wash); color:var(--muted); font-size:11px; font-weight:700; }
+  .opp .txt { flex:1; font-size:13.5px; min-width:0; }
   .opp .txt .h { font-weight:600; margin-bottom:2px; }
-  .opp .txt .d { color:var(--muted); font-size:12.5px; margin-top:2px; }
+  .opp .txt .d { color:var(--muted); font-size:13px; margin-top:2px; }
   .opp .fig { flex:0 0 auto; text-align:right; }
-  .opp .fig .n { font-size:17px; font-weight:600; letter-spacing:-.01em; }
+  .opp .fig .n { font-size:18px; font-weight:600; letter-spacing:-.01em; }
   .opp .fig .u { font-size:11px; color:var(--muted); }
-  /* #88's NEXT STEPS: a numbered list, each item naming the figure that
-     justifies it. */
-  ol.next { margin:8px 0 0; padding-left:20px; font-size:13px; }
-  ol.next li { margin-bottom:8px; }
-  ol.next li:last-child { margin-bottom:0; }
-  ol.next .why { color:var(--muted); font-size:12.5px; display:block; }
-  /* #89's SUMMARY LEVEL. Two idioms, both named, neither an inline style
-     string: the four-dot status strip, and the knob row.
-
-     THE STRIP IS STATUS, NOT CONTENT -- one line, four questions, a coloured
-     dot and two or three words each. The four states come from the API
-     (`serve.STRIP_*`) and only the colours are this page's; `dot-unknown` is a
-     colour of its own rather than a paler `dot-watch`, because "we could not
-     check" and "we checked and it is middling" are different claims and a dot
-     is read before any word beside it. */
+  /* #89's SUMMARY LEVEL. One idiom, named rather than written as an inline
+     style string: the knob row. The four-dot status strip stood here too
+     until 2026-08-31, when the product owner removed it -- every one of its
+     dots restated a card or a knob row already on the same screen. */
   /* THE SUMMARY LEVEL'S OWN SURFACE. Not `.panel`, which is the raw-data
      view's, and not `.q`, which is the question card: three levels that looked
      alike would be three levels the reader cannot tell apart, and the level
      distinction is the whole of #70 and #89. */
-  .board { background:var(--card); border:1px solid var(--line); border-radius:11px;
-           padding:15px 17px 8px; margin-bottom:14px; }
-  .board > h2 { font-size:15px; margin:0 0 3px; letter-spacing:-.01em; }
-  .strip { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line);
-           border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-bottom:16px; }
-  .st { background:var(--card); padding:11px 13px; display:flex; align-items:center; gap:9px; }
-  .dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
-  .dot-good { background:var(--ok); }
-  .dot-watch { background:var(--amber); }
-  .dot-bad { background:var(--red); }
-  /* Neither green nor amber: an unestablished answer must not borrow either
-     verdict's look. Same direction as `HEALTH_TONE_UNRECOGNISED`. */
-  .dot-unknown { background:var(--neutral); }
-  .stq { font-size:11px; color:var(--muted); }
-  .sta { font-size:13px; font-weight:650; margin-top:1px; }
+  .board { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius);
+           padding:17px 19px 10px; margin-bottom:14px; box-shadow:var(--shadow-sm); }
+  .board > h2 { font-size:16px; margin:0 0 3px; letter-spacing:-.01em; }
 
   /* THE KNOB ROW: gauge, imperative, why, figure. A knob that does not apply
      is DIMMED, not hidden -- seeing that five knobs exist and three are
@@ -232,19 +261,19 @@
      padding is the only thing here that can be spent without hiding a
      measurement, so it is spent. */
   .knob { display:grid; grid-template-columns:60px 1fr 150px; gap:14px; align-items:center;
-          padding:10px 0; border-top:1px solid var(--line); }
+          padding:16px 0; border-top:1px solid var(--line); }
   .knob:first-of-type { border-top:0; }
   .knob.off { opacity:.55; }
-  .gauge { width:60px; height:40px; flex:0 0 auto; }
+  .gauge { width:60px; height:40px; flex:0 0 auto; overflow:visible; }
   /* The dial's parts, coloured by CLASS so no severity, provenance kind or
      colour is spelled at a binding. `gauge-track` is the sweep the arcs are
      drawn over -- it is the DIAL, never a reading, so it is the same neutral
      whether or not anything was measured. */
   .gauge path { fill:none; stroke-linecap:round; }
-  .gauge-track { stroke:var(--line); stroke-width:7; }
-  .arc-ok { stroke:var(--ok-bg); stroke-width:7; }
-  .arc-watch { stroke:var(--amber-bg); stroke-width:7; }
-  .arc-act { stroke:var(--red-bg); stroke-width:7; }
+  .gauge-track { stroke:rgba(255,255,255,.08); stroke-width:7; }
+  .arc-ok { stroke:var(--ok-bg); stroke-width:7; filter:drop-shadow(0 0 4px rgba(58,214,141,.4)); }
+  .arc-watch { stroke:var(--amber-bg); stroke-width:7; filter:drop-shadow(0 0 4px rgba(240,180,41,.4)); }
+  .arc-act { stroke:var(--red-bg); stroke-width:7; filter:drop-shadow(0 0 4px rgba(242,85,95,.4)); }
   /* An arc whose severity this build has no colour for is still VISIBLE, never
      the track's own colour: an uncoloured segment would be a range rendered as
      an absence. Same direction as `BAND_TONE_UNRECOGNISED`. */
@@ -254,30 +283,39 @@
      same reason they must not read alike in the table. */
      Each sets `color` as well as `stroke`, because the same class marks the
      tick on the dial AND the words beside it: one voice, one place. */
-  .tick-cited { stroke:#0f766e; color:#0f766e; stroke-width:2; }
-  .tick-judged { stroke:#818cf8; color:#4338ca; stroke-width:2; font-style:italic; }
-  .tick-structural { stroke:#9ca3af; color:#6b7280; stroke-width:2; }
+  .tick-cited { stroke:#2dd4bf; color:#2dd4bf; stroke-width:2; }
+  .tick-judged { stroke:#818cf8; color:var(--indigo-ink); stroke-width:2; font-style:italic; }
+  .tick-structural { stroke:#a8b3cc; color:#a8b3cc; stroke-width:2; }
   /* The needle starts at the pivot and its round cap IS the hub, so a dial
      with no reading has no pivot either -- a lone hub at the centre of an
      empty dial still reads as an instrument pointing at something. */
   .needle { stroke:var(--ink); stroke-width:3; }
-  .kh { font-size:15px; font-weight:650; letter-spacing:-.01em; }
-  .kh .tag { font-size:10px; font-weight:700; letter-spacing:.05em; padding:1px 5px;
-             border-radius:3px; margin-right:7px; vertical-align:1px; }
-  .tag-now { background:#fee2e2; color:var(--red); }
-  .tag-soon { background:#fef3c7; color:var(--amber); }
-  .tag-fine { background:#ecfdf5; color:var(--ok); }
+  .kh { font-size:18px; font-weight:700; letter-spacing:-.01em; }
+  .kh .tag { font-size:11.5px; font-weight:700; letter-spacing:.05em; padding:2px 7px;
+             border-radius:4px; margin-right:7px; vertical-align:1px; }
+  .tag-now { background:var(--red-tint); color:var(--red); }
+  .tag-soon { background:var(--amber-tint); color:var(--amber); }
+  .tag-fine { background:var(--ok-tint); color:var(--ok); }
   /* An unmeasured knob's tag: neither an urgency nor a clean bill of health. */
-  .tag-none { background:#eef2ff; color:var(--neutral); }
-  /* THE ACTION LINE (product-owner direction, #122, 2026-08-31): this used to be
-     `means`, a metric DEFINITION, at 12px muted -- quieter than the figure
-     beside it, so the loudest thing on the card was a percentage and not the
-     move to make. It is now the one-sentence reason/action `actionDetail()`
-     derives from `k.recommendation`, sized and coloured to read FIRST; the
-     figure and gauge are demoted below for exactly the reason the charts
-     stay -- they are for understanding this line, not a second place to look
-     for what to do. -->
-  .kw { font-size:13.5px; color:var(--ink); margin-top:3px; line-height:1.4; }
+  .tag-none { background:var(--indigo-tint); color:var(--neutral); }
+  /* THE CALLOUT (#124 follow-up): `k.action` -- the literal thing to type or
+     say -- gets a box of its own, big and warm, so it cannot be mistaken for
+     part of the explanation below it. Basic shapes on purpose: one border,
+     one background, one weight of text -- nothing to parse before the reader
+     gets to the words. */
+  .k-callout { display:flex; align-items:baseline; gap:9px; flex-wrap:wrap;
+               background:var(--warm-bg); border:1px solid var(--warm-border);
+               border-radius:var(--radius); padding:11px 15px; margin-top:9px;
+               box-shadow:0 4px 16px rgba(255,235,153,.07); }
+  .k-callout-label { font-size:12.5px; font-weight:700; letter-spacing:.04em;
+                      text-transform:uppercase; color:var(--warm); opacity:.9; }
+  .k-callout-action { font-size:19px; font-weight:700; color:var(--warm);
+                       line-height:1.3; }
+  /* THE WHY (product-owner direction, #122, 2026-08-31; demoted again for
+     #124): the reasoning stays, but the callout above is now the loudest
+     thing on the card -- this is the second thing a reader reaches, once
+     they know what to do and want to know why. */
+  .kw { font-size:13.5px; color:var(--muted); margin-top:6px; line-height:1.45; }
   /* #93: THE COMPACT ROWS. A knob with no basis costs one line rather than a
      61px row carrying a dial with nothing to point at. It is still on screen,
      still named, and now also states its own shortfall -- "dimmed, not hidden"
@@ -292,7 +330,7 @@
   .thin-m { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .thin-w { color:var(--muted); margin-left:8px; }
   .thin-n { text-align:right; color:var(--muted); white-space:nowrap; }
-  .tag-thin { background:#f1f5f9; color:#475569; }
+  .tag-thin { background:var(--wash); color:var(--muted); }
   .thin-note { font-size:11.5px; color:var(--muted); margin-top:7px;
                padding-top:6px; border-top:1px dotted var(--line); }
   /* Every cut point of one dial, one click down. The metric key heads the
@@ -319,12 +357,12 @@
      inline style string: the tab, the period line, the drill-down and the
      filter notice are each a repeated pattern, and this page's rule is that a
      repeated pattern gets a name. */
-  .tabs { display:flex; gap:4px; background:#e9ecef; padding:4px; border-radius:10px; margin-bottom:14px; }
+  .tabs { display:flex; gap:4px; background:rgba(8,8,22,.45); border:1px solid var(--line); padding:5px; border-radius:var(--radius); margin-bottom:14px; }
   .tabs button { flex:0 0 auto; border:none; background:none; padding:7px 15px; border-radius:7px;
-                 font:inherit; font-size:13px; font-weight:600; color:var(--muted); cursor:pointer; }
-  .tabs button.on { background:var(--card); color:var(--ink); box-shadow:0 1px 2px rgba(0,0,0,.07); }
+                 font:inherit; font-size:13.5px; font-weight:600; color:var(--muted); cursor:pointer; }
+  .tabs button.on { background:var(--surface-soft); color:var(--ink); box-shadow:var(--shadow-sm); }
   .tabs .hint { flex:1; text-align:right; align-self:center; font-size:11.5px; color:var(--muted); padding-right:6px; }
-  .period { color:var(--muted); font-size:12px; margin-bottom:12px; }
+  .period { color:var(--muted); font-size:12.5px; margin-bottom:12px; }
   .period strong { color:var(--ink); }
   /* A drill-down NAMES its destination and carries its filter, so it is a
      button rather than a bare link: it changes state on this page. */
@@ -333,8 +371,8 @@
   .drill:hover { text-decoration:underline; }
   /* A filter nobody can see is a table that silently disagrees with the figure
      that linked to it, so it is marked in the same register as the banner. */
-  .filter-note { font-weight:normal; color:#78350f; background:#fef3c7; border:1px solid #f59e0b;
-                 border-radius:6px; padding:2px 8px; font-size:12px; }
+  .filter-note { font-weight:normal; color:var(--amber); background:var(--amber-tint); border:1px solid #a16207;
+                 border-radius:6px; padding:2px 8px; font-size:12.5px; }
   .filter-note button { background:none; border:none; color:var(--accent); font:inherit;
                         cursor:pointer; padding:0 0 0 6px; }
   tbody tr.unmeasured { color:var(--muted); }
@@ -452,8 +490,24 @@
        a FIXED order chosen by how badly the figures on screen can mislead. A
        second writer is now impossible rather than merely discouraged: no code
        reaches this element at all. -->
-  <div class="banner" id="banner" x-cloak x-show="bannerMessages.length"
-       x-text="bannerMessages.join(' ')"></div>
+  <div class="banner-row" x-cloak x-show="bannerMessages.length || refresh.state !== 'idle'">
+    <div class="banner" id="banner" x-show="bannerMessages.length"
+         x-text="bannerMessages.join(' ')"></div>
+    <!-- THE BUTTON THAT DOES THE THING (product-owner direction, 2026-08-31).
+         The banner it sits beside used to end "Run ingest.py to refresh it",
+         naming a remedy its reader -- who is in a browser -- cannot perform.
+         `bannerMessages` keeps its ONE binding and this element writes nothing
+         into it: the button reports its own outcome on its own line, so a
+         refresh failure can never be mistaken for one of the data warnings
+         above it. -->
+    <div class="refresh-box">
+      <button type="button" class="btn-refresh" @click="refreshNow()"
+              :disabled="refresh.state === 'running'"
+              x-text="refresh.state === 'running' ? 'Refreshing...' : 'Refresh now'"></button>
+      <span class="refresh-msg" :class="refresh.ok === false ? 'bad' : 'good'"
+            x-show="refresh.message" x-text="refresh.message"></span>
+    </div>
+  </div>
 
   <!-- #20: how old these numbers are, immediately above the numbers -- a
        freshness note in a corner is one nobody reads before trusting a total.
@@ -524,8 +578,7 @@
            and `elapsedNote` below says in words that this is elapsed time and
            not a re-reading. -->
       <template x-if="summary.ingest.last_run_at !== null"><span>Last ingest:
-        <strong x-text="fmtAge(asOfNow - summary.ingest.last_run_at)"></strong>
-        (<span x-text="fmtTs(summary.ingest.last_run_at)"></span>)</span></template>
+        <strong x-text="fmtAge(asOfNow - summary.ingest.last_run_at)"></strong></span></template>
       <!-- #105: WHICH SET that age is over, annotating the line rather than
            taking a surface of its own (CLAUDE.md constraint 4). `ingest.py
            --transcript` is a completed run over ONE file, and it is the only
@@ -542,9 +595,8 @@
            of them reaches the banner. -->
       <template x-if="summary.ingest.last_run_at !== null"><span>
         <template x-if="summary.ingest.last_full_scan_at !== null"><span>
-          &middot; last full-corpus scan:
-          <strong x-text="fmtAge(asOfNow - summary.ingest.last_full_scan_at)"></strong>
-          (<span x-text="fmtTs(summary.ingest.last_full_scan_at)"></span>)</span></template>
+          &middot; last full scan:
+          <strong x-text="fmtAge(asOfNow - summary.ingest.last_full_scan_at)"></strong></span></template>
         <template x-if="summary.ingest.full_scan_unknown_reason === 'no-full-scan-recorded'"><span>
           &middot; <strong>no full-corpus scan on record</strong> &mdash; this
           database has been maintained one file at a time, which is what the
@@ -602,9 +654,8 @@
         one of them recorded an ingest. See the banner above
       </span></template>
       <template x-if="summary.hooks.state === 'not-a-plugin-install'"><span>
-        &middot; automatic ingest: <strong>not applicable</strong> &mdash; this
-        is a checkout, not a plugin install, so nothing ingests on its own here.
-        Run <code>ingest.py</code> yourself
+        &middot; auto-ingest: <strong>off</strong> (checkout, not a plugin) &mdash;
+        run <code>ingest.py</code> yourself
       </span></template>
       <template x-if="summary.hooks.state === null"><span>
         &middot; automatic ingest (plugin hooks): <strong>cannot tell</strong>
@@ -622,10 +673,9 @@
       &middot;
       <template x-if="summary.ingest.newest_call_ts === null"><span>newest measured
         call: <strong>none</strong> &mdash; no API calls ingested</span></template>
-      <template x-if="summary.ingest.newest_call_ts !== null"><span>newest measured call:
+      <template x-if="summary.ingest.newest_call_ts !== null"><span>newest call:
         <strong x-text="fmtAge(asOfNow - summary.ingest.newest_call_ts)"></strong>
-        (<span x-text="fmtTs(summary.ingest.newest_call_ts)"></span>), across ALL
-        ingested data &mdash; not this window</span></template>
+        (all data, not this window)</span></template>
     </span></template>
     <!-- Annotates the line whose numbers moved, rather than adding a surface
          of its own (CLAUDE.md constraint 4), and stays empty until a tick has
@@ -633,7 +683,7 @@
     <template x-if="elapsedNote"><span x-text="elapsedNote"></span></template>
   </div>
 
-  <!-- #64: IS ANYTHING BLOWING UP? The first of #62's four questions, and the
+  <!-- #64: IS ANYTHING BLOWING UP? The first of #62's questions, and the
        one the report computed everything for and never answered.
 
        The page said "8,163 records parsed, 0 unparsed" and then stopped. A
@@ -697,7 +747,7 @@
   <section class="q" id="health-note" x-cloak x-show="summary"
            :class="healthTone + (healthOneLine ? ' compact' : '')">
     <!-- The numbered heading is question 1's, and it is what a level that is
-         not the four question cards can do without: the summary is not a list
+         not the question cards can do without: the summary is not a list
          of questions, and the verdict below states itself in words. -->
     <template x-if="!healthOneLine"><h2><span class="num">1</span>Is anything blowing up?</h2></template>
     <template x-if="summary && banner.loadFailure"><div>
@@ -742,7 +792,10 @@
   </section>
 
   <!-- ===================================================================
-       THE OVERVIEW (#88). #62's four questions, as four numbered cards.
+       THE OVERVIEW (#88). #62's questions, as numbered cards -- four of them
+       until 2026-09-01, when the product owner merged the last two: "where can
+       I optimize?" and "what do I do next?" were one question asked twice over
+       one payload path, so there are three, and question 1 is chrome.
 
        WHAT THIS REPLACED, AND WHY THE REPLACEMENT IS STRUCTURAL. #63 through
        #68 answered every one of those questions correctly and poured all four
@@ -761,7 +814,10 @@
        the raw token deck and the scope band moved DOWN to the detail view --
        they are inputs to these answers, not answers -- and the recommendation
        band split into questions 3 and 4. Nothing was added net, and the detail
-       view kept every panel it had.
+       view kept every panel it had. The 2026-09-01 merge of those two back
+       into one card moves the register the other way, which is the direction
+       constraint 4 is happy in: `EXPECTED_SURFACES` is restated DOWN, by hand,
+       rather than left to drift.
 
        DENSITY SCALES WITH HOW MUCH IS WRONG. Each card states its ANSWER and
        stops; its evidence -- meters, quarter medians, ranked rows, counts,
@@ -800,8 +856,8 @@
        THREE LEVELS OVER ONE PAYLOAD. #70 split the report into an overview and
        the raw data; #89 puts a level above both, because the overview answers
        "why?" and the question most readers arrive with is "what do I do?".
-       The four question cards are still there, one click down, with every
-       figure they had; nothing was removed at any level.
+       The question cards are still there, one click down, with every figure
+       they had; nothing was removed at any level.
 
        THE GAUGE NEEDS NO NEW JUDGMENT, AND THIS IS THE WHOLE POINT. A
        prototype of this screen invented its targets ("aim under 1.5x"). This
@@ -830,33 +886,10 @@
   <section id="view-summary" x-cloak x-show="view === 'summary'">
 
     <!-- The window every figure below covers, through the one getter that
-         composes it. A caption, not a panel -- the same decision `#overview-
-         period` and `#details-period` record. -->
+         composes it. A caption, not a panel. -->
     <div class="period" id="summary-period">Covering <strong x-text="periodLabel"></strong>.
-      <button type="button" class="drill" @click="setView('overview')">Why? The four
+      <button type="button" class="drill" @click="setView('overview')">Why? The
         questions behind this &rarr;</button>
-    </div>
-
-    <!-- THE STATUS STRIP: four questions, one line, status rather than
-         content. Every dot's state, question and answer is the API's
-         (`serve.STRIP_*`), composed there off the SAME `health`, `context` and
-         table readings the cards below and one level down render -- so a dot
-         cannot disagree with the card it summarises. Iterated, so a fifth
-         question added server-side reaches this strip by construction.
-
-         The colours are this page's, keyed on the API's four states through
-         `STRIP_DOT_TONE`; the state's own answer is rendered in words beside
-         it, so no verdict here is carried by colour alone. -->
-    <div class="strip" id="status-strip" x-cloak x-show="summary">
-      <template x-for="d in (summary ? summary.status.dots : [])" :key="d.key">
-        <div class="st">
-          <span class="dot" :class="dotTone(d.state)"></span>
-          <div>
-            <div class="stq" x-text="d.question"></div>
-            <div class="sta" x-text="d.answer"></div>
-          </div>
-        </div>
-      </template>
     </div>
 
     <!-- THE KNOBS. One row per metric in the dated table, in the table's own
@@ -867,8 +900,7 @@
          say rather than by one of them being absent. -->
     <section class="board" id="knobs-note">
       <h2>What you can change today</h2>
-      <div class="body">Worst first, in the dated table's own order. A row with
-        nothing to turn is dimmed, not hidden.</div>
+      <div class="body">Fixes for what's flagged above. Worst first.</div>
 
       <template x-for="k in bandedKnobs" :key="k.metric">
         <div class="knob" :class="{ off: !k.directive }">
@@ -947,6 +979,15 @@
                  the disclosure at the foot of this panel, and under "Measures:"
                  on the diagnosis card one level down. Moving a figure behind a
                  disclosure is not dropping it. -->
+            <!-- THE CALLOUT (#124 follow-up): `k.action` is the literal,
+                 short step -- a slash command or the exact words to say --
+                 kept as its OWN field in the payload precisely so the page
+                 never has to parse it back out of a sentence. `None` on a
+                 healthy reading, same as `k.directive`. -->
+            <template x-if="k.action"><div class="k-callout">
+              <span class="k-callout-label">Do this</span>
+              <span class="k-callout-action" x-text="k.action"></span>
+            </div></template>
             <div class="kw" x-text="actionDetail(k)"></div>
           </div>
 
@@ -1675,7 +1716,22 @@
   </section>
 
   <!-- =====================================================================
-       QUESTION 3: WHERE CAN I OPTIMIZE? (#78, #79, #84, #88)
+       QUESTION 3: WHAT SHOULD I DO FIRST? (#78, #79, #84, #88, #124)
+
+       ONE QUESTION WHERE THERE WERE TWO (product-owner direction,
+       2026-09-01). "Where can I optimize?" and "What do I do next?" were the
+       same question, answered from the same payload path -- one array,
+       `summary.recommendations.ranked` -- in two question boxes, one directly under the
+       other. Each opened with the same warm "Do this" callout the summary
+       level had already stated, so two actions rendered THREE times on one
+       page and the reader had to work out that the three were one.
+
+       THE TAB HINT IS THE RULE THE MERGE RESTORES: "same numbers, three
+       levels -- what to do, why, and every panel this report has ever had".
+       The SUMMARY level says what to do, and the callouts belong to it and
+       only to it. This level says WHY: the ranked readings, the figures they
+       rest on and both provenances. A card that repeated the summary's
+       callouts was not a second level, it was the same level twice.
 
        THE PAGE PERFORMS NO LOOKUP AND HOLDS NO THRESHOLD. Every boundary,
        every severity, every word of advice and both provenances are read off
@@ -1697,6 +1753,15 @@
        the rule this repository is built on. Unmeasured metrics get the API's
        own `unmeasured_note` for the same reason, never a dash and never a 0.
 
+       WHAT CHANGED ON 2026-09-01 IS THE WEIGHT, NEVER THE DATA. Three of the
+       five ranked readings are healthy, and three full rows saying "do not
+       change this" -- each with its own provenance disclosure -- were the
+       bulk of a card headed by a question about what to do FIRST. They are
+       now counted in one line and rendered in full one click below it. The
+       count is read off the same `ranked` array the moves are, so it cannot
+       become a second tally; and a page that dropped them instead would be
+       back to healthy and unmeasured looking alike.
+
        THE FIFTH ENTRY NEEDED NO MARKUP (#84), and that is the structure
        working rather than an oversight. `ranked` is iterated and `unmeasured`
        is consumed whole, so a metric added to the table reaches this card by
@@ -1708,14 +1773,30 @@
        edge and a JUDGED upper edge, so the marking is on the edge.
        ===================================================================== -->
   <section class="q" id="advice-note">
-    <h2><span class="num">3</span>Where can I optimize?</h2>
+    <h2><span class="num">3</span>What should I do first?</h2>
     <template x-if="!summary"><div class="answer">Loading&hellip;</div></template>
     <template x-if="summary"><div>
       <template x-if="topOpportunity === null"><div class="answer">
-        Nothing to do here &mdash; everything's already in a healthy range.
+        <span class="tag">NOTHING</span> No reading carries a lever, so there is
+        no move to make first &mdash; every measured reading already sits inside
+        its healthy range. That is a measured verdict over the table, not an
+        empty list.
       </div></template>
-      <template x-if="topOpportunity !== null"><div class="answer" x-text="topOpportunity.recommendation"></div></template>
-      <div class="answer-key">See "What you can change today" above for the full list, ranked biggest first.
+      <!-- THE LEAD IS THE MOVE ITSELF, in the module's own action-oriented
+           phrase. This was the answer of the "what do I do next?" card until
+           that card merged into this one (product-owner direction,
+           2026-09-01), and the binding is spelled exactly as it was there:
+           `topOpportunity` aliases one element of `recommendations.ranked`,
+           which the wiring walker cannot follow back to the array, so
+           `OverviewRestingStateTest.RESTING` is what pins this reading rather
+           than `SummaryPayloadIsWiredTest`. -->
+      <template x-if="topOpportunity !== null"><div class="answer">
+        First: <strong x-text="topOpportunity.lever.directive"></strong>.
+      </div></template>
+      <div class="answer-key">Why, and every reading behind it, below &mdash; in
+        the order the dated table ranks them. The literal step to run or say is
+        on the summary level, under "What you can change today" &mdash; the
+        one place on this report that states it.
         <!-- THE UNMEASURED COUNT IS THE PRICE OF COLLAPSING ON IT. This card
              no longer opens itself for a metric with no sample -- a project
              that dispatches no subagent has no main-to-subagent ratio and
@@ -1736,66 +1817,142 @@
           <span x-text="summary.recommendations.ranking_provenance"></span></span>
 
         <template x-for="(a, i) in summary.recommendations.ranked" :key="a.metric">
-          <div class="opp">
-            <div class="rank" x-text="i + 1"></div>
-            <div class="txt">
-              <!-- `a.recommendation` is already the one-sentence "do this,
-                   because X" answer ("{directive}. {detail}", or just the
-                   detail for a healthy reading with no directive) -- the SAME
-                   text the summary card shows. The raw metric key, the
-                   `measurement` definition and a separate "Lever:" line that
-                   only restated the recommendation's own first sentence are
-                   gone (product-owner direction, #122, 2026-08-31): a second,
-                   jargon-heavier rendering of one fact is not a second fact. -->
-              <div class="d" x-text="a.recommendation"></div>
-              <details class="disclosure">
-                <summary>Where this number comes from</summary>
-                <span class="advice-line">Range
-                  <strong x-text="fmtUnit(a.range_lower, a.unit)"></strong> to
-                  <strong x-text="a.range_upper === null ? 'no ceiling' : fmtUnit(a.range_upper, a.unit)"></strong>,
-                  <!-- The key the order was derived from, published beside the
-                       order it produced: `RANKED_BY`'s rule, and the reason
-                       `ranking_provenance` above is a field rather than a
-                       comment. -->
-                  ranked <span x-text="fmtMetric(a.depth_in_severity)"></span> into the
-                  <span x-text="a.severity"></span> band.</span>
-                <!-- The two edges, each in its own voice. Written out twice
-                     rather than looped, because a helper that reshaped them
-                     would spell the field names in JavaScript where the wiring
-                     guard cannot follow them to the payload. `covers` rides in
-                     the tooltip: it is a paragraph qualifying exactly what the
-                     citation does and does not cover. -->
-                <span class="advice-line" :class="provenanceVoice(a.lower_provenance)">
-                  Lower edge <span x-text="fmtUnit(a.range_lower, a.unit)"></span> &mdash;
-                  <strong x-text="a.lower_provenance.kind"></strong>:
-                  <span x-text="a.lower_provenance.statement"></span>
-                  <template x-if="a.lower_provenance.checked"><span>(<span
-                    x-text="a.lower_provenance.checked"></span>)</span></template>
-                  <template x-if="a.lower_provenance.source"><span>Source:
-                    <span class="mono" :title="a.lower_provenance.covers"
-                          x-text="a.lower_provenance.source"></span>
-                    &mdash; hover for what it covers.</span></template>
-                </span>
-                <template x-if="a.upper_provenance">
-                  <span class="advice-line" :class="provenanceVoice(a.upper_provenance)">
-                    Upper edge <span x-text="fmtUnit(a.range_upper, a.unit)"></span> &mdash;
-                    <strong x-text="a.upper_provenance.kind"></strong>:
-                    <span x-text="a.upper_provenance.statement"></span>
-                    <template x-if="a.upper_provenance.checked"><span>(<span
-                      x-text="a.upper_provenance.checked"></span>)</span></template>
-                    <template x-if="a.upper_provenance.source"><span>Source:
-                      <span class="mono" :title="a.upper_provenance.covers"
-                            x-text="a.upper_provenance.source"></span>
+          <template x-if="a.lever">
+            <div class="opp">
+              <div class="rank" x-text="i + 1"></div>
+              <div class="txt">
+                <!-- THE DIRECTIVE, NOT THE PARAGRAPH (product-owner direction,
+                     2026-09-01). This line was `a.recommendation` -- the whole
+                     "{directive}. {detail}" sentence, which is VERBATIM what the
+                     summary level's knob card already prints for the same
+                     reading. One paragraph, twice on one page, under two
+                     headings. `lever.directive` is the module's own short phrase
+                     and it is the half this level needs: the detail that follows
+                     it there is the WHY, and the why is what the disclosure under
+                     this row holds, in figures rather than in prose.
+
+                     THE "Do this" CALLOUT LEFT THIS CARD AND DID NOT LEAVE THE
+                     PAGE. `a.action` is the literal step -- a slash command, or
+                     the exact words to say -- and the summary level states it,
+                     once, in the callout it owns. Repeated here it made the two
+                     actions this report has to offer render three times between
+                     two adjacent question boxes. A healthy reading carries neither
+                     field, which is why this row renders only for a reading with a
+                     lever and why the counted line below it renders the ones
+                     that do not. -->
+                <div class="d"><strong x-text="a.lever.directive"></strong></div>
+                <details class="disclosure">
+                  <summary>Where this number comes from</summary>
+                  <span class="advice-line">Range
+                    <strong x-text="fmtUnit(a.range_lower, a.unit)"></strong> to
+                    <strong x-text="a.range_upper === null ? 'no ceiling' : fmtUnit(a.range_upper, a.unit)"></strong>,
+                    <!-- The key the order was derived from, published beside the
+                         order it produced: `RANKED_BY`'s rule, and the reason
+                         `ranking_provenance` above is a field rather than a
+                         comment. -->
+                    ranked <span x-text="fmtMetric(a.depth_in_severity)"></span> into the
+                    <span x-text="a.severity"></span> band.</span>
+                  <!-- The two edges, each in its own voice. Written out twice
+                       rather than looped, because a helper that reshaped them
+                       would spell the field names in JavaScript where the wiring
+                       guard cannot follow them to the payload. `covers` rides in
+                       the tooltip: it is a paragraph qualifying exactly what the
+                       citation does and does not cover. -->
+                  <span class="advice-line" :class="provenanceVoice(a.lower_provenance)">
+                    Lower edge <span x-text="fmtUnit(a.range_lower, a.unit)"></span> &mdash;
+                    <strong x-text="a.lower_provenance.kind"></strong>:
+                    <span x-text="a.lower_provenance.statement"></span>
+                    <template x-if="a.lower_provenance.checked"><span>(<span
+                      x-text="a.lower_provenance.checked"></span>)</span></template>
+                    <template x-if="a.lower_provenance.source"><span>Source:
+                      <span class="mono" :title="a.lower_provenance.covers"
+                            x-text="a.lower_provenance.source"></span>
                       &mdash; hover for what it covers.</span></template>
                   </span>
-                </template>
-              </details>
+                  <template x-if="a.upper_provenance">
+                    <span class="advice-line" :class="provenanceVoice(a.upper_provenance)">
+                      Upper edge <span x-text="fmtUnit(a.range_upper, a.unit)"></span> &mdash;
+                      <strong x-text="a.upper_provenance.kind"></strong>:
+                      <span x-text="a.upper_provenance.statement"></span>
+                      <template x-if="a.upper_provenance.checked"><span>(<span
+                        x-text="a.upper_provenance.checked"></span>)</span></template>
+                      <template x-if="a.upper_provenance.source"><span>Source:
+                        <span class="mono" :title="a.upper_provenance.covers"
+                              x-text="a.upper_provenance.source"></span>
+                        &mdash; hover for what it covers.</span></template>
+                    </span>
+                  </template>
+                </details>
+              </div>
+              <div class="fig">
+                <div class="n" x-text="fmtUnit(a.value, a.unit)"></div>
+                <div class="u" x-text="a.severity"></div>
+              </div>
             </div>
-            <div class="fig">
-              <div class="n" x-text="fmtUnit(a.value, a.unit)"></div>
-              <div class="u" x-text="a.severity"></div>
-            </div>
-          </div>
+          </template>
+        </template>
+
+        <!-- THE HEALTHY READINGS, COUNTED HERE AND RENDERED ONE CLICK DOWN
+             (product-owner direction, 2026-09-01). Measured that day over
+             this project's own transcripts, three of the five ranked readings
+             carried no lever -- and each of the three occupied a full row,
+             rank, sentence, figure and a provenance disclosure of its own,
+             under a heading asking what to do FIRST. Rows saying "do not
+             change this" at the same weight as the moves above them are a
+             list of non-events. The proportion is a dated observation, not a
+             constant: the split is made per row, so a corpus where every
+             reading has a lever renders no counted line at all.
+
+             COUNTED, AND STILL RENDERED. That healthy readings EXIST is the
+             information: a page that dropped them would make healthy and
+             unmeasured render identically, which is the one thing this
+             repository refuses everywhere else. So the count is the summary
+             line and every row is one click under it -- a presentation
+             decision, never a data one.
+
+             THE COUNT IS DERIVED FROM THE ARRAY IT DESCRIBES, in the same
+             expression the loop below filters on, so there is no second tally
+             this page keeps and nothing for the two to disagree about.
+             `recommendations.py` guarantees the correspondence: an `ok`
+             reading has no lever, and a reading that is not `ok` always has
+             one. -->
+        <!-- SILENT WHERE THERE IS NOTHING TO COUNT. "0 other reading(s) are in
+             a healthy range" is a line that varies only in a number nobody
+             reads, and this page's own rule for the project band and the
+             not-fully-banded notice is the same one: a notice that never
+             varies is a notice nobody reads. The guard is `some`, over the
+             array the count and the loop both range over, so all three ask
+             one question of one list. -->
+        <template x-if="summary.recommendations.ranked.some(a => !a.lever)">
+        <details class="disclosure">
+          <summary><span
+              x-text="summary.recommendations.ranked.filter(a => !a.lever).length"></span>
+            other reading(s) are in a healthy range &mdash; nothing to change.</summary>
+          <template x-for="a in summary.recommendations.ranked" :key="a.metric">
+            <template x-if="!a.lever">
+              <div class="opp">
+                <!-- NO RANK NUMBER. The ranking orders things to DO, and these
+                     are the readings there is nothing to do about; a number
+                     beside one would invite the reader to act on it in turn. -->
+                <div class="rank">&mdash;</div>
+                <div class="txt">
+                  <!-- The whole content of a healthy reading is this one
+                       sentence -- `Recommendation.__post_init__` refuses an
+                       empty `detail`, and every `ok` detail in
+                       `recommendations.py` ends "Nothing to change here" or
+                       "Do not change this" -- so there is no directive to lead
+                       with and `a.recommendation` is the fallback the row
+                       above names. -->
+                  <div class="d" x-text="a.recommendation"></div>
+                </div>
+                <div class="fig">
+                  <div class="n" x-text="fmtUnit(a.value, a.unit)"></div>
+                  <div class="u" x-text="a.severity"></div>
+                </div>
+              </div>
+            </template>
+          </template>
+        </details>
         </template>
 
         <!-- UNMEASURED IS NAMED, NEVER DROPPED. A metric with no sample that
@@ -1852,71 +2009,6 @@
       </details>
     </div></template>
   </section>
-
-  <!-- =====================================================================
-       QUESTION 4: WHAT DO I DO NEXT? (#67, #88)
-
-       THE SAME READINGS, AS MOVES. Question 3 is the diagnosis -- which figure
-       is out of range and by how much; this is the prescription, in the
-       table's own order, each move naming the figure that justifies it. Both
-       read `recommendations.ranked`, which is one payload path bound twice
-       within ONE view: they cannot disagree, because there is nothing between
-       them to drift.
-
-       THE PAGE COMPOSES NO ADVICE. `lever.directive` is the module's own
-       action-oriented phrase, built from a closed registry, so this list can
-       state a move that does not exist in the table only by the module
-       inventing it first.
-
-       A LIST WITH NO ITEMS IS A NAMED ABSENCE. Every reading being healthy is
-       a finding, not an empty `<ol>`: it is stated in words, in the same
-       branch that would otherwise carry the first move.
-       ===================================================================== -->
-  <section class="q" id="next-note">
-    <h2><span class="num">4</span>What do I do next?</h2>
-    <template x-if="!summary"><div class="answer">Loading&hellip;</div></template>
-    <template x-if="summary"><div>
-      <template x-if="topOpportunity === null"><div class="answer">
-        <span class="tag">NOTHING</span> No reading carries a lever, so there is
-        no move to make first. That is a measured verdict over the table, not an
-        empty list.
-      </div></template>
-      <template x-if="topOpportunity !== null"><div class="answer">
-        First: <strong x-text="topOpportunity.lever.directive"></strong>.
-      </div></template>
-      <div class="answer-key">In the order the dated table ranks them, each move
-        named by the figure that justifies it.
-        <!-- The same count as question 3's, for the same reason and on the
-             same card-by-card rule: a metric with no sample might have been
-             the first move, so a list that collapses on "no lever" must state
-             at rest how many readings never got one. -->
-        <template x-if="Object.keys(summary.recommendations.unmeasured).length"><span>
-          <span x-text="Object.keys(summary.recommendations.unmeasured).length"></span>
-          reading(s) could not be measured in this period, so no move is offered
-          for them &mdash; unmeasured, not healthy.</span></template></div>
-
-      <details class="disclosure" id="next-detail" :open="opportunitiesOpen">
-        <summary>Show the full timeline</summary>
-        <!-- One line per move, and the line IS `a.recommendation` -- the same
-             "{directive}. {detail}" sentence question 3 shows, not a second
-             composition of the raw metric key, value and severity around it
-             (product-owner direction, #122, 2026-08-31: that repeated the directive
-             a third time on this page alone and named a debugging identifier
-             no first-time reader needs). -->
-        <ol class="next">
-          <template x-for="a in summary.recommendations.ranked" :key="a.metric">
-            <template x-if="a.lever">
-              <li x-text="a.recommendation"></li>
-            </template>
-          </template>
-        </ol>
-        <template x-if="topOpportunity === null"><div class="body">Nothing to
-          list: every measured reading sits inside its healthy range, so no
-          lever is offered. This is a positive statement about the table, not a
-          gap in it.</div></template>
-      </details>
-    </div></template>
-  </section>
   </section>
 
   <!-- ===================================================================
@@ -1950,7 +2042,7 @@
   <!-- #88: THE RAW TOKEN DECK AND THE SCOPE BAND, MOVED DOWN A LEVEL.
 
        They were the first two things a reader met on the landing page, and
-       they are INPUTS TO the four answers rather than answers: "Input tokens
+       they are INPUTS TO the overview's answers rather than answers: "Input tokens
        32.1k / Cache-read 443.47M / Cache-write 8.07M" is three raw token
        classes with no verdict, and the reader's own reaction to it -- "what do
        I do with this?" -- is what #62 was filed over. They are not deleted and
@@ -2628,14 +2720,6 @@ const TICK_VOICE = {
 function tickVoice(kind) {
   return TICK_VOICE[kind] ?? TICK_VOICE.judged;
 }
-const STRIP_DOT_TONE = {
-  good: "dot-good",
-  watch: "dot-watch",
-  bad: "dot-bad",
-  unknown: "dot-unknown",
-};
-const STRIP_DOT_TONE_UNRECOGNISED = "dot-bad";
-
 // #93: the one sample state this page names, and it names ONE on purpose.
 //
 // The split it drives is binary -- a row whose bands can be read, and a row
@@ -2651,9 +2735,6 @@ const STRIP_DOT_TONE_UNRECOGNISED = "dot-bad";
 // full row and being drawn as one. Same direction as every other fallback
 // here -- an unrecognised state may weaken a claim and never make one.
 const SAMPLE_MEASURED = "measured";
-function dotTone(state) {
-  return STRIP_DOT_TONE[state] ?? STRIP_DOT_TONE_UNRECOGNISED;
-}
 
 function fmtTokRounded(n) {
   // The guard comes BEFORE the rounding on purpose: `Math.round(null)` is 0,
@@ -2765,13 +2846,19 @@ function chartTooltipLabel(c) {
     : `${base} (over all ${fmtCount(total)} call(s))`;
 }
 
-const CLASS_COLORS = { input: "#2563eb", cache_read: "#059669", cache_write: "#d97706", output: "#dc2626" };
+const CLASS_COLORS = { input: "#60a5fa", cache_read: "#34d399", cache_write: "#fbbf24", output: "#f87171" };
 // One colour per turn-type series, cycled. Must stay >= the number of keys the
 // "by turn type" chart can produce, or two series share a colour and the stack
 // silently misreads: 9 turn_type values + "(no turn)" + the subagent scope
 // bucket = 11.
-const TT_COLORS = ["#2563eb", "#059669", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#be185d", "#64748b",
-                   "#65a30d", "#9333ea", "#0f766e", "#b45309"];
+const TT_COLORS = ["#60a5fa", "#34d399", "#fbbf24", "#f87171", "#a78bfa", "#22d3ee", "#f472b6", "#a7b0c8",
+                   "#a3e635", "#c084fc", "#2dd4bf", "#fb923c"];
+// Chart.js defaults to near-black text and grey gridlines, invisible against
+// this page's dark navy cards -- set once, globally, so every chart (present
+// and future) inherits readable text/grid colour without repeating it per
+// scale.
+Chart.defaults.color = "#8b96b3";
+Chart.defaults.borderColor = "rgba(148,163,184,.15)";
 
 // The three states a dispatch can be in, spelled once: label, and the tooltip
 // that says what the figures beside it are worth (#41). "Reaped" is not one
@@ -3002,6 +3089,12 @@ function report() {
     // A failure is never dropped by a later render: only a load in which EVERY
     // endpoint succeeded clears it, and `load()` is the one place that happens.
     banner: { loadFailure: null, stale: null, notices: [] },
+    // THE REFRESH THE PAGE CAN PERFORM ITSELF. `ok` is TRI-STATE -- null
+    // until a refresh has been attempted, then the server's own verdict --
+    // for the same reason `ingest.stale` is: "not tried yet" and "tried and
+    // failed" are different facts, and a two-state flag would render the
+    // first as the second.
+    refresh: { state: "idle", ok: null, message: "" },
     // The page's own clock, and the instant the figures on screen ARRIVED
     // (#24). Both are local `Date.now()` readings and only their DIFFERENCE is
     // ever used, so nothing here is compared against the server's clock: the
@@ -3620,8 +3713,8 @@ function report() {
         contextCalls: ts.context_calls,
         unmeasuredCalls: ts.unmeasured_calls,
         totalCalls: ts.calls,
-        borderColor: "#111827",
-        backgroundColor: "#111827",
+        borderColor: "#e5e7eb",
+        backgroundColor: "#e5e7eb",
         yAxisID: "y2",
         tension: 0.2,
         pointRadius: 2,
@@ -3656,6 +3749,41 @@ function report() {
       // Highest precedence in `bannerMessages`, and cleared only by a load in
       // which every endpoint returned.
       this.banner.loadFailure = "Load failed: " + e.message + " -- displayed figures may be stale.";
+    },
+
+    // Runs the ingest on the server and re-reads the page from it.
+    //
+    // IT NEVER CLAIMS A REFRESH IT DID NOT GET. The server answers `ok`
+    // only when the ingest process exited 0; anything else arrives with an
+    // `error`, which is shown verbatim and leaves every figure below exactly
+    // as stale as it was. A green "done" over numbers that did not move would
+    // be worse than the banner this button replaced -- the reader would trust
+    // stale figures MORE than before they clicked.
+    async refreshNow() {
+      if (this.refresh.state === "running") return;
+      this.refresh.state = "running";
+      this.refresh.ok = null;
+      this.refresh.message = "";
+      let result;
+      try {
+        const r = await fetch("/api/refresh", { method: "POST" });
+        result = await r.json();
+      } catch (e) {
+        this.refresh.state = "idle";
+        this.refresh.ok = false;
+        this.refresh.message = "Refresh failed: " + e.message;
+        return;
+      }
+      this.refresh.state = "idle";
+      this.refresh.ok = result.ok === true;
+      if (!this.refresh.ok) {
+        this.refresh.message = result.error || "Refresh failed for a reason the server did not name.";
+        return;
+      }
+      // The data really moved, so re-read it. `load()` reports its own
+      // failure through the banner if the re-read is what breaks.
+      await this.load();
+      this.refresh.message = "Up to date.";
     },
 
     async load() {
@@ -3712,9 +3840,8 @@ function report() {
       // `fmtAge`/`fmtSpan` are unchanged -- only the sentence is shorter and
       // leads with the action.
       this.banner.stale = this.summary.ingest.stale === true
-        ? `This data was ${fmtAge(this.summary.ingest.as_of - this.summary.ingest.last_run_at)} old `
-          + `when this page loaded (older than the ${fmtSpan(this.summary.ingest.stale_after_seconds)} we trust). `
-          + `Run ingest.py to refresh it before trusting the numbers below.`
+        ? `These numbers were ${fmtAge(this.summary.ingest.as_of - this.summary.ingest.last_run_at)} old `
+          + `when this page loaded. Refresh before trusting them.`
         : null;
       // An UNKNOWN age is not a staleness verdict, so it never takes the
       // banner's `stale` slot above — but it must not be left to the grey
@@ -3722,17 +3849,12 @@ function report() {
       // in the same register as the archived-source and unparsed-record
       // notices below.
       if (this.summary.ingest.stale_unknown_reason === "run-in-future") msgs.push(
-        `INCONCLUSIVE: the last recorded ingest is dated in the FUTURE `
-        + `(${fmtTs(this.summary.ingest.last_run_at)}, ahead of this server's clock). The `
-        + `database's age cannot be measured, so nothing below is qualified as `
-        + `fresh or stale — check the clock, or whether this database was copied `
-        + `from another machine.`);
+        `Can't tell how old this data is — the last ingest is dated in the future `
+        + `(${fmtTs(this.summary.ingest.last_run_at)}). Check this machine's clock.`);
       if (this.summary.ingest.stale_unknown_reason === "no-run-recorded") msgs.push(
-        `INCONCLUSIVE: no ingest.py run has ever COMPLETED over this database, `
-        + `which holds ${this.summary.ingest.files.toLocaleString()} ingested file(s). Its age `
-        + `is unknown and may be unbounded — a run that raises never stamps, so a `
-        + `failing ingest looks exactly like this. Re-run ingest.py and check it `
-        + `exits cleanly.`);
+        `Can't tell how old this data is — no ingest has ever finished here, `
+        + `though it holds ${this.summary.ingest.files.toLocaleString()} file(s). `
+        + `Hit Refresh; if it fails, that is why.`);
       // "No files ingested yet — run ingest.py." USED TO BE HERE and is gone
       // (#64). The health band's `records-parsed` check states it, and states
       // more: an empty ledger is UNCHECKED rather than clean, which a banner
@@ -3744,7 +3866,7 @@ function report() {
       // same `ingest.unparsed_records` rather than a replacement for it, and a
       // warning the reader could navigate away from would be a warning this
       // page had quietly weakened.
-      if (this.summary.ingest.unparsed_records > 0) msgs.push(`INCONCLUSIVE: ${this.summary.ingest.unparsed_records} unparsed record(s) across ingested files — totals may undercount.`);
+      if (this.summary.ingest.unparsed_records > 0) msgs.push(`${this.summary.ingest.unparsed_records} record(s) couldn't be read, so totals may be low.`);
       // #116: the plugin is installed, its hooks have never recorded a run,
       // and enough turns have ended since this build arrived that a working
       // hook would have. That is a broken automatic ingest, and it is the ONE
@@ -3770,7 +3892,7 @@ function report() {
       // Totals here are COMPLETE — the archived calls are counted. What they
       // are not is reproducible: those transcripts are gone, so this database
       // is the only copy and re-ingesting will not bring them back. Back it up.
-      if (!this.summary.durability.reproducible) msgs.push(`${this.summary.durability.archived_calls} call(s) in this window come from ${this.summary.durability.archived_sources} transcript(s) no longer on disk — counted in the totals, but NOT reproducible by re-ingesting. This database is their only copy.`);
+      if (!this.summary.durability.reproducible) msgs.push(`${this.summary.durability.archived_calls} call(s) come from ${this.summary.durability.archived_sources} deleted transcript(s). They're counted here, and this database is the only copy left.`);
       this.banner.notices = msgs;
     },
 

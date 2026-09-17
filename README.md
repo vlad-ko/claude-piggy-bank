@@ -71,9 +71,9 @@ and where that database lives: [`docs/install.md`](docs/install.md). Flags,
 
 ## What you get
 
-One page answering four questions, in order: **Is anything blowing up? · Am I
-wasting context? · Where can I optimize? · What do I do next?** Each answer is
-one sentence, plus a "show me the numbers" link if you want the detail — token
+One page answering three questions, in order: **Is anything blowing up? · Am I
+wasting context? · What should I do first?** Each answer is one sentence, plus
+a "show me the numbers" link if you want the detail — token
 totals, sessions, per-model breakdowns, your daily usage over time, and the
 biggest individual dispatches and calls. Every context figure is shown as a
 share of that model's actual limit, so "266.6k tokens" reads as "68% full"

@@ -42,6 +42,74 @@ require entries for historical
 versions: pinning history would force a rewrite at every release, which is how
 a check becomes something people route around.
 
+## 4.3.0 — 2026-09-04
+
+**No migration.** The report looks different and says less; every figure it
+publishes is the same figure, computed the same way.
+
+**What changed for a user:**
+
+- **The report can refresh itself.** The staleness banner used to end "Run
+  ingest.py to refresh it" — a true instruction naming a script path, in a
+  directory nobody was shown, with a `--db` flag nobody was given, to a reader
+  sitting in a browser. There is now a **Refresh now** button beside the
+  banner. It runs the same `ingest.py` command the plugin's hooks and the
+  `/claude-piggy-bank:cpb` skill already run, over the database this server is
+  reading, and reports what happened. A refresh that fails, times out, or
+  cannot find the script says so and leaves every figure exactly as stale as it
+  was: a green "refreshed" over numbers that never moved would leave a reader
+  trusting stale figures *more* than before they clicked.
+- **Each action is stated once.** `Run: /clear` and `Say: "use a subagent for
+  this"` were each rendered three times on one page — the summary card, "Where
+  can I optimize?", and "What do I do next?" — with the same paragraph under
+  each. The action now appears only on the Summary level, which is the level
+  that answers *what to do*.
+- **The overview's questions 3 and 4 are one question.** They ranked the same
+  readings from the same field and answered the same way; they are now "What
+  should I do first?". The overview has three numbered questions rather than
+  four.
+- **Readings that are already healthy collapse to a counted line** —
+  "N other reading(s) are in a healthy range" — with every one of them still
+  rendered in full, with its sentence and its figure, inside "Show every
+  reading". Nothing is filtered out of the data: both row loops iterate the
+  whole ranked list.
+- **The four-dot status strip is gone.** Its dots restated things already on
+  the same screen: the broken/unchecked verdict is the health card above it,
+  and "2 of 5" was a tally of the five rows directly below it.
+- **New look.** A dark navy palette with the cyan and gold accents from
+  wealthbot.io, gradient surfaces, larger type, and gauge dials whose arcs
+  carry their severity colour. The four-dot strip's replacement glyph — before
+  the strip was removed — is why the dials and the status shapes now share one
+  silhouette.
+
+**For anyone driving this over HTTP:** `POST /api/refresh` is new. It answers
+`{"ok": true, ...}` only when the ingest process exits 0, and `{"ok": false,
+"error": ...}` otherwise. It is a POST, not a GET, because it changes the
+database — behind GET, a browser prefetch or a history revisit would each
+silently start an ingest — and it repeats the loopback-host check the read
+routes perform. No existing route, parameter or field changed meaning.
+
+## 4.2.1 — 2026-08-31
+
+**No migration.** A correction to the recommendation table's advice text; no
+boundary, severity or field changed.
+
+**What changed for a user:** the "reduce main-thread context" and "increase
+subagent dispatch" advice told you WHAT was wrong but not what to actually
+do about it -- "dispatch work to subagents" and "start a fresh session at a
+natural break" are true, but neither says what to type. Every ACT/WATCH
+detail across all five metrics now names the literal action: say "use a
+subagent for this" when you have a big search or file-reading task, and run
+`/clear` to start over instead of continuing a long conversation. The
+prompt-prefix-stability advice similarly now says what changes between calls
+usually breaks the cache (editing `CLAUDE.md`, switching tools mid-session)
+and what to do about it.
+
+**Why, precisely.** 4.2.0's copy sweep made every panel state one plain
+sentence; it did not go far enough on WHAT that sentence asked the reader to
+do. Reported directly by a first-time reader looking at the live report:
+"what does it mean? how do I do that?"
+
 ## 4.2.0 — 2026-08-31
 
 **No migration.** A rewrite of the report's action-oriented prose, plus one

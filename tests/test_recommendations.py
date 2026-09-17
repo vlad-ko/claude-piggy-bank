@@ -209,6 +209,9 @@ def synthetic_metric(
                     if severity == SEVERITY_OK
                     else lever(ACTION_INCREASE, "subagent_dispatch"),
                     detail=f"synthetic {key} {severity} detail {i}",
+                    action=None
+                    if severity == SEVERITY_OK
+                    else f"synthetic {key} {severity} action {i}",
                 ),
             )
         )
@@ -313,6 +316,7 @@ class RangesPartitionTheDomainTest(unittest.TestCase):
                         SEVERITY_ACT,
                         lever(ACTION_INCREASE, "subagent_dispatch"),
                         "high",
+                        "test action",
                     ),
                 ),
             ),
@@ -342,6 +346,7 @@ class RangesPartitionTheDomainTest(unittest.TestCase):
                         SEVERITY_ACT,
                         lever(ACTION_INCREASE, "subagent_dispatch"),
                         "high",
+                        "test action",
                     ),
                 ),
             ),
@@ -587,6 +592,29 @@ class HealthyIsAnExplicitEntryTest(unittest.TestCase):
                         entry.recommendation.lever.directive,
                         entry.recommendation.text,
                     )
+
+    def test_every_firing_entry_in_the_table_names_a_literal_action(self):
+        # #124 follow-up: `lever.directive` and `detail` can both be true and
+        # still leave a first-time reader unable to say what to type -- this
+        # is the field that closes that gap, so a firing entry missing it is
+        # the same defect a missing lever would be. `Recommendation.__post_
+        # init__` already refuses this at construction; this walks the real
+        # table so a future range that slips past review still fails a test
+        # a reviewer is likely to see, not just an import-time exception
+        # buried in a traceback.
+        for key, metric in METRICS.items():
+            for entry in metric.ranges:
+                if entry.recommendation.severity == SEVERITY_OK:
+                    continue
+                with self.subTest(metric=key, lower=entry.lower.value):
+                    action = entry.recommendation.action
+                    self.assertIsNotNone(action)
+                    self.assertTrue(action.strip())
+                    # A placeholder that just repeats the directive would
+                    # satisfy "not blank" while still leaving nothing to
+                    # type -- so the action must be its own sentence, not a
+                    # copy of the lever's.
+                    self.assertNotEqual(action, entry.recommendation.lever.directive)
 
 
 class UnmeasuredIsNotHealthyTest(unittest.TestCase):
@@ -1280,6 +1308,7 @@ class AdviceToShrinkTheDiscountIsUnrepresentableTest(unittest.TestCase):
                     severity=SEVERITY_ACT,
                     lever=lever(ACTION_INCREASE, "subagent_dispatch"),
                     detail=detail,
+                    action="test action",
                 )
 
     def test_prose_that_merely_mentions_cache_reads_is_allowed(self):
@@ -1290,6 +1319,7 @@ class AdviceToShrinkTheDiscountIsUnrepresentableTest(unittest.TestCase):
             lever=lever(ACTION_REDUCE, "main_thread_context"),
             detail="Reduce the main session's context. The cache read discount "
             "then applies to a smaller prefix.",
+            action="test action",
         )
         self.assertIn("cache read", built.detail)
 
@@ -1435,6 +1465,7 @@ class RankingIsDerivedNotAuthoredTest(unittest.TestCase):
             severity=severity,
             recommendation=f"{metric} says {severity}",
             lever=None,
+            action=None,
             depth_in_severity=depth,
             range_lower=0.0,
             range_upper=None,
